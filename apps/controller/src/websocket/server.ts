@@ -10,6 +10,7 @@ import {
   LeaseAcceptPayloadSchema,
   LeaseRejectPayloadSchema,
   LogChunkPayloadSchema,
+  SourceNeedPayloadSchema,
   SourceReadyPayloadSchema,
   negotiateProtocolVersion,
 } from '@rbo/protocol';
@@ -29,6 +30,7 @@ import {
   handleRemoteLeaseAccept,
   handleRemoteLeaseReject,
   handleRemoteLogChunk,
+  handleRemoteSourceNeed,
   handleRemoteSourceReady,
   renewActiveLease,
 } from '../execution/remote-execution.js';
@@ -44,6 +46,7 @@ export interface AgentPlaneDispatchContext {
   allowedProjectRoots?: string[];
   allowedArtifactDestinations?: string[];
   maxConcurrentJobs?: number;
+  gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
 }
 
 export interface AgentPlaneOptions {
@@ -129,6 +132,7 @@ export async function startAgentPlaneServer(
     serverPort: boundPort,
     controllerPublicHost: options.controllerPublicHost,
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
+    allowedProjectRoots: options.dispatchContext?.allowedProjectRoots,
   });
 
   const buildSubmitContext = () => {
@@ -144,6 +148,7 @@ export async function startAgentPlaneServer(
         options.dispatchContext.allowedProjectRoots ??
         [],
       maxConcurrentJobs: options.dispatchContext.maxConcurrentJobs ?? 1,
+      gitAllowlist: options.dispatchContext.gitAllowlist,
       clientId: 'agent-plane-dispatcher',
       controllerIdentity: identity,
       connectedAgents,
@@ -333,6 +338,14 @@ export async function startAgentPlaneServer(
             if (!payload) return;
             handleRemoteLeaseReject(remoteOpts(), authenticated.agentId, payload);
             maybeDispatchQueued();
+            return;
+          }
+
+          case 'source_need': {
+            if (!authenticated) return;
+            const payload = parsePayload(SourceNeedPayloadSchema, message.payload, message.type);
+            if (!payload) return;
+            void handleRemoteSourceNeed(remoteOpts(), authenticated.agentId, payload);
             return;
           }
 

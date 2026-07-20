@@ -84,8 +84,13 @@ export function parsePorcelainV2(output: Buffer | string): GitStatusEntry[] {
         const path = fields[fields.length - 1] ?? '';
         entries.push({ path, xy, kind: 'tracked' });
       } else {
-        const origPath = fields[fields.length - 1] ?? '';
-        const path = fields[fields.length - 2] ?? '';
+        // Rename/copy: `<line with path>` NUL `<origPath>` NUL
+        const path = fields[fields.length - 1] ?? '';
+        const origEnd = buf.indexOf(0, offset);
+        const origPath = buf
+          .subarray(offset, origEnd === -1 ? buf.length : origEnd)
+          .toString('utf8');
+        offset = origEnd === -1 ? buf.length : origEnd + 1;
         entries.push({ path, origPath, xy, kind: 'tracked' });
       }
       continue;

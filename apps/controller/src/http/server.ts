@@ -39,6 +39,7 @@ export interface ControllerServerOptions {
   allowedProjectRoots?: string[];
   allowedArtifactDestinations?: string[];
   maxConcurrentJobs?: number;
+  gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
 }
 
 export interface RunningControllerServer {
@@ -95,6 +96,7 @@ function buildToolContext(
     agentPlanePort: options.agentPlanePort,
     controllerPublicHost: options.controllerPublicHost,
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
+    gitAllowlist: options.gitAllowlist,
   };
 }
 

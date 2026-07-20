@@ -16,20 +16,26 @@ import {
 import type {
   ArtifactManifestPayload,
   ArtifactUploadGrantPayload,
+  BundleDownloadPayload,
   CancelJobPayload,
   CleanupCompletePayload,
   JobExitPayload,
   LeaseOfferPayload,
+  PrepareSourceGitOverlayPayload,
   PrepareSourcePayload,
   RunJobPayload,
+  SourceNeedReason,
 } from '@rbo/protocol';
 import { certificateFingerprint, createLogger, generateId, resolveContainedCwd } from '@rbo/shared';
-import { materializeFullSnapshot } from '@rbo/snapshot';
+import type { GitUrlAllowlist } from '@rbo/shared';
+import { applyGitOverlay, materializeFullSnapshot } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
+import { type RepoCacheConfig, RepoMirrorManager } from '../repos/mirror.js';
 import { StreamRedactor } from './redactor.js';
 
 const logger = createLogger('agent.executor');
 const ARTIFACT_TOKEN_TIMEOUT_MS = 60_000;
+const BUNDLE_TOKEN_TIMEOUT_MS = 120_000;
 
 type ToolchainProfile = NonNullable<LeaseOfferPayload['selected_toolchain_profiles']>[number];
 
@@ -41,6 +47,8 @@ export interface AgentExecutorConfig {
   secretMap?: Record<string, string>;
   /** Current capability toolchain profiles for fingerprint recheck before spawn. */
   toolchainProfiles?: ToolchainProfile[];
+  gitAllowlist: GitUrlAllowlist;
+  repoCache: RepoCacheConfig;
 }
 
 function assertPinnedPeerCert(
@@ -64,10 +72,16 @@ function assertPinnedPeerCert(
 }
 
 export class AgentJobExecutor {
+  private readonly mirrorManager: RepoMirrorManager;
   private activeAttemptId: string | null = null;
   private currentOffer: LeaseOfferPayload | null = null;
   private currentPrepare: PrepareSourcePayload | null = null;
+  /** True after source_ready until attempt clear — cancel must emit terminal itself. */
+  private prepareReady = false;
+  /** True while handleRunJob owns the attempt (including pre-spawn). */
+  private runInProgress = false;
   private materializedProjectPath: string | null = null;
+  private overlayRepoUrl: string | null = null;
   private activeProcessKill?: (graceSeconds?: number) => Promise<void>;
   private cancelSignal = { cancelled: false };
   private pendingArtifactUpload: {
@@ -76,11 +90,23 @@ export class AgentJobExecutor {
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
+  private pendingBundleDownload: {
+    attemptId: string;
+    resolve: (grant: BundleDownloadPayload) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
 
   constructor(
     private socket: WebSocket,
     private config: AgentExecutorConfig,
-  ) {}
+  ) {
+    this.mirrorManager = new RepoMirrorManager({
+      reposDir: join(config.stateDir, 'repos'),
+      allowlist: config.gitAllowlist,
+      repoCache: config.repoCache,
+    });
+  }
 
   public isBusy(): boolean {
     return this.activeAttemptId !== null;
@@ -123,7 +149,10 @@ export class AgentJobExecutor {
     this.activeAttemptId = null;
     this.currentOffer = null;
     this.currentPrepare = null;
+    this.prepareReady = false;
+    this.runInProgress = false;
     this.materializedProjectPath = null;
+    this.overlayRepoUrl = null;
     this.activeProcessKill = undefined;
     this.cancelSignal = { cancelled: false };
     if (this.pendingArtifactUpload) {
@@ -132,6 +161,21 @@ export class AgentJobExecutor {
       this.pendingArtifactUpload = null;
       pending.reject(new Error('attempt cleared'));
     }
+    if (this.pendingBundleDownload) {
+      clearTimeout(this.pendingBundleDownload.timer);
+      const pending = this.pendingBundleDownload;
+      this.pendingBundleDownload = null;
+      pending.reject(new Error('attempt cleared'));
+    }
+  }
+
+  private async cleanupOverlayWorktree(): Promise<void> {
+    if (this.overlayRepoUrl && this.materializedProjectPath) {
+      await this.mirrorManager
+        .removeWorktree(this.overlayRepoUrl, this.materializedProjectPath)
+        .catch(() => undefined);
+    }
+    this.overlayRepoUrl = null;
   }
 
   /**
@@ -258,6 +302,14 @@ export class AgentJobExecutor {
       return;
     }
     this.currentPrepare = prepare;
+    this.prepareReady = false;
+
+    if (prepare.source_mode === 'git_overlay') {
+      await this.handlePrepareGitOverlay(prepare);
+      return;
+    }
+
+    await this.cleanupOverlayWorktree();
 
     const attemptDir = join(this.config.stateDir, 'workspaces', prepare.attempt_id);
     const archivePartPath = join(attemptDir, 'snapshot.tar.zst.part');
@@ -307,6 +359,7 @@ export class AgentJobExecutor {
         return;
       }
 
+      this.prepareReady = true;
       this.sendFrame('source_ready', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
         attempt_id: prepare.attempt_id,
         lease_id: prepare.lease_id,
@@ -317,6 +370,10 @@ export class AgentJobExecutor {
         attemptId: prepare.attempt_id,
         error: String(error),
       });
+      if (!this.matchesReservedLease(prepare.attempt_id, prepare.lease_id, prepare.lease_epoch)) {
+        await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
+        return;
+      }
       if (this.cancelSignal.cancelled || String(error).includes('cancelled')) {
         this.sendCancelledTerminal(
           prepare.attempt_id,
@@ -338,6 +395,254 @@ export class AgentJobExecutor {
     }
   }
 
+  /** Phase 5 git_overlay prepare — mirror + worktree + overlay materialization. */
+  private async handlePrepareGitOverlay(prepare: PrepareSourceGitOverlayPayload): Promise<void> {
+    const attemptDir = join(this.config.stateDir, 'workspaces', prepare.attempt_id);
+    const projectPath = join(attemptDir, 'project');
+    let worktreeCreated = false;
+
+    await mkdir(attemptDir, { recursive: true });
+
+    try {
+      if (this.cancelSignal.cancelled) {
+        throw new Error('cancelled');
+      }
+
+      let repoKey: string | undefined;
+      let fetchFailed = false;
+      let fetchError: unknown;
+      try {
+        const mirror = await this.mirrorManager.ensureMirror(prepare.repo.url);
+        repoKey = mirror.repoKey;
+        if (prepare.repo.fetch_refs.length > 0) {
+          await this.mirrorManager.fetchRefs(prepare.repo.url, prepare.repo.fetch_refs);
+        }
+      } catch (error) {
+        fetchFailed = true;
+        fetchError = error;
+        logger.warn('mirror ensure/fetch failed', {
+          attemptId: prepare.attempt_id,
+          error: String(error),
+        });
+      }
+
+      let hasCommit =
+        repoKey != null && (await this.mirrorManager.hasCommit(repoKey, prepare.repo.base_commit));
+
+      if (!hasCommit) {
+        // Design order: fetch → bundle → full. Always try bundle before escalating.
+        this.sendFrame('source_need', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
+          attempt_id: prepare.attempt_id,
+          lease_id: prepare.lease_id,
+          lease_epoch: prepare.lease_epoch,
+          reason: 'base_commit_missing',
+          detail: fetchFailed
+            ? `Fetch failed (${String(fetchError)}); requesting bundle for ${prepare.repo.base_commit}`
+            : `Commit ${prepare.repo.base_commit} missing`,
+        });
+
+        let bundle: BundleDownloadPayload;
+        try {
+          bundle = await this.waitForBundleDownload(
+            prepare.attempt_id,
+            prepare.lease_id,
+            prepare.lease_epoch,
+          );
+        } catch (bundleError) {
+          if (this.cancelSignal.cancelled || String(bundleError).includes('cancelled')) {
+            throw new Error('cancelled');
+          }
+          const escalate: SourceNeedReason = fetchFailed
+            ? 'repo_fetch_failed'
+            : 'full_snapshot_required';
+          this.sendFrame('source_need', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
+            attempt_id: prepare.attempt_id,
+            lease_id: prepare.lease_id,
+            lease_epoch: prepare.lease_epoch,
+            reason: escalate,
+            detail: `Bundle unavailable after missing commit: ${String(bundleError)}`,
+          });
+          return;
+        }
+        if (this.cancelSignal.cancelled) {
+          throw new Error('cancelled');
+        }
+
+        const bundlePartPath = join(attemptDir, 'bundle.part');
+        const bundlePath = join(attemptDir, 'bundle.gitbundle');
+        await this.downloadSnapshotFile(
+          bundle.download_url,
+          bundle.data_token,
+          bundlePartPath,
+          bundle.expected_size_bytes,
+          bundle.expected_sha256,
+        );
+        await rename(bundlePartPath, bundlePath);
+        const bundleId = `${prepare.attempt_id}-${Date.now()}`;
+        await this.mirrorManager.importBundle(prepare.repo.url, bundlePath, bundleId);
+        if (!repoKey) {
+          const mirror = await this.mirrorManager.ensureMirror(prepare.repo.url);
+          repoKey = mirror.repoKey;
+        }
+        hasCommit = await this.mirrorManager.hasCommit(repoKey, prepare.repo.base_commit);
+        if (!hasCommit) {
+          const escalate: SourceNeedReason = fetchFailed
+            ? 'repo_fetch_failed'
+            : 'full_snapshot_required';
+          this.sendFrame('source_need', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
+            attempt_id: prepare.attempt_id,
+            lease_id: prepare.lease_id,
+            lease_epoch: prepare.lease_epoch,
+            reason: escalate,
+            detail: `Commit ${prepare.repo.base_commit} still missing after bundle import`,
+          });
+          return;
+        }
+      }
+
+      await this.mirrorManager.createWorktree(
+        prepare.repo.url,
+        prepare.repo.base_commit,
+        projectPath,
+      );
+      worktreeCreated = true;
+      this.overlayRepoUrl = prepare.repo.url;
+      this.materializedProjectPath = projectPath;
+
+      if (this.cancelSignal.cancelled) {
+        throw new Error('cancelled');
+      }
+
+      const overlayPartPath = join(attemptDir, 'overlay.tar.zst.part');
+      const overlayPath = join(attemptDir, 'overlay.tar.zst');
+      await this.downloadSnapshotFile(
+        prepare.overlay.download_url,
+        prepare.overlay.data_token,
+        overlayPartPath,
+        prepare.overlay.expected_size_bytes,
+        prepare.overlay.expected_sha256,
+      );
+      await rename(overlayPartPath, overlayPath);
+
+      if (this.cancelSignal.cancelled) {
+        throw new Error('cancelled');
+      }
+
+      await applyGitOverlay({
+        manifest: prepare.manifest,
+        archivePath: overlayPath,
+        workspaceRoot: attemptDir,
+        projectPath,
+      });
+
+      if (this.cancelSignal.cancelled) {
+        this.sendCancelledTerminal(
+          prepare.attempt_id,
+          prepare.lease_id,
+          prepare.lease_epoch,
+          'Job cancelled during prepare_source',
+        );
+        await this.cleanupOverlayAttempt(
+          attemptDir,
+          prepare.repo.url,
+          projectPath,
+          worktreeCreated,
+        );
+        this.clearAttempt();
+        return;
+      }
+
+      this.prepareReady = true;
+      this.sendFrame('source_ready', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
+        attempt_id: prepare.attempt_id,
+        lease_id: prepare.lease_id,
+        lease_epoch: prepare.lease_epoch,
+      });
+    } catch (error) {
+      logger.error('git_overlay prepare_source failed', {
+        attemptId: prepare.attempt_id,
+        error: String(error),
+      });
+      if (!this.matchesReservedLease(prepare.attempt_id, prepare.lease_id, prepare.lease_epoch)) {
+        await this.cleanupOverlayAttempt(
+          attemptDir,
+          prepare.repo.url,
+          projectPath,
+          worktreeCreated,
+        );
+        return;
+      }
+      if (this.cancelSignal.cancelled || String(error).includes('cancelled')) {
+        this.sendCancelledTerminal(
+          prepare.attempt_id,
+          prepare.lease_id,
+          prepare.lease_epoch,
+          'Job cancelled during prepare_source',
+        );
+      } else {
+        this.failTerminal(
+          prepare.attempt_id,
+          prepare.lease_id,
+          prepare.lease_epoch,
+          String(error).includes('fetch') ? 'repo_fetch' : 'materialization',
+          String(error),
+        );
+      }
+      await this.cleanupOverlayAttempt(attemptDir, prepare.repo.url, projectPath, worktreeCreated);
+      this.clearAttempt();
+    }
+  }
+
+  public handleBundleDownload(bundle: BundleDownloadPayload): void {
+    if (
+      !this.matchesReservedLease(bundle.attempt_id, bundle.lease_id, bundle.lease_epoch) ||
+      !this.pendingBundleDownload ||
+      this.pendingBundleDownload.attemptId !== bundle.attempt_id
+    ) {
+      return;
+    }
+    clearTimeout(this.pendingBundleDownload.timer);
+    const { resolve } = this.pendingBundleDownload;
+    this.pendingBundleDownload = null;
+    resolve(bundle);
+  }
+
+  private waitForBundleDownload(
+    attemptId: string,
+    leaseId: string,
+    leaseEpoch: number,
+  ): Promise<BundleDownloadPayload> {
+    return new Promise((resolvePromise, rejectPromise) => {
+      if (this.pendingBundleDownload) {
+        rejectPromise(new Error('bundle download already pending'));
+        return;
+      }
+      const timer = setTimeout(() => {
+        this.pendingBundleDownload = null;
+        rejectPromise(new Error('timed out waiting for bundle_download'));
+      }, BUNDLE_TOKEN_TIMEOUT_MS);
+      this.pendingBundleDownload = {
+        attemptId,
+        resolve: resolvePromise,
+        reject: rejectPromise,
+        timer,
+      };
+    });
+  }
+
+  private async cleanupOverlayAttempt(
+    attemptDir: string,
+    repoUrl: string,
+    projectPath: string,
+    worktreeCreated: boolean,
+  ): Promise<void> {
+    if (worktreeCreated) {
+      await this.mirrorManager.removeWorktree(repoUrl, projectPath).catch(() => undefined);
+    }
+    this.overlayRepoUrl = null;
+    await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+
   public async handleRunJob(run: RunJobPayload): Promise<void> {
     if (
       !this.matchesReservedLease(run.attempt_id, run.lease_id, run.lease_epoch) ||
@@ -347,10 +652,13 @@ export class AgentJobExecutor {
       return;
     }
 
+    this.runInProgress = true;
+
     const offer = this.currentOffer;
     const request = offer.job_request;
     const attemptDir = join(this.config.stateDir, 'workspaces', run.attempt_id);
-    const workspaceRoot = join(attemptDir, 'workspace');
+    const isOverlay = this.currentPrepare?.source_mode === 'git_overlay';
+    const workspaceRoot = isOverlay ? attemptDir : join(attemptDir, 'workspace');
     const controlDir = join(attemptDir, 'control');
     const artifactsDir = join(attemptDir, 'artifacts');
     const logsDir = join(attemptDir, 'logs');
@@ -642,6 +950,11 @@ export class AgentJobExecutor {
       logger.error('run_job failed', { attemptId: run.attempt_id, error: String(error) });
       this.failTerminal(run.attempt_id, run.lease_id, run.lease_epoch, 'internal', String(error));
     } finally {
+      if (this.overlayRepoUrl && this.materializedProjectPath) {
+        await this.mirrorManager
+          .removeWorktree(this.overlayRepoUrl, this.materializedProjectPath)
+          .catch(() => undefined);
+      }
       await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
       this.clearAttempt();
     }
@@ -665,19 +978,41 @@ export class AgentJobExecutor {
       await this.activeProcessKill(cancel.grace_seconds);
       return;
     }
-    // In-flight prepare_source / pre-spawn run_job observe cancelSignal.
-    if (this.currentPrepare) {
+
+    // run_job owns the attempt (including pre-spawn): keep cancelSignal for waiters.
+    if (this.runInProgress) {
       return;
     }
-    // Lease reserved but prepare not started yet — free the slot now.
+
+    // Unblock prepare waiting on bundle_download.
+    if (this.pendingBundleDownload?.attemptId === cancel.attempt_id) {
+      clearTimeout(this.pendingBundleDownload.timer);
+      const pending = this.pendingBundleDownload;
+      this.pendingBundleDownload = null;
+      pending.reject(new Error('cancelled'));
+    }
+
+    const attemptDir = join(this.config.stateDir, 'workspaces', cancel.attempt_id);
+    const projectPath = join(attemptDir, 'project');
+    if (this.overlayRepoUrl) {
+      await this.mirrorManager
+        .removeWorktree(this.overlayRepoUrl, projectPath)
+        .catch(() => undefined);
+    }
+    await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
+
+    // In-flight prepare (before source_ready): prepare observes cancelSignal / bundle reject.
+    if (this.currentPrepare && !this.prepareReady) {
+      return;
+    }
+
+    // Lease reserved, prepare ready (or not started) — free the slot now.
     this.sendCancelledTerminal(
       cancel.attempt_id,
       cancel.lease_id,
       cancel.lease_epoch,
       cancel.reason ?? 'Job cancelled before process start',
     );
-    const attemptDir = join(this.config.stateDir, 'workspaces', cancel.attempt_id);
-    await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
     this.clearAttempt();
   }
 

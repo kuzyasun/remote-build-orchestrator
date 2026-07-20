@@ -1,8 +1,14 @@
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { promisify } from 'node:util';
 import { appendLogChunk, ensureAttemptLogs } from '@rbo/executor';
 import type {
   ArtifactManifestPayload,
   ArtifactUploadGrantPayload,
+  BundleDownloadPayload,
   CleanupCompletePayload,
   JobExitPayload,
   JobStartedPayload,
@@ -12,11 +18,13 @@ import type {
   LogChunkPayload,
   PrepareSourcePayload,
   RunJobPayload,
+  SourceNeedPayload,
   SourceReadyPayload,
   ToolchainProfileSchema,
 } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
 import { RboError, createLogger, generateId } from '@rbo/shared';
+import { captureFullSnapshot } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
 import { clearArtifactExpectations, registerArtifactExpectations } from '../http/data-plane.js';
@@ -33,7 +41,9 @@ import { issueDataToken } from '../security/data-tokens.js';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
 import type { ConnectedAgent } from '../websocket/server.js';
-import { attemptLogDir } from './runner.js';
+import { attemptLogDir, attemptTransferDir } from './runner.js';
+
+const execFileAsync = promisify(execFile);
 
 type ToolchainProfile = z.infer<typeof ToolchainProfileSchema>;
 
@@ -53,6 +63,267 @@ export interface RemoteExecutionOptions {
   controllerPublicHost?: string;
   /** Full base URL override (e.g. https://192.168.1.10:7411). Wins over host+port. */
   dataPlaneBaseUrl?: string;
+  allowedProjectRoots?: string[];
+}
+
+function snapshotManifestMode(manifest: unknown): 'full' | 'git_overlay' {
+  if (
+    manifest &&
+    typeof manifest === 'object' &&
+    'payload' in manifest &&
+    manifest.payload &&
+    typeof manifest.payload === 'object' &&
+    'mode' in manifest.payload &&
+    manifest.payload.mode === 'git_overlay'
+  ) {
+    return 'git_overlay';
+  }
+  return 'full';
+}
+
+/** Derive targeted fetch refs (§10.6) from manifest repo fields. */
+function resolveFetchRefs(repo: Record<string, unknown>): string[] {
+  if (Array.isArray(repo.fetch_refs) && repo.fetch_refs.length > 0) {
+    return repo.fetch_refs.map((ref) => String(ref));
+  }
+  const branch = repo.branch == null ? null : String(repo.branch);
+  if (branch && branch.length > 0) {
+    return [`refs/heads/${branch}`];
+  }
+  return [];
+}
+
+function loadSnapshotForJob(
+  db: ControllerDatabase,
+  jobId: string,
+): { size_bytes: number; sha256: string; manifest_path: string; payload_path: string } | undefined {
+  return db
+    .prepare(
+      `SELECT s.size_bytes, s.sha256, s.manifest_path, s.payload_path
+       FROM jobs j JOIN snapshots s ON j.snapshot_id = s.id
+       WHERE j.id = ?`,
+    )
+    .get(jobId) as
+    | { size_bytes: number; sha256: string; manifest_path: string; payload_path: string }
+    | undefined;
+}
+
+function sendPrepareSource(
+  opts: RemoteExecutionOptions,
+  agentId: string,
+  attemptId: string,
+  leaseId: string,
+  leaseEpoch: number,
+  jobId: string,
+  manifest: unknown,
+  snapshotRow: { size_bytes: number; sha256: string; payload_path: string },
+): void {
+  const mode = snapshotManifestMode(manifest);
+  const baseUrl = resolveDataPlaneBaseUrl(opts);
+
+  if (mode === 'git_overlay' && manifest && typeof manifest === 'object') {
+    const repo = (manifest as { repo?: Record<string, unknown> }).repo;
+    const payload = (manifest as { payload?: { size?: number; sha256?: string } }).payload;
+    if (!repo?.url || !repo.base_commit || !payload?.sha256 || payload.size == null) {
+      failAttemptPrepare(opts, attemptId, jobId, 'materialization', 'Invalid git_overlay manifest');
+      return;
+    }
+
+    const overlayToken = issueDataToken(opts.identity, {
+      agent_id: agentId,
+      job_id: jobId,
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: leaseEpoch,
+      op: 'overlay_download',
+    });
+    const overlayUrl = `${baseUrl}/data/v1/attempts/${attemptId}/overlay`;
+
+    const preparePayload: PrepareSourcePayload = {
+      source_mode: 'git_overlay',
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: leaseEpoch,
+      repo: {
+        url: String(repo.url),
+        canonical_id: String(repo.canonical_id ?? repo.url),
+        branch: repo.branch == null ? null : String(repo.branch),
+        base_commit: String(repo.base_commit),
+        fetch_refs: resolveFetchRefs(repo),
+      },
+      overlay: {
+        download_url: overlayUrl,
+        data_token: overlayToken,
+        expected_size_bytes: payload.size,
+        expected_sha256: payload.sha256,
+      },
+      manifest,
+    };
+
+    const conn = opts.connectedAgents.get(agentId);
+    if (conn) {
+      sendWsFrame(
+        conn.socket,
+        'prepare_source',
+        attemptId,
+        leaseId,
+        leaseEpoch,
+        preparePayload as unknown as Record<string, unknown>,
+      );
+    }
+    return;
+  }
+
+  const dataToken = issueDataToken(opts.identity, {
+    agent_id: agentId,
+    job_id: jobId,
+    attempt_id: attemptId,
+    lease_id: leaseId,
+    lease_epoch: leaseEpoch,
+    op: 'snapshot_download',
+  });
+  const downloadUrl = `${baseUrl}/data/v1/attempts/${attemptId}/snapshot`;
+
+  const preparePayload: PrepareSourcePayload = {
+    source_mode: 'full',
+    attempt_id: attemptId,
+    lease_id: leaseId,
+    lease_epoch: leaseEpoch,
+    download_url: downloadUrl,
+    data_token: dataToken,
+    expected_size_bytes: snapshotRow.size_bytes,
+    expected_sha256: snapshotRow.sha256,
+    manifest,
+  };
+
+  const conn = opts.connectedAgents.get(agentId);
+  if (conn) {
+    sendWsFrame(
+      conn.socket,
+      'prepare_source',
+      attemptId,
+      leaseId,
+      leaseEpoch,
+      preparePayload as unknown as Record<string, unknown>,
+    );
+  }
+}
+
+function failAttemptPrepare(
+  opts: RemoteExecutionOptions,
+  attemptId: string,
+  jobId: string,
+  category: NonNullable<JobExitPayload['failure_category']>,
+  message: string,
+): void {
+  transitionAttemptState(opts.db, attemptId, 'completed', {
+    outcome: 'failed',
+    finished_at: nowIso(),
+  });
+  transitionJobState(opts.db, jobId, 'completed', {
+    outcome: 'failed',
+    finished_at: nowIso(),
+    failure_category: category,
+    failure_message: message,
+  });
+}
+
+async function createGitBundle(
+  projectRoot: string,
+  baseCommit: string,
+  bundlePath: string,
+): Promise<{ sizeBytes: number; sha256: string }> {
+  await mkdir(dirname(bundlePath), { recursive: true });
+  const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+    cwd: projectRoot,
+    windowsHide: true,
+  });
+  const headCommit = head.trim();
+  await execFileAsync('git', ['cat-file', '-e', `${baseCommit}^{commit}`], {
+    cwd: projectRoot,
+    windowsHide: true,
+  });
+  const bundleRef = headCommit === baseCommit ? 'HEAD' : baseCommit;
+  try {
+    await execFileAsync('git', ['bundle', 'create', bundlePath, bundleRef], {
+      cwd: projectRoot,
+      maxBuffer: 64 * 1024 * 1024,
+      windowsHide: true,
+    });
+  } catch {
+    await execFileAsync('git', ['bundle', 'create', bundlePath, '--all'], {
+      cwd: projectRoot,
+      maxBuffer: 64 * 1024 * 1024,
+      windowsHide: true,
+    });
+  }
+  const data = await readFile(bundlePath);
+  return {
+    sizeBytes: data.length,
+    sha256: createHash('sha256').update(data).digest('hex'),
+  };
+}
+
+async function ensureFullFallbackArchive(
+  opts: RemoteExecutionOptions,
+  attemptId: string,
+  jobId: string,
+): Promise<{
+  archivePath: string;
+  sizeBytes: number;
+  sha256: string;
+  manifest: unknown;
+} | null> {
+  const request = getJobRequest(opts.db, jobId);
+  if (!request) {
+    return null;
+  }
+
+  const transferDir = attemptTransferDir(opts.dataDir, attemptId);
+  const archivePath = join(transferDir, 'snapshot.tar.zst');
+  const manifestPath = join(transferDir, 'snapshot.manifest.json');
+  try {
+    const existing = await stat(archivePath);
+    const data = await readFile(archivePath);
+    const sha256 = createHash('sha256').update(data).digest('hex');
+    const manifestRaw = await readFile(manifestPath, 'utf8');
+    const manifest = JSON.parse(manifestRaw) as {
+      payload?: { sha256?: string; size?: number };
+    };
+    if (manifest.payload?.sha256 === sha256 && manifest.payload?.size === existing.size) {
+      return {
+        archivePath,
+        sizeBytes: existing.size,
+        sha256,
+        manifest,
+      };
+    }
+    // Stale cache: recreate below.
+  } catch {
+    // create on demand
+  }
+
+  await mkdir(transferDir, { recursive: true });
+  const captured = await captureFullSnapshot({
+    projectRoot: request.source.project_root,
+    allowedProjectRoots: opts.allowedProjectRoots ?? [request.source.project_root],
+    cwd: request.source.cwd,
+    sourcePolicy: {
+      include_untracked: request.source_policy?.include_untracked ?? true,
+      include_ignored: request.source_policy?.include_ignored ?? [],
+      secret_policy: request.source_policy?.secret_policy ?? 'block',
+    },
+    additionalRoots: request.source.additional_roots,
+    contentStorageDir: transferDir,
+  });
+  await writeFile(archivePath, await readFile(captured.archivePath));
+  await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
+  return {
+    archivePath,
+    sizeBytes: captured.manifest.payload.size,
+    sha256: captured.manifest.payload.sha256,
+    manifest: captured.manifest,
+  };
 }
 
 function resolveDataPlaneBaseUrl(opts: RemoteExecutionOptions): string {
@@ -297,27 +568,16 @@ export function handleRemoteLeaseAccept(
   transitionAttemptState(opts.db, attempt.id, 'preparing_source');
   transitionJobState(opts.db, attempt.job_id, 'preparing_source');
 
-  const snapshotRow = opts.db
-    .prepare(
-      `SELECT s.size_bytes, s.sha256, s.manifest_path
-       FROM jobs j JOIN snapshots s ON j.snapshot_id = s.id
-       WHERE j.id = ?`,
-    )
-    .get(attempt.job_id) as
-    | { size_bytes: number; sha256: string; manifest_path: string }
-    | undefined;
+  const snapshotRow = loadSnapshotForJob(opts.db, attempt.job_id);
 
-  if (!snapshotRow?.sha256 || snapshotRow.size_bytes == null) {
-    transitionAttemptState(opts.db, attempt.id, 'completed', {
-      outcome: 'failed',
-      finished_at: nowIso(),
-    });
-    transitionJobState(opts.db, attempt.job_id, 'completed', {
-      outcome: 'failed',
-      finished_at: nowIso(),
-      failure_category: 'materialization',
-      failure_message: 'Snapshot metadata missing size or sha256',
-    });
+  if (!snapshotRow?.sha256 || snapshotRow.size_bytes == null || !snapshotRow.payload_path) {
+    failAttemptPrepare(
+      opts,
+      attempt.id,
+      attempt.job_id,
+      'materialization',
+      'Snapshot metadata missing size, sha256, or payload path',
+    );
     return;
   }
 
@@ -330,30 +590,196 @@ export function handleRemoteLeaseAccept(
     }
   }
 
-  const dataToken = issueDataToken(opts.identity, {
-    agent_id: agentId,
-    job_id: attempt.job_id,
-    attempt_id: attempt.id,
-    lease_id: payload.lease_id,
-    lease_epoch: payload.lease_epoch,
-    op: 'snapshot_download',
-  });
-
-  const downloadUrl = `${resolveDataPlaneBaseUrl(opts)}/data/v1/attempts/${attempt.id}/snapshot`;
-
-  const preparePayload: PrepareSourcePayload = {
-    attempt_id: attempt.id,
-    lease_id: payload.lease_id,
-    lease_epoch: payload.lease_epoch,
-    download_url: downloadUrl,
-    data_token: dataToken,
-    expected_size_bytes: snapshotRow.size_bytes,
-    expected_sha256: snapshotRow.sha256,
+  sendPrepareSource(
+    opts,
+    agentId,
+    attempt.id,
+    payload.lease_id,
+    payload.lease_epoch,
+    attempt.job_id,
     manifest,
-  };
+    snapshotRow,
+  );
+}
+
+export async function handleRemoteSourceNeed(
+  opts: RemoteExecutionOptions,
+  agentId: string,
+  payload: SourceNeedPayload,
+): Promise<void> {
+  const attempt = loadAttemptByLease(
+    opts.db,
+    payload.attempt_id,
+    payload.lease_id,
+    payload.lease_epoch,
+  );
+  if (!rejectStale('source_need', attempt, agentId, ['preparing_source'])) {
+    return;
+  }
+
+  if (payload.reason === 'base_present') {
+    return;
+  }
 
   const conn = opts.connectedAgents.get(agentId);
-  if (conn) {
+  if (!conn) {
+    return;
+  }
+
+  if (payload.reason === 'base_commit_missing' || payload.reason === 'bundle_required') {
+    const request = getJobRequest(opts.db, attempt.job_id);
+    const snapshotRow = loadSnapshotForJob(opts.db, attempt.job_id);
+    if (!request || !snapshotRow?.manifest_path) {
+      failAttemptPrepare(
+        opts,
+        attempt.id,
+        attempt.job_id,
+        'materialization',
+        'Cannot create bundle: missing job request or manifest',
+      );
+      return;
+    }
+
+    let manifest: { repo?: { base_commit?: string } };
+    try {
+      manifest = JSON.parse(readFileSync(snapshotRow.manifest_path, 'utf8')) as {
+        repo?: { base_commit?: string };
+      };
+    } catch {
+      failAttemptPrepare(
+        opts,
+        attempt.id,
+        attempt.job_id,
+        'materialization',
+        'Cannot create bundle: manifest unreadable',
+      );
+      return;
+    }
+
+    const baseCommit = manifest.repo?.base_commit;
+    if (!baseCommit) {
+      failAttemptPrepare(
+        opts,
+        attempt.id,
+        attempt.job_id,
+        'materialization',
+        'Cannot create bundle: manifest missing base_commit',
+      );
+      return;
+    }
+
+    const transferDir = attemptTransferDir(opts.dataDir, attempt.id);
+    const bundlePath = join(transferDir, 'bundle.gitbundle');
+    try {
+      const { sizeBytes, sha256 } = await createGitBundle(
+        request.source.project_root,
+        baseCommit,
+        bundlePath,
+      );
+      const bundleToken = issueDataToken(opts.identity, {
+        agent_id: agentId,
+        job_id: attempt.job_id,
+        attempt_id: attempt.id,
+        lease_id: payload.lease_id,
+        lease_epoch: payload.lease_epoch,
+        op: 'bundle_download',
+      });
+      const bundleUrl = `${resolveDataPlaneBaseUrl(opts)}/data/v1/attempts/${attempt.id}/bundle`;
+      const bundlePayload: BundleDownloadPayload = {
+        attempt_id: attempt.id,
+        lease_id: payload.lease_id,
+        lease_epoch: payload.lease_epoch,
+        download_url: bundleUrl,
+        data_token: bundleToken,
+        expected_size_bytes: sizeBytes,
+        expected_sha256: sha256,
+      };
+      sendWsFrame(
+        conn.socket,
+        'bundle_download',
+        attempt.id,
+        payload.lease_id,
+        payload.lease_epoch,
+        bundlePayload as unknown as Record<string, unknown>,
+      );
+    } catch (error) {
+      failAttemptPrepare(
+        opts,
+        attempt.id,
+        attempt.job_id,
+        'materialization',
+        `Failed to create git bundle: ${String(error)}`,
+      );
+    }
+    return;
+  }
+
+  if (payload.reason === 'full_snapshot_required' || payload.reason === 'repo_fetch_failed') {
+    const snapshotRow = loadSnapshotForJob(opts.db, attempt.job_id);
+    if (!snapshotRow) {
+      failAttemptPrepare(
+        opts,
+        attempt.id,
+        attempt.job_id,
+        'repo_fetch',
+        'No snapshot available for full-mode fallback',
+      );
+      return;
+    }
+
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(readFileSync(snapshotRow.manifest_path, 'utf8'));
+    } catch {
+      manifest = undefined;
+    }
+
+    if (snapshotManifestMode(manifest) === 'full') {
+      sendPrepareSource(
+        opts,
+        agentId,
+        attempt.id,
+        payload.lease_id,
+        payload.lease_epoch,
+        attempt.job_id,
+        manifest,
+        snapshotRow,
+      );
+      return;
+    }
+
+    const fallback = await ensureFullFallbackArchive(opts, attempt.id, attempt.job_id);
+    if (!fallback) {
+      failAttemptPrepare(
+        opts,
+        attempt.id,
+        attempt.job_id,
+        'repo_fetch',
+        'Full snapshot fallback unavailable',
+      );
+      return;
+    }
+
+    const dataToken = issueDataToken(opts.identity, {
+      agent_id: agentId,
+      job_id: attempt.job_id,
+      attempt_id: attempt.id,
+      lease_id: payload.lease_id,
+      lease_epoch: payload.lease_epoch,
+      op: 'snapshot_download',
+    });
+    const downloadUrl = `${resolveDataPlaneBaseUrl(opts)}/data/v1/attempts/${attempt.id}/snapshot`;
+    const preparePayload: PrepareSourcePayload = {
+      source_mode: 'full',
+      attempt_id: attempt.id,
+      lease_id: payload.lease_id,
+      lease_epoch: payload.lease_epoch,
+      download_url: downloadUrl,
+      data_token: dataToken,
+      expected_size_bytes: fallback.sizeBytes,
+      expected_sha256: fallback.sha256,
+      manifest: fallback.manifest,
+    };
     sendWsFrame(
       conn.socket,
       'prepare_source',

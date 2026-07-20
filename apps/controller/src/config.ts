@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import type { GitUrlAllowlist } from '@rbo/shared';
 
 export interface LocalExecutorConfig {
   maxConcurrentJobs: number;
@@ -18,7 +19,53 @@ export interface ControllerConfig {
   databasePath: string;
   allowedProjectRoots: string[];
   allowedArtifactDestinations: string[];
+  /** Git remote allowlist for overlay capture (§10.4). */
+  gitAllowlist: GitUrlAllowlist;
   localExecutor: LocalExecutorConfig;
+}
+
+/** Default Git schemes when RBO_GIT_ALLOWLIST_SCHEMES is unset. */
+export const DEFAULT_GIT_ALLOWLIST_SCHEMES = ['https', 'ssh'] as const;
+
+/** Default Git hosts when RBO_GIT_ALLOWLIST_HOSTS is unset. */
+export const DEFAULT_GIT_ALLOWLIST_HOSTS = ['github.com'] as const;
+
+function parseCsv(raw: string | undefined): string[] {
+  if (!raw?.trim()) {
+    return [];
+  }
+  return raw
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function parseGitAllowlist(overrides?: GitUrlAllowlist): GitUrlAllowlist {
+  if (overrides) {
+    return overrides;
+  }
+  const schemes = parseCsv(process.env.RBO_GIT_ALLOWLIST_SCHEMES);
+  const hosts = parseCsv(process.env.RBO_GIT_ALLOWLIST_HOSTS);
+  const prefixesRaw = process.env.RBO_GIT_ALLOWLIST_PREFIXES?.trim();
+  let repository_prefixes: string[] | undefined;
+  if (prefixesRaw) {
+    try {
+      const parsed = JSON.parse(prefixesRaw) as unknown;
+      if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== 'string')) {
+        throw new Error('must be a JSON string array');
+      }
+      repository_prefixes = parsed;
+    } catch (error) {
+      throw new Error(
+        `Invalid RBO_GIT_ALLOWLIST_PREFIXES: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return {
+    schemes: schemes.length > 0 ? schemes : [...DEFAULT_GIT_ALLOWLIST_SCHEMES],
+    hosts: hosts.length > 0 ? hosts : [...DEFAULT_GIT_ALLOWLIST_HOSTS],
+    ...(repository_prefixes ? { repository_prefixes } : {}),
+  };
 }
 
 export function resolveDefaultDataDir(): string {
@@ -42,6 +89,7 @@ export function loadControllerConfig(overrides: Partial<ControllerConfig> = {}):
     databasePath: overrides.databasePath ?? join(dataDir, 'controller.db'),
     allowedProjectRoots: overrides.allowedProjectRoots ?? [],
     allowedArtifactDestinations: overrides.allowedArtifactDestinations ?? [],
+    gitAllowlist: parseGitAllowlist(overrides.gitAllowlist),
     localExecutor: {
       maxConcurrentJobs:
         overrides.localExecutor?.maxConcurrentJobs ??

@@ -129,8 +129,13 @@ export async function handleJobSubmit(
   const pendingJobId = generateId('job');
 
   try {
+    const captureCtx: LocalRunnerContext = {
+      ...ctx,
+      remoteCapable: (ctx.connectedAgents?.size ?? 0) > 0,
+      gitAllowlist: ctx.gitAllowlist,
+    };
     const { snapshotId, contentId, secretWarnings } = await captureAndPersistSnapshot(
-      ctx,
+      captureCtx,
       pendingJobId,
       request,
     );
@@ -247,8 +252,17 @@ export async function dispatchJobExecution(
     }
   }
 
+  const snapshotMeta = ctx.db
+    .prepare(
+      'SELECT repo_id, base_commit FROM snapshots WHERE id = (SELECT snapshot_id FROM jobs WHERE id = ?)',
+    )
+    .get(jobId) as { repo_id: string | null; base_commit: string | null } | undefined;
+
   const decision = selectAgentForJob(candidates, request, {
     allowLocalFallback: true,
+    repoCanonicalId:
+      snapshotMeta?.repo_id && snapshotMeta.repo_id !== 'local' ? snapshotMeta.repo_id : null,
+    baseCommit: snapshotMeta?.base_commit ?? null,
   });
 
   if (decision.action === 'remote' && decision.selectedAgent && ctx.agentPlanePort) {

@@ -7,7 +7,7 @@ export interface DataTokenClaims {
   attempt_id: string;
   lease_id: string;
   lease_epoch: number;
-  op: 'snapshot_download' | 'artifact_upload';
+  op: 'snapshot_download' | 'overlay_download' | 'bundle_download' | 'artifact_upload';
   artifact_id?: string;
   ttl_seconds?: number;
 }
@@ -18,7 +18,7 @@ export interface VerifiedDataToken {
   attemptId: string;
   leaseId: string;
   leaseEpoch: number;
-  op: 'snapshot_download' | 'artifact_upload';
+  op: 'snapshot_download' | 'overlay_download' | 'bundle_download' | 'artifact_upload';
   artifactId?: string;
 }
 
@@ -58,7 +58,12 @@ export function verifyDataToken(
   const leaseEpoch =
     typeof claims.lease_epoch === 'number' ? claims.lease_epoch : Number(claims.lease_epoch);
   const op =
-    claims.op === 'snapshot_download' || claims.op === 'artifact_upload' ? claims.op : null;
+    claims.op === 'snapshot_download' ||
+    claims.op === 'overlay_download' ||
+    claims.op === 'bundle_download' ||
+    claims.op === 'artifact_upload'
+      ? claims.op
+      : null;
 
   if (!agentId || !jobId || !attemptId || !leaseId || !leaseEpoch || !op) {
     return null;

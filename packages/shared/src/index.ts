@@ -3,6 +3,7 @@ export * from './errors.js';
 export * from './ids.js';
 export * from './hashing.js';
 export * from './paths.js';
+export * from './git-allowlist.js';
 export * from './logging.js';
 export * from './crypto.js';
 export * from './controller-identity.js';

@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
+import { readFile, readdir } from 'node:fs/promises';
 import { arch, cpus, freemem, hostname, platform, release, totalmem } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { AgentCapabilityReport } from '@rbo/protocol';
 
@@ -56,11 +58,41 @@ export interface ProbeInput {
   agentId: string;
   displayName: string;
   maxJobs: number;
+  /** When set, advertise repository_cache from mirror metadata (§19.2). */
+  stateDir?: string;
+}
+
+async function loadRepositoryCache(
+  stateDir: string,
+): Promise<NonNullable<AgentCapabilityReport['repository_cache']>> {
+  const reposDir = join(stateDir, 'repos');
+  try {
+    const entries = await readdir(reposDir, { withFileTypes: true });
+    const cache: NonNullable<AgentCapabilityReport['repository_cache']> = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      try {
+        const raw = await readFile(join(reposDir, entry.name, 'metadata.json'), 'utf8');
+        const meta = JSON.parse(raw) as { canonical_id?: string };
+        if (meta.canonical_id) {
+          cache.push({ canonical_id: meta.canonical_id });
+        }
+      } catch {
+        // skip broken metadata
+      }
+    }
+    return cache;
+  } catch {
+    return [];
+  }
 }
 
 export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabilityReport> {
   const shells = await detectShells();
   const gitVersions = await detectGitVersion();
+  const repository_cache = input.stateDir ? await loadRepositoryCache(input.stateDir) : [];
 
   return {
     agent_id: input.agentId,
@@ -87,5 +119,6 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
     toolchain_profiles: [],
     labels: {},
     secret_refs: [],
+    ...(repository_cache.length > 0 ? { repository_cache } : {}),
   };
 }

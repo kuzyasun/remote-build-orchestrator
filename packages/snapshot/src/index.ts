@@ -58,6 +58,8 @@ export const SnapshotRepoSchema = z.object({
   branch: z.string().nullable(),
   base_commit: z.string().min(1),
   head_is_pushed: z.boolean(),
+  /** Optional; Controller derives from branch when absent (§10.6). */
+  fetch_refs: z.array(z.string().min(1)).optional(),
 });
 
 const payloadBase = {
@@ -128,4 +130,5 @@ export * from './secret-policy.js';
 export * from './archive.js';
 export * from './canonical.js';
 export * from './capture.js';
+export * from './overlay.js';
 export * from './materialize.js';

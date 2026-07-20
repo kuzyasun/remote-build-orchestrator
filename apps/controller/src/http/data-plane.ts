@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, rename, rm, stat } from 'node:fs/promises';
+import { access, mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { dirname, join } from 'node:path';
 import type { ControllerIdentity } from '@rbo/shared';
 import { createLogger, generateId, isPathContained, isSafeRelativePath } from '@rbo/shared';
-import { attemptArtifactsDir } from '../execution/runner.js';
+import { attemptArtifactsDir, attemptTransferDir } from '../execution/runner.js';
 import { verifyDataToken } from '../security/data-tokens.js';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
@@ -220,7 +220,26 @@ export async function handleDataPlaneRequest(
       )
       .get(attemptId) as { payload_path: string; size_bytes: number; sha256: string } | undefined;
 
-    if (!row || !row.payload_path) {
+    const transferSnapshot = join(
+      attemptTransferDir(options.dataDir, attemptId),
+      'snapshot.tar.zst',
+    );
+    let payloadPath = row?.payload_path;
+    let sizeBytes = row?.size_bytes;
+    let sha256 = row?.sha256;
+    try {
+      await access(transferSnapshot);
+      const transferStats = await stat(transferSnapshot);
+      payloadPath = transferSnapshot;
+      sizeBytes = transferStats.size;
+      // Header must match the bytes we stream (fallback archive ≠ DB overlay hash).
+      const transferData = await readFile(transferSnapshot);
+      sha256 = createHash('sha256').update(transferData).digest('hex');
+    } catch {
+      // use DB snapshot path
+    }
+
+    if (!payloadPath || sizeBytes == null || !sha256) {
       sendJson(res, 404, {
         error: {
           category: 'materialization',
@@ -232,13 +251,13 @@ export async function handleDataPlaneRequest(
     }
 
     try {
-      const fileStats = await stat(row.payload_path);
+      const fileStats = await stat(payloadPath);
       res.writeHead(200, {
         'content-type': 'application/zstd',
         'content-length': fileStats.size,
-        'x-rbo-sha256': row.sha256,
+        'x-rbo-sha256': sha256,
       });
-      const stream = createReadStream(row.payload_path);
+      const stream = createReadStream(payloadPath);
       stream.pipe(res);
     } catch (error) {
       logger.error('failed to stream snapshot', { attemptId, error: String(error) });
@@ -467,6 +486,138 @@ export async function handleDataPlaneRequest(
           },
         });
       }
+    }
+    return true;
+  }
+
+  // Route 3: GET /data/v1/attempts/:attemptId/overlay
+  const overlayMatch = /^\/data\/v1\/attempts\/([^/]+)\/overlay$/.exec(url.pathname);
+  if (overlayMatch) {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, {
+        error: { category: 'validation', message: 'GET required', retryable: false },
+      });
+      return true;
+    }
+    const attemptId = overlayMatch[1];
+    if (token.op !== 'overlay_download') {
+      sendJson(res, 403, {
+        error: {
+          category: 'validation',
+          message: 'Token claim mismatch for overlay download',
+          retryable: false,
+        },
+      });
+      return true;
+    }
+
+    const auth = authorizeAttemptToken(options.db, token, attemptId, [
+      'preparing_source',
+      'transferring_source',
+      'materializing',
+    ]);
+    if (!auth.ok) {
+      sendJson(res, auth.status, {
+        error: { category: 'validation', message: auth.message, retryable: false },
+      });
+      return true;
+    }
+
+    const row = options.db
+      .prepare(
+        `SELECT s.payload_path, s.size_bytes, s.sha256
+         FROM job_attempts a
+         JOIN jobs j ON a.job_id = j.id
+         JOIN snapshots s ON j.snapshot_id = s.id
+         WHERE a.id = ?`,
+      )
+      .get(attemptId) as { payload_path: string; size_bytes: number; sha256: string } | undefined;
+
+    if (!row?.payload_path) {
+      sendJson(res, 404, {
+        error: {
+          category: 'materialization',
+          message: 'Overlay payload not found',
+          retryable: false,
+        },
+      });
+      return true;
+    }
+
+    try {
+      const fileStats = await stat(row.payload_path);
+      res.writeHead(200, {
+        'content-type': 'application/zstd',
+        'content-length': fileStats.size,
+        'x-rbo-sha256': row.sha256,
+      });
+      createReadStream(row.payload_path).pipe(res);
+    } catch (error) {
+      logger.error('failed to stream overlay', { attemptId, error: String(error) });
+      if (!res.headersSent) {
+        sendJson(res, 500, {
+          error: {
+            category: 'internal',
+            message: 'Failed to read overlay file',
+            retryable: false,
+          },
+        });
+      }
+    }
+    return true;
+  }
+
+  // Route 4: GET /data/v1/attempts/:attemptId/bundle
+  const bundleMatch = /^\/data\/v1\/attempts\/([^/]+)\/bundle$/.exec(url.pathname);
+  if (bundleMatch) {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, {
+        error: { category: 'validation', message: 'GET required', retryable: false },
+      });
+      return true;
+    }
+    const attemptId = bundleMatch[1];
+    if (token.op !== 'bundle_download') {
+      sendJson(res, 403, {
+        error: {
+          category: 'validation',
+          message: 'Token claim mismatch for bundle download',
+          retryable: false,
+        },
+      });
+      return true;
+    }
+
+    const auth = authorizeAttemptToken(options.db, token, attemptId, [
+      'preparing_source',
+      'transferring_source',
+      'materializing',
+    ]);
+    if (!auth.ok) {
+      sendJson(res, auth.status, {
+        error: { category: 'validation', message: auth.message, retryable: false },
+      });
+      return true;
+    }
+
+    const bundlePath = join(attemptTransferDir(options.dataDir, attemptId), 'bundle.gitbundle');
+    try {
+      const data = await readFile(bundlePath);
+      const sha256 = createHash('sha256').update(data).digest('hex');
+      res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-length': data.length,
+        'x-rbo-sha256': sha256,
+      });
+      res.end(data);
+    } catch {
+      sendJson(res, 404, {
+        error: {
+          category: 'materialization',
+          message: 'Bundle payload not found',
+          retryable: false,
+        },
+      });
     }
     return true;
   }

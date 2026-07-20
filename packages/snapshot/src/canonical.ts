@@ -1,5 +1,10 @@
 import { sha256 } from '@rbo/shared';
-import type { FullSnapshotManifest, SnapshotFileEntry } from './index.js';
+import type {
+  FullSnapshotManifest,
+  GitOverlaySnapshotManifest,
+  SnapshotFileEntry,
+  SnapshotManifest,
+} from './index.js';
 
 /** Stable JSON serialization for deterministic content_id (§11.16). */
 export function stableStringify(value: unknown): string {
@@ -14,10 +19,9 @@ export function stableStringify(value: unknown): string {
   return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(obj[key])}`).join(',')}}`;
 }
 
-export function computeContentId(
-  manifestBody: Omit<FullSnapshotManifest, 'content_id'>,
-  orderedFileHashes: string[],
-): string {
+type ManifestBody = Omit<SnapshotManifest, 'content_id'>;
+
+export function computeContentId(manifestBody: ManifestBody, orderedFileHashes: string[]): string {
   const canonical = stableStringify(manifestBody);
   const hashInput = `${canonical}\n${orderedFileHashes.join('\n')}`;
   return `sha256:${sha256(hashInput)}`;
@@ -25,16 +29,25 @@ export function computeContentId(
 
 export function attachContentId(
   manifestBody: Omit<FullSnapshotManifest, 'content_id'>,
-): FullSnapshotManifest {
+): FullSnapshotManifest;
+export function attachContentId(
+  manifestBody: Omit<GitOverlaySnapshotManifest, 'content_id'>,
+): GitOverlaySnapshotManifest;
+export function attachContentId(manifestBody: ManifestBody): SnapshotManifest {
   const fileHashes = collectOrderedFileHashes(manifestBody);
   const content_id = computeContentId(manifestBody, fileHashes);
-  return { ...manifestBody, content_id };
+  return { ...manifestBody, content_id } as SnapshotManifest;
 }
 
-function collectOrderedFileHashes(manifest: Omit<FullSnapshotManifest, 'content_id'>): string[] {
-  const hashes = manifest.source.files
+function collectOrderedFileHashes(manifest: ManifestBody): string[] {
+  let files: SnapshotFileEntry[] = [];
+  if (manifest.payload.mode === 'full') {
+    files = (manifest as Omit<FullSnapshotManifest, 'content_id'>).source.files;
+  } else if (manifest.payload.mode === 'git_overlay') {
+    files = (manifest as Omit<GitOverlaySnapshotManifest, 'content_id'>).overlay.files;
+  }
+  return files
     .filter((entry): entry is Extract<SnapshotFileEntry, { type: 'file' }> => entry.type === 'file')
     .map((entry) => entry.sha256)
     .sort();
-  return hashes;
 }

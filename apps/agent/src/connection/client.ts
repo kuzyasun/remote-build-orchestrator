@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { AgentCapabilityReport } from '@rbo/protocol';
 import {
   ArtifactUploadGrantPayloadSchema,
+  BundleDownloadPayloadSchema,
   CancelJobPayloadSchema,
   LeaseOfferPayloadSchema,
   PrepareSourcePayloadSchema,
@@ -16,8 +17,10 @@ import {
   generateId,
   signNonce,
 } from '@rbo/shared';
+import type { GitUrlAllowlist } from '@rbo/shared';
 import WebSocket from 'ws';
 import { AgentJobExecutor } from '../executor/index.js';
+import { DEFAULT_REPO_CACHE_CONFIG, type RepoCacheConfig } from '../repos/mirror.js';
 
 const logger = createLogger('agent.connection');
 
@@ -31,6 +34,8 @@ export interface AgentConnectionOptions {
   capabilities: AgentCapabilityReport;
   /** Maps store ref → env var name holding the secret (optional). */
   secretMap?: Record<string, string>;
+  gitAllowlist: GitUrlAllowlist;
+  repoCache?: RepoCacheConfig;
 }
 
 export interface ConnectResult {
@@ -193,6 +198,8 @@ export class AgentConnection {
               controllerFingerprint: this.options.expectedFingerprint,
               secretMap: this.options.secretMap,
               toolchainProfiles: this.options.capabilities.toolchain_profiles,
+              gitAllowlist: this.options.gitAllowlist,
+              repoCache: this.options.repoCache ?? DEFAULT_REPO_CACHE_CONFIG,
             });
             this.startHeartbeats(socket);
             finish({ status: 'authenticated', agentId });
@@ -233,6 +240,15 @@ export class AgentConnection {
                 void this.executor.handleRunJob(parsed.data);
               } else {
                 logger.warn('invalid run_job payload', { issues: parsed.error.issues });
+              }
+              break;
+            }
+            case 'bundle_download': {
+              const parsed = BundleDownloadPayloadSchema.safeParse(message.payload);
+              if (parsed.success) {
+                this.executor.handleBundleDownload(parsed.data);
+              } else {
+                logger.warn('invalid bundle_download payload', { issues: parsed.error.issues });
               }
               break;
             }

@@ -73,6 +73,7 @@ describe('Phase 4 Remote Execution End-to-End', () => {
       expectedFingerprint: identity.fingerprint,
       stateDir: agentStateDir,
       displayName: 'test-remote-agent',
+      gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
       capabilities: {
         agent_id: '',
         display_name: 'test-remote-agent',
@@ -121,6 +122,7 @@ describe('Phase 4 Remote Execution End-to-End', () => {
       expectedFingerprint: identity.fingerprint,
       stateDir: agentStateDir,
       displayName: 'test-remote-agent',
+      gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
       capabilities: {
         agent_id: '',
         display_name: 'test-remote-agent',

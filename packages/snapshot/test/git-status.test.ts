@@ -15,12 +15,14 @@ describe('git-status porcelain v2 parser', () => {
   });
 
   it('parses rename entry (v2 line 2)', () => {
-    const output = '2 AM N... 100644 100644 100644 e69de29 e69de29 R100 new.txt old.txt\0';
+    // Real git emits path and origPath as consecutive NUL-terminated fields.
+    const output = '2 AM N... 100644 100644 100644 e69de29 e69de29 R100 new.txt\0old.txt\0';
     const entries = parsePorcelainV2(output);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({
       path: 'new.txt',
       origPath: 'old.txt',
+      xy: 'AM',
       kind: 'tracked',
     });
   });

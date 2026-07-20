@@ -245,4 +245,61 @@ describe('Scheduler Engine (§19.2, Phase 4)', () => {
       'fail_fast',
     );
   });
+
+  it('applies repository_cache_hit bonus (+500) when prefer_repo_cache and agent has repo', () => {
+    const cold = makeAgent('agt_cold', {
+      repository_cache: [],
+      resources: {
+        cpu_logical: 8,
+        memory_total_mb: 16384,
+        memory_free_mb: 9000,
+        disk_free_mb: 50000,
+      },
+    });
+    const warm = makeAgent('agt_warm', {
+      repository_cache: [
+        {
+          canonical_id: 'github.com/kuzyasun/esp32-boilerplate',
+          commits: ['abc123'],
+        },
+      ],
+      resources: {
+        cpu_logical: 8,
+        memory_total_mb: 16384,
+        memory_free_mb: 1000,
+        disk_free_mb: 50000,
+      },
+    });
+
+    const req = makeRequest({ preferences: { prefer_repo_cache: true } });
+    const decision = selectAgentForJob([cold, warm], req, {
+      repoCanonicalId: 'github.com/kuzyasun/esp32-boilerplate',
+      baseCommit: 'abc123',
+    });
+
+    expect(decision.action).toBe('remote');
+    expect(decision.selectedAgent?.agentId).toBe('agt_warm');
+  });
+
+  it('does not let repo cache affinity bypass hard filters', () => {
+    const warmWrongOs = makeAgent('agt_warm_linux', {
+      os: { family: 'linux', version: '6', arch: 'x64' },
+      repository_cache: [{ canonical_id: 'github.com/kuzyasun/esp32-boilerplate' }],
+    });
+    const coldWin = makeAgent('agt_cold_win', {
+      os: { family: 'windows', version: '10', arch: 'x64' },
+      repository_cache: [],
+    });
+
+    const req = makeRequest({
+      requirements: { os: ['windows'] },
+      preferences: { prefer_repo_cache: true },
+    });
+    const decision = selectAgentForJob([warmWrongOs, coldWin], req, {
+      repoCanonicalId: 'github.com/kuzyasun/esp32-boilerplate',
+      baseCommit: 'abc123',
+    });
+
+    expect(decision.selectedAgent?.agentId).toBe('agt_cold_win');
+  });
 });

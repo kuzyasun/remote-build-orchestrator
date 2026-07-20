@@ -53,6 +53,7 @@ function agentConnection(stateDir: string, fingerprint?: string): AgentConnectio
     stateDir,
     displayName: 'test-agent',
     capabilities: createMockAgentCapability({ display_name: 'test-agent' }),
+    gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
   });
 }
 

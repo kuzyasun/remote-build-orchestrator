@@ -53,6 +53,7 @@ describe('Phase 4 Protocol Schemas', () => {
 
   it('validates PrepareSource payload', () => {
     const valid = PrepareSourcePayloadSchema.safeParse({
+      source_mode: 'full',
       attempt_id: 'att_123',
       lease_id: 'lease_123',
       lease_epoch: 1,

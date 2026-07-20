@@ -279,6 +279,19 @@ export const AgentCapabilityReportSchema = z.object({
   toolchain_profiles: z.array(ToolchainProfileSchema),
   labels: z.record(z.string(), z.string()),
   secret_refs: z.array(z.string()),
+  /**
+   * Optional Phase 5 repository-cache advertisement for scheduler affinity (§19.2).
+   * Agents may report canonical ids (and optionally known commits) present in mirrors.
+   */
+  repository_cache: z
+    .array(
+      z.object({
+        canonical_id: z.string().min(1),
+        /** Optional known commits present in the mirror (best-effort). */
+        commits: z.array(z.string().min(1)).optional(),
+      }),
+    )
+    .optional(),
 });
 
 export type AgentCapabilityReport = z.infer<typeof AgentCapabilityReportSchema>;

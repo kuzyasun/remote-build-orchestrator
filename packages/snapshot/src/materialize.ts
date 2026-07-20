@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import {
   RboError,
@@ -8,7 +8,12 @@ import {
   sha256,
 } from '@rbo/shared';
 import { decompressTarZstd, parseTarArchive } from './archive.js';
-import { type FullSnapshotManifest, FullSnapshotManifestSchema } from './index.js';
+import {
+  type FullSnapshotManifest,
+  FullSnapshotManifestSchema,
+  type GitOverlaySnapshotManifest,
+  GitOverlaySnapshotManifestSchema,
+} from './index.js';
 
 export interface MaterializeFullSnapshotInput {
   /** Raw or already-parsed manifest — always re-validated before use. */
@@ -235,4 +240,131 @@ export async function materializeFullSnapshot(
   }
 
   return { workspaceRoot: realWorkspace, projectPath };
+}
+
+export interface ApplyGitOverlayInput {
+  manifest: unknown;
+  archivePath: string;
+  workspaceRoot: string;
+  /** Detached worktree / project directory already checked out at base_commit. */
+  projectPath: string;
+}
+
+/**
+ * Apply a git_overlay archive onto an existing base worktree (§11 / Phase 5).
+ * Order: deletions → extract overlay files/modes/symlinks → empty dirs → hash verify.
+ */
+export async function applyGitOverlay(input: ApplyGitOverlayInput): Promise<MaterializedWorkspace> {
+  const manifest = GitOverlaySnapshotManifestSchema.parse(input.manifest);
+
+  const archiveData = await readFile(input.archivePath);
+  const archiveHash = sha256(archiveData);
+  if (archiveHash !== manifest.payload.sha256) {
+    throw new RboError('snapshot_hash', 'Overlay archive hash mismatch', false, {
+      expected: manifest.payload.sha256,
+      actual: archiveHash,
+    });
+  }
+
+  const realWorkspace = await resolveRealPath(input.workspaceRoot);
+  const realProject = await resolveRealPath(input.projectPath);
+  if (!isPathContained(realWorkspace, realProject)) {
+    throw new RboError('materialization', 'projectPath escapes workspaceRoot');
+  }
+
+  for (const deletion of manifest.overlay.deletions) {
+    if (!isSafeRelativePath(deletion)) {
+      throw new RboError('materialization', `Unsafe deletion path: ${deletion}`);
+    }
+    const dest = resolve(realProject, deletion);
+    if (!isPathContained(realProject, dest)) {
+      throw new RboError('materialization', `Deletion escapes project: ${deletion}`);
+    }
+    await rm(dest, { recursive: true, force: true });
+  }
+
+  const tar = decompressTarZstd(archiveData);
+  const entries = parseTarArchive(tar);
+
+  for (const entry of entries) {
+    const normalized = entry.path.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!isSafeRelativePath(normalized)) {
+      throw new RboError('materialization', `Overlay entry path is unsafe: ${entry.path}`);
+    }
+
+    // Additional-root mounts are workspace-relative; overlay files are project-relative.
+    const isAdditional = manifest.additional_roots.some((root) => {
+      const mount = root.mount.replace(/\\/g, '/').replace(/\/+$/, '');
+      return normalized === mount || normalized.startsWith(`${mount}/`);
+    });
+    const dest = isAdditional
+      ? await safeWritePath(realWorkspace, normalized)
+      : await safeWritePath(realProject, normalized);
+
+    if (entry.type === 'directory') {
+      await mkdir(dest, { recursive: true });
+      continue;
+    }
+
+    if (entry.type === 'symlink') {
+      if (!entry.target) {
+        throw new RboError('materialization', `Symlink missing target: ${entry.path}`);
+      }
+      const containRoot = isAdditional ? realWorkspace : realProject;
+      await assertSymlinkTargetContained(containRoot, dest, entry.target);
+      try {
+        await symlink(entry.target, dest);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (process.platform === 'win32') {
+          throw new RboError('materialization', 'symlink_unsupported', false, { path: entry.path });
+        }
+        throw new RboError('materialization', message, false, { path: entry.path });
+      }
+      continue;
+    }
+
+    await writeFile(dest, entry.content);
+    if (entry.mode & 0o111) {
+      await chmod(dest, entry.mode);
+    }
+  }
+
+  for (const emptyDir of manifest.overlay.empty_directories) {
+    if (!isSafeRelativePath(emptyDir)) {
+      throw new RboError('materialization', `Unsafe empty directory: ${emptyDir}`);
+    }
+    await mkdir(await safeWritePath(realProject, emptyDir), { recursive: true });
+  }
+
+  for (const file of manifest.overlay.files) {
+    if (file.type !== 'file') {
+      continue;
+    }
+    const dest = await safeWritePath(realProject, file.path);
+    const content = await readFile(dest);
+    const hash = sha256(content);
+    if (hash !== file.sha256) {
+      throw new RboError(
+        'snapshot_hash',
+        `Overlay file hash mismatch after apply: ${file.path}`,
+        false,
+        { expected: file.sha256, actual: hash },
+      );
+    }
+  }
+
+  for (const root of manifest.additional_roots) {
+    if ((root.mode ?? 'read_only') !== 'read_only') {
+      continue;
+    }
+    const mountPath = await safeWritePath(realWorkspace, root.mount);
+    try {
+      await applyReadOnlyTree(mountPath);
+    } catch {
+      // mount may be empty
+    }
+  }
+
+  return { workspaceRoot: realWorkspace, projectPath: realProject };
 }

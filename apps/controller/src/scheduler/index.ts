@@ -19,6 +19,14 @@ export interface SchedulingDecision {
 
 export interface SchedulerOptions {
   allowLocalFallback?: boolean;
+  /**
+   * Canonical repository id for the job (normalized). When set with
+   * prefer_repo_cache, agents advertising a matching repository_cache entry
+   * receive the §19.2 repository_cache_hit bonus (+500).
+   */
+  repoCanonicalId?: string | null;
+  /** Optional base commit — bonus only if agent reports the commit OR omits commits (fetch path allowed). */
+  baseCommit?: string | null;
 }
 
 function matchesOs(requestOs?: string[], agentOs?: string): boolean {
@@ -65,6 +73,29 @@ function matchesSecretRefs(requestRefs: string[], agentRefs: string[]): boolean 
   }
   const agentSet = new Set(agentRefs);
   return requestRefs.every((ref) => agentSet.has(ref));
+}
+
+/** §19.2 repository_cache_hit: same canonical repo and base commit (or allowed fetch path). */
+export function agentHasRepoCacheHit(
+  caps: AgentCapabilityReport,
+  repoCanonicalId: string,
+  baseCommit: string | null,
+): boolean {
+  const entries = caps.repository_cache ?? [];
+  for (const entry of entries) {
+    if (entry.canonical_id !== repoCanonicalId) {
+      continue;
+    }
+    if (!baseCommit) {
+      return true;
+    }
+    // If the agent does not list commits, treat as "allowed fetch path" for affinity.
+    if (!entry.commits || entry.commits.length === 0) {
+      return true;
+    }
+    return entry.commits.includes(baseCommit);
+  }
+  return false;
 }
 
 /** Compare dotted numeric versions; non-numeric segments compared as strings. */
@@ -255,6 +286,13 @@ export function selectAgentForJob(
 
     // Memory headroom score
     score += Math.floor(caps.resources.memory_free_mb / 1024);
+
+    // Repository cache affinity (§19.2) — preference only, after hard filters.
+    if (prefs.prefer_repo_cache !== false && options.repoCanonicalId) {
+      if (agentHasRepoCacheHit(caps, options.repoCanonicalId, options.baseCommit ?? null)) {
+        score += 500;
+      }
+    }
 
     eligibleCandidates.push({
       agent: candidate,

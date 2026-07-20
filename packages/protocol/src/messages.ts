@@ -101,7 +101,34 @@ export const LeaseRejectPayloadSchema = z.object({
   reason: z.string().min(1),
 });
 
-export const PrepareSourcePayloadSchema = z.object({
+/** Phase 5 source_need reasons — exact enum, never free-form. */
+export const SourceNeedReasonSchema = z.enum([
+  'base_present',
+  'base_commit_missing',
+  'bundle_required',
+  'full_snapshot_required',
+  'repo_fetch_failed',
+]);
+
+export type SourceNeedReason = z.infer<typeof SourceNeedReasonSchema>;
+
+const DataTransferDescriptorSchema = z.object({
+  download_url: z.string().min(1),
+  data_token: z.string().min(1),
+  expected_size_bytes: z.number().int().nonnegative(),
+  expected_sha256: z.string().min(1),
+});
+
+export const PrepareSourceRepoSchema = z.object({
+  url: z.string().min(1),
+  canonical_id: z.string().min(1),
+  branch: z.string().nullable(),
+  base_commit: z.string().min(1),
+  fetch_refs: z.array(z.string().min(1)).default([]),
+});
+
+export const PrepareSourceFullPayloadSchema = z.object({
+  source_mode: z.literal('full'),
   attempt_id: z.string().min(1),
   lease_id: z.string().min(1),
   lease_epoch: z.number().int().positive(),
@@ -110,6 +137,40 @@ export const PrepareSourcePayloadSchema = z.object({
   expected_size_bytes: z.number().int().nonnegative(),
   expected_sha256: z.string().min(1),
   manifest: z.unknown().optional(),
+});
+
+export const PrepareSourceGitOverlayPayloadSchema = z.object({
+  source_mode: z.literal('git_overlay'),
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  repo: PrepareSourceRepoSchema,
+  overlay: DataTransferDescriptorSchema,
+  manifest: z.unknown().optional(),
+});
+
+/** Discriminated by source_mode (§12.1 / Phase 5). */
+export const PrepareSourcePayloadSchema = z.discriminatedUnion('source_mode', [
+  PrepareSourceFullPayloadSchema,
+  PrepareSourceGitOverlayPayloadSchema,
+]);
+
+export const SourceNeedPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  reason: SourceNeedReasonSchema,
+  detail: z.string().optional(),
+});
+
+export const BundleDownloadPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  download_url: z.string().min(1),
+  data_token: z.string().min(1),
+  expected_size_bytes: z.number().int().nonnegative(),
+  expected_sha256: z.string().min(1),
 });
 
 export const SourceReadyPayloadSchema = z.object({
@@ -203,6 +264,10 @@ export type LeaseOfferPayload = z.infer<typeof LeaseOfferPayloadSchema>;
 export type LeaseAcceptPayload = z.infer<typeof LeaseAcceptPayloadSchema>;
 export type LeaseRejectPayload = z.infer<typeof LeaseRejectPayloadSchema>;
 export type PrepareSourcePayload = z.infer<typeof PrepareSourcePayloadSchema>;
+export type PrepareSourceFullPayload = z.infer<typeof PrepareSourceFullPayloadSchema>;
+export type PrepareSourceGitOverlayPayload = z.infer<typeof PrepareSourceGitOverlayPayloadSchema>;
+export type SourceNeedPayload = z.infer<typeof SourceNeedPayloadSchema>;
+export type BundleDownloadPayload = z.infer<typeof BundleDownloadPayloadSchema>;
 export type SourceReadyPayload = z.infer<typeof SourceReadyPayloadSchema>;
 export type RunJobPayload = z.infer<typeof RunJobPayloadSchema>;
 export type CancelJobPayload = z.infer<typeof CancelJobPayloadSchema>;

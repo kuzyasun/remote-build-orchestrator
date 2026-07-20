@@ -11,8 +11,19 @@ import {
   writeJobScript,
 } from '@rbo/executor';
 import type { JobEvent, JobRequest } from '@rbo/protocol';
-import { RboError, resolveContainedCwd } from '@rbo/shared';
-import { captureFullSnapshot, materializeFullSnapshot } from '@rbo/snapshot';
+import {
+  type GitUrlAllowlist,
+  RboError,
+  isAllowedRepositoryUrl,
+  resolveContainedCwd,
+} from '@rbo/shared';
+import {
+  captureFullSnapshot,
+  captureGitOverlaySnapshot,
+  describeRepository,
+  gitFindRoot,
+  materializeFullSnapshot,
+} from '@rbo/snapshot';
 import {
   createAttempt,
   createJobEvent,
@@ -34,6 +45,9 @@ export interface LocalRunnerContext {
   allowedProjectRoots: string[];
   allowedArtifactDestinations: string[];
   maxConcurrentJobs?: number;
+  gitAllowlist?: GitUrlAllowlist;
+  /** When true, prefer git_overlay capture for remote-eligible jobs. */
+  remoteCapable?: boolean;
 }
 
 const activeCancels = new Map<string, () => Promise<void>>();
@@ -125,6 +139,10 @@ export function attemptArtifactsDir(dataDir: string, attemptId: string): string 
 
 export function attemptControlDir(dataDir: string, attemptId: string): string {
   return join(attemptBaseDir(dataDir, attemptId), 'control');
+}
+
+export function attemptTransferDir(dataDir: string, attemptId: string): string {
+  return join(dataDir, 'transfers', attemptId);
 }
 
 export { readLogTail };
@@ -534,14 +552,28 @@ export async function captureAndPersistSnapshot(
     secret_policy: request.source_policy?.secret_policy ?? 'block',
   } as const;
 
-  const captured = await captureFullSnapshot({
-    projectRoot: request.source.project_root,
-    allowedProjectRoots: ctx.allowedProjectRoots,
-    cwd: request.source.cwd,
-    sourcePolicy,
-    additionalRoots: request.source.additional_roots,
-    contentStorageDir: storageDir,
-  });
+  const useOverlay =
+    ctx.remoteCapable === true &&
+    ctx.gitAllowlist &&
+    (await canCaptureGitOverlay(request.source.project_root, ctx.gitAllowlist));
+
+  const captured = useOverlay
+    ? await captureGitOverlaySnapshot({
+        projectRoot: request.source.project_root,
+        allowedProjectRoots: ctx.allowedProjectRoots,
+        cwd: request.source.cwd,
+        sourcePolicy,
+        additionalRoots: request.source.additional_roots,
+        contentStorageDir: storageDir,
+      })
+    : await captureFullSnapshot({
+        projectRoot: request.source.project_root,
+        allowedProjectRoots: ctx.allowedProjectRoots,
+        cwd: request.source.cwd,
+        sourcePolicy,
+        additionalRoots: request.source.additional_roots,
+        contentStorageDir: storageDir,
+      });
 
   const manifestPath = join(storageDir, 'manifest.json');
   await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
@@ -574,4 +606,20 @@ export async function captureAndPersistSnapshot(
     contentId: captured.manifest.content_id,
     secretWarnings: captured.secretWarnings,
   };
+}
+
+async function canCaptureGitOverlay(
+  projectRoot: string,
+  allowlist: GitUrlAllowlist,
+): Promise<boolean> {
+  try {
+    const repoRoot = await gitFindRoot(projectRoot);
+    const repoInfo = await describeRepository(repoRoot);
+    if (!repoInfo.remoteUrl || !repoInfo.head) {
+      return false;
+    }
+    return isAllowedRepositoryUrl(repoInfo.remoteUrl, allowlist);
+  } catch {
+    return false;
+  }
 }

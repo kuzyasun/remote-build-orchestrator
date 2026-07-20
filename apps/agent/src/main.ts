@@ -16,6 +16,7 @@ async function main(): Promise<void> {
     agentId: '', // overwritten by the Controller-assigned ID once known
     displayName: config.displayName,
     maxJobs: config.maxJobs,
+    stateDir: config.stateDir,
   });
 
   logger.info('agent starting', {
@@ -41,6 +42,8 @@ async function main(): Promise<void> {
       displayName: config.displayName,
       capabilities,
       secretMap: config.secretMap,
+      gitAllowlist: config.gitAllowlist,
+      repoCache: config.repoCache,
     });
 
     try {

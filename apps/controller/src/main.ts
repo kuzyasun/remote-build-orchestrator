@@ -27,6 +27,7 @@ async function main(): Promise<void> {
       allowedProjectRoots: config.allowedProjectRoots,
       allowedArtifactDestinations: config.allowedArtifactDestinations,
       maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
+      gitAllowlist: config.gitAllowlist,
     },
   });
 
@@ -43,6 +44,7 @@ async function main(): Promise<void> {
     allowedProjectRoots: config.allowedProjectRoots,
     allowedArtifactDestinations: config.allowedArtifactDestinations,
     maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
+    gitAllowlist: config.gitAllowlist,
   });
 
   logger.info('controller started', {

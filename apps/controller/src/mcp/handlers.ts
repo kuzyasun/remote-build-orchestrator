@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { readEventsFromCursor, readLogsFromCursor } from '@rbo/executor';
 import type { McpToolName } from '@rbo/protocol';
 import { getMcpToolDef } from '@rbo/protocol';
-import type { ControllerIdentity, StructuredErrorDetails } from '@rbo/shared';
+import type { ControllerIdentity, GitUrlAllowlist, StructuredErrorDetails } from '@rbo/shared';
 import { RboError } from '@rbo/shared';
 import { z } from 'zod';
 import { listAgents } from '../agents/service.js';
@@ -38,6 +38,7 @@ export interface ToolContext {
   agentPlanePort?: number;
   controllerPublicHost?: string;
   dataPlaneBaseUrl?: string;
+  gitAllowlist?: GitUrlAllowlist;
 }
 
 export interface ToolErrorResult {
@@ -51,6 +52,7 @@ function runnerContext(ctx: ToolContext) {
     allowedProjectRoots: ctx.allowedProjectRoots ?? [],
     allowedArtifactDestinations: ctx.allowedArtifactDestinations ?? ctx.allowedProjectRoots ?? [],
     maxConcurrentJobs: ctx.maxConcurrentJobs ?? 1,
+    gitAllowlist: ctx.gitAllowlist,
   };
 }
 

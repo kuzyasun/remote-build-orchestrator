@@ -101,6 +101,8 @@ describe('Agent cancelSignal race across spawn', () => {
     const executor = new AgentJobExecutor(socket, {
       stateDir,
       controllerFingerprint: 'sha256:test',
+      gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+      repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
     });
     holder.current = executor;
     executorRef = executor;
@@ -137,6 +139,7 @@ describe('Agent cancelSignal race across spawn', () => {
       materializedProjectPath: string;
     };
     exe.currentPrepare = {
+      source_mode: 'full',
       attempt_id: 'att_1',
       lease_id: 'lease_1',
       lease_epoch: 1,
