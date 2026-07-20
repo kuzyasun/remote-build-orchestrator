@@ -1,16 +1,20 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
-import { mkdir, rename, rm, stat } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
 import {
-  appendLogChunk,
+  type AttemptSpool,
+  appendChunk,
   collectArtifactFiles,
-  ensureAttemptLogs,
+  openAttemptSpool,
+  readAck,
   runCleanupScript,
   spawnJobScript,
+  totalBytes,
   waitForCompletion,
+  writeAck,
   writeJobScript,
 } from '@rbo/executor';
 import type {
@@ -21,6 +25,7 @@ import type {
   CleanupCompletePayload,
   JobExitPayload,
   LeaseOfferPayload,
+  LogAckPayload,
   PrepareSourceGitOverlayPayload,
   PrepareSourcePayload,
   RunJobPayload,
@@ -30,6 +35,17 @@ import { certificateFingerprint, createLogger, generateId, resolveContainedCwd }
 import type { GitUrlAllowlist } from '@rbo/shared';
 import { applyGitOverlay, materializeFullSnapshot } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
+import { DEFAULT_LOG_SEND_QUEUE_MAX, DEFAULT_LOG_SPOOL_MAX_BYTES } from '../config.js';
+import { SpoolSender } from '../logs/spool-sender.js';
+import {
+  type AttemptArtifactManifestItem,
+  type AttemptMetadata,
+  processIdentityFromPid,
+  readAttemptMetadata,
+  writeAttemptMetadata,
+} from '../recovery/attempt-metadata.js';
+import type { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
+import { isAcceptingJobsUnderDiskPressure } from '../recovery/disk-pressure.js';
 import { type RepoCacheConfig, RepoMirrorManager } from '../repos/mirror.js';
 import { StreamRedactor } from './redactor.js';
 
@@ -38,6 +54,12 @@ const ARTIFACT_TOKEN_TIMEOUT_MS = 60_000;
 const BUNDLE_TOKEN_TIMEOUT_MS = 120_000;
 
 type ToolchainProfile = NonNullable<LeaseOfferPayload['selected_toolchain_profiles']>[number];
+type RiskLevel = AttemptMetadata['risk_level'];
+
+/** True when job risk requires Agent self-termination at lease expiry. */
+export function isDestructiveOrHardwareRisk(risk: RiskLevel | undefined | null): boolean {
+  return risk === 'destructive' || risk === 'hardware';
+}
 
 export interface AgentExecutorConfig {
   stateDir: string;
@@ -49,6 +71,18 @@ export interface AgentExecutorConfig {
   toolchainProfiles?: ToolchainProfile[];
   gitAllowlist: GitUrlAllowlist;
   repoCache: RepoCacheConfig;
+  /** Max attempt spool bytes (stdout+stderr); default 512 MiB. */
+  logSpoolMaxBytes?: number;
+  /** Max in-memory log send queue; default 64. */
+  logSendQueueMax?: number;
+  /** Optional recovery coordinator for metadata + adopt replay. */
+  recovery?: AgentRecoveryCoordinator;
+  /** Minimum free disk bytes for admission; when set with freeBytes probe, reject leases. */
+  diskMinFreeBytes?: number;
+  /** Injectable free-disk bytes (tests / probe). */
+  getFreeDiskBytes?: () => number | Promise<number>;
+  /** Injectable spool-pressure flag. */
+  getSpoolPressure?: () => boolean;
 }
 
 function assertPinnedPeerCert(
@@ -96,6 +130,22 @@ export class AgentJobExecutor {
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
+  private activeSpool: AttemptSpool | null = null;
+  private activeSpoolSender: SpoolSender | null = null;
+  private activeSpoolLease: {
+    attemptId: string;
+    leaseId: string;
+    leaseEpoch: number;
+  } | null = null;
+  /** Serializes disk spool writes across concurrent stdout/stderr handlers. */
+  private spoolWriteChain: Promise<void> = Promise.resolve();
+  private spoolLimitBreached = false;
+  /** Local lease deadline (ms since epoch) from offer / heartbeat renewals. */
+  private leaseDeadlineMs: number | null = null;
+  private leaseTtlSeconds = 300;
+  private leaseRisk: RiskLevel = 'normal';
+  private leaseTimer: ReturnType<typeof setTimeout> | null = null;
+  private leaseExpired = false;
 
   constructor(
     private socket: WebSocket,
@@ -110,6 +160,11 @@ export class AgentJobExecutor {
 
   public isBusy(): boolean {
     return this.activeAttemptId !== null;
+  }
+
+  /** True when the active log send queue is saturated (disk carries backlog). */
+  public isUnderSpoolPressure(): boolean {
+    return this.activeSpoolSender?.isUnderPressure() ?? false;
   }
 
   private sendFrame(
@@ -146,6 +201,13 @@ export class AgentJobExecutor {
   }
 
   private clearAttempt(): void {
+    if (this.activeAttemptId && this.config.recovery) {
+      this.config.recovery.clearLiveSender(this.activeAttemptId);
+    }
+    this.clearLeaseTimer();
+    this.leaseDeadlineMs = null;
+    this.leaseExpired = false;
+    this.leaseRisk = 'normal';
     this.activeAttemptId = null;
     this.currentOffer = null;
     this.currentPrepare = null;
@@ -155,6 +217,11 @@ export class AgentJobExecutor {
     this.overlayRepoUrl = null;
     this.activeProcessKill = undefined;
     this.cancelSignal = { cancelled: false };
+    this.activeSpool = null;
+    this.activeSpoolSender = null;
+    this.activeSpoolLease = null;
+    this.spoolWriteChain = Promise.resolve();
+    this.spoolLimitBreached = false;
     if (this.pendingArtifactUpload) {
       clearTimeout(this.pendingArtifactUpload.timer);
       const pending = this.pendingArtifactUpload;
@@ -169,6 +236,112 @@ export class AgentJobExecutor {
     }
   }
 
+  private clearLeaseTimer(): void {
+    if (this.leaseTimer) {
+      clearTimeout(this.leaseTimer);
+      this.leaseTimer = null;
+    }
+  }
+
+  private scheduleLeaseTimer(): void {
+    this.clearLeaseTimer();
+    if (this.leaseDeadlineMs === null) {
+      return;
+    }
+    const delay = Math.max(0, this.leaseDeadlineMs - Date.now());
+    this.leaseTimer = setTimeout(() => {
+      void this.onLeaseExpired();
+    }, delay);
+    this.leaseTimer.unref?.();
+  }
+
+  /**
+   * Arm / re-arm local lease deadline from offer TTL.
+   * Heartbeat renewals call {@link renewLeaseDeadline} while connected.
+   */
+  private armLeaseDeadline(offer: LeaseOfferPayload): void {
+    this.leaseTtlSeconds = offer.lease_ttl_seconds;
+    this.leaseRisk = offer.job_request.risk_level ?? 'normal';
+    this.leaseDeadlineMs = Date.now() + offer.lease_ttl_seconds * 1000;
+    this.leaseExpired = false;
+    this.scheduleLeaseTimer();
+  }
+
+  /** Mirror Controller renewActiveLease while heartbeats succeed. */
+  public renewLeaseDeadline(ttlSeconds?: number): void {
+    if (this.leaseDeadlineMs === null || this.leaseExpired) {
+      return;
+    }
+    const ttl = ttlSeconds ?? this.leaseTtlSeconds;
+    this.leaseDeadlineMs = Date.now() + ttl * 1000;
+    this.scheduleLeaseTimer();
+    const attemptId = this.activeAttemptId;
+    if (attemptId) {
+      const existing = readAttemptMetadata(this.config.stateDir, attemptId);
+      if (existing) {
+        writeAttemptMetadata(this.config.stateDir, {
+          ...existing,
+          lease_deadline: new Date(this.leaseDeadlineMs).toISOString(),
+          updated_at: new Date().toISOString(),
+        });
+      }
+    }
+  }
+
+  private async onLeaseExpired(): Promise<void> {
+    if (this.leaseExpired || this.leaseDeadlineMs === null) {
+      return;
+    }
+    if (Date.now() < this.leaseDeadlineMs) {
+      this.scheduleLeaseTimer();
+      return;
+    }
+    if (!isDestructiveOrHardwareRisk(this.leaseRisk)) {
+      // safe/normal: Controller owns lease expiry / orphan / lost.
+      return;
+    }
+    this.leaseExpired = true;
+    const offer = this.currentOffer;
+    const attemptId = this.activeAttemptId;
+    logger.warn('lease expired — self-terminating destructive/hardware attempt', {
+      attemptId,
+      risk: this.leaseRisk,
+    });
+    this.cancelSignal.cancelled = true;
+    if (this.activeProcessKill) {
+      try {
+        await this.activeProcessKill(10);
+      } catch (error) {
+        logger.warn('failed to kill process on lease expiry', { error: String(error) });
+      }
+    }
+    if (attemptId && offer) {
+      const existing = readAttemptMetadata(this.config.stateDir, attemptId);
+      writeAttemptMetadata(this.config.stateDir, {
+        attempt_id: attemptId,
+        job_id: offer.job_id,
+        lease_id: offer.lease_id,
+        lease_epoch: offer.lease_epoch,
+        process_identity: existing?.process_identity ?? null,
+        status: 'terminal',
+        workspace_path:
+          existing?.workspace_path ?? join(this.config.stateDir, 'workspaces', attemptId),
+        spool_dir: existing?.spool_dir ?? join(this.config.stateDir, 'logs', attemptId),
+        risk_level: this.leaseRisk,
+        updated_at: new Date().toISOString(),
+        lease_deadline: new Date(this.leaseDeadlineMs).toISOString(),
+        last_exit: {
+          exit_code: null,
+          outcome: 'failed',
+          failure_category: 'lease_expired',
+          failure_message: 'Lease expired — Agent self-terminated destructive/hardware job',
+        },
+        ...(existing?.artifact_manifest ? { artifact_manifest: existing.artifact_manifest } : {}),
+      });
+    }
+    // Terminal frames are emitted from handleRunJob after waitForCompletion observes the kill.
+  }
+
   private async cleanupOverlayWorktree(): Promise<void> {
     if (this.overlayRepoUrl && this.materializedProjectPath) {
       await this.mirrorManager
@@ -179,20 +352,192 @@ export class AgentJobExecutor {
   }
 
   /**
-   * On WS disconnect / close: kill any running process and free the one-slot
-   * registry so a reconnect cannot accept a new lease while work still runs.
-   * Frames are not sent — the Controller already treats disconnect as terminal.
+   * Re-bind the WebSocket after reconnect so frames (including spool replay) use the new socket.
+   */
+  public attachSocket(socket: WebSocket): void {
+    this.socket = socket;
+  }
+
+  public getActiveAttemptId(): string | null {
+    return this.activeAttemptId;
+  }
+
+  /**
+   * On WS disconnect: keep safe/normal (and destructive until lease expiry) process alive.
+   * Persist orphaned metadata; do not kill or clear the attempt registry.
+   * Frames are not sent — Controller enters grace/orphan reconciliation.
    */
   public async abandonOnDisconnect(): Promise<void> {
+    const attemptId = this.activeAttemptId;
+    if (attemptId && this.config.recovery) {
+      this.config.recovery.onDisconnectPark(attemptId);
+      this.config.recovery.detachSocket();
+    }
+    // Intentionally do NOT kill the process or clearAttempt — Phase 6 grace/adopt.
+  }
+
+  /** Operator shutdown / terminate_stale: kill process and free the slot. */
+  public async forceAbandon(): Promise<void> {
     this.cancelSignal.cancelled = true;
     if (this.activeProcessKill) {
       try {
         await this.activeProcessKill(10);
       } catch (error) {
-        logger.warn('failed to kill process on disconnect', { error: String(error) });
+        logger.warn('failed to kill process on force abandon', { error: String(error) });
       }
     }
+    if (this.activeAttemptId && this.config.recovery) {
+      this.config.recovery.clearLiveSender(this.activeAttemptId);
+    }
     this.clearAttempt();
+  }
+
+  /** Recovery terminate_stale hook. */
+  public async terminateAttemptForRecovery(attemptId: string): Promise<void> {
+    if (this.activeAttemptId !== attemptId) {
+      return;
+    }
+    await this.forceAbandon();
+  }
+
+  /**
+   * After adopt: if the process already exited, re-send job_exit so the Controller
+   * can leave orphaned / resume collecting_artifacts.
+   */
+  public resendJobExitIfCompleted(meta: AttemptMetadata): void {
+    const exit = meta.last_exit;
+    if (!exit) {
+      return;
+    }
+    const payload: JobExitPayload = {
+      attempt_id: meta.attempt_id,
+      lease_id: meta.lease_id,
+      lease_epoch: meta.lease_epoch,
+      exit_code: exit.exit_code,
+      outcome: exit.outcome,
+      ...(exit.failure_category ? { failure_category: exit.failure_category } : {}),
+      ...(exit.failure_message ? { failure_message: exit.failure_message } : {}),
+    };
+    this.sendFrame(
+      'job_exit',
+      meta.attempt_id,
+      meta.lease_id,
+      meta.lease_epoch,
+      payload as unknown as Record<string, unknown>,
+    );
+    logger.info('re-sent job_exit after adopt', { attemptId: meta.attempt_id });
+  }
+
+  /**
+   * Resume artifact upload from persisted hash-verified staging only.
+   * Never re-collects from a mutable workspace.
+   */
+  public async resumeArtifactUpload(meta: AttemptMetadata): Promise<void> {
+    const items = meta.artifact_manifest;
+    if (!items || items.length === 0) {
+      return;
+    }
+    const verified: AttemptArtifactManifestItem[] = [];
+    for (const item of items) {
+      try {
+        const buf = await readFile(item.path);
+        const hash = createHash('sha256').update(buf).digest('hex');
+        if (hash !== item.sha256 || buf.length !== item.size_bytes) {
+          logger.warn('skipping artifact resume — staging hash mismatch', {
+            logical_name: item.logical_name,
+          });
+          continue;
+        }
+        verified.push(item);
+      } catch (error) {
+        logger.warn('skipping missing staging artifact on resume', {
+          logical_name: item.logical_name,
+          error: String(error),
+        });
+      }
+    }
+    if (verified.length === 0) {
+      return;
+    }
+
+    this.activeAttemptId = meta.attempt_id;
+    this.leaseRisk = meta.risk_level;
+    if (meta.lease_deadline) {
+      this.leaseDeadlineMs = Date.parse(meta.lease_deadline);
+    }
+
+    const uploadGrant = await this.requestArtifactUploadTokens(
+      meta.attempt_id,
+      meta.lease_id,
+      meta.lease_epoch,
+      verified.map((f) => ({
+        logical_name: f.logical_name,
+        path: f.path,
+        size_bytes: f.size_bytes,
+        sha256: f.sha256,
+      })),
+    );
+
+    for (const art of uploadGrant.artifacts) {
+      try {
+        await this.uploadArtifactFile(
+          art.upload_url,
+          art.upload_token,
+          art.path,
+          art.logical_name,
+          art.size_bytes,
+          art.sha256,
+        );
+      } catch (error) {
+        logger.error('failed artifact resume upload', {
+          artifact: art.logical_name,
+          error: String(error),
+        });
+      }
+    }
+  }
+
+  private persistCompletedAwaitingUpload(
+    offer: LeaseOfferPayload,
+    run: RunJobPayload,
+    exit: {
+      exit_code: number | null;
+      outcome: JobExitPayload['outcome'];
+      failure_category?: JobExitPayload['failure_category'];
+      failure_message?: string;
+    },
+    artifactManifest?: AttemptArtifactManifestItem[],
+  ): void {
+    const existing = readAttemptMetadata(this.config.stateDir, run.attempt_id);
+    writeAttemptMetadata(this.config.stateDir, {
+      attempt_id: run.attempt_id,
+      job_id: offer.job_id,
+      lease_id: run.lease_id,
+      lease_epoch: run.lease_epoch,
+      process_identity: existing?.process_identity ?? null,
+      status: 'completed_awaiting_upload',
+      workspace_path:
+        existing?.workspace_path ?? join(this.config.stateDir, 'workspaces', run.attempt_id),
+      spool_dir: existing?.spool_dir ?? join(this.config.stateDir, 'logs', run.attempt_id),
+      risk_level: offer.job_request.risk_level ?? existing?.risk_level ?? 'normal',
+      updated_at: new Date().toISOString(),
+      ...(this.leaseDeadlineMs
+        ? { lease_deadline: new Date(this.leaseDeadlineMs).toISOString() }
+        : existing?.lease_deadline
+          ? { lease_deadline: existing.lease_deadline }
+          : {}),
+      last_exit: {
+        exit_code: exit.exit_code,
+        outcome: exit.outcome,
+        ...(exit.failure_category ? { failure_category: exit.failure_category } : {}),
+        ...(exit.failure_message ? { failure_message: exit.failure_message } : {}),
+      },
+      ...(artifactManifest
+        ? { artifact_manifest: artifactManifest }
+        : existing?.artifact_manifest
+          ? { artifact_manifest: existing.artifact_manifest }
+          : {}),
+    });
   }
 
   private sendCancelledTerminal(
@@ -277,6 +622,9 @@ export class AgentJobExecutor {
   }
 
   public handleLeaseOffer(offer: LeaseOfferPayload): void {
+    if (this.config.recovery?.isRejected(offer.attempt_id)) {
+      return;
+    }
     if (this.isBusy()) {
       this.sendFrame('lease_reject', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
         attempt_id: offer.attempt_id,
@@ -287,8 +635,50 @@ export class AgentJobExecutor {
       return;
     }
 
+    const minFree = this.config.diskMinFreeBytes;
+    if (minFree !== undefined && this.config.getFreeDiskBytes) {
+      const free = this.config.getFreeDiskBytes();
+      const freeBytes = typeof free === 'number' ? free : undefined;
+      const spoolPressure = this.config.getSpoolPressure?.() ?? false;
+      if (
+        freeBytes !== undefined &&
+        !isAcceptingJobsUnderDiskPressure({
+          freeBytes,
+          minFreeBytes: minFree,
+          spoolPressure,
+        })
+      ) {
+        this.sendFrame('lease_reject', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
+          attempt_id: offer.attempt_id,
+          lease_id: offer.lease_id,
+          lease_epoch: offer.lease_epoch,
+          reason: spoolPressure
+            ? 'Agent refusing leases under log spool pressure'
+            : 'Agent refusing leases under disk pressure',
+        });
+        return;
+      }
+    }
+
     this.activeAttemptId = offer.attempt_id;
     this.currentOffer = offer;
+    this.armLeaseDeadline(offer);
+
+    const risk = offer.job_request.risk_level ?? 'normal';
+    const spoolDir = join(this.config.stateDir, 'logs', offer.attempt_id);
+    writeAttemptMetadata(this.config.stateDir, {
+      attempt_id: offer.attempt_id,
+      job_id: offer.job_id,
+      lease_id: offer.lease_id,
+      lease_epoch: offer.lease_epoch,
+      process_identity: null,
+      status: 'accepted',
+      workspace_path: join(this.config.stateDir, 'workspaces', offer.attempt_id),
+      spool_dir: spoolDir,
+      risk_level: risk,
+      updated_at: new Date().toISOString(),
+      lease_deadline: new Date(this.leaseDeadlineMs ?? Date.now()).toISOString(),
+    });
 
     this.sendFrame('lease_accept', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
       attempt_id: offer.attempt_id,
@@ -661,12 +1051,45 @@ export class AgentJobExecutor {
     const workspaceRoot = isOverlay ? attemptDir : join(attemptDir, 'workspace');
     const controlDir = join(attemptDir, 'control');
     const artifactsDir = join(attemptDir, 'artifacts');
-    const logsDir = join(attemptDir, 'logs');
+    // Canonical spool: {stateDir}/logs/<attempt-id>/ (also RBO_LOG_DIR via AttemptLogPaths)
+    const logsDir = join(this.config.stateDir, 'logs', run.attempt_id);
 
     await mkdir(controlDir, { recursive: true });
     await mkdir(artifactsDir, { recursive: true });
 
-    const logs = await ensureAttemptLogs(logsDir);
+    const spool = await openAttemptSpool(logsDir);
+    const logs = spool.logs;
+    const logSpoolMaxBytes = this.config.logSpoolMaxBytes ?? DEFAULT_LOG_SPOOL_MAX_BYTES;
+    const logSendQueueMax = this.config.logSendQueueMax ?? DEFAULT_LOG_SEND_QUEUE_MAX;
+    this.activeSpool = spool;
+    this.activeSpoolLease = {
+      attemptId: run.attempt_id,
+      leaseId: run.lease_id,
+      leaseEpoch: run.lease_epoch,
+    };
+    this.spoolLimitBreached = false;
+    this.spoolWriteChain = Promise.resolve();
+    const sender = new SpoolSender({
+      maxQueue: logSendQueueMax,
+      getSpool: () => this.activeSpool ?? spool,
+      send: (chunk) => {
+        if (this.socket.readyState !== this.socket.OPEN) {
+          return false;
+        }
+        this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
+          attempt_id: run.attempt_id,
+          lease_id: run.lease_id,
+          lease_epoch: run.lease_epoch,
+          stream: chunk.stream,
+          sequence: chunk.sequence,
+          bytes: chunk.bytes,
+        });
+        return true;
+      },
+    });
+    sender.setAcked(await readAck(spool));
+    this.activeSpoolSender = sender;
+    this.config.recovery?.registerLiveSender(run.attempt_id, sender);
 
     // Toolchain recheck before spawn: path + environment_fingerprint vs current caps
     const currentProfiles = this.config.toolchainProfiles ?? [];
@@ -749,7 +1172,6 @@ export class AgentJobExecutor {
       const projectPath = this.materializedProjectPath ?? join(workspaceRoot, 'main_mount');
       const projectCwd = await resolveContainedCwd(projectPath, request.source.cwd);
 
-      let sequence = 0;
       const child = spawnJobScript({
         attemptId: run.attempt_id,
         controlDir,
@@ -774,39 +1196,67 @@ export class AgentJobExecutor {
         ...(child.pid && child.pid > 0 ? { pid: child.pid } : {}),
       });
 
+      if (child.pid && child.pid > 0) {
+        const identity = processIdentityFromPid(child.pid);
+        const risk = request.risk_level ?? 'normal';
+        writeAttemptMetadata(this.config.stateDir, {
+          attempt_id: run.attempt_id,
+          job_id: offer.job_id,
+          lease_id: run.lease_id,
+          lease_epoch: run.lease_epoch,
+          process_identity: identity,
+          status: 'running',
+          workspace_path: workspaceRoot,
+          spool_dir: logsDir,
+          risk_level: risk,
+          updated_at: new Date().toISOString(),
+        });
+      }
+
       this.activeProcessKill = (grace) => child.kill(grace ?? 10);
       // Keep the same cancelSignal object through waitForCompletion so a cancel
       // that fired during spawn is not wiped.
 
+      // If lease already expired before spawn finished, terminate now.
+      if (
+        this.leaseDeadlineMs !== null &&
+        Date.now() >= this.leaseDeadlineMs &&
+        isDestructiveOrHardwareRisk(this.leaseRisk)
+      ) {
+        void this.onLeaseExpired();
+      }
+
+      const appendAndEnqueue = (stream: 'stdout' | 'stderr', text: string): Promise<void> => {
+        const runAppend = async (): Promise<void> => {
+          if (this.spoolLimitBreached) {
+            return;
+          }
+          const { sequence: seq } = await appendChunk(spool, stream, text);
+          sender.enqueue({ sequence: seq, stream, bytes: text });
+          if ((await totalBytes(spool)) >= logSpoolMaxBytes) {
+            this.spoolLimitBreached = true;
+            logger.error('log spool limit breached', {
+              attemptId: run.attempt_id,
+              maxBytes: logSpoolMaxBytes,
+            });
+            void child.kill(request.execution.cancel_grace_seconds);
+          }
+        };
+        this.spoolWriteChain = this.spoolWriteChain.then(runAppend, runAppend);
+        return this.spoolWriteChain;
+      };
+
       child.stdout.on('data', (rawChunk: Buffer) => {
         const redacted = stdoutRedactor.redact(rawChunk.toString('utf8'));
         if (redacted) {
-          sequence += 1;
-          void appendLogChunk(logs, 'stdout', redacted);
-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
-            attempt_id: run.attempt_id,
-            lease_id: run.lease_id,
-            lease_epoch: run.lease_epoch,
-            stream: 'stdout',
-            sequence,
-            bytes: redacted,
-          });
+          void appendAndEnqueue('stdout', redacted);
         }
       });
 
       child.stderr.on('data', (rawChunk: Buffer) => {
         const redacted = stderrRedactor.redact(rawChunk.toString('utf8'));
         if (redacted) {
-          sequence += 1;
-          void appendLogChunk(logs, 'stderr', redacted);
-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
-            attempt_id: run.attempt_id,
-            lease_id: run.lease_id,
-            lease_epoch: run.lease_epoch,
-            stream: 'stderr',
-            sequence,
-            bytes: redacted,
-          });
+          void appendAndEnqueue('stderr', redacted);
         }
       });
 
@@ -817,28 +1267,23 @@ export class AgentJobExecutor {
         signal: this.cancelSignal,
       });
 
+      // Drain in-flight spool writes before flush / exit.
+      await this.spoolWriteChain.catch(() => undefined);
+
       for (const [stream, redactor] of [
         ['stdout', stdoutRedactor],
         ['stderr', stderrRedactor],
       ] as const) {
         const flushed = redactor.flush();
         if (flushed) {
-          sequence += 1;
-          void appendLogChunk(logs, stream, flushed);
-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
-            attempt_id: run.attempt_id,
-            lease_id: run.lease_id,
-            lease_epoch: run.lease_epoch,
-            stream,
-            sequence,
-            bytes: flushed,
-          });
+          await appendAndEnqueue(stream, flushed);
         }
       }
 
       let timedOut = false;
       let logFailure = false;
       let durationComplete = false;
+      const spoolLimit = this.spoolLimitBreached;
 
       if (result.type === 'timeout') {
         timedOut = true;
@@ -856,35 +1301,91 @@ export class AgentJobExecutor {
       const exitCode = result.type === 'exit' ? result.exitCode : null;
       const outcome = this.cancelSignal.cancelled
         ? 'cancelled'
-        : timedOut
-          ? 'timed_out'
-          : logFailure
-            ? 'failed'
-            : durationComplete || result.type === 'log_success'
-              ? 'succeeded'
-              : exitCode === 0
+        : spoolLimit
+          ? 'failed'
+          : timedOut
+            ? 'timed_out'
+            : logFailure
+              ? 'failed'
+              : durationComplete || result.type === 'log_success'
                 ? 'succeeded'
-                : 'failed';
+                : exitCode === 0
+                  ? 'succeeded'
+                  : 'failed';
+
+      const exitExtras = spoolLimit
+        ? {
+            failure_category: 'log_spool_limit' as const,
+            failure_message: `Log spool exceeded ${logSpoolMaxBytes} bytes`,
+          }
+        : this.leaseExpired
+          ? {
+              failure_category: 'lease_expired' as const,
+              failure_message: 'Lease expired — Agent self-terminated destructive/hardware job',
+            }
+          : outcome === 'failed'
+            ? {
+                failure_category: 'process_exit' as const,
+                failure_message: logFailure
+                  ? 'Completion failure_pattern matched in logs'
+                  : `Script exited with code ${exitCode}`,
+              }
+            : outcome === 'timed_out'
+              ? {
+                  failure_category: 'timeout' as const,
+                  failure_message: 'Execution timed out',
+                }
+              : {};
+
+      const effectiveOutcome = this.leaseExpired
+        ? ('failed' as const)
+        : this.cancelSignal.cancelled
+          ? ('cancelled' as const)
+          : outcome;
+
+      if (this.leaseExpired) {
+        // Metadata already written in onLeaseExpired; emit terminals if still connected.
+        const exitPayload: JobExitPayload = {
+          attempt_id: run.attempt_id,
+          lease_id: run.lease_id,
+          lease_epoch: run.lease_epoch,
+          exit_code: null,
+          outcome: 'failed',
+          failure_category: 'lease_expired',
+          failure_message: 'Lease expired — Agent self-terminated destructive/hardware job',
+        };
+        this.sendFrame(
+          'job_exit',
+          run.attempt_id,
+          run.lease_id,
+          run.lease_epoch,
+          exitPayload as unknown as Record<string, unknown>,
+        );
+        this.sendFrame('cleanup_complete', run.attempt_id, run.lease_id, run.lease_epoch, {
+          attempt_id: run.attempt_id,
+          lease_id: run.lease_id,
+          lease_epoch: run.lease_epoch,
+          exit_code: null,
+          timed_out: false,
+          message: 'Lease expired — Agent self-terminated destructive/hardware job',
+        });
+        return;
+      }
+
+      // Persist before/alongside job_exit so reconnect can recover completion.
+      this.persistCompletedAwaitingUpload(offer, run, {
+        exit_code: exitCode,
+        outcome: effectiveOutcome,
+        ...exitExtras,
+      });
 
       this.sendFrame('job_exit', run.attempt_id, run.lease_id, run.lease_epoch, {
         attempt_id: run.attempt_id,
         lease_id: run.lease_id,
         lease_epoch: run.lease_epoch,
         exit_code: exitCode,
-        outcome,
-        ...(outcome === 'failed'
-          ? {
-              failure_category: 'process_exit' as const,
-              failure_message: logFailure
-                ? 'Completion failure_pattern matched in logs'
-                : `Script exited with code ${exitCode}`,
-            }
-          : outcome === 'timed_out'
-            ? {
-                failure_category: 'timeout' as const,
-                failure_message: 'Execution timed out',
-              }
-            : {}),
+        outcome: effectiveOutcome,
+        ...exitExtras,
       });
 
       const collection = await collectArtifactFiles({
@@ -893,9 +1394,36 @@ export class AgentJobExecutor {
         tempDir: join(artifactsDir, '.collect-tmp'),
       });
 
-      const artifactItems = collection.files.map((f) => ({
+      // Stage under durable artifacts dir for resume (never re-glob workspace later).
+      const stagingRoot = join(this.config.stateDir, 'artifacts', run.attempt_id);
+      await mkdir(stagingRoot, { recursive: true });
+      const stagedManifest: AttemptArtifactManifestItem[] = [];
+      for (const f of collection.files) {
+        const stagedPath = join(stagingRoot, f.logical_name);
+        await mkdir(join(stagedPath, '..'), { recursive: true });
+        await copyFile(f.sourcePath, stagedPath);
+        stagedManifest.push({
+          logical_name: f.logical_name,
+          path: stagedPath,
+          size_bytes: f.size_bytes,
+          sha256: f.sha256,
+        });
+      }
+
+      this.persistCompletedAwaitingUpload(
+        offer,
+        run,
+        {
+          exit_code: exitCode,
+          outcome: effectiveOutcome,
+          ...exitExtras,
+        },
+        stagedManifest,
+      );
+
+      const artifactItems = stagedManifest.map((f) => ({
         logical_name: f.logical_name,
-        path: f.sourcePath,
+        path: f.path,
         size_bytes: f.size_bytes,
         sha256: f.sha256,
       }));
@@ -967,6 +1495,26 @@ export class AgentJobExecutor {
       this.pendingArtifactUpload = null;
       resolve(grant);
     }
+  }
+
+  /** Controller contiguous log_ack — persist ack.json and advance the sender cursor. */
+  public async handleLogAck(ack: LogAckPayload): Promise<void> {
+    const lease = this.activeSpoolLease;
+    if (
+      !lease ||
+      lease.attemptId !== ack.attempt_id ||
+      lease.leaseId !== ack.lease_id ||
+      lease.leaseEpoch !== ack.lease_epoch
+    ) {
+      return;
+    }
+    const spool = this.activeSpool;
+    const sender = this.activeSpoolSender;
+    if (!spool || !sender) {
+      return;
+    }
+    await writeAck(spool, ack.sequence);
+    sender.onAck(ack.sequence);
   }
 
   public async handleCancelJob(cancel: CancelJobPayload): Promise<void> {

@@ -35,7 +35,15 @@ export interface AttemptRow {
   outcome: string | null;
   started_at: string | null;
   finished_at: string | null;
+  log_acked_sequence: number;
+  orphaned_at: string | null;
+  process_identity: string | null;
+  last_reconcile_at: string | null;
 }
+
+/** Phase 6 attempt states/outcomes — no SQLite CHECK on state; callers use these literals. */
+export const ATTEMPT_STATE_ORPHANED = 'orphaned' as const;
+export const ATTEMPT_OUTCOME_LOST = 'lost' as const;
 
 export interface SnapshotRow {
   id: string;
@@ -155,13 +163,13 @@ export function createAttempt(db: ControllerDatabase, jobId: string, ordinal: nu
   return row;
 }
 
+const ATTEMPT_SELECT_COLUMNS = `id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline,
+              state, outcome, started_at, finished_at, log_acked_sequence, orphaned_at,
+              process_identity, last_reconcile_at`;
+
 export function getAttempt(db: ControllerDatabase, attemptId: string): AttemptRow | null {
   const row = db
-    .prepare(
-      `SELECT id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline,
-              state, outcome, started_at, finished_at
-       FROM job_attempts WHERE id = ?`,
-    )
+    .prepare(`SELECT ${ATTEMPT_SELECT_COLUMNS} FROM job_attempts WHERE id = ?`)
     .get(attemptId);
   return (row as AttemptRow | undefined) ?? null;
 }
@@ -169,13 +177,48 @@ export function getAttempt(db: ControllerDatabase, attemptId: string): AttemptRo
 export function getLatestAttempt(db: ControllerDatabase, jobId: string): AttemptRow | null {
   const row = db
     .prepare(
-      `SELECT id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline,
-              state, outcome, started_at, finished_at
-       FROM job_attempts WHERE job_id = ?
+      `SELECT ${ATTEMPT_SELECT_COLUMNS} FROM job_attempts WHERE job_id = ?
        ORDER BY ordinal DESC LIMIT 1`,
     )
     .get(jobId);
   return (row as AttemptRow | undefined) ?? null;
+}
+
+export function updateAttempt(
+  db: ControllerDatabase,
+  attemptId: string,
+  fields: Partial<{
+    log_acked_sequence: number;
+    orphaned_at: string | null;
+    process_identity: string | null;
+    last_reconcile_at: string | null;
+    state: string;
+    outcome: string | null;
+    agent_id: string | null;
+    lease_deadline: string | null;
+    finished_at: string | null;
+  }>,
+): AttemptRow {
+  const sets: string[] = [];
+  const values: unknown[] = [];
+  for (const [key, value] of Object.entries(fields)) {
+    sets.push(`${key} = ?`);
+    values.push(value);
+  }
+  if (sets.length === 0) {
+    const row = getAttempt(db, attemptId);
+    if (!row) {
+      throw new Error(`Attempt not found: ${attemptId}`);
+    }
+    return row;
+  }
+  values.push(attemptId);
+  db.prepare(`UPDATE job_attempts SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+  const row = getAttempt(db, attemptId);
+  if (!row) {
+    throw new Error(`Attempt not found after update: ${attemptId}`);
+  }
+  return row;
 }
 
 export function transitionAttemptState(

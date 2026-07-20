@@ -27,7 +27,11 @@ import { RboError, createLogger, generateId } from '@rbo/shared';
 import { captureFullSnapshot } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
-import { clearArtifactExpectations, registerArtifactExpectations } from '../http/data-plane.js';
+import {
+  clearArtifactExpectations,
+  filterMissingArtifacts,
+  registerArtifactExpectations,
+} from '../http/data-plane.js';
 import {
   createJobEvent,
   getJob,
@@ -36,7 +40,9 @@ import {
   recordEvent,
   transitionAttemptState,
   transitionJobState,
+  updateAttempt,
 } from '../jobs/lifecycle.js';
+import { processIdentityFromPid } from '../recovery/coordinator.js';
 import { issueDataToken } from '../security/data-tokens.js';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
@@ -343,6 +349,7 @@ interface AttemptLeaseRow {
   lease_epoch: number;
   lease_deadline: string | null;
   outcome: string | null;
+  log_acked_sequence: number;
 }
 
 function sendWsFrame(
@@ -378,7 +385,8 @@ function loadAttemptByLease(
 ): AttemptLeaseRow | undefined {
   return db
     .prepare(
-      `SELECT id, job_id, agent_id, state, lease_id, lease_epoch, lease_deadline, outcome
+      `SELECT id, job_id, agent_id, state, lease_id, lease_epoch, lease_deadline, outcome,
+              log_acked_sequence
        FROM job_attempts WHERE id = ? AND lease_id = ? AND lease_epoch = ?`,
     )
     .get(attemptId, leaseId, leaseEpoch) as AttemptLeaseRow | undefined;
@@ -436,7 +444,7 @@ export function expireStaleLeases(db: ControllerDatabase): void {
   const rows = db
     .prepare(
       `SELECT id, job_id FROM job_attempts
-       WHERE state NOT IN ('completed')
+       WHERE state NOT IN ('completed', 'orphaned')
          AND lease_deadline IS NOT NULL
          AND lease_deadline <= ?`,
     )
@@ -928,9 +936,40 @@ export async function handleRemoteLogChunk(
     return;
   }
 
+  const prev = attempt.log_acked_sequence ?? 0;
+  const sendAck = (): void => {
+    const conn = opts.connectedAgents.get(agentId);
+    if (!conn) {
+      return;
+    }
+    sendWsFrame(conn.socket, 'log_ack', attempt.id, payload.lease_id, payload.lease_epoch, {
+      attempt_id: attempt.id,
+      lease_id: payload.lease_id,
+      lease_epoch: payload.lease_epoch,
+      sequence: payload.sequence,
+    });
+  };
+
+  if (payload.sequence <= prev) {
+    // Duplicate / already acked — re-ack without appending.
+    sendAck();
+    return;
+  }
+  if (payload.sequence !== prev + 1) {
+    // Out-of-order gap — do not append; agent must replay in order.
+    logger.warn('out-of-order log_chunk ignored', {
+      attemptId: attempt.id,
+      sequence: payload.sequence,
+      expected: prev + 1,
+    });
+    return;
+  }
+
   const logDir = attemptLogDir(opts.dataDir, attempt.id);
   const logs = await ensureAttemptLogs(logDir);
   await appendLogChunk(logs, payload.stream, payload.bytes);
+  updateAttempt(opts.db, attempt.id, { log_acked_sequence: payload.sequence });
+  sendAck();
 }
 
 export function handleRemoteJobStarted(
@@ -946,6 +985,12 @@ export function handleRemoteJobStarted(
   );
   if (!rejectStale('job_started', attempt, agentId, ['running'])) {
     return;
+  }
+
+  if (payload.pid && payload.pid > 0) {
+    updateAttempt(opts.db, attempt.id, {
+      process_identity: processIdentityFromPid(payload.pid),
+    });
   }
 
   const event = createJobEvent(opts.db, {
@@ -969,7 +1014,15 @@ export function handleRemoteJobExit(
     payload.lease_id,
     payload.lease_epoch,
   );
-  if (!rejectStale('job_exit', attempt, agentId, ['leasing', 'preparing_source', 'running'])) {
+  if (
+    !rejectStale('job_exit', attempt, agentId, [
+      'leasing',
+      'preparing_source',
+      'running',
+      'orphaned',
+      'collecting_artifacts',
+    ])
+  ) {
     return;
   }
 
@@ -977,6 +1030,7 @@ export function handleRemoteJobExit(
   transitionAttemptState(opts.db, attempt.id, 'collecting_artifacts', {
     outcome: payload.outcome,
   });
+  updateAttempt(opts.db, attempt.id, { orphaned_at: null });
   opts.db
     .prepare(
       `UPDATE jobs SET exit_code = ?, failure_category = ?, failure_message = ?, updated_at = ?
@@ -1007,40 +1061,51 @@ export function handleRemoteArtifactManifest(
     return;
   }
 
-  const artifactsWithTokens = payload.artifacts.map((art) => {
-    const uploadToken = issueDataToken(opts.identity, {
-      agent_id: agentId,
-      job_id: attempt.job_id,
+  // Register full manifest expectations, then grant tokens only for missing objects.
+  registerArtifactExpectations(attempt.id, payload.artifacts);
+
+  void filterMissingArtifacts(opts.dataDir, attempt.id, payload.artifacts).then((missing) => {
+    const pathByName = new Map(payload.artifacts.map((a) => [a.logical_name, a.path]));
+    const artifactsWithTokens = missing.map((art) => {
+      const uploadToken = issueDataToken(opts.identity, {
+        agent_id: agentId,
+        job_id: attempt.job_id,
+        attempt_id: attempt.id,
+        lease_id: payload.lease_id,
+        lease_epoch: payload.lease_epoch,
+        op: 'artifact_upload',
+        artifact_id: art.logical_name,
+      });
+      const uploadUrl = `${resolveDataPlaneBaseUrl(opts)}/data/v1/attempts/${attempt.id}/artifacts/${encodeURIComponent(art.logical_name)}`;
+      return {
+        logical_name: art.logical_name,
+        path: pathByName.get(art.logical_name) ?? art.logical_name,
+        size_bytes: art.size_bytes,
+        sha256: art.sha256,
+        upload_token: uploadToken,
+        upload_url: uploadUrl,
+      };
+    });
+
+    const responsePayload: ArtifactUploadGrantPayload = {
       attempt_id: attempt.id,
       lease_id: payload.lease_id,
       lease_epoch: payload.lease_epoch,
-      op: 'artifact_upload',
-      artifact_id: art.logical_name,
-    });
-    const uploadUrl = `${resolveDataPlaneBaseUrl(opts)}/data/v1/attempts/${attempt.id}/artifacts/${encodeURIComponent(art.logical_name)}`;
-    return { ...art, upload_token: uploadToken, upload_url: uploadUrl };
+      artifacts: artifactsWithTokens,
+    };
+
+    const conn = opts.connectedAgents.get(agentId);
+    if (conn) {
+      sendWsFrame(
+        conn.socket,
+        'artifact_upload_grant',
+        attempt.id,
+        payload.lease_id,
+        payload.lease_epoch,
+        responsePayload as unknown as Record<string, unknown>,
+      );
+    }
   });
-
-  registerArtifactExpectations(attempt.id, payload.artifacts);
-
-  const responsePayload: ArtifactUploadGrantPayload = {
-    attempt_id: attempt.id,
-    lease_id: payload.lease_id,
-    lease_epoch: payload.lease_epoch,
-    artifacts: artifactsWithTokens,
-  };
-
-  const conn = opts.connectedAgents.get(agentId);
-  if (conn) {
-    sendWsFrame(
-      conn.socket,
-      'artifact_upload_grant',
-      attempt.id,
-      payload.lease_id,
-      payload.lease_epoch,
-      responsePayload as unknown as Record<string, unknown>,
-    );
-  }
 }
 
 export function handleRemoteCleanupComplete(
@@ -1102,21 +1167,12 @@ export function handleRemoteCleanupComplete(
 }
 
 export function handleAgentDisconnect(db: ControllerDatabase, agentId: string): void {
-  const attempts = db
-    .prepare(
-      `SELECT id, job_id FROM job_attempts
-       WHERE agent_id = ? AND state NOT IN ('completed')`,
-    )
-    .all(agentId) as Array<{ id: string; job_id: string }>;
-
-  for (const att of attempts) {
-    clearArtifactExpectations(att.id);
-    transitionAttemptState(db, att.id, 'completed', { outcome: 'failed', finished_at: nowIso() });
-    transitionJobState(db, att.job_id, 'completed', {
-      outcome: 'failed',
-      finished_at: nowIso(),
-      failure_category: 'agent_disconnected',
-      failure_message: 'Agent disconnected during remote execution',
-    });
-  }
+  // Phase 6: immediate fail-all is replaced by RecoveryCoordinator (grace → orphan → adopt/lost).
+  // Kept as a no-op shim only when a coordinator is not wired (should not happen in production).
+  void db;
+  void agentId;
+  logger.warn(
+    'handleAgentDisconnect called without RecoveryCoordinator — no-op (Phase 6 requires coordinator)',
+    { agentId },
+  );
 }

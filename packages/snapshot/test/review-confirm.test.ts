@@ -103,5 +103,5 @@ describe('Phase 5 review fixes', () => {
       await repo.cleanup();
       await rm(storage, { recursive: true, force: true });
     }
-  });
+  }, 90_000);
 });

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile, readdir, statfs } from 'node:fs/promises';
 import { arch, cpus, freemem, hostname, platform, release, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -18,6 +18,15 @@ function osFamily(): 'macos' | 'windows' | 'linux' {
   if (p === 'darwin') return 'macos';
   if (p === 'win32') return 'windows';
   return 'linux';
+}
+
+async function probeFreeDiskBytes(path: string): Promise<number> {
+  try {
+    const s = await statfs(path);
+    return Number(s.bavail) * Number(s.bsize);
+  } catch {
+    return 0;
+  }
 }
 
 async function detectShells(): Promise<string[]> {
@@ -60,6 +69,8 @@ export interface ProbeInput {
   maxJobs: number;
   /** When set, advertise repository_cache from mirror metadata (§19.2). */
   stateDir?: string;
+  /** Phase 6 disk admission floor. */
+  diskMinFreeBytes?: number;
 }
 
 async function loadRepositoryCache(
@@ -93,6 +104,9 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
   const shells = await detectShells();
   const gitVersions = await detectGitVersion();
   const repository_cache = input.stateDir ? await loadRepositoryCache(input.stateDir) : [];
+  const diskFreeBytes = input.stateDir ? await probeFreeDiskBytes(input.stateDir) : 0;
+  const diskMinFreeBytes = input.diskMinFreeBytes ?? 0;
+  const diskPressure = diskMinFreeBytes > 0 && diskFreeBytes < diskMinFreeBytes;
 
   return {
     agent_id: input.agentId,
@@ -107,7 +121,10 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
       cpu_logical: cpus().length,
       memory_total_mb: Math.round(totalmem() / (1024 * 1024)),
       memory_free_mb: Math.round(freemem() / (1024 * 1024)),
-      disk_free_mb: 0, // TODO(Phase 3): real disk-free probe per platform
+      disk_free_mb: Math.round(diskFreeBytes / (1024 * 1024)),
+      disk_free_bytes: diskFreeBytes,
+      ...(diskMinFreeBytes > 0 ? { disk_min_free_bytes: diskMinFreeBytes } : {}),
+      disk_pressure: diskPressure,
     },
     execution: {
       max_jobs: input.maxJobs,
@@ -119,6 +136,7 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
     toolchain_profiles: [],
     labels: {},
     secret_refs: [],
+    accepting_jobs: !diskPressure,
     ...(repository_cache.length > 0 ? { repository_cache } : {}),
   };
 }

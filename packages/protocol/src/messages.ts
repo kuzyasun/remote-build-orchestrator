@@ -23,6 +23,7 @@ export const AgentMessageTypeSchema = z.enum([
   'artifact_manifest',
   'cleanup_complete',
   'agent_error',
+  'recovery_report',
 ]);
 
 // --- Controller → Agent (§20.4) ---
@@ -41,6 +42,8 @@ export const ControllerMessageTypeSchema = z.enum([
   'resume',
   'refresh_capabilities',
   'shutdown',
+  'log_ack',
+  'reconcile_decision',
 ]);
 
 /** All wire message types — both directions */
@@ -67,6 +70,9 @@ export const JOB_SCOPED_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'artifact_manifest',
   'artifact_upload_grant',
   'cleanup_complete',
+  'log_ack',
+  'recovery_report',
+  'reconcile_decision',
 ]);
 
 // --- Typed Job-Scoped Message Payloads (§20.2 - §20.4, §35 Phase 4) ---
@@ -260,6 +266,39 @@ export const CleanupCompletePayloadSchema = z.object({
   message: z.string().optional(),
 });
 
+export const LogAckPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  sequence: z.number().int().positive(),
+});
+
+export const RecoveryReportStatusSchema = z.enum([
+  'running',
+  'completed_awaiting_upload',
+  'orphaned',
+]);
+
+export const RecoveryReportPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  status: RecoveryReportStatusSchema,
+  process_identity: z.string().min(1),
+  last_sent_sequence: z.number().int().nonnegative(),
+  last_acked_sequence: z.number().int().nonnegative(),
+  artifact_upload_pending: z.boolean(),
+});
+
+export const ReconcileDecisionPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  action: z.enum(['adopt', 'terminate_stale']),
+  resume_from_sequence: z.number().int().nonnegative().optional(),
+  reason: z.string().optional(),
+});
+
 export type LeaseOfferPayload = z.infer<typeof LeaseOfferPayloadSchema>;
 export type LeaseAcceptPayload = z.infer<typeof LeaseAcceptPayloadSchema>;
 export type LeaseRejectPayload = z.infer<typeof LeaseRejectPayloadSchema>;
@@ -277,6 +316,9 @@ export type JobExitPayload = z.infer<typeof JobExitPayloadSchema>;
 export type ArtifactManifestPayload = z.infer<typeof ArtifactManifestPayloadSchema>;
 export type ArtifactUploadGrantPayload = z.infer<typeof ArtifactUploadGrantPayloadSchema>;
 export type CleanupCompletePayload = z.infer<typeof CleanupCompletePayloadSchema>;
+export type LogAckPayload = z.infer<typeof LogAckPayloadSchema>;
+export type RecoveryReportPayload = z.infer<typeof RecoveryReportPayloadSchema>;
+export type ReconcileDecisionPayload = z.infer<typeof ReconcileDecisionPayloadSchema>;
 
 export const WireMessageEnvelopeSchema = z
   .object({

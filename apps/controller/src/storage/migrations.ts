@@ -171,4 +171,17 @@ ALTER TABLE agents DROP COLUMN device_thumbprint;
 ALTER TABLE agents DROP COLUMN device_public_key;
 `,
   },
+  {
+    version: 3,
+    name: 'phase6-attempt-recovery',
+    up: `
+ALTER TABLE job_attempts ADD COLUMN log_acked_sequence INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE job_attempts ADD COLUMN orphaned_at TEXT;
+ALTER TABLE job_attempts ADD COLUMN process_identity TEXT;
+ALTER TABLE job_attempts ADD COLUMN last_reconcile_at TEXT;
+`,
+    down: `
+-- SQLite cannot DROP COLUMN portably in all versions used here; no-op downgrade.
+`,
+  },
 ];

@@ -12,11 +12,28 @@ async function main(): Promise<void> {
   const config = loadAgentConfig();
   ensureStateDir(config);
 
+  let cachedFreeBytes = 0;
+  const refreshFreeDisk = async () => {
+    try {
+      const { statfs } = await import('node:fs/promises');
+      const s = await statfs(config.stateDir);
+      cachedFreeBytes = Number(s.bavail) * Number(s.bsize);
+    } catch {
+      cachedFreeBytes = 0;
+    }
+  };
+  await refreshFreeDisk();
+  const freeDiskTimer = setInterval(() => {
+    void refreshFreeDisk();
+  }, 30_000);
+  freeDiskTimer.unref?.();
+
   const capabilities = await probeCapabilities({
     agentId: '', // overwritten by the Controller-assigned ID once known
     displayName: config.displayName,
     maxJobs: config.maxJobs,
     stateDir: config.stateDir,
+    diskMinFreeBytes: config.diskMinFreeBytes,
   });
 
   logger.info('agent starting', {
@@ -34,18 +51,22 @@ async function main(): Promise<void> {
     stopped = true;
   });
 
-  while (!stopped) {
-    const connection = new AgentConnection({
-      controllerUrl: config.controllerUrl,
-      expectedFingerprint: config.controllerFingerprint,
-      stateDir: config.stateDir,
-      displayName: config.displayName,
-      capabilities,
-      secretMap: config.secretMap,
-      gitAllowlist: config.gitAllowlist,
-      repoCache: config.repoCache,
-    });
+  const connection = new AgentConnection({
+    controllerUrl: config.controllerUrl,
+    expectedFingerprint: config.controllerFingerprint,
+    stateDir: config.stateDir,
+    displayName: config.displayName,
+    capabilities,
+    secretMap: config.secretMap,
+    gitAllowlist: config.gitAllowlist,
+    repoCache: config.repoCache,
+    logSpoolMaxBytes: config.logSpoolMaxBytes,
+    logSendQueueMax: config.logSendQueueMax,
+    diskMinFreeBytes: config.diskMinFreeBytes,
+    getFreeDiskBytes: () => cachedFreeBytes,
+  });
 
+  while (!stopped) {
     try {
       const result = await connection.connectOnce();
       attempt = 0;
@@ -67,10 +88,12 @@ async function main(): Promise<void> {
       logger.error('connection failed, retrying', { error: String(error), retry_in_ms: delay });
       await sleep(delay);
     } finally {
-      connection.close();
+      // Park attempt for reconnect; kill only when the agent process is stopping.
+      connection.close({ killProcess: stopped });
     }
   }
 
+  connection.close({ killProcess: true });
   logger.info('agent stopped');
 }
 

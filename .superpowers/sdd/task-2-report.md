@@ -1,46 +1,107 @@
-# Phase 5 Task 2 — Agent Repository Mirror Infrastructure
+# Task 2 Report — Agent disk spool, bounded sender, Controller idempotent append + `log_ack`
 
-## Status
-
-**DONE**
+**Status:** DONE  
+**Date:** 2026-07-21  
+**Commits:** none (per instructions)
 
 ## Summary
 
-Implemented Agent-side bare repository mirror management with allowlist enforcement, per-`repo_key` fetch/import serialization, detached worktree lifecycle, bundle import under `refs/rbo/bundles/...`, metadata persistence, and LRU eviction with active-worktree protection.
+Implemented attempt-scoped disk log spool (`AttemptSpool`), Agent bounded `SpoolSender` (disk-first, never blocks the job process), and Controller contiguous-sequence idempotent `log_chunk` handling with outbound `log_ack`. No reconnect/orphan/adoption coordinators (Task 3).
 
-## Files changed
+## TDD Evidence
+
+### RED — Spool unit tests (Step 1)
+
+Command:
+```bash
+pnpm exec vitest run packages/executor/test/spool.test.ts
+```
+
+Result: **FAIL** — `Cannot find module '../src/spool.js'` (feature missing).
+
+### GREEN — Spool implementation (Step 2)
+
+Same command after `packages/executor/src/spool.ts`: **6 passed**.
+
+### RED — Controller idempotent tests (Step 3)
+
+Command:
+```bash
+pnpm exec vitest run apps/controller/test/log-spool.test.ts
+```
+
+Result: **FAIL** — `log_acked_sequence` stayed `0` (no ack / no idempotent gate). Fixture lease deadline corrected first so failure was feature-missing, not expired-lease.
+
+### GREEN — Controller + Agent wire (Steps 4–6)
+
+Same controller test: **1 passed**. Combined targeted:
+```bash
+pnpm exec vitest run packages/executor/test/spool.test.ts apps/controller/test/log-spool.test.ts apps/agent/test/cancel-signal.test.ts
+```
+**9 passed** (plus worktree duplicate of cancel-signal before exclude).
+
+Final gate:
+```bash
+pnpm format
+pnpm verify
+```
+Exit code **0** (lint, build, unit tests, rust:verify).
+
+## Files Changed
 
 | File | Change |
 |------|--------|
-| `apps/agent/src/repos/mirror.ts` | **New** — `RepoMirrorManager`, mirror metadata, mutex/fetch.lock, fetch, bundle import, worktree add/remove, eviction |
-| `apps/agent/src/config.ts` | Extended `AgentConfig` with `gitAllowlist` + `repoCache` (defaults per §10.10), env parsing, `resolveReposDir()` |
-| `apps/agent/test/mirror.test.ts` | **New** — 9 tests covering allowlist, commit detection, worktrees, concurrency, bundle import, eviction |
+| `packages/executor/src/spool.ts` | **Created** — `openAttemptSpool`, `appendChunk`, `readAck`/`writeAck`, `iterUnacked`, `totalBytes` |
+| `packages/executor/src/index.ts` | Export spool API |
+| `packages/executor/test/spool.test.ts` | **Created** — sequence, disk-first, atomic ack, iterUnacked, totalBytes, resume |
+| `apps/controller/src/execution/remote-execution.ts` | Idempotent `handleRemoteLogChunk` + `log_ack` via `sendWsFrame`; SELECT/`AttemptLeaseRow` include `log_acked_sequence`; `updateAttempt` |
+| `apps/controller/test/log-spool.test.ts` | **Created** — append/ack, duplicate, gap, `readLogsFromCursor` |
+| `apps/agent/src/logs/spool-sender.ts` | **Created** — bounded queue, `enqueue`/`onAck`/`startReplay` |
+| `apps/agent/src/executor/index.ts` | Disk-first spool at `{stateDir}/logs/<id>/`; sender; `handleLogAck`; `log_spool_limit` terminal |
+| `apps/agent/src/config.ts` | `RBO_LOG_SPOOL_MAX_BYTES` (default 512MiB), `RBO_LOG_SEND_QUEUE_MAX` (default 64) |
+| `apps/agent/src/connection/client.ts` | Inbound `log_ack` → `handleLogAck`; pass spool config |
+| `apps/agent/src/main.ts` | Pass spool config into connection |
+| `apps/agent/test/cancel-signal.test.ts` | Mock spool APIs used by new path |
+| `vitest.config.ts` | Exclude `**/.claude/**` so nested worktree tests do not pollute verify |
 
-## Test command and results
+**Not modified:** `apps/controller/src/websocket/server.ts` — outbound `log_ack` is sent from `handleRemoteLogChunk` via existing `connectedAgents` + `sendWsFrame` (no new WS route needed). `packages/executor/src/logs.ts` reused as-is via `ensureAttemptLogs` inside the spool.
 
-```bash
-pnpm exec vitest run apps/agent/test/mirror.test.ts
-```
+## Contiguous Ack Semantics (Controller)
 
-```
-Test Files  1 passed (1)
-     Tests  9 passed (9)
-```
+| Condition | Behavior |
+|-----------|----------|
+| `sequence === prev + 1` | Append bytes, set `log_acked_sequence`, send `log_ack` |
+| `sequence <= prev` | No append; re-send `log_ack` |
+| `sequence > prev + 1` | No append; no ack (agent must replay in order) |
 
-Agent package build:
+## Deliverables Checklist
 
-```bash
-pnpm --filter @rbo/agent build
-```
+- [x] `AttemptSpool` API with `chunks.jsonl` index `{sequence,stream,byte_offset,byte_length}` and atomic `ack.json`
+- [x] Spool layout under `{stateDir}/logs/<attempt-id>/` (Agent); Controller continues `attemptLogDir`
+- [x] `SpoolSender` bounded queue; disk-first append before enqueue; `startReplay` for overflow/reconnect hook
+- [x] Controller idempotent append + `log_ack`
+- [x] Agent `log_ack` handler → `writeAck` + `sender.onAck`
+- [x] Spool cap → kill + `failure_category: 'log_spool_limit'`
+- [x] No Task 3 reconnect/orphan/adoption coordinators
 
-Succeeds.
+## Self-Review
+
+1. **Disk-first** — stdout/stderr path awaits `appendChunk` on a serialized write chain before `sender.enqueue`; fire-and-forget live-only `sendFrame` removed.
+2. **Lease fencing** — Controller still validates fenced lease + agent + state before ack/append; Agent `handleLogAck` checks active spool lease tuple.
+3. **UTF-8 chunk boundaries** — Replay reads exact byte ranges from `chunks.jsonl`, not line-split stream files.
+4. **Queue overflow** — Drops from memory only; sets `needsReplay` and reloads from disk when capacity frees after ack (in addition to Task 3 `startReplay`).
+5. **Scope** — No orphan grace, recovery_report, or reconcile_decision handling.
+6. **Verify hygiene** — Excluded `.claude/**` from Vitest after nested worktree fixtures failed unrelated git-harness assertions during full `pnpm test`.
 
 ## Concerns
 
-1. **Windows git paths** — Git for Windows rejects extended `\\?\` paths; `toGitOsPath()` strips the prefix before passing worktree/bundle paths to git CLI. Production paths under `ProgramData` should be fine; very long temp paths in tests required this workaround.
+- `websocket/server.ts` unchanged by design (ack send lives in remote-execution). Call out if reviewers expected an explicit server helper.
+- Full reconnect orchestration that *calls* `startReplay` on WS re-auth is intentionally Task 3; within a live session, overflow recovery uses `needsReplay`.
 
-2. **`onFetchMutexHeld` test hook** — Optional constructor callback used only by tests to assert fetch/import serialization without mocking `execFile` (not spyable in ESM). Production callers must leave it unset.
+## Test Commands
 
-3. **Monorepo `pnpm verify`** — Fails on pre-existing `@rbo/snapshot` TypeScript errors in `capture.ts` (overlay/source manifest typing from other Phase 5 work). Unrelated to this task; agent mirror tests and `@rbo/agent` build are green.
-
-4. **Initial mirror clone** — Uses `git clone --mirror` with `cwd` set to the repo directory and a relative `mirror.git` target to avoid Windows `--git-dir` extended-path issues.
+```bash
+pnpm exec vitest run packages/executor/test/spool.test.ts apps/controller/test/log-spool.test.ts
+pnpm format
+pnpm verify
+```

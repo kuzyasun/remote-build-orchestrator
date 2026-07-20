@@ -22,6 +22,12 @@ export interface ControllerConfig {
   /** Git remote allowlist for overlay capture (§10.4). */
   gitAllowlist: GitUrlAllowlist;
   localExecutor: LocalExecutorConfig;
+  /** Disconnect grace before orphaning (Phase 6). Default 60. */
+  disconnectGraceSeconds: number;
+  /** Orphan timeout before outcome=lost (Phase 6). Default 300. */
+  orphanTimeoutSeconds: number;
+  /** Controller restart wait for Agent recovery_report (Phase 6). Default 120. */
+  reconcileDeadlineSeconds: number;
 }
 
 /** Default Git schemes when RBO_GIT_ALLOWLIST_SCHEMES is unset. */
@@ -95,6 +101,13 @@ export function loadControllerConfig(overrides: Partial<ControllerConfig> = {}):
         overrides.localExecutor?.maxConcurrentJobs ??
         Number(process.env.RBO_LOCAL_MAX_CONCURRENT_JOBS ?? 1),
     },
+    disconnectGraceSeconds:
+      overrides.disconnectGraceSeconds ?? Number(process.env.RBO_DISCONNECT_GRACE_SECONDS ?? 60),
+    orphanTimeoutSeconds:
+      overrides.orphanTimeoutSeconds ?? Number(process.env.RBO_ORPHAN_TIMEOUT_SECONDS ?? 300),
+    reconcileDeadlineSeconds:
+      overrides.reconcileDeadlineSeconds ??
+      Number(process.env.RBO_RECONCILE_DEADLINE_SECONDS ?? 120),
   };
 }
 

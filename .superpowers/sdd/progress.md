@@ -1,12 +1,21 @@
-# Phase 5 Progress
-
-Branch: feat/initial-version
-Started: 2026-07-20
-
-Task 1: complete — protocol schemas (source_need, prepare_source modes, bundle_download), git allowlist
-Task 2: complete (commits n/a) — RepoMirrorManager + mirror.test.ts
-Task 3: complete — captureGitOverlaySnapshot, applyGitOverlay, overlay.test.ts; porcelain rename fix
-Task 4: complete — Controller prepare/source_need/bundle/data-plane; Agent overlay prepare; prepare-overlay + source-need tests
-Task 5: complete — scheduler repository_cache_hit +500; capability repository_cache field; probe advertisement
-
-Remaining: final format + verify gate
+﻿# Phase 5 Progress
+
+Branch: feat/initial-version
+Started: 2026-07-20
+Final gate: complete — Phase 5 accepted for Phase 6 start.
+
+---
+
+# Phase 6 Progress
+
+Branch: feat/initial-version
+Started: 2026-07-21
+Plan: docs/superpowers/plans/2026-07-21-phase6-reliability.md
+
+Task 1: complete (uncommitted, review clean) — schemas, log_spool_limit, migration v3
+Task 2: complete (uncommitted, review clean) — AttemptSpool, SpoolSender, idempotent log_ack
+Task 3: complete (uncommitted, review clean after fix) — grace/orphan/adopt/lost
+Task 4: complete (uncommitted, review clean after wiring fix) — lease self-term, artifact resume, disk-pressure cleanup on heartbeat
+Task 5: complete (uncommitted) — fault-injection suite + large-output bound; pnpm verify exit 0
+
+Phase 6: COMPLETE — see `.superpowers/sdd/phase-6-report.md`

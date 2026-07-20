@@ -268,6 +268,10 @@ export const AgentCapabilityReportSchema = z.object({
     memory_total_mb: z.number(),
     memory_free_mb: z.number(),
     disk_free_mb: z.number(),
+    /** Additive Phase 6 capacity fields (bytes). */
+    disk_free_bytes: z.number().nonnegative().optional(),
+    disk_min_free_bytes: z.number().nonnegative().optional(),
+    disk_pressure: z.boolean().optional(),
   }),
   execution: z.object({
     max_jobs: z.number(),
@@ -292,6 +296,8 @@ export const AgentCapabilityReportSchema = z.object({
       }),
     )
     .optional(),
+  /** Phase 6: false under disk/spool pressure — Agent also lease_rejects. */
+  accepting_jobs: z.boolean().optional(),
 });
 
 export type AgentCapabilityReport = z.infer<typeof AgentCapabilityReportSchema>;

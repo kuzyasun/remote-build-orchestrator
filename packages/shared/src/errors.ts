@@ -31,6 +31,7 @@ export const ErrorCategorySchema = z.enum([
   'toolchain_changed',
   'agent_disconnected',
   'lease_expired',
+  'log_spool_limit',
   'internal',
 ]);
 

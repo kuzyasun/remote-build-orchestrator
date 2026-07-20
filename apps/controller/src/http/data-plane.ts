@@ -65,6 +65,33 @@ export function clearArtifactExpectations(attemptId: string): void {
   }
 }
 
+/**
+ * Resume helper: return only manifest artifacts not already stored with matching
+ * size + sha256 under the attempt artifacts dir.
+ */
+export async function filterMissingArtifacts(
+  dataDir: string,
+  attemptId: string,
+  artifacts: Array<{ logical_name: string; size_bytes: number; sha256: string }>,
+): Promise<Array<{ logical_name: string; size_bytes: number; sha256: string }>> {
+  const artifactsDir = attemptArtifactsDir(dataDir, attemptId);
+  const missing: Array<{ logical_name: string; size_bytes: number; sha256: string }> = [];
+  for (const art of artifacts) {
+    const destPath = join(artifactsDir, art.logical_name);
+    try {
+      const buf = await readFile(destPath);
+      const hash = createHash('sha256').update(buf).digest('hex');
+      if (hash === art.sha256 && buf.length === art.size_bytes) {
+        continue;
+      }
+    } catch {
+      // missing or unreadable → need upload
+    }
+    missing.push(art);
+  }
+  return missing;
+}
+
 function getArtifactExpectation(
   attemptId: string,
   logicalName: string,

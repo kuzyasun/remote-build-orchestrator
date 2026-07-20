@@ -22,6 +22,9 @@ async function main(): Promise<void> {
     dataDir: config.dataDir,
     controllerPublicHost: config.controllerPublicHost,
     dataPlaneBaseUrl: config.dataPlaneBaseUrl,
+    disconnectGraceSeconds: config.disconnectGraceSeconds,
+    orphanTimeoutSeconds: config.orphanTimeoutSeconds,
+    reconcileDeadlineSeconds: config.reconcileDeadlineSeconds,
     dispatchContext: {
       dataDir: config.dataDir,
       allowedProjectRoots: config.allowedProjectRoots,

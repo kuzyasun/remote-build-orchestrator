@@ -10,6 +10,7 @@ import {
   LeaseAcceptPayloadSchema,
   LeaseRejectPayloadSchema,
   LogChunkPayloadSchema,
+  RecoveryReportPayloadSchema,
   SourceNeedPayloadSchema,
   SourceReadyPayloadSchema,
   negotiateProtocolVersion,
@@ -22,7 +23,6 @@ import type { z } from 'zod';
 import { updateAgentCapabilities } from '../agents/registry.js';
 import {
   expireStaleLeases,
-  handleAgentDisconnect,
   handleRemoteArtifactManifest,
   handleRemoteCleanupComplete,
   handleRemoteJobExit,
@@ -35,6 +35,12 @@ import {
   renewActiveLease,
 } from '../execution/remote-execution.js';
 import { handleDataPlaneRequest } from '../http/data-plane.js';
+import {
+  DEFAULT_DISCONNECT_GRACE_SECONDS,
+  DEFAULT_ORPHAN_TIMEOUT_SECONDS,
+  DEFAULT_RECONCILE_DEADLINE_SECONDS,
+  RecoveryCoordinator,
+} from '../recovery/coordinator.js';
 import { markAgentSeen, verifyAgentCredential } from '../security/credentials.js';
 import { claimApprovedPairing, createPairingRequest } from '../security/pairing.js';
 import type { ControllerDatabase } from '../storage/database.js';
@@ -58,6 +64,9 @@ export interface AgentPlaneOptions {
   /** Host/IP advertised in prepare_source / upload grant URLs. */
   controllerPublicHost?: string;
   dataPlaneBaseUrl?: string;
+  disconnectGraceSeconds?: number;
+  orphanTimeoutSeconds?: number;
+  reconcileDeadlineSeconds?: number;
 }
 
 export interface ConnectedAgent {
@@ -71,6 +80,7 @@ export interface RunningAgentPlane {
   port: number;
   server: HttpsServer;
   connectedAgents: Map<string, ConnectedAgent>;
+  recovery: RecoveryCoordinator;
   close(): Promise<void>;
 }
 
@@ -123,6 +133,15 @@ export async function startAgentPlaneServer(
   });
   const wss = new WebSocketServer({ server: httpsServer, path: '/agent' });
   const connectedAgents = new Map<string, ConnectedAgent>();
+  const recovery = new RecoveryCoordinator({
+    db,
+    connectedAgents,
+    disconnectGraceSeconds: options.disconnectGraceSeconds ?? DEFAULT_DISCONNECT_GRACE_SECONDS,
+    orphanTimeoutSeconds: options.orphanTimeoutSeconds ?? DEFAULT_ORPHAN_TIMEOUT_SECONDS,
+    reconcileDeadlineSeconds:
+      options.reconcileDeadlineSeconds ?? DEFAULT_RECONCILE_DEADLINE_SECONDS,
+  });
+  recovery.onControllerStartup();
 
   const remoteOpts = () => ({
     db,
@@ -406,6 +425,18 @@ export async function startAgentPlaneServer(
             return;
           }
 
+          case 'recovery_report': {
+            if (!authenticated) return;
+            const payload = parsePayload(
+              RecoveryReportPayloadSchema,
+              message.payload,
+              message.type,
+            );
+            if (!payload) return;
+            recovery.onRecoveryReport(authenticated.agentId, payload);
+            return;
+          }
+
           default:
             logger.warn('unhandled agent message', { type: message.type });
         }
@@ -421,7 +452,7 @@ export async function startAgentPlaneServer(
       if (authenticated) {
         connectedAgents.delete(authenticated.agentId);
         markAgentSeen(db, authenticated.agentId, 'offline');
-        handleAgentDisconnect(db, authenticated.agentId);
+        recovery.onAgentDisconnect(authenticated.agentId);
         maybeDispatchQueued();
       }
     });
@@ -444,9 +475,11 @@ export async function startAgentPlaneServer(
     port,
     server: httpsServer,
     connectedAgents,
+    recovery,
     close: () =>
       new Promise<void>((resolvePromise) => {
         clearInterval(leaseSweep);
+        recovery.dispose();
         for (const client of wss.clients) {
           client.terminate();
         }

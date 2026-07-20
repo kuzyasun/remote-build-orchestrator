@@ -1,0 +1,2020 @@
+﻿# Task 2 review package
+
+ M apps/agent/src/config.ts
+ M apps/agent/src/connection/client.ts
+ M apps/agent/src/executor/index.ts
+ M apps/agent/test/cancel-signal.test.ts
+ M apps/controller/src/execution/remote-execution.ts
+ M packages/executor/src/index.ts
+?? apps/agent/src/logs/spool-sender.ts
+?? apps/controller/test/log-spool.test.ts
+?? packages/executor/src/spool.ts
+?? packages/executor/test/spool.test.ts
+
+## STAT
+
+ apps/agent/src/config.ts                          |  16 ++
+ apps/agent/src/connection/client.ts               |  14 ++
+ apps/agent/src/executor/index.ts                  | 185 ++++++++++++++++------
+ apps/agent/test/cancel-signal.test.ts             |  19 +++
+ apps/controller/src/execution/remote-execution.ts |  36 ++++-
+ packages/executor/src/index.ts                    |   1 +
+ 6 files changed, 218 insertions(+), 53 deletions(-)
+
+## FULL DIFF
+
+diff --git a/apps/agent/src/config.ts b/apps/agent/src/config.ts
+index 38cda4b..a99c6fe 100644
+--- a/apps/agent/src/config.ts
++++ b/apps/agent/src/config.ts
+@@ -11,18 +11,28 @@ export interface AgentConfig {
+   maxJobs: number;
+   stateDir: string;
+   /** Maps store ref name ΓåÆ environment variable that holds the secret value. */
+   secretMap?: Record<string, string>;
+   /** Git remote allowlist enforced before clone/fetch/bundle import (┬º10.4). */
+   gitAllowlist: GitUrlAllowlist;
+   /** On-disk bare mirror cache limits (┬º10.10). */
+   repoCache: RepoCacheConfig;
++  /** Max bytes for attempt log spool (stdout+stderr). Breach ΓåÆ log_spool_limit. */
++  logSpoolMaxBytes: number;
++  /** Max in-memory pending log_chunk send queue depth. */
++  logSendQueueMax: number;
+ }
+ 
++/** Default max spool size: 512 MiB. */
++export const DEFAULT_LOG_SPOOL_MAX_BYTES = 536_870_912;
++
++/** Default bounded send queue depth. */
++export const DEFAULT_LOG_SEND_QUEUE_MAX = 64;
++
+ /** Default Git schemes when RBO_GIT_ALLOWLIST_SCHEMES is unset. */
+ export const DEFAULT_GIT_ALLOWLIST_SCHEMES = ['https', 'ssh'] as const;
+ 
+ /** Default Git hosts when RBO_GIT_ALLOWLIST_HOSTS is unset. */
+ export const DEFAULT_GIT_ALLOWLIST_HOSTS = ['github.com'] as const;
+ 
+ function parseCsv(raw: string | undefined): string[] {
+   if (!raw?.trim()) {
+@@ -132,16 +142,22 @@ export function loadAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
+     controllerUrl,
+     controllerFingerprint,
+     displayName: overrides.displayName ?? process.env.RBO_AGENT_NAME ?? 'rbo-agent',
+     maxJobs: overrides.maxJobs ?? Number(process.env.RBO_MAX_JOBS ?? 1),
+     stateDir: overrides.stateDir ?? process.env.RBO_AGENT_STATE_DIR ?? resolveDefaultStateDir(),
+     secretMap: overrides.secretMap ?? parseSecretMap(process.env.RBO_SECRET_MAP),
+     gitAllowlist: parseGitAllowlist(overrides.gitAllowlist),
+     repoCache: parseRepoCache(overrides.repoCache),
++    logSpoolMaxBytes:
++      overrides.logSpoolMaxBytes ??
++      Number(process.env.RBO_LOG_SPOOL_MAX_BYTES ?? DEFAULT_LOG_SPOOL_MAX_BYTES),
++    logSendQueueMax:
++      overrides.logSendQueueMax ??
++      Number(process.env.RBO_LOG_SEND_QUEUE_MAX ?? DEFAULT_LOG_SEND_QUEUE_MAX),
+   };
+ }
+ 
+ /** Resolved path for bare repository mirrors (┬º10.1). */
+ export function resolveReposDir(config: AgentConfig): string {
+   return join(config.stateDir, 'repos');
+ }
+ 
+diff --git a/apps/agent/src/connection/client.ts b/apps/agent/src/connection/client.ts
+index 994d78c..cb897b2 100644
+--- a/apps/agent/src/connection/client.ts
++++ b/apps/agent/src/connection/client.ts
+@@ -2,16 +2,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+ import { hostname } from 'node:os';
+ import { join } from 'node:path';
+ import type { AgentCapabilityReport } from '@rbo/protocol';
+ import {
+   ArtifactUploadGrantPayloadSchema,
+   BundleDownloadPayloadSchema,
+   CancelJobPayloadSchema,
+   LeaseOfferPayloadSchema,
++  LogAckPayloadSchema,
+   PrepareSourcePayloadSchema,
+   RunJobPayloadSchema,
+ } from '@rbo/protocol';
+ import {
+   certificateFingerprint,
+   createLogger,
+   generateDeviceKeyPair,
+   generateId,
+@@ -31,16 +32,18 @@ export interface AgentConnectionOptions {
+   expectedFingerprint: string;
+   stateDir: string;
+   displayName: string;
+   capabilities: AgentCapabilityReport;
+   /** Maps store ref ΓåÆ env var name holding the secret (optional). */
+   secretMap?: Record<string, string>;
+   gitAllowlist: GitUrlAllowlist;
+   repoCache?: RepoCacheConfig;
++  logSpoolMaxBytes?: number;
++  logSendQueueMax?: number;
+ }
+ 
+ export interface ConnectResult {
+   status:
+     | 'pairing_pending'
+     | 'pairing_approved'
+     | 'authenticated'
+     | 'rejected'
+@@ -195,16 +198,18 @@ export class AgentConnection {
+ 
+             this.executor = new AgentJobExecutor(socket, {
+               stateDir: this.options.stateDir,
+               controllerFingerprint: this.options.expectedFingerprint,
+               secretMap: this.options.secretMap,
+               toolchainProfiles: this.options.capabilities.toolchain_profiles,
+               gitAllowlist: this.options.gitAllowlist,
+               repoCache: this.options.repoCache ?? DEFAULT_REPO_CACHE_CONFIG,
++              logSpoolMaxBytes: this.options.logSpoolMaxBytes,
++              logSendQueueMax: this.options.logSendQueueMax,
+             });
+             this.startHeartbeats(socket);
+             finish({ status: 'authenticated', agentId });
+             return;
+           }
+ 
+           if (status === 'incompatible_protocol') {
+             finish({ status: 'incompatible_protocol' });
+@@ -267,16 +272,25 @@ export class AgentConnection {
+               const parsed = CancelJobPayloadSchema.safeParse(message.payload);
+               if (parsed.success) {
+                 void this.executor.handleCancelJob(parsed.data);
+               } else {
+                 logger.warn('invalid cancel_job payload', { issues: parsed.error.issues });
+               }
+               break;
+             }
++            case 'log_ack': {
++              const parsed = LogAckPayloadSchema.safeParse(message.payload);
++              if (parsed.success) {
++                void this.executor.handleLogAck(parsed.data);
++              } else {
++                logger.warn('invalid log_ack payload', { issues: parsed.error.issues });
++              }
++              break;
++            }
+           }
+         }
+       });
+ 
+       socket.on('close', () => {
+         this.stopHeartbeats();
+         void this.executor?.abandonOnDisconnect();
+         this.executor = null;
+diff --git a/apps/agent/src/executor/index.ts b/apps/agent/src/executor/index.ts
+index 0fdc253..ff6ad19 100644
+--- a/apps/agent/src/executor/index.ts
++++ b/apps/agent/src/executor/index.ts
+@@ -1,40 +1,47 @@
+ import { createHash } from 'node:crypto';
+ import { createReadStream, createWriteStream, existsSync } from 'node:fs';
+ import { mkdir, rename, rm, stat } from 'node:fs/promises';
+ import type { IncomingMessage } from 'node:http';
+ import { request as httpsRequest } from 'node:https';
+ import { join } from 'node:path';
+ import {
+-  appendLogChunk,
++  type AttemptSpool,
++  appendChunk,
+   collectArtifactFiles,
+-  ensureAttemptLogs,
++  openAttemptSpool,
++  readAck,
+   runCleanupScript,
+   spawnJobScript,
++  totalBytes,
+   waitForCompletion,
++  writeAck,
+   writeJobScript,
+ } from '@rbo/executor';
+ import type {
+   ArtifactManifestPayload,
+   ArtifactUploadGrantPayload,
+   BundleDownloadPayload,
+   CancelJobPayload,
+   CleanupCompletePayload,
+   JobExitPayload,
+   LeaseOfferPayload,
++  LogAckPayload,
+   PrepareSourceGitOverlayPayload,
+   PrepareSourcePayload,
+   RunJobPayload,
+   SourceNeedReason,
+ } from '@rbo/protocol';
+ import { certificateFingerprint, createLogger, generateId, resolveContainedCwd } from '@rbo/shared';
+ import type { GitUrlAllowlist } from '@rbo/shared';
+ import { applyGitOverlay, materializeFullSnapshot } from '@rbo/snapshot';
+ import type { WebSocket } from 'ws';
++import { DEFAULT_LOG_SEND_QUEUE_MAX, DEFAULT_LOG_SPOOL_MAX_BYTES } from '../config.js';
++import { SpoolSender } from '../logs/spool-sender.js';
+ import { type RepoCacheConfig, RepoMirrorManager } from '../repos/mirror.js';
+ import { StreamRedactor } from './redactor.js';
+ 
+ const logger = createLogger('agent.executor');
+ const ARTIFACT_TOKEN_TIMEOUT_MS = 60_000;
+ const BUNDLE_TOKEN_TIMEOUT_MS = 120_000;
+ 
+ type ToolchainProfile = NonNullable<LeaseOfferPayload['selected_toolchain_profiles']>[number];
+@@ -44,16 +51,20 @@ export interface AgentExecutorConfig {
+   /** Controller TLS certificate fingerprint (sha256:...), same pin as the WS session. */
+   controllerFingerprint: string;
+   /** Maps store ref name ΓåÆ environment variable that holds the secret value. */
+   secretMap?: Record<string, string>;
+   /** Current capability toolchain profiles for fingerprint recheck before spawn. */
+   toolchainProfiles?: ToolchainProfile[];
+   gitAllowlist: GitUrlAllowlist;
+   repoCache: RepoCacheConfig;
++  /** Max attempt spool bytes (stdout+stderr); default 512 MiB. */
++  logSpoolMaxBytes?: number;
++  /** Max in-memory log send queue; default 64. */
++  logSendQueueMax?: number;
+ }
+ 
+ function assertPinnedPeerCert(
+   res: IncomingMessage,
+   expectedFingerprint: string,
+ ): Error | undefined {
+   const socket = res.socket as unknown as {
+     getPeerCertificate?: (detailed?: boolean) => { raw?: Buffer };
+@@ -91,16 +102,26 @@ export class AgentJobExecutor {
+     timer: ReturnType<typeof setTimeout>;
+   } | null = null;
+   private pendingBundleDownload: {
+     attemptId: string;
+     resolve: (grant: BundleDownloadPayload) => void;
+     reject: (error: Error) => void;
+     timer: ReturnType<typeof setTimeout>;
+   } | null = null;
++  private activeSpool: AttemptSpool | null = null;
++  private activeSpoolSender: SpoolSender | null = null;
++  private activeSpoolLease: {
++    attemptId: string;
++    leaseId: string;
++    leaseEpoch: number;
++  } | null = null;
++  /** Serializes disk spool writes across concurrent stdout/stderr handlers. */
++  private spoolWriteChain: Promise<void> = Promise.resolve();
++  private spoolLimitBreached = false;
+ 
+   constructor(
+     private socket: WebSocket,
+     private config: AgentExecutorConfig,
+   ) {
+     this.mirrorManager = new RepoMirrorManager({
+       reposDir: join(config.stateDir, 'repos'),
+       allowlist: config.gitAllowlist,
+@@ -150,16 +171,21 @@ export class AgentJobExecutor {
+     this.currentOffer = null;
+     this.currentPrepare = null;
+     this.prepareReady = false;
+     this.runInProgress = false;
+     this.materializedProjectPath = null;
+     this.overlayRepoUrl = null;
+     this.activeProcessKill = undefined;
+     this.cancelSignal = { cancelled: false };
++    this.activeSpool = null;
++    this.activeSpoolSender = null;
++    this.activeSpoolLease = null;
++    this.spoolWriteChain = Promise.resolve();
++    this.spoolLimitBreached = false;
+     if (this.pendingArtifactUpload) {
+       clearTimeout(this.pendingArtifactUpload.timer);
+       const pending = this.pendingArtifactUpload;
+       this.pendingArtifactUpload = null;
+       pending.reject(new Error('attempt cleared'));
+     }
+     if (this.pendingBundleDownload) {
+       clearTimeout(this.pendingBundleDownload.timer);
+@@ -656,22 +682,54 @@ export class AgentJobExecutor {
+ 
+     const offer = this.currentOffer;
+     const request = offer.job_request;
+     const attemptDir = join(this.config.stateDir, 'workspaces', run.attempt_id);
+     const isOverlay = this.currentPrepare?.source_mode === 'git_overlay';
+     const workspaceRoot = isOverlay ? attemptDir : join(attemptDir, 'workspace');
+     const controlDir = join(attemptDir, 'control');
+     const artifactsDir = join(attemptDir, 'artifacts');
+-    const logsDir = join(attemptDir, 'logs');
++    // Canonical spool: {stateDir}/logs/<attempt-id>/ (also RBO_LOG_DIR via AttemptLogPaths)
++    const logsDir = join(this.config.stateDir, 'logs', run.attempt_id);
+ 
+     await mkdir(controlDir, { recursive: true });
+     await mkdir(artifactsDir, { recursive: true });
+ 
+-    const logs = await ensureAttemptLogs(logsDir);
++    const spool = await openAttemptSpool(logsDir);
++    const logs = spool.logs;
++    const logSpoolMaxBytes = this.config.logSpoolMaxBytes ?? DEFAULT_LOG_SPOOL_MAX_BYTES;
++    const logSendQueueMax = this.config.logSendQueueMax ?? DEFAULT_LOG_SEND_QUEUE_MAX;
++    this.activeSpool = spool;
++    this.activeSpoolLease = {
++      attemptId: run.attempt_id,
++      leaseId: run.lease_id,
++      leaseEpoch: run.lease_epoch,
++    };
++    this.spoolLimitBreached = false;
++    this.spoolWriteChain = Promise.resolve();
++    const sender = new SpoolSender({
++      maxQueue: logSendQueueMax,
++      getSpool: () => this.activeSpool ?? spool,
++      send: (chunk) => {
++        if (this.socket.readyState !== this.socket.OPEN) {
++          return false;
++        }
++        this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
++          attempt_id: run.attempt_id,
++          lease_id: run.lease_id,
++          lease_epoch: run.lease_epoch,
++          stream: chunk.stream,
++          sequence: chunk.sequence,
++          bytes: chunk.bytes,
++        });
++        return true;
++      },
++    });
++    sender.setAcked(await readAck(spool));
++    this.activeSpoolSender = sender;
+ 
+     // Toolchain recheck before spawn: path + environment_fingerprint vs current caps
+     const currentProfiles = this.config.toolchainProfiles ?? [];
+     for (const profile of offer.selected_toolchain_profiles ?? []) {
+       const activationPath = profile.activation.path;
+       if (activationPath && !existsSync(activationPath)) {
+         this.failTerminal(
+           run.attempt_id,
+@@ -744,17 +802,16 @@ export class AgentJobExecutor {
+     const stderrRedactor = new StreamRedactor(secretValuesToRedact);
+ 
+     try {
+       await writeJobScript(controlDir, request.execution);
+ 
+       const projectPath = this.materializedProjectPath ?? join(workspaceRoot, 'main_mount');
+       const projectCwd = await resolveContainedCwd(projectPath, request.source.cwd);
+ 
+-      let sequence = 0;
+       const child = spawnJobScript({
+         attemptId: run.attempt_id,
+         controlDir,
+         workspacePath: workspaceRoot,
+         projectPath: projectCwd,
+         execution: request.execution,
+         env: {
+           ...request.execution.env,
+@@ -773,77 +830,74 @@ export class AgentJobExecutor {
+         lease_epoch: run.lease_epoch,
+         ...(child.pid && child.pid > 0 ? { pid: child.pid } : {}),
+       });
+ 
+       this.activeProcessKill = (grace) => child.kill(grace ?? 10);
+       // Keep the same cancelSignal object through waitForCompletion so a cancel
+       // that fired during spawn is not wiped.
+ 
++      const appendAndEnqueue = (stream: 'stdout' | 'stderr', text: string): Promise<void> => {
++        const runAppend = async (): Promise<void> => {
++          if (this.spoolLimitBreached) {
++            return;
++          }
++          const { sequence: seq } = await appendChunk(spool, stream, text);
++          sender.enqueue({ sequence: seq, stream, bytes: text });
++          if ((await totalBytes(spool)) >= logSpoolMaxBytes) {
++            this.spoolLimitBreached = true;
++            logger.error('log spool limit breached', {
++              attemptId: run.attempt_id,
++              maxBytes: logSpoolMaxBytes,
++            });
++            void child.kill(request.execution.cancel_grace_seconds);
++          }
++        };
++        this.spoolWriteChain = this.spoolWriteChain.then(runAppend, runAppend);
++        return this.spoolWriteChain;
++      };
++
+       child.stdout.on('data', (rawChunk: Buffer) => {
+         const redacted = stdoutRedactor.redact(rawChunk.toString('utf8'));
+         if (redacted) {
+-          sequence += 1;
+-          void appendLogChunk(logs, 'stdout', redacted);
+-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
+-            attempt_id: run.attempt_id,
+-            lease_id: run.lease_id,
+-            lease_epoch: run.lease_epoch,
+-            stream: 'stdout',
+-            sequence,
+-            bytes: redacted,
+-          });
++          void appendAndEnqueue('stdout', redacted);
+         }
+       });
+ 
+       child.stderr.on('data', (rawChunk: Buffer) => {
+         const redacted = stderrRedactor.redact(rawChunk.toString('utf8'));
+         if (redacted) {
+-          sequence += 1;
+-          void appendLogChunk(logs, 'stderr', redacted);
+-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
+-            attempt_id: run.attempt_id,
+-            lease_id: run.lease_id,
+-            lease_epoch: run.lease_epoch,
+-            stream: 'stderr',
+-            sequence,
+-            bytes: redacted,
+-          });
++          void appendAndEnqueue('stderr', redacted);
+         }
+       });
+ 
+       const result = await waitForCompletion({
+         child,
+         execution: request.execution,
+         logs,
+         signal: this.cancelSignal,
+       });
+ 
++      // Drain in-flight spool writes before flush / exit.
++      await this.spoolWriteChain.catch(() => undefined);
++
+       for (const [stream, redactor] of [
+         ['stdout', stdoutRedactor],
+         ['stderr', stderrRedactor],
+       ] as const) {
+         const flushed = redactor.flush();
+         if (flushed) {
+-          sequence += 1;
+-          void appendLogChunk(logs, stream, flushed);
+-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
+-            attempt_id: run.attempt_id,
+-            lease_id: run.lease_id,
+-            lease_epoch: run.lease_epoch,
+-            stream,
+-            sequence,
+-            bytes: flushed,
+-          });
++          await appendAndEnqueue(stream, flushed);
+         }
+       }
+ 
+       let timedOut = false;
+       let logFailure = false;
+       let durationComplete = false;
++      const spoolLimit = this.spoolLimitBreached;
+ 
+       if (result.type === 'timeout') {
+         timedOut = true;
+         await child.kill(request.execution.cancel_grace_seconds);
+       } else if (result.type === 'duration_complete') {
+         durationComplete = true;
+         await child.kill(request.execution.cancel_grace_seconds);
+       } else if (result.type === 'log_success') {
+@@ -851,45 +905,52 @@ export class AgentJobExecutor {
+       } else if (result.type === 'log_failure') {
+         logFailure = true;
+         await child.kill(request.execution.cancel_grace_seconds);
+       }
+ 
+       const exitCode = result.type === 'exit' ? result.exitCode : null;
+       const outcome = this.cancelSignal.cancelled
+         ? 'cancelled'
+-        : timedOut
+-          ? 'timed_out'
+-          : logFailure
+-            ? 'failed'
+-            : durationComplete || result.type === 'log_success'
+-              ? 'succeeded'
+-              : exitCode === 0
++        : spoolLimit
++          ? 'failed'
++          : timedOut
++            ? 'timed_out'
++            : logFailure
++              ? 'failed'
++              : durationComplete || result.type === 'log_success'
+                 ? 'succeeded'
+-                : 'failed';
++                : exitCode === 0
++                  ? 'succeeded'
++                  : 'failed';
+ 
+       this.sendFrame('job_exit', run.attempt_id, run.lease_id, run.lease_epoch, {
+         attempt_id: run.attempt_id,
+         lease_id: run.lease_id,
+         lease_epoch: run.lease_epoch,
+         exit_code: exitCode,
+         outcome,
+-        ...(outcome === 'failed'
++        ...(spoolLimit
+           ? {
+-              failure_category: 'process_exit' as const,
+-              failure_message: logFailure
+-                ? 'Completion failure_pattern matched in logs'
+-                : `Script exited with code ${exitCode}`,
++              failure_category: 'log_spool_limit' as const,
++              failure_message: `Log spool exceeded ${logSpoolMaxBytes} bytes`,
+             }
+-          : outcome === 'timed_out'
++          : outcome === 'failed'
+             ? {
+-                failure_category: 'timeout' as const,
+-                failure_message: 'Execution timed out',
++                failure_category: 'process_exit' as const,
++                failure_message: logFailure
++                  ? 'Completion failure_pattern matched in logs'
++                  : `Script exited with code ${exitCode}`,
+               }
+-            : {}),
++            : outcome === 'timed_out'
++              ? {
++                  failure_category: 'timeout' as const,
++                  failure_message: 'Execution timed out',
++                }
++              : {}),
+       });
+ 
+       const collection = await collectArtifactFiles({
+         projectPath,
+         rules: request.artifacts ?? [],
+         tempDir: join(artifactsDir, '.collect-tmp'),
+       });
+ 
+@@ -964,16 +1025,36 @@ export class AgentJobExecutor {
+     if (this.pendingArtifactUpload && this.pendingArtifactUpload.attemptId === grant.attempt_id) {
+       clearTimeout(this.pendingArtifactUpload.timer);
+       const { resolve } = this.pendingArtifactUpload;
+       this.pendingArtifactUpload = null;
+       resolve(grant);
+     }
+   }
+ 
++  /** Controller contiguous log_ack ΓÇö persist ack.json and advance the sender cursor. */
++  public async handleLogAck(ack: LogAckPayload): Promise<void> {
++    const lease = this.activeSpoolLease;
++    if (
++      !lease ||
++      lease.attemptId !== ack.attempt_id ||
++      lease.leaseId !== ack.lease_id ||
++      lease.leaseEpoch !== ack.lease_epoch
++    ) {
++      return;
++    }
++    const spool = this.activeSpool;
++    const sender = this.activeSpoolSender;
++    if (!spool || !sender) {
++      return;
++    }
++    await writeAck(spool, ack.sequence);
++    sender.onAck(ack.sequence);
++  }
++
+   public async handleCancelJob(cancel: CancelJobPayload): Promise<void> {
+     if (!this.matchesReservedLease(cancel.attempt_id, cancel.lease_id, cancel.lease_epoch)) {
+       return;
+     }
+     this.cancelSignal.cancelled = true;
+     if (this.activeProcessKill) {
+       await this.activeProcessKill(cancel.grace_seconds);
+       return;
+diff --git a/apps/agent/test/cancel-signal.test.ts b/apps/agent/test/cancel-signal.test.ts
+index 9141fae..b713465 100644
+--- a/apps/agent/test/cancel-signal.test.ts
++++ b/apps/agent/test/cancel-signal.test.ts
+@@ -41,21 +41,40 @@ vi.mock('@rbo/executor', async (importOriginal) => {
+       return child;
+     }),
+     waitForCompletion: vi.fn(async ({ signal }: { signal: { cancelled: boolean } }) => {
+       waitSignal = signal;
+       return { type: 'exit' as const, exitCode: signal.cancelled ? null : 0 };
+     }),
+     writeJobScript: vi.fn(async () => 'script'),
+     ensureAttemptLogs: vi.fn(async () => ({
++      logDir: '/dev/null',
+       stdoutPath: '/dev/null',
+       stderrPath: '/dev/null',
+       eventsPath: '/dev/null',
+     })),
++    openAttemptSpool: vi.fn(async () => ({
++      dir: '/dev/null',
++      logs: {
++        logDir: '/dev/null',
++        stdoutPath: '/dev/null',
++        stderrPath: '/dev/null',
++        eventsPath: '/dev/null',
++      },
++      chunksPath: '/dev/null',
++      ackPath: '/dev/null',
++      nextSequence: 1,
++      streamOffsets: { stdout: 0, stderr: 0 },
++    })),
++    appendChunk: vi.fn(async () => ({ sequence: 1 })),
+     appendLogChunk: vi.fn(async () => undefined),
++    readAck: vi.fn(async () => 0),
++    writeAck: vi.fn(async () => undefined),
++    totalBytes: vi.fn(async () => 0),
++    iterUnacked: vi.fn(async function* () {}),
+     collectArtifactFiles: vi.fn(async () => ({ files: [] })),
+     runCleanupScript: vi.fn(async () => ({ exitCode: 0, timedOut: false })),
+   };
+ });
+ 
+ function mockSocket(executorHolder: { current: AgentJobExecutor | null }): WebSocket & {
+   sent: Array<Record<string, unknown>>;
+ } {
+diff --git a/apps/controller/src/execution/remote-execution.ts b/apps/controller/src/execution/remote-execution.ts
+index a5af6aa..93fadf5 100644
+--- a/apps/controller/src/execution/remote-execution.ts
++++ b/apps/controller/src/execution/remote-execution.ts
+@@ -31,16 +31,17 @@ import { clearArtifactExpectations, registerArtifactExpectations } from '../http
+ import {
+   createJobEvent,
+   getJob,
+   getJobRequest,
+   getLatestAttempt,
+   recordEvent,
+   transitionAttemptState,
+   transitionJobState,
++  updateAttempt,
+ } from '../jobs/lifecycle.js';
+ import { issueDataToken } from '../security/data-tokens.js';
+ import type { ControllerDatabase } from '../storage/database.js';
+ import { nowIso } from '../storage/database.js';
+ import type { ConnectedAgent } from '../websocket/server.js';
+ import { attemptLogDir, attemptTransferDir } from './runner.js';
+ 
+ const execFileAsync = promisify(execFile);
+@@ -338,16 +339,17 @@ interface AttemptLeaseRow {
+   id: string;
+   job_id: string;
+   agent_id: string;
+   state: string;
+   lease_id: string;
+   lease_epoch: number;
+   lease_deadline: string | null;
+   outcome: string | null;
++  log_acked_sequence: number;
+ }
+ 
+ function sendWsFrame(
+   socket: WebSocket,
+   type: string,
+   attemptId: string,
+   leaseId: string,
+   leaseEpoch: number,
+@@ -373,17 +375,18 @@ function sendWsFrame(
+ function loadAttemptByLease(
+   db: ControllerDatabase,
+   attemptId: string,
+   leaseId: string,
+   leaseEpoch: number,
+ ): AttemptLeaseRow | undefined {
+   return db
+     .prepare(
+-      `SELECT id, job_id, agent_id, state, lease_id, lease_epoch, lease_deadline, outcome
++      `SELECT id, job_id, agent_id, state, lease_id, lease_epoch, lease_deadline, outcome,
++              log_acked_sequence
+        FROM job_attempts WHERE id = ? AND lease_id = ? AND lease_epoch = ?`,
+     )
+     .get(attemptId, leaseId, leaseEpoch) as AttemptLeaseRow | undefined;
+ }
+ 
+ function isLeaseExpired(attempt: AttemptLeaseRow, now = Date.now()): boolean {
+   if (!attempt.lease_deadline) {
+     return false;
+@@ -923,19 +926,50 @@ export async function handleRemoteLogChunk(
+     payload.attempt_id,
+     payload.lease_id,
+     payload.lease_epoch,
+   );
+   if (!rejectStale('log_chunk', attempt, agentId, ['running', 'collecting_artifacts'])) {
+     return;
+   }
+ 
++  const prev = attempt.log_acked_sequence ?? 0;
++  const sendAck = (): void => {
++    const conn = opts.connectedAgents.get(agentId);
++    if (!conn) {
++      return;
++    }
++    sendWsFrame(conn.socket, 'log_ack', attempt.id, payload.lease_id, payload.lease_epoch, {
++      attempt_id: attempt.id,
++      lease_id: payload.lease_id,
++      lease_epoch: payload.lease_epoch,
++      sequence: payload.sequence,
++    });
++  };
++
++  if (payload.sequence <= prev) {
++    // Duplicate / already acked ΓÇö re-ack without appending.
++    sendAck();
++    return;
++  }
++  if (payload.sequence !== prev + 1) {
++    // Out-of-order gap ΓÇö do not append; agent must replay in order.
++    logger.warn('out-of-order log_chunk ignored', {
++      attemptId: attempt.id,
++      sequence: payload.sequence,
++      expected: prev + 1,
++    });
++    return;
++  }
++
+   const logDir = attemptLogDir(opts.dataDir, attempt.id);
+   const logs = await ensureAttemptLogs(logDir);
+   await appendLogChunk(logs, payload.stream, payload.bytes);
++  updateAttempt(opts.db, attempt.id, { log_acked_sequence: payload.sequence });
++  sendAck();
+ }
+ 
+ export function handleRemoteJobStarted(
+   opts: RemoteExecutionOptions,
+   agentId: string,
+   payload: JobStartedPayload,
+ ): void {
+   const attempt = loadAttemptByLease(
+diff --git a/packages/executor/src/index.ts b/packages/executor/src/index.ts
+index 1aaea00..1a212d2 100644
+--- a/packages/executor/src/index.ts
++++ b/packages/executor/src/index.ts
+@@ -1,5 +1,6 @@
+ export * from './logs.js';
++export * from './spool.js';
+ export * from './script.js';
+ export * from './artifacts.js';
+ export * from './windows-frames.js';
+ export * from './completion.js';
+
+## UNTRACKED FILES (full content)
+
+
+### packages/executor/src/spool.ts
+
+import { appendFile, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { type AttemptLogPaths, ensureAttemptLogs } from './logs.js';
+
+export interface ChunkIndexEntry {
+  sequence: number;
+  stream: 'stdout' | 'stderr';
+  byte_offset: number;
+  byte_length: number;
+}
+
+export interface SpoolChunk {
+  sequence: number;
+  stream: 'stdout' | 'stderr';
+  bytes: string;
+}
+
+export interface AttemptSpool {
+  dir: string;
+  logs: AttemptLogPaths;
+  chunksPath: string;
+  ackPath: string;
+  /** Next sequence to assign (1-based). */
+  nextSequence: number;
+  /** Running byte offsets per stream (end of file). */
+  streamOffsets: { stdout: number; stderr: number };
+}
+
+async function readChunksFile(path: string): Promise<ChunkIndexEntry[]> {
+  try {
+    const content = await readFile(path, 'utf8');
+    if (!content.trim()) {
+      return [];
+    }
+    const entries: ChunkIndexEntry[] = [];
+    for (const line of content.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      entries.push(JSON.parse(line) as ChunkIndexEntry);
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+export async function openAttemptSpool(spoolDir: string): Promise<AttemptSpool> {
+  const logs = await ensureAttemptLogs(spoolDir);
+  const chunksPath = join(spoolDir, 'chunks.jsonl');
+  const ackPath = join(spoolDir, 'ack.json');
+
+  try {
+    await readFile(chunksPath);
+  } catch {
+    await writeFile(chunksPath, '');
+  }
+  try {
+    await readFile(ackPath);
+  } catch {
+    await writeFile(ackPath, JSON.stringify({ acked_sequence: 0 }));
+  }
+
+  const entries = await readChunksFile(chunksPath);
+  let nextSequence = 1;
+  const streamOffsets = { stdout: 0, stderr: 0 };
+  for (const entry of entries) {
+    if (entry.sequence >= nextSequence) {
+      nextSequence = entry.sequence + 1;
+    }
+    const end = entry.byte_offset + entry.byte_length;
+    if (end > streamOffsets[entry.stream]) {
+      streamOffsets[entry.stream] = end;
+    }
+  }
+
+  // Prefer live file sizes if they exceed indexed offsets (defensive).
+  for (const stream of ['stdout', 'stderr'] as const) {
+    const path = stream === 'stdout' ? logs.stdoutPath : logs.stderrPath;
+    try {
+      const size = (await stat(path)).size;
+      if (size > streamOffsets[stream]) {
+        streamOffsets[stream] = size;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    dir: spoolDir,
+    logs,
+    chunksPath,
+    ackPath,
+    nextSequence,
+    streamOffsets,
+  };
+}
+
+export async function appendChunk(
+  spool: AttemptSpool,
+  stream: 'stdout' | 'stderr',
+  bytes: string | Buffer,
+): Promise<{ sequence: number }> {
+  const buf = typeof bytes === 'string' ? Buffer.from(bytes, 'utf8') : bytes;
+  const sequence = spool.nextSequence;
+  const byte_offset = spool.streamOffsets[stream];
+  const byte_length = buf.byteLength;
+
+  const path = stream === 'stdout' ? spool.logs.stdoutPath : spool.logs.stderrPath;
+  await appendFile(path, buf);
+
+  const entry: ChunkIndexEntry = { sequence, stream, byte_offset, byte_length };
+  await appendFile(spool.chunksPath, `${JSON.stringify(entry)}\n`);
+
+  spool.nextSequence = sequence + 1;
+  spool.streamOffsets[stream] = byte_offset + byte_length;
+
+  return { sequence };
+}
+
+export async function readAck(spool: AttemptSpool): Promise<number> {
+  try {
+    const raw = await readFile(spool.ackPath, 'utf8');
+    const parsed = JSON.parse(raw) as { acked_sequence?: unknown };
+    return typeof parsed.acked_sequence === 'number' && Number.isFinite(parsed.acked_sequence)
+      ? parsed.acked_sequence
+      : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function writeAck(spool: AttemptSpool, sequence: number): Promise<void> {
+  const tmpPath = `${spool.ackPath}.${process.pid}.${Date.now()}.tmp`;
+  const payload = JSON.stringify({ acked_sequence: sequence });
+  await writeFile(tmpPath, payload);
+  await rename(tmpPath, spool.ackPath);
+}
+
+export async function* iterUnacked(
+  spool: AttemptSpool,
+  afterSequence: number,
+): AsyncIterable<SpoolChunk> {
+  const entries = await readChunksFile(spool.chunksPath);
+  const stdoutContent = await readFile(spool.logs.stdoutPath);
+  const stderrContent = await readFile(spool.logs.stderrPath);
+
+  for (const entry of entries) {
+    if (entry.sequence <= afterSequence) {
+      continue;
+    }
+    const file = entry.stream === 'stdout' ? stdoutContent : stderrContent;
+    const slice = file.subarray(entry.byte_offset, entry.byte_offset + entry.byte_length);
+    yield {
+      sequence: entry.sequence,
+      stream: entry.stream,
+      bytes: slice.toString('utf8'),
+    };
+  }
+}
+
+export async function totalBytes(spool: AttemptSpool): Promise<number> {
+  let total = 0;
+  for (const path of [spool.logs.stdoutPath, spool.logs.stderrPath]) {
+    try {
+      total += (await stat(path)).size;
+    } catch {
+      // ignore missing
+    }
+  }
+  return total;
+}
+
+
+### packages/executor/test/spool.test.ts
+
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  appendChunk,
+  iterUnacked,
+  openAttemptSpool,
+  readAck,
+  totalBytes,
+  writeAck,
+} from '../src/spool.js';
+
+describe('AttemptSpool', () => {
+  let spoolDir: string;
+
+  afterEach(async () => {
+    if (spoolDir) {
+      await rm(spoolDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it('allocates sequences starting at 1 and appends to disk before return', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-'));
+    const spool = await openAttemptSpool(spoolDir);
+
+    const first = await appendChunk(spool, 'stdout', 'hello');
+    expect(first.sequence).toBe(1);
+
+    const stdout = await readFile(join(spoolDir, 'stdout.log'), 'utf8');
+    expect(stdout).toBe('hello');
+
+    const index = (await readFile(join(spoolDir, 'chunks.jsonl'), 'utf8')).trim();
+    expect(JSON.parse(index)).toMatchObject({
+      sequence: 1,
+      stream: 'stdout',
+      byte_offset: 0,
+      byte_length: Buffer.byteLength('hello'),
+    });
+
+    const second = await appendChunk(spool, 'stderr', 'err');
+    expect(second.sequence).toBe(2);
+  });
+
+  it('writeAck atomically replaces ack.json', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-ack-'));
+    const spool = await openAttemptSpool(spoolDir);
+    await appendChunk(spool, 'stdout', 'a');
+
+    await writeAck(spool, 1);
+    expect(await readAck(spool)).toBe(1);
+
+    const raw = await readFile(join(spoolDir, 'ack.json'), 'utf8');
+    expect(JSON.parse(raw)).toEqual({ acked_sequence: 1 });
+  });
+
+  it('iterUnacked returns only sequences > afterSequence in order', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-iter-'));
+    const spool = await openAttemptSpool(spoolDir);
+    await appendChunk(spool, 'stdout', 'one');
+    await appendChunk(spool, 'stderr', 'two');
+    await appendChunk(spool, 'stdout', 'three');
+    await writeAck(spool, 1);
+
+    const chunks: Array<{ sequence: number; stream: string; bytes: string }> = [];
+    for await (const chunk of iterUnacked(spool, await readAck(spool))) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toEqual([
+      { sequence: 2, stream: 'stderr', bytes: 'two' },
+      { sequence: 3, stream: 'stdout', bytes: 'three' },
+    ]);
+  });
+
+  it('iterUnacked is empty after all chunks are acked', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-empty-'));
+    const spool = await openAttemptSpool(spoolDir);
+    await appendChunk(spool, 'stdout', 'only');
+    await writeAck(spool, 1);
+
+    const chunks = [];
+    for await (const chunk of iterUnacked(spool, 1)) {
+      chunks.push(chunk);
+    }
+    expect(chunks).toEqual([]);
+  });
+
+  it('totalBytes grows with appended stream bytes', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-bytes-'));
+    const spool = await openAttemptSpool(spoolDir);
+    expect(await totalBytes(spool)).toBe(0);
+
+    await appendChunk(spool, 'stdout', 'abc');
+    expect(await totalBytes(spool)).toBe(3);
+
+    await appendChunk(spool, 'stderr', 'de');
+    expect(await totalBytes(spool)).toBe(5);
+  });
+
+  it('openAttemptSpool resumes sequence from existing chunks.jsonl', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-resume-'));
+    await mkdir(spoolDir, { recursive: true });
+    await writeFile(join(spoolDir, 'stdout.log'), 'hi');
+    await writeFile(join(spoolDir, 'stderr.log'), '');
+    await writeFile(join(spoolDir, 'events.jsonl'), '');
+    await writeFile(
+      join(spoolDir, 'chunks.jsonl'),
+      `${JSON.stringify({ sequence: 1, stream: 'stdout', byte_offset: 0, byte_length: 2 })}\n`,
+    );
+    await writeFile(join(spoolDir, 'ack.json'), JSON.stringify({ acked_sequence: 1 }));
+
+    const spool = await openAttemptSpool(spoolDir);
+    const next = await appendChunk(spool, 'stdout', '!');
+    expect(next.sequence).toBe(2);
+    expect(await readAck(spool)).toBe(1);
+  });
+});
+
+
+### apps/agent/src/logs/spool-sender.ts
+
+import type { AttemptSpool, SpoolChunk } from '@rbo/executor';
+import { iterUnacked } from '@rbo/executor';
+
+export type SpoolSendFn = (chunk: {
+  sequence: number;
+  stream: 'stdout' | 'stderr';
+  bytes: string;
+}) => boolean;
+
+export interface SpoolSenderOptions {
+  /** Max in-memory pending send queue depth. */
+  maxQueue: number;
+  /** Attempt to send one chunk over the wire; return false if WS unavailable. */
+  send: SpoolSendFn;
+  /** Spool used for replay after reconnect. */
+  getSpool: () => AttemptSpool;
+}
+
+/**
+ * Bounded in-memory sender over a durable AttemptSpool.
+ * Never blocks the job process: enqueue is O(1) and drops when the queue is full
+ * (disk already holds the chunk; startReplay recovers).
+ */
+export class SpoolSender {
+  private readonly queue: SpoolChunk[] = [];
+  private lastAcked = 0;
+  private pumping = false;
+  private needsReplay = false;
+
+  constructor(private readonly opts: SpoolSenderOptions) {}
+
+  /** Highest contiguous sequence acknowledged by the Controller. */
+  get lastAckedSequence(): number {
+    return this.lastAcked;
+  }
+
+  enqueue(chunk: SpoolChunk): void {
+    if (chunk.sequence <= this.lastAcked) {
+      return;
+    }
+    if (this.queue.some((c) => c.sequence === chunk.sequence)) {
+      return;
+    }
+    if (this.queue.length >= this.opts.maxQueue) {
+      // Memory-bound: leave on disk; replay when capacity frees.
+      this.needsReplay = true;
+      return;
+    }
+    this.queue.push(chunk);
+    this.queue.sort((a, b) => a.sequence - b.sequence);
+    this.pump();
+  }
+
+  onAck(sequence: number): void {
+    if (sequence > this.lastAcked) {
+      this.lastAcked = sequence;
+    }
+    while (this.queue.length > 0) {
+      const head = this.queue[0];
+      if (!head || head.sequence > this.lastAcked) {
+        break;
+      }
+      this.queue.shift();
+    }
+    this.pump();
+    if (this.needsReplay && this.queue.length < this.opts.maxQueue) {
+      this.needsReplay = false;
+      void this.startReplay();
+    }
+  }
+
+  /** Seed ack cursor (e.g. from disk ack.json on open). */
+  setAcked(sequence: number): void {
+    this.lastAcked = Math.max(0, sequence);
+  }
+
+  /**
+   * Enqueue all disk chunks with sequence > lastAcked.
+   * Intended for reconnect (Task 3); also used when the send queue overflows.
+   */
+  async startReplay(): Promise<void> {
+    const spool = this.opts.getSpool();
+    for await (const chunk of iterUnacked(spool, this.lastAcked)) {
+      this.enqueue(chunk);
+    }
+  }
+
+  private pump(): void {
+    if (this.pumping) {
+      return;
+    }
+    this.pumping = true;
+    try {
+      while (this.queue.length > 0) {
+        const chunk = this.queue[0];
+        if (!chunk) {
+          break;
+        }
+        if (chunk.sequence <= this.lastAcked) {
+          this.queue.shift();
+          continue;
+        }
+        const ok = this.opts.send({
+          sequence: chunk.sequence,
+          stream: chunk.stream,
+          bytes: chunk.bytes,
+        });
+        if (!ok) {
+          break;
+        }
+        // Sent â€” remove from memory; durable confirmation via onAck.
+        this.queue.shift();
+      }
+    } finally {
+      this.pumping = false;
+    }
+  }
+}
+
+
+### apps/controller/test/log-spool.test.ts
+
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ensureAttemptLogs, readLogsFromCursor } from '@rbo/executor';
+import { afterEach, describe, expect, it } from 'vitest';
+import type { WebSocket } from 'ws';
+import { handleRemoteLogChunk } from '../src/execution/remote-execution.js';
+import { attemptLogDir } from '../src/execution/runner.js';
+import { createJob, getAttempt, transitionJobState } from '../src/jobs/lifecycle.js';
+import { migrateToLatest, nowIso, openDatabase } from '../src/storage/database.js';
+import type { ConnectedAgent } from '../src/websocket/server.js';
+
+function mockSocket(): WebSocket & { sent: Array<Record<string, unknown>> } {
+  const sent: Array<Record<string, unknown>> = [];
+  return {
+    readyState: 1,
+    OPEN: 1,
+    sent,
+    send(raw: string) {
+      sent.push(JSON.parse(raw) as Record<string, unknown>);
+    },
+  } as unknown as WebSocket & { sent: Array<Record<string, unknown>> };
+}
+
+function insertAgent(db: ReturnType<typeof openDatabase>, agentId: string): void {
+  db.prepare(
+    `INSERT INTO agents (id, display_name, hostname, state, capabilities_json, paired_at)
+     VALUES (?, ?, ?, 'offline', '{}', ?)`,
+  ).run(agentId, agentId, 'localhost', nowIso());
+}
+
+describe('Controller idempotent log_chunk + log_ack', () => {
+  let dataDir: string;
+
+  afterEach(async () => {
+    if (dataDir) {
+      await rm(dataDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  async function setup() {
+    dataDir = await mkdtemp(join(tmpdir(), 'rbo-log-spool-'));
+    const db = openDatabase(join(dataDir, 'controller.db'));
+    migrateToLatest(db);
+    insertAgent(db, 'agt_1');
+
+    const identity = {
+      controllerId: 'ctl',
+      fingerprint: 'sha256:abc',
+      tlsCertPem: '',
+      tlsKeyPem: '',
+      signingPublicKeyPem: '',
+      signingPrivateKeyPem: '',
+    };
+
+    const job = createJob(db, {
+      clientId: 'client',
+      clientRequestId: 'req_log_spool',
+      initialState: 'queued',
+      request: {
+        client_request_id: 'req_log_spool',
+        source: { project_root: '/tmp', cwd: '.' },
+        execution: { script: 'echo hi' },
+        queue_policy: 'wait',
+      },
+    });
+    transitionJobState(db, job.id, 'running');
+
+    const attemptId = 'att_log_1';
+    const leaseId = 'lease_log_1';
+    const futureDeadline = new Date(Date.now() + 60_000).toISOString();
+    db.prepare(
+      `INSERT INTO job_attempts (id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline, state)
+       VALUES (?, ?, 1, ?, ?, 1, ?, 'running')`,
+    ).run(attemptId, job.id, 'agt_1', leaseId, futureDeadline);
+
+    const socket = mockSocket();
+    const connectedAgents = new Map<string, ConnectedAgent>([
+      [
+        'agt_1',
+        {
+          agentId: 'agt_1',
+          socket,
+          protocolVersion: 1,
+          lastHeartbeatAt: Date.now(),
+        },
+      ],
+    ]);
+
+    const opts = {
+      db,
+      identity,
+      dataDir,
+      connectedAgents,
+      serverPort: 0,
+    };
+
+    return { db, opts, socket, attemptId, leaseId };
+  }
+
+  it('appends sequence=1 and emits log_ack; replay does not duplicate; gap ignored', async () => {
+    const { db, opts, socket, attemptId, leaseId } = await setup();
+
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 1,
+      bytes: 'hello',
+    });
+
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(1);
+    expect(socket.sent).toHaveLength(1);
+    expect(socket.sent[0]?.type).toBe('log_ack');
+    expect(socket.sent[0]?.payload).toMatchObject({
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      sequence: 1,
+    });
+
+    const logDir = attemptLogDir(dataDir, attemptId);
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('hello');
+
+    // Replay same sequence â€” no duplicate bytes; re-ack
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 1,
+      bytes: 'hello',
+    });
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('hello');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(1);
+    expect(socket.sent).toHaveLength(2);
+    expect(socket.sent[1]?.type).toBe('log_ack');
+    expect(socket.sent[1]?.payload).toMatchObject({ sequence: 1 });
+
+    // Gap: sequence=3 before 2 â€” ignore, no append
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 3,
+      bytes: 'gap',
+    });
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('hello');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(1);
+    expect(socket.sent).toHaveLength(2);
+
+    // Contiguous sequence=2 appends
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 2,
+      bytes: ' world',
+    });
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('hello world');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(2);
+    expect(socket.sent.at(-1)?.type).toBe('log_ack');
+    expect(socket.sent.at(-1)?.payload).toMatchObject({ sequence: 2 });
+
+    // job_logs cursor reads durable bytes once
+    const logs = await ensureAttemptLogs(logDir);
+    const chunk = await readLogsFromCursor(logs, 0, 10_000, ['stdout']);
+    expect(chunk.data).toBe('hello world');
+    expect(chunk.nextCursor).toBe(Buffer.byteLength('hello world'));
+
+    db.close();
+  });
+});
+
+
+## UNTRACKED FILES (full content)
+
+
+### packages/executor/src/spool.ts
+
+```typescript
+import { appendFile, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { type AttemptLogPaths, ensureAttemptLogs } from './logs.js';
+
+export interface ChunkIndexEntry {
+  sequence: number;
+  stream: 'stdout' | 'stderr';
+  byte_offset: number;
+  byte_length: number;
+}
+
+export interface SpoolChunk {
+  sequence: number;
+  stream: 'stdout' | 'stderr';
+  bytes: string;
+}
+
+export interface AttemptSpool {
+  dir: string;
+  logs: AttemptLogPaths;
+  chunksPath: string;
+  ackPath: string;
+  /** Next sequence to assign (1-based). */
+  nextSequence: number;
+  /** Running byte offsets per stream (end of file). */
+  streamOffsets: { stdout: number; stderr: number };
+}
+
+async function readChunksFile(path: string): Promise<ChunkIndexEntry[]> {
+  try {
+    const content = await readFile(path, 'utf8');
+    if (!content.trim()) {
+      return [];
+    }
+    const entries: ChunkIndexEntry[] = [];
+    for (const line of content.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      entries.push(JSON.parse(line) as ChunkIndexEntry);
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+export async function openAttemptSpool(spoolDir: string): Promise<AttemptSpool> {
+  const logs = await ensureAttemptLogs(spoolDir);
+  const chunksPath = join(spoolDir, 'chunks.jsonl');
+  const ackPath = join(spoolDir, 'ack.json');
+
+  try {
+    await readFile(chunksPath);
+  } catch {
+    await writeFile(chunksPath, '');
+  }
+  try {
+    await readFile(ackPath);
+  } catch {
+    await writeFile(ackPath, JSON.stringify({ acked_sequence: 0 }));
+  }
+
+  const entries = await readChunksFile(chunksPath);
+  let nextSequence = 1;
+  const streamOffsets = { stdout: 0, stderr: 0 };
+  for (const entry of entries) {
+    if (entry.sequence >= nextSequence) {
+      nextSequence = entry.sequence + 1;
+    }
+    const end = entry.byte_offset + entry.byte_length;
+    if (end > streamOffsets[entry.stream]) {
+      streamOffsets[entry.stream] = end;
+    }
+  }
+
+  // Prefer live file sizes if they exceed indexed offsets (defensive).
+  for (const stream of ['stdout', 'stderr'] as const) {
+    const path = stream === 'stdout' ? logs.stdoutPath : logs.stderrPath;
+    try {
+      const size = (await stat(path)).size;
+      if (size > streamOffsets[stream]) {
+        streamOffsets[stream] = size;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    dir: spoolDir,
+    logs,
+    chunksPath,
+    ackPath,
+    nextSequence,
+    streamOffsets,
+  };
+}
+
+export async function appendChunk(
+  spool: AttemptSpool,
+  stream: 'stdout' | 'stderr',
+  bytes: string | Buffer,
+): Promise<{ sequence: number }> {
+  const buf = typeof bytes === 'string' ? Buffer.from(bytes, 'utf8') : bytes;
+  const sequence = spool.nextSequence;
+  const byte_offset = spool.streamOffsets[stream];
+  const byte_length = buf.byteLength;
+
+  const path = stream === 'stdout' ? spool.logs.stdoutPath : spool.logs.stderrPath;
+  await appendFile(path, buf);
+
+  const entry: ChunkIndexEntry = { sequence, stream, byte_offset, byte_length };
+  await appendFile(spool.chunksPath, `${JSON.stringify(entry)}\n`);
+
+  spool.nextSequence = sequence + 1;
+  spool.streamOffsets[stream] = byte_offset + byte_length;
+
+  return { sequence };
+}
+
+export async function readAck(spool: AttemptSpool): Promise<number> {
+  try {
+    const raw = await readFile(spool.ackPath, 'utf8');
+    const parsed = JSON.parse(raw) as { acked_sequence?: unknown };
+    return typeof parsed.acked_sequence === 'number' && Number.isFinite(parsed.acked_sequence)
+      ? parsed.acked_sequence
+      : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function writeAck(spool: AttemptSpool, sequence: number): Promise<void> {
+  const tmpPath = `${spool.ackPath}.${process.pid}.${Date.now()}.tmp`;
+  const payload = JSON.stringify({ acked_sequence: sequence });
+  await writeFile(tmpPath, payload);
+  await rename(tmpPath, spool.ackPath);
+}
+
+export async function* iterUnacked(
+  spool: AttemptSpool,
+  afterSequence: number,
+): AsyncIterable<SpoolChunk> {
+  const entries = await readChunksFile(spool.chunksPath);
+  const stdoutContent = await readFile(spool.logs.stdoutPath);
+  const stderrContent = await readFile(spool.logs.stderrPath);
+
+  for (const entry of entries) {
+    if (entry.sequence <= afterSequence) {
+      continue;
+    }
+    const file = entry.stream === 'stdout' ? stdoutContent : stderrContent;
+    const slice = file.subarray(entry.byte_offset, entry.byte_offset + entry.byte_length);
+    yield {
+      sequence: entry.sequence,
+      stream: entry.stream,
+      bytes: slice.toString('utf8'),
+    };
+  }
+}
+
+export async function totalBytes(spool: AttemptSpool): Promise<number> {
+  let total = 0;
+  for (const path of [spool.logs.stdoutPath, spool.logs.stderrPath]) {
+    try {
+      total += (await stat(path)).size;
+    } catch {
+      // ignore missing
+    }
+  }
+  return total;
+}
+```
+
+### packages/executor/test/spool.test.ts
+
+```typescript
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  appendChunk,
+  iterUnacked,
+  openAttemptSpool,
+  readAck,
+  totalBytes,
+  writeAck,
+} from '../src/spool.js';
+
+describe('AttemptSpool', () => {
+  let spoolDir: string;
+
+  afterEach(async () => {
+    if (spoolDir) {
+      await rm(spoolDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it('allocates sequences starting at 1 and appends to disk before return', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-'));
+    const spool = await openAttemptSpool(spoolDir);
+
+    const first = await appendChunk(spool, 'stdout', 'hello');
+    expect(first.sequence).toBe(1);
+
+    const stdout = await readFile(join(spoolDir, 'stdout.log'), 'utf8');
+    expect(stdout).toBe('hello');
+
+    const index = (await readFile(join(spoolDir, 'chunks.jsonl'), 'utf8')).trim();
+    expect(JSON.parse(index)).toMatchObject({
+      sequence: 1,
+      stream: 'stdout',
+      byte_offset: 0,
+      byte_length: Buffer.byteLength('hello'),
+    });
+
+    const second = await appendChunk(spool, 'stderr', 'err');
+    expect(second.sequence).toBe(2);
+  });
+
+  it('writeAck atomically replaces ack.json', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-ack-'));
+    const spool = await openAttemptSpool(spoolDir);
+    await appendChunk(spool, 'stdout', 'a');
+
+    await writeAck(spool, 1);
+    expect(await readAck(spool)).toBe(1);
+
+    const raw = await readFile(join(spoolDir, 'ack.json'), 'utf8');
+    expect(JSON.parse(raw)).toEqual({ acked_sequence: 1 });
+  });
+
+  it('iterUnacked returns only sequences > afterSequence in order', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-iter-'));
+    const spool = await openAttemptSpool(spoolDir);
+    await appendChunk(spool, 'stdout', 'one');
+    await appendChunk(spool, 'stderr', 'two');
+    await appendChunk(spool, 'stdout', 'three');
+    await writeAck(spool, 1);
+
+    const chunks: Array<{ sequence: number; stream: string; bytes: string }> = [];
+    for await (const chunk of iterUnacked(spool, await readAck(spool))) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toEqual([
+      { sequence: 2, stream: 'stderr', bytes: 'two' },
+      { sequence: 3, stream: 'stdout', bytes: 'three' },
+    ]);
+  });
+
+  it('iterUnacked is empty after all chunks are acked', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-empty-'));
+    const spool = await openAttemptSpool(spoolDir);
+    await appendChunk(spool, 'stdout', 'only');
+    await writeAck(spool, 1);
+
+    const chunks = [];
+    for await (const chunk of iterUnacked(spool, 1)) {
+      chunks.push(chunk);
+    }
+    expect(chunks).toEqual([]);
+  });
+
+  it('totalBytes grows with appended stream bytes', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-bytes-'));
+    const spool = await openAttemptSpool(spoolDir);
+    expect(await totalBytes(spool)).toBe(0);
+
+    await appendChunk(spool, 'stdout', 'abc');
+    expect(await totalBytes(spool)).toBe(3);
+
+    await appendChunk(spool, 'stderr', 'de');
+    expect(await totalBytes(spool)).toBe(5);
+  });
+
+  it('openAttemptSpool resumes sequence from existing chunks.jsonl', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-resume-'));
+    await mkdir(spoolDir, { recursive: true });
+    await writeFile(join(spoolDir, 'stdout.log'), 'hi');
+    await writeFile(join(spoolDir, 'stderr.log'), '');
+    await writeFile(join(spoolDir, 'events.jsonl'), '');
+    await writeFile(
+      join(spoolDir, 'chunks.jsonl'),
+      `${JSON.stringify({ sequence: 1, stream: 'stdout', byte_offset: 0, byte_length: 2 })}\n`,
+    );
+    await writeFile(join(spoolDir, 'ack.json'), JSON.stringify({ acked_sequence: 1 }));
+
+    const spool = await openAttemptSpool(spoolDir);
+    const next = await appendChunk(spool, 'stdout', '!');
+    expect(next.sequence).toBe(2);
+    expect(await readAck(spool)).toBe(1);
+  });
+});
+```
+
+### apps/agent/src/logs/spool-sender.ts
+
+```typescript
+import type { AttemptSpool, SpoolChunk } from '@rbo/executor';
+import { iterUnacked } from '@rbo/executor';
+
+export type SpoolSendFn = (chunk: {
+  sequence: number;
+  stream: 'stdout' | 'stderr';
+  bytes: string;
+}) => boolean;
+
+export interface SpoolSenderOptions {
+  /** Max in-memory pending send queue depth. */
+  maxQueue: number;
+  /** Attempt to send one chunk over the wire; return false if WS unavailable. */
+  send: SpoolSendFn;
+  /** Spool used for replay after reconnect. */
+  getSpool: () => AttemptSpool;
+}
+
+/**
+ * Bounded in-memory sender over a durable AttemptSpool.
+ * Never blocks the job process: enqueue is O(1) and drops when the queue is full
+ * (disk already holds the chunk; startReplay recovers).
+ */
+export class SpoolSender {
+  private readonly queue: SpoolChunk[] = [];
+  private lastAcked = 0;
+  private pumping = false;
+  private needsReplay = false;
+
+  constructor(private readonly opts: SpoolSenderOptions) {}
+
+  /** Highest contiguous sequence acknowledged by the Controller. */
+  get lastAckedSequence(): number {
+    return this.lastAcked;
+  }
+
+  enqueue(chunk: SpoolChunk): void {
+    if (chunk.sequence <= this.lastAcked) {
+      return;
+    }
+    if (this.queue.some((c) => c.sequence === chunk.sequence)) {
+      return;
+    }
+    if (this.queue.length >= this.opts.maxQueue) {
+      // Memory-bound: leave on disk; replay when capacity frees.
+      this.needsReplay = true;
+      return;
+    }
+    this.queue.push(chunk);
+    this.queue.sort((a, b) => a.sequence - b.sequence);
+    this.pump();
+  }
+
+  onAck(sequence: number): void {
+    if (sequence > this.lastAcked) {
+      this.lastAcked = sequence;
+    }
+    while (this.queue.length > 0) {
+      const head = this.queue[0];
+      if (!head || head.sequence > this.lastAcked) {
+        break;
+      }
+      this.queue.shift();
+    }
+    this.pump();
+    if (this.needsReplay && this.queue.length < this.opts.maxQueue) {
+      this.needsReplay = false;
+      void this.startReplay();
+    }
+  }
+
+  /** Seed ack cursor (e.g. from disk ack.json on open). */
+  setAcked(sequence: number): void {
+    this.lastAcked = Math.max(0, sequence);
+  }
+
+  /**
+   * Enqueue all disk chunks with sequence > lastAcked.
+   * Intended for reconnect (Task 3); also used when the send queue overflows.
+   */
+  async startReplay(): Promise<void> {
+    const spool = this.opts.getSpool();
+    for await (const chunk of iterUnacked(spool, this.lastAcked)) {
+      this.enqueue(chunk);
+    }
+  }
+
+  private pump(): void {
+    if (this.pumping) {
+      return;
+    }
+    this.pumping = true;
+    try {
+      while (this.queue.length > 0) {
+        const chunk = this.queue[0];
+        if (!chunk) {
+          break;
+        }
+        if (chunk.sequence <= this.lastAcked) {
+          this.queue.shift();
+          continue;
+        }
+        const ok = this.opts.send({
+          sequence: chunk.sequence,
+          stream: chunk.stream,
+          bytes: chunk.bytes,
+        });
+        if (!ok) {
+          break;
+        }
+        // Sent â€” remove from memory; durable confirmation via onAck.
+        this.queue.shift();
+      }
+    } finally {
+      this.pumping = false;
+    }
+  }
+}
+```
+
+### apps/controller/test/log-spool.test.ts
+
+```typescript
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ensureAttemptLogs, readLogsFromCursor } from '@rbo/executor';
+import { afterEach, describe, expect, it } from 'vitest';
+import type { WebSocket } from 'ws';
+import { handleRemoteLogChunk } from '../src/execution/remote-execution.js';
+import { attemptLogDir } from '../src/execution/runner.js';
+import { createJob, getAttempt, transitionJobState } from '../src/jobs/lifecycle.js';
+import { migrateToLatest, nowIso, openDatabase } from '../src/storage/database.js';
+import type { ConnectedAgent } from '../src/websocket/server.js';
+
+function mockSocket(): WebSocket & { sent: Array<Record<string, unknown>> } {
+  const sent: Array<Record<string, unknown>> = [];
+  return {
+    readyState: 1,
+    OPEN: 1,
+    sent,
+    send(raw: string) {
+      sent.push(JSON.parse(raw) as Record<string, unknown>);
+    },
+  } as unknown as WebSocket & { sent: Array<Record<string, unknown>> };
+}
+
+function insertAgent(db: ReturnType<typeof openDatabase>, agentId: string): void {
+  db.prepare(
+    `INSERT INTO agents (id, display_name, hostname, state, capabilities_json, paired_at)
+     VALUES (?, ?, ?, 'offline', '{}', ?)`,
+  ).run(agentId, agentId, 'localhost', nowIso());
+}
+
+describe('Controller idempotent log_chunk + log_ack', () => {
+  let dataDir: string;
+
+  afterEach(async () => {
+    if (dataDir) {
+      await rm(dataDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  async function setup() {
+    dataDir = await mkdtemp(join(tmpdir(), 'rbo-log-spool-'));
+    const db = openDatabase(join(dataDir, 'controller.db'));
+    migrateToLatest(db);
+    insertAgent(db, 'agt_1');
+
+    const identity = {
+      controllerId: 'ctl',
+      fingerprint: 'sha256:abc',
+      tlsCertPem: '',
+      tlsKeyPem: '',
+      signingPublicKeyPem: '',
+      signingPrivateKeyPem: '',
+    };
+
+    const job = createJob(db, {
+      clientId: 'client',
+      clientRequestId: 'req_log_spool',
+      initialState: 'queued',
+      request: {
+        client_request_id: 'req_log_spool',
+        source: { project_root: '/tmp', cwd: '.' },
+        execution: { script: 'echo hi' },
+        queue_policy: 'wait',
+      },
+    });
+    transitionJobState(db, job.id, 'running');
+
+    const attemptId = 'att_log_1';
+    const leaseId = 'lease_log_1';
+    const futureDeadline = new Date(Date.now() + 60_000).toISOString();
+    db.prepare(
+      `INSERT INTO job_attempts (id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline, state)
+       VALUES (?, ?, 1, ?, ?, 1, ?, 'running')`,
+    ).run(attemptId, job.id, 'agt_1', leaseId, futureDeadline);
+
+    const socket = mockSocket();
+    const connectedAgents = new Map<string, ConnectedAgent>([
+      [
+        'agt_1',
+        {
+          agentId: 'agt_1',
+          socket,
+          protocolVersion: 1,
+          lastHeartbeatAt: Date.now(),
+        },
+      ],
+    ]);
+
+    const opts = {
+      db,
+      identity,
+      dataDir,
+      connectedAgents,
+      serverPort: 0,
+    };
+
+    return { db, opts, socket, attemptId, leaseId };
+  }
+
+  it('appends sequence=1 and emits log_ack; replay does not duplicate; gap ignored', async () => {
+    const { db, opts, socket, attemptId, leaseId } = await setup();
+
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 1,
+      bytes: 'hello',
+    });
+
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(1);
+    expect(socket.sent).toHaveLength(1);
+    expect(socket.sent[0]?.type).toBe('log_ack');
+    expect(socket.sent[0]?.payload).toMatchObject({
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      sequence: 1,
+    });
+
+    const logDir = attemptLogDir(dataDir, attemptId);
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('hello');
+
+    // Replay same sequence â€” no duplicate bytes; re-ack
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 1,
+      bytes: 'hello',
+    });
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('hello');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(1);
+    expect(socket.sent).toHaveLength(2);
+    expect(socket.sent[1]?.type).toBe('log_ack');
+    expect(socket.sent[1]?.payload).toMatchObject({ sequence: 1 });
+
+    // Gap: sequence=3 before 2 â€” ignore, no append
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 3,
+      bytes: 'gap',
+    });
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('hello');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(1);
+    expect(socket.sent).toHaveLength(2);
+
+    // Contiguous sequence=2 appends
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 2,
+      bytes: ' world',
+    });
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('hello world');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(2);
+    expect(socket.sent.at(-1)?.type).toBe('log_ack');
+    expect(socket.sent.at(-1)?.payload).toMatchObject({ sequence: 2 });
+
+    // job_logs cursor reads durable bytes once
+    const logs = await ensureAttemptLogs(logDir);
+    const chunk = await readLogsFromCursor(logs, 0, 10_000, ['stdout']);
+    expect(chunk.data).toBe('hello world');
+    expect(chunk.nextCursor).toBe(Buffer.byteLength('hello world'));
+
+    db.close();
+  });
+});
+```
+diff --git a/apps/agent/src/config.ts b/apps/agent/src/config.ts
+index 38cda4b..a99c6fe 100644
+--- a/apps/agent/src/config.ts
++++ b/apps/agent/src/config.ts
+@@ -11,18 +11,28 @@ export interface AgentConfig {
+   maxJobs: number;
+   stateDir: string;
+   /** Maps store ref name ΓåÆ environment variable that holds the secret value. */
+   secretMap?: Record<string, string>;
+   /** Git remote allowlist enforced before clone/fetch/bundle import (┬º10.4). */
+   gitAllowlist: GitUrlAllowlist;
+   /** On-disk bare mirror cache limits (┬º10.10). */
+   repoCache: RepoCacheConfig;
++  /** Max bytes for attempt log spool (stdout+stderr). Breach ΓåÆ log_spool_limit. */
++  logSpoolMaxBytes: number;
++  /** Max in-memory pending log_chunk send queue depth. */
++  logSendQueueMax: number;
+ }
+ 
++/** Default max spool size: 512 MiB. */
++export const DEFAULT_LOG_SPOOL_MAX_BYTES = 536_870_912;
++
++/** Default bounded send queue depth. */
++export const DEFAULT_LOG_SEND_QUEUE_MAX = 64;
++
+ /** Default Git schemes when RBO_GIT_ALLOWLIST_SCHEMES is unset. */
+ export const DEFAULT_GIT_ALLOWLIST_SCHEMES = ['https', 'ssh'] as const;
+ 
+ /** Default Git hosts when RBO_GIT_ALLOWLIST_HOSTS is unset. */
+ export const DEFAULT_GIT_ALLOWLIST_HOSTS = ['github.com'] as const;
+ 
+ function parseCsv(raw: string | undefined): string[] {
+   if (!raw?.trim()) {
+@@ -132,16 +142,22 @@ export function loadAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
+     controllerUrl,
+     controllerFingerprint,
+     displayName: overrides.displayName ?? process.env.RBO_AGENT_NAME ?? 'rbo-agent',
+     maxJobs: overrides.maxJobs ?? Number(process.env.RBO_MAX_JOBS ?? 1),
+     stateDir: overrides.stateDir ?? process.env.RBO_AGENT_STATE_DIR ?? resolveDefaultStateDir(),
+     secretMap: overrides.secretMap ?? parseSecretMap(process.env.RBO_SECRET_MAP),
+     gitAllowlist: parseGitAllowlist(overrides.gitAllowlist),
+     repoCache: parseRepoCache(overrides.repoCache),
++    logSpoolMaxBytes:
++      overrides.logSpoolMaxBytes ??
++      Number(process.env.RBO_LOG_SPOOL_MAX_BYTES ?? DEFAULT_LOG_SPOOL_MAX_BYTES),
++    logSendQueueMax:
++      overrides.logSendQueueMax ??
++      Number(process.env.RBO_LOG_SEND_QUEUE_MAX ?? DEFAULT_LOG_SEND_QUEUE_MAX),
+   };
+ }
+ 
+ /** Resolved path for bare repository mirrors (┬º10.1). */
+ export function resolveReposDir(config: AgentConfig): string {
+   return join(config.stateDir, 'repos');
+ }
+ 
+diff --git a/packages/executor/src/index.ts b/packages/executor/src/index.ts
+index 1aaea00..1a212d2 100644
+--- a/packages/executor/src/index.ts
++++ b/packages/executor/src/index.ts
+@@ -1,5 +1,6 @@
+ export * from './logs.js';
++export * from './spool.js';
+ export * from './script.js';
+ export * from './artifacts.js';
+ export * from './windows-frames.js';
+ export * from './completion.js';

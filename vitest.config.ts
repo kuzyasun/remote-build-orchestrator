@@ -11,6 +11,7 @@ export default defineConfig({
     // Snapshot capture and MCP e2e tests routinely exceed the 5s default under load.
     testTimeout: 30_000,
     hookTimeout: 60_000,
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.claude/**'],
   },
   resolve: {
     alias: {

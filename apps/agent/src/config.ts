@@ -16,7 +16,31 @@ export interface AgentConfig {
   gitAllowlist: GitUrlAllowlist;
   /** On-disk bare mirror cache limits (§10.10). */
   repoCache: RepoCacheConfig;
+  /** Max bytes for attempt log spool (stdout+stderr). Breach → log_spool_limit. */
+  logSpoolMaxBytes: number;
+  /** Max in-memory pending log_chunk send queue depth. */
+  logSendQueueMax: number;
+  /** Disconnect grace before orphaning (Phase 6). Default 60. */
+  disconnectGraceSeconds: number;
+  /** Orphan timeout before local cleanup eligibility (Phase 6). Default 300. */
+  orphanTimeoutSeconds: number;
+  /** Controller restart wait mirror (Agent may use for local deadlines). Default 120. */
+  reconcileDeadlineSeconds: number;
+  /**
+   * Minimum free disk bytes before admission control refuses new leases (§31.4).
+   * Defaults from RBO_DISK_MIN_FREE_BYTES or repo-cache min_free_disk_gb.
+   */
+  diskMinFreeBytes: number;
 }
+
+/** Default disk admission floor: 1 GiB when RBO_DISK_MIN_FREE_BYTES unset. */
+export const DEFAULT_DISK_MIN_FREE_BYTES = 1_073_741_824;
+
+/** Default max spool size: 512 MiB. */
+export const DEFAULT_LOG_SPOOL_MAX_BYTES = 536_870_912;
+
+/** Default bounded send queue depth. */
+export const DEFAULT_LOG_SEND_QUEUE_MAX = 64;
 
 /** Default Git schemes when RBO_GIT_ALLOWLIST_SCHEMES is unset. */
 export const DEFAULT_GIT_ALLOWLIST_SCHEMES = ['https', 'ssh'] as const;
@@ -137,6 +161,32 @@ export function loadAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
     secretMap: overrides.secretMap ?? parseSecretMap(process.env.RBO_SECRET_MAP),
     gitAllowlist: parseGitAllowlist(overrides.gitAllowlist),
     repoCache: parseRepoCache(overrides.repoCache),
+    logSpoolMaxBytes:
+      overrides.logSpoolMaxBytes ??
+      Number(process.env.RBO_LOG_SPOOL_MAX_BYTES ?? DEFAULT_LOG_SPOOL_MAX_BYTES),
+    logSendQueueMax:
+      overrides.logSendQueueMax ??
+      Number(process.env.RBO_LOG_SEND_QUEUE_MAX ?? DEFAULT_LOG_SEND_QUEUE_MAX),
+    disconnectGraceSeconds:
+      overrides.disconnectGraceSeconds ?? Number(process.env.RBO_DISCONNECT_GRACE_SECONDS ?? 60),
+    orphanTimeoutSeconds:
+      overrides.orphanTimeoutSeconds ?? Number(process.env.RBO_ORPHAN_TIMEOUT_SECONDS ?? 300),
+    reconcileDeadlineSeconds:
+      overrides.reconcileDeadlineSeconds ??
+      Number(process.env.RBO_RECONCILE_DEADLINE_SECONDS ?? 120),
+    diskMinFreeBytes: (() => {
+      if (overrides.diskMinFreeBytes !== undefined) {
+        return overrides.diskMinFreeBytes;
+      }
+      if (process.env.RBO_DISK_MIN_FREE_BYTES) {
+        return Number(process.env.RBO_DISK_MIN_FREE_BYTES);
+      }
+      const repoCache = parseRepoCache(overrides.repoCache);
+      return Math.max(
+        DEFAULT_DISK_MIN_FREE_BYTES,
+        Math.floor(repoCache.min_free_disk_gb * 1024 ** 3),
+      );
+    })(),
   };
 }
 

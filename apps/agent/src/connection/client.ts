@@ -7,7 +7,9 @@ import {
   BundleDownloadPayloadSchema,
   CancelJobPayloadSchema,
   LeaseOfferPayloadSchema,
+  LogAckPayloadSchema,
   PrepareSourcePayloadSchema,
+  ReconcileDecisionPayloadSchema,
   RunJobPayloadSchema,
 } from '@rbo/protocol';
 import {
@@ -20,6 +22,8 @@ import {
 import type { GitUrlAllowlist } from '@rbo/shared';
 import WebSocket from 'ws';
 import { AgentJobExecutor } from '../executor/index.js';
+import { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
+import { applyDiskPressureCleanup } from '../recovery/disk-pressure.js';
 import { DEFAULT_REPO_CACHE_CONFIG, type RepoCacheConfig } from '../repos/mirror.js';
 
 const logger = createLogger('agent.connection');
@@ -36,6 +40,12 @@ export interface AgentConnectionOptions {
   secretMap?: Record<string, string>;
   gitAllowlist: GitUrlAllowlist;
   repoCache?: RepoCacheConfig;
+  logSpoolMaxBytes?: number;
+  logSendQueueMax?: number;
+  /** Disk admission floor (Phase 6). */
+  diskMinFreeBytes?: number;
+  /** Cached free-disk probe used for heartbeat/capabilities/admission. */
+  getFreeDiskBytes?: () => number;
 }
 
 export interface ConnectResult {
@@ -59,10 +69,25 @@ export class AgentConnection {
   private readonly options: AgentConnectionOptions;
   private socket: WebSocket | null = null;
   private executor: AgentJobExecutor | null = null;
+  private recovery: AgentRecoveryCoordinator;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: AgentConnectionOptions) {
     this.options = options;
+    this.recovery = new AgentRecoveryCoordinator({
+      stateDir: options.stateDir,
+      hooks: {
+        terminateAttempt: async (attemptId) => {
+          await this.executor?.terminateAttemptForRecovery(attemptId);
+        },
+        resendJobExit: (meta) => {
+          this.executor?.resendJobExitIfCompleted(meta);
+        },
+        resumeArtifactUpload: async (meta) => {
+          await this.executor?.resumeArtifactUpload(meta);
+        },
+      },
+    });
   }
 
   private statePath(): string {
@@ -193,13 +218,28 @@ export class AgentConnection {
               agent_id: agentId,
             });
 
-            this.executor = new AgentJobExecutor(socket, {
-              stateDir: this.options.stateDir,
-              controllerFingerprint: this.options.expectedFingerprint,
-              secretMap: this.options.secretMap,
-              toolchainProfiles: this.options.capabilities.toolchain_profiles,
-              gitAllowlist: this.options.gitAllowlist,
-              repoCache: this.options.repoCache ?? DEFAULT_REPO_CACHE_CONFIG,
+            this.recovery.attachSocket(socket);
+            if (this.executor) {
+              // Reconnect with live attempt: re-bind socket and reconcile.
+              this.executor.attachSocket(socket);
+            } else {
+              this.executor = new AgentJobExecutor(socket, {
+                stateDir: this.options.stateDir,
+                controllerFingerprint: this.options.expectedFingerprint,
+                secretMap: this.options.secretMap,
+                toolchainProfiles: this.options.capabilities.toolchain_profiles,
+                gitAllowlist: this.options.gitAllowlist,
+                repoCache: this.options.repoCache ?? DEFAULT_REPO_CACHE_CONFIG,
+                logSpoolMaxBytes: this.options.logSpoolMaxBytes,
+                logSendQueueMax: this.options.logSendQueueMax,
+                recovery: this.recovery,
+                diskMinFreeBytes: this.options.diskMinFreeBytes,
+                getFreeDiskBytes: this.options.getFreeDiskBytes,
+                getSpoolPressure: () => this.executor?.isUnderSpoolPressure() ?? false,
+              });
+            }
+            void this.recovery.reportAll().catch((error) => {
+              logger.warn('recovery_report scan failed', { error: String(error) });
             });
             this.startHeartbeats(socket);
             finish({ status: 'authenticated', agentId });
@@ -272,14 +312,35 @@ export class AgentConnection {
               }
               break;
             }
+            case 'log_ack': {
+              const parsed = LogAckPayloadSchema.safeParse(message.payload);
+              if (parsed.success) {
+                void this.executor.handleLogAck(parsed.data);
+              } else {
+                logger.warn('invalid log_ack payload', { issues: parsed.error.issues });
+              }
+              break;
+            }
+            case 'reconcile_decision': {
+              const parsed = ReconcileDecisionPayloadSchema.safeParse(message.payload);
+              if (parsed.success) {
+                void this.recovery.handleReconcileDecision(parsed.data);
+              } else {
+                logger.warn('invalid reconcile_decision payload', {
+                  issues: parsed.error.issues,
+                });
+              }
+              break;
+            }
           }
         }
       });
 
       socket.on('close', () => {
         this.stopHeartbeats();
+        // Park attempt through grace — do not kill safe/normal jobs.
         void this.executor?.abandonOnDisconnect();
-        this.executor = null;
+        // Keep executor alive across reconnect so the process and spool sender remain.
       });
 
       socket.on('error', (error) => {
@@ -314,9 +375,35 @@ export class AgentConnection {
 
   private sendHeartbeat(socket: WebSocket): void {
     const busy = this.executor?.isBusy() ?? false;
+    this.executor?.renewLeaseDeadline();
+    const freeBytes = this.options.getFreeDiskBytes?.() ?? 0;
+    const minFree = this.options.diskMinFreeBytes ?? 0;
+    const spoolPressure = this.executor?.isUnderSpoolPressure() ?? false;
+    const diskPressure = minFree > 0 && freeBytes < minFree;
+    const underPressure = diskPressure || spoolPressure;
+    const accepting = underPressure ? false : (this.options.capabilities.accepting_jobs ?? true);
+
+    if (underPressure) {
+      const retentionDays = this.options.repoCache?.retention_days ?? 14;
+      void applyDiskPressureCleanup({
+        stateDir: this.options.stateDir,
+        minFreeBytes: minFree > 0 ? minFree : 1,
+        freeBytes,
+        spoolPressure,
+        retentionMs: retentionDays * 24 * 60 * 60 * 1000,
+      }).catch((error) => {
+        logger.warn('disk-pressure cleanup failed', { error: String(error) });
+      });
+    }
+
     this.send(socket, 'heartbeat', {
       state: busy ? 'busy' : 'idle',
       active_jobs: [],
+      accepting_jobs: accepting,
+      disk_free_bytes: freeBytes,
+      disk_min_free_bytes: minFree,
+      disk_pressure: diskPressure,
+      spool_pressure: spoolPressure,
     });
   }
 
@@ -342,15 +429,25 @@ export class AgentConnection {
     );
   }
 
-  close(): void {
+  /**
+   * Close the WS session.
+   * @param opts.killProcess when true (agent shutdown), kill any running job.
+   *   Default false parks the attempt for reconnect grace.
+   */
+  close(opts?: { killProcess?: boolean }): void {
     this.stopHeartbeats();
+    const kill = opts?.killProcess === true;
     const executor = this.executor;
-    this.executor = null;
-    void executor?.abandonOnDisconnect();
+    if (kill) {
+      this.executor = null;
+      void executor?.forceAbandon();
+    } else {
+      void executor?.abandonOnDisconnect();
+    }
     if (this.socket) {
       this.socket.close();
       this.socket = null;
     }
-    logger.debug('connection closed');
+    logger.debug('connection closed', { killProcess: kill });
   }
 }

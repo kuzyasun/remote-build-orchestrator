@@ -290,11 +290,12 @@ describe('Wire Protocol (Section 20)', () => {
       'artifact_manifest',
       'cleanup_complete',
       'agent_error',
+      'recovery_report',
     ];
     for (const t of agentTypes) {
       expect(() => AgentMessageTypeSchema.parse(t)).not.toThrow();
     }
-    expect(AgentMessageTypeSchema.options).toHaveLength(14);
+    expect(AgentMessageTypeSchema.options).toHaveLength(15);
   });
 
   it('should validate Controller→Agent message types (§20.4)', () => {
@@ -312,11 +313,13 @@ describe('Wire Protocol (Section 20)', () => {
       'resume',
       'refresh_capabilities',
       'shutdown',
+      'log_ack',
+      'reconcile_decision',
     ];
     for (const t of controllerTypes) {
       expect(() => ControllerMessageTypeSchema.parse(t)).not.toThrow();
     }
-    expect(ControllerMessageTypeSchema.options).toHaveLength(13);
+    expect(ControllerMessageTypeSchema.options).toHaveLength(15);
   });
 
   it('should validate Section 20.2 WireMessageEnvelope', () => {

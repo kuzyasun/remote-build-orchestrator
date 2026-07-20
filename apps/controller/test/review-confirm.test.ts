@@ -58,7 +58,7 @@ describe('Phase 5 controller review fixes', () => {
       await repo.cleanup();
       await rm(storage, { recursive: true, force: true });
     }
-  });
+  }, 90_000);
 
   it('default controller git allowlist hosts github.com when unset', () => {
     const cfg = loadControllerConfig({

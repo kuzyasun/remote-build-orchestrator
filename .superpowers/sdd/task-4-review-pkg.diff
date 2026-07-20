@@ -1,0 +1,2528 @@
+﻿# Task 4 review package (Phase 6)
+
+M  apps/agent/src/capabilities/probe.ts
+M  apps/agent/src/config.ts
+M  apps/agent/src/connection/client.ts
+M  apps/agent/src/executor/index.ts
+A  apps/agent/src/recovery/coordinator.ts
+A  apps/agent/src/recovery/disk-pressure.ts
+A  apps/agent/test/artifact-resume.test.ts
+A  apps/agent/test/lease-self-term.test.ts
+A  apps/controller/test/disk-pressure.test.ts
+
+## DIFF vs HEAD (tracked mods)
+
+diff --git a/apps/agent/src/capabilities/probe.ts b/apps/agent/src/capabilities/probe.ts
+index 95e8bdb..f175f55 100644
+--- a/apps/agent/src/capabilities/probe.ts
++++ b/apps/agent/src/capabilities/probe.ts
+@@ -1,8 +1,8 @@
+ import { execFile } from 'node:child_process';
+-import { readFile, readdir } from 'node:fs/promises';
++import { readFile, readdir, statfs } from 'node:fs/promises';
+ import { arch, cpus, freemem, hostname, platform, release, totalmem } from 'node:os';
+ import { join } from 'node:path';
+ import { promisify } from 'node:util';
+ import type { AgentCapabilityReport } from '@rbo/protocol';
+ 
+ const execFileAsync = promisify(execFile);
+@@ -17,12 +17,21 @@ function osFamily(): 'macos' | 'windows' | 'linux' {
+   const p = platform();
+   if (p === 'darwin') return 'macos';
+   if (p === 'win32') return 'windows';
+   return 'linux';
+ }
+ 
++async function probeFreeDiskBytes(path: string): Promise<number> {
++  try {
++    const s = await statfs(path);
++    return Number(s.bavail) * Number(s.bsize);
++  } catch {
++    return 0;
++  }
++}
++
+ async function detectShells(): Promise<string[]> {
+   const candidates: Array<[string, string[]]> =
+     process.platform === 'win32'
+       ? [
+           ['powershell', ['-NoProfile', '-Command', 'exit']],
+           ['cmd', ['/c', 'exit']],
+@@ -57,12 +66,14 @@ async function detectGitVersion(): Promise<string[]> {
+ export interface ProbeInput {
+   agentId: string;
+   displayName: string;
+   maxJobs: number;
+   /** When set, advertise repository_cache from mirror metadata (┬º19.2). */
+   stateDir?: string;
++  /** Phase 6 disk admission floor. */
++  diskMinFreeBytes?: number;
+ }
+ 
+ async function loadRepositoryCache(
+   stateDir: string,
+ ): Promise<NonNullable<AgentCapabilityReport['repository_cache']>> {
+   const reposDir = join(stateDir, 'repos');
+@@ -90,12 +101,15 @@ async function loadRepositoryCache(
+ }
+ 
+ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabilityReport> {
+   const shells = await detectShells();
+   const gitVersions = await detectGitVersion();
+   const repository_cache = input.stateDir ? await loadRepositoryCache(input.stateDir) : [];
++  const diskFreeBytes = input.stateDir ? await probeFreeDiskBytes(input.stateDir) : 0;
++  const diskMinFreeBytes = input.diskMinFreeBytes ?? 0;
++  const diskPressure = diskMinFreeBytes > 0 && diskFreeBytes < diskMinFreeBytes;
+ 
+   return {
+     agent_id: input.agentId,
+     display_name: input.displayName,
+     hostname: hostname(),
+     os: {
+@@ -104,21 +118,25 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
+       arch: arch(),
+     },
+     resources: {
+       cpu_logical: cpus().length,
+       memory_total_mb: Math.round(totalmem() / (1024 * 1024)),
+       memory_free_mb: Math.round(freemem() / (1024 * 1024)),
+-      disk_free_mb: 0, // TODO(Phase 3): real disk-free probe per platform
++      disk_free_mb: Math.round(diskFreeBytes / (1024 * 1024)),
++      disk_free_bytes: diskFreeBytes,
++      ...(diskMinFreeBytes > 0 ? { disk_min_free_bytes: diskMinFreeBytes } : {}),
++      disk_pressure: diskPressure,
+     },
+     execution: {
+       max_jobs: input.maxJobs,
+       shells,
+       supports_tty: process.platform !== 'win32',
+       supports_process_tree_kill: process.platform === 'win32', // via native helper, wired in Phase 3
+     },
+     tools: gitVersions.length > 0 ? { git: gitVersions } : {},
+     toolchain_profiles: [],
+     labels: {},
+     secret_refs: [],
++    accepting_jobs: !diskPressure,
+     ...(repository_cache.length > 0 ? { repository_cache } : {}),
+   };
+ }
+diff --git a/apps/agent/src/config.ts b/apps/agent/src/config.ts
+index 38cda4b..aae6819 100644
+--- a/apps/agent/src/config.ts
++++ b/apps/agent/src/config.ts
+@@ -13,14 +13,38 @@ export interface AgentConfig {
+   /** Maps store ref name ΓåÆ environment variable that holds the secret value. */
+   secretMap?: Record<string, string>;
+   /** Git remote allowlist enforced before clone/fetch/bundle import (┬º10.4). */
+   gitAllowlist: GitUrlAllowlist;
+   /** On-disk bare mirror cache limits (┬º10.10). */
+   repoCache: RepoCacheConfig;
++  /** Max bytes for attempt log spool (stdout+stderr). Breach ΓåÆ log_spool_limit. */
++  logSpoolMaxBytes: number;
++  /** Max in-memory pending log_chunk send queue depth. */
++  logSendQueueMax: number;
++  /** Disconnect grace before orphaning (Phase 6). Default 60. */
++  disconnectGraceSeconds: number;
++  /** Orphan timeout before local cleanup eligibility (Phase 6). Default 300. */
++  orphanTimeoutSeconds: number;
++  /** Controller restart wait mirror (Agent may use for local deadlines). Default 120. */
++  reconcileDeadlineSeconds: number;
++  /**
++   * Minimum free disk bytes before admission control refuses new leases (┬º31.4).
++   * Defaults from RBO_DISK_MIN_FREE_BYTES or repo-cache min_free_disk_gb.
++   */
++  diskMinFreeBytes: number;
+ }
+ 
++/** Default disk admission floor: 1 GiB when RBO_DISK_MIN_FREE_BYTES unset. */
++export const DEFAULT_DISK_MIN_FREE_BYTES = 1_073_741_824;
++
++/** Default max spool size: 512 MiB. */
++export const DEFAULT_LOG_SPOOL_MAX_BYTES = 536_870_912;
++
++/** Default bounded send queue depth. */
++export const DEFAULT_LOG_SEND_QUEUE_MAX = 64;
++
+ /** Default Git schemes when RBO_GIT_ALLOWLIST_SCHEMES is unset. */
+ export const DEFAULT_GIT_ALLOWLIST_SCHEMES = ['https', 'ssh'] as const;
+ 
+ /** Default Git hosts when RBO_GIT_ALLOWLIST_HOSTS is unset. */
+ export const DEFAULT_GIT_ALLOWLIST_HOSTS = ['github.com'] as const;
+ 
+@@ -134,12 +158,38 @@ export function loadAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
+     displayName: overrides.displayName ?? process.env.RBO_AGENT_NAME ?? 'rbo-agent',
+     maxJobs: overrides.maxJobs ?? Number(process.env.RBO_MAX_JOBS ?? 1),
+     stateDir: overrides.stateDir ?? process.env.RBO_AGENT_STATE_DIR ?? resolveDefaultStateDir(),
+     secretMap: overrides.secretMap ?? parseSecretMap(process.env.RBO_SECRET_MAP),
+     gitAllowlist: parseGitAllowlist(overrides.gitAllowlist),
+     repoCache: parseRepoCache(overrides.repoCache),
++    logSpoolMaxBytes:
++      overrides.logSpoolMaxBytes ??
++      Number(process.env.RBO_LOG_SPOOL_MAX_BYTES ?? DEFAULT_LOG_SPOOL_MAX_BYTES),
++    logSendQueueMax:
++      overrides.logSendQueueMax ??
++      Number(process.env.RBO_LOG_SEND_QUEUE_MAX ?? DEFAULT_LOG_SEND_QUEUE_MAX),
++    disconnectGraceSeconds:
++      overrides.disconnectGraceSeconds ?? Number(process.env.RBO_DISCONNECT_GRACE_SECONDS ?? 60),
++    orphanTimeoutSeconds:
++      overrides.orphanTimeoutSeconds ?? Number(process.env.RBO_ORPHAN_TIMEOUT_SECONDS ?? 300),
++    reconcileDeadlineSeconds:
++      overrides.reconcileDeadlineSeconds ??
++      Number(process.env.RBO_RECONCILE_DEADLINE_SECONDS ?? 120),
++    diskMinFreeBytes: (() => {
++      if (overrides.diskMinFreeBytes !== undefined) {
++        return overrides.diskMinFreeBytes;
++      }
++      if (process.env.RBO_DISK_MIN_FREE_BYTES) {
++        return Number(process.env.RBO_DISK_MIN_FREE_BYTES);
++      }
++      const repoCache = parseRepoCache(overrides.repoCache);
++      return Math.max(
++        DEFAULT_DISK_MIN_FREE_BYTES,
++        Math.floor(repoCache.min_free_disk_gb * 1024 ** 3),
++      );
++    })(),
+   };
+ }
+ 
+ /** Resolved path for bare repository mirrors (┬º10.1). */
+ export function resolveReposDir(config: AgentConfig): string {
+   return join(config.stateDir, 'repos');
+diff --git a/apps/agent/src/connection/client.ts b/apps/agent/src/connection/client.ts
+index 994d78c..9221227 100644
+--- a/apps/agent/src/connection/client.ts
++++ b/apps/agent/src/connection/client.ts
+@@ -4,25 +4,28 @@ import { join } from 'node:path';
+ import type { AgentCapabilityReport } from '@rbo/protocol';
+ import {
+   ArtifactUploadGrantPayloadSchema,
+   BundleDownloadPayloadSchema,
+   CancelJobPayloadSchema,
+   LeaseOfferPayloadSchema,
++  LogAckPayloadSchema,
+   PrepareSourcePayloadSchema,
++  ReconcileDecisionPayloadSchema,
+   RunJobPayloadSchema,
+ } from '@rbo/protocol';
+ import {
+   certificateFingerprint,
+   createLogger,
+   generateDeviceKeyPair,
+   generateId,
+   signNonce,
+ } from '@rbo/shared';
+ import type { GitUrlAllowlist } from '@rbo/shared';
+ import WebSocket from 'ws';
+ import { AgentJobExecutor } from '../executor/index.js';
++import { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
+ import { DEFAULT_REPO_CACHE_CONFIG, type RepoCacheConfig } from '../repos/mirror.js';
+ 
+ const logger = createLogger('agent.connection');
+ 
+ const HEARTBEAT_INTERVAL_MS = 20_000;
+ 
+@@ -33,12 +36,18 @@ export interface AgentConnectionOptions {
+   displayName: string;
+   capabilities: AgentCapabilityReport;
+   /** Maps store ref ΓåÆ env var name holding the secret (optional). */
+   secretMap?: Record<string, string>;
+   gitAllowlist: GitUrlAllowlist;
+   repoCache?: RepoCacheConfig;
++  logSpoolMaxBytes?: number;
++  logSendQueueMax?: number;
++  /** Disk admission floor (Phase 6). */
++  diskMinFreeBytes?: number;
++  /** Cached free-disk probe used for heartbeat/capabilities/admission. */
++  getFreeDiskBytes?: () => number;
+ }
+ 
+ export interface ConnectResult {
+   status:
+     | 'pairing_pending'
+     | 'pairing_approved'
+@@ -56,16 +65,31 @@ interface StoredState {
+ }
+ 
+ export class AgentConnection {
+   private readonly options: AgentConnectionOptions;
+   private socket: WebSocket | null = null;
+   private executor: AgentJobExecutor | null = null;
++  private recovery: AgentRecoveryCoordinator;
+   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+ 
+   constructor(options: AgentConnectionOptions) {
+     this.options = options;
++    this.recovery = new AgentRecoveryCoordinator({
++      stateDir: options.stateDir,
++      hooks: {
++        terminateAttempt: async (attemptId) => {
++          await this.executor?.terminateAttemptForRecovery(attemptId);
++        },
++        resendJobExit: (meta) => {
++          this.executor?.resendJobExitIfCompleted(meta);
++        },
++        resumeArtifactUpload: async (meta) => {
++          await this.executor?.resumeArtifactUpload(meta);
++        },
++      },
++    });
+   }
+ 
+   private statePath(): string {
+     return join(this.options.stateDir, 'agent-state.json');
+   }
+ 
+@@ -190,19 +214,33 @@ export class AgentConnection {
+             this.saveState({ ...state, agentId });
+             this.send(socket, 'capabilities', {
+               ...this.options.capabilities,
+               agent_id: agentId,
+             });
+ 
+-            this.executor = new AgentJobExecutor(socket, {
+-              stateDir: this.options.stateDir,
+-              controllerFingerprint: this.options.expectedFingerprint,
+-              secretMap: this.options.secretMap,
+-              toolchainProfiles: this.options.capabilities.toolchain_profiles,
+-              gitAllowlist: this.options.gitAllowlist,
+-              repoCache: this.options.repoCache ?? DEFAULT_REPO_CACHE_CONFIG,
++            this.recovery.attachSocket(socket);
++            if (this.executor) {
++              // Reconnect with live attempt: re-bind socket and reconcile.
++              this.executor.attachSocket(socket);
++            } else {
++              this.executor = new AgentJobExecutor(socket, {
++                stateDir: this.options.stateDir,
++                controllerFingerprint: this.options.expectedFingerprint,
++                secretMap: this.options.secretMap,
++                toolchainProfiles: this.options.capabilities.toolchain_profiles,
++                gitAllowlist: this.options.gitAllowlist,
++                repoCache: this.options.repoCache ?? DEFAULT_REPO_CACHE_CONFIG,
++                logSpoolMaxBytes: this.options.logSpoolMaxBytes,
++                logSendQueueMax: this.options.logSendQueueMax,
++                recovery: this.recovery,
++                diskMinFreeBytes: this.options.diskMinFreeBytes,
++                getFreeDiskBytes: this.options.getFreeDiskBytes,
++              });
++            }
++            void this.recovery.reportAll().catch((error) => {
++              logger.warn('recovery_report scan failed', { error: String(error) });
+             });
+             this.startHeartbeats(socket);
+             finish({ status: 'authenticated', agentId });
+             return;
+           }
+ 
+@@ -269,20 +307,41 @@ export class AgentConnection {
+                 void this.executor.handleCancelJob(parsed.data);
+               } else {
+                 logger.warn('invalid cancel_job payload', { issues: parsed.error.issues });
+               }
+               break;
+             }
++            case 'log_ack': {
++              const parsed = LogAckPayloadSchema.safeParse(message.payload);
++              if (parsed.success) {
++                void this.executor.handleLogAck(parsed.data);
++              } else {
++                logger.warn('invalid log_ack payload', { issues: parsed.error.issues });
++              }
++              break;
++            }
++            case 'reconcile_decision': {
++              const parsed = ReconcileDecisionPayloadSchema.safeParse(message.payload);
++              if (parsed.success) {
++                void this.recovery.handleReconcileDecision(parsed.data);
++              } else {
++                logger.warn('invalid reconcile_decision payload', {
++                  issues: parsed.error.issues,
++                });
++              }
++              break;
++            }
+           }
+         }
+       });
+ 
+       socket.on('close', () => {
+         this.stopHeartbeats();
++        // Park attempt through grace ΓÇö do not kill safe/normal jobs.
+         void this.executor?.abandonOnDisconnect();
+-        this.executor = null;
++        // Keep executor alive across reconnect so the process and spool sender remain.
+       });
+ 
+       socket.on('error', (error) => {
+         fail(error instanceof Error ? error : new Error(String(error)));
+       });
+     });
+@@ -311,15 +370,26 @@ export class AgentConnection {
+     }, HEARTBEAT_INTERVAL_MS);
+     this.heartbeatTimer.unref?.();
+   }
+ 
+   private sendHeartbeat(socket: WebSocket): void {
+     const busy = this.executor?.isBusy() ?? false;
++    this.executor?.renewLeaseDeadline();
++    const freeBytes = this.options.getFreeDiskBytes?.() ?? 0;
++    const minFree = this.options.diskMinFreeBytes ?? 0;
++    const accepting =
++      minFree <= 0 || freeBytes >= minFree
++        ? (this.options.capabilities.accepting_jobs ?? true)
++        : false;
+     this.send(socket, 'heartbeat', {
+       state: busy ? 'busy' : 'idle',
+       active_jobs: [],
++      accepting_jobs: accepting,
++      disk_free_bytes: freeBytes,
++      disk_min_free_bytes: minFree,
++      disk_pressure: !accepting,
+     });
+   }
+ 
+   private stopHeartbeats(): void {
+     if (this.heartbeatTimer) {
+       clearInterval(this.heartbeatTimer);
+@@ -339,18 +409,28 @@ export class AgentConnection {
+         lease_epoch: null,
+         payload,
+       }),
+     );
+   }
+ 
+-  close(): void {
++  /**
++   * Close the WS session.
++   * @param opts.killProcess when true (agent shutdown), kill any running job.
++   *   Default false parks the attempt for reconnect grace.
++   */
++  close(opts?: { killProcess?: boolean }): void {
+     this.stopHeartbeats();
++    const kill = opts?.killProcess === true;
+     const executor = this.executor;
+-    this.executor = null;
+-    void executor?.abandonOnDisconnect();
++    if (kill) {
++      this.executor = null;
++      void executor?.forceAbandon();
++    } else {
++      void executor?.abandonOnDisconnect();
++    }
+     if (this.socket) {
+       this.socket.close();
+       this.socket = null;
+     }
+-    logger.debug('connection closed');
++    logger.debug('connection closed', { killProcess: kill });
+   }
+ }
+diff --git a/apps/agent/src/executor/index.ts b/apps/agent/src/executor/index.ts
+index 0fdc253..9d10910 100644
+--- a/apps/agent/src/executor/index.ts
++++ b/apps/agent/src/executor/index.ts
+@@ -1,57 +1,91 @@
+ import { createHash } from 'node:crypto';
+ import { createReadStream, createWriteStream, existsSync } from 'node:fs';
+-import { mkdir, rename, rm, stat } from 'node:fs/promises';
++import { copyFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
+ import type { IncomingMessage } from 'node:http';
+ import { request as httpsRequest } from 'node:https';
+ import { join } from 'node:path';
+ import {
+-  appendLogChunk,
++  type AttemptSpool,
++  appendChunk,
+   collectArtifactFiles,
+-  ensureAttemptLogs,
++  openAttemptSpool,
++  readAck,
+   runCleanupScript,
+   spawnJobScript,
++  totalBytes,
+   waitForCompletion,
++  writeAck,
+   writeJobScript,
+ } from '@rbo/executor';
+ import type {
+   ArtifactManifestPayload,
+   ArtifactUploadGrantPayload,
+   BundleDownloadPayload,
+   CancelJobPayload,
+   CleanupCompletePayload,
+   JobExitPayload,
+   LeaseOfferPayload,
++  LogAckPayload,
+   PrepareSourceGitOverlayPayload,
+   PrepareSourcePayload,
+   RunJobPayload,
+   SourceNeedReason,
+ } from '@rbo/protocol';
+ import { certificateFingerprint, createLogger, generateId, resolveContainedCwd } from '@rbo/shared';
+ import type { GitUrlAllowlist } from '@rbo/shared';
+ import { applyGitOverlay, materializeFullSnapshot } from '@rbo/snapshot';
+ import type { WebSocket } from 'ws';
++import { DEFAULT_LOG_SEND_QUEUE_MAX, DEFAULT_LOG_SPOOL_MAX_BYTES } from '../config.js';
++import { SpoolSender } from '../logs/spool-sender.js';
++import {
++  type AttemptArtifactManifestItem,
++  type AttemptMetadata,
++  processIdentityFromPid,
++  readAttemptMetadata,
++  writeAttemptMetadata,
++} from '../recovery/attempt-metadata.js';
++import type { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
++import { isAcceptingJobsUnderDiskPressure } from '../recovery/disk-pressure.js';
+ import { type RepoCacheConfig, RepoMirrorManager } from '../repos/mirror.js';
+ import { StreamRedactor } from './redactor.js';
+ 
+ const logger = createLogger('agent.executor');
+ const ARTIFACT_TOKEN_TIMEOUT_MS = 60_000;
+ const BUNDLE_TOKEN_TIMEOUT_MS = 120_000;
+ 
+ type ToolchainProfile = NonNullable<LeaseOfferPayload['selected_toolchain_profiles']>[number];
++type RiskLevel = AttemptMetadata['risk_level'];
++
++/** True when job risk requires Agent self-termination at lease expiry. */
++export function isDestructiveOrHardwareRisk(risk: RiskLevel | undefined | null): boolean {
++  return risk === 'destructive' || risk === 'hardware';
++}
+ 
+ export interface AgentExecutorConfig {
+   stateDir: string;
+   /** Controller TLS certificate fingerprint (sha256:...), same pin as the WS session. */
+   controllerFingerprint: string;
+   /** Maps store ref name ΓåÆ environment variable that holds the secret value. */
+   secretMap?: Record<string, string>;
+   /** Current capability toolchain profiles for fingerprint recheck before spawn. */
+   toolchainProfiles?: ToolchainProfile[];
+   gitAllowlist: GitUrlAllowlist;
+   repoCache: RepoCacheConfig;
++  /** Max attempt spool bytes (stdout+stderr); default 512 MiB. */
++  logSpoolMaxBytes?: number;
++  /** Max in-memory log send queue; default 64. */
++  logSendQueueMax?: number;
++  /** Optional recovery coordinator for metadata + adopt replay. */
++  recovery?: AgentRecoveryCoordinator;
++  /** Minimum free disk bytes for admission; when set with freeBytes probe, reject leases. */
++  diskMinFreeBytes?: number;
++  /** Injectable free-disk bytes (tests / probe). */
++  getFreeDiskBytes?: () => number | Promise<number>;
++  /** Injectable spool-pressure flag. */
++  getSpoolPressure?: () => boolean;
+ }
+ 
+ function assertPinnedPeerCert(
+   res: IncomingMessage,
+   expectedFingerprint: string,
+ ): Error | undefined {
+@@ -93,12 +127,28 @@ export class AgentJobExecutor {
+   private pendingBundleDownload: {
+     attemptId: string;
+     resolve: (grant: BundleDownloadPayload) => void;
+     reject: (error: Error) => void;
+     timer: ReturnType<typeof setTimeout>;
+   } | null = null;
++  private activeSpool: AttemptSpool | null = null;
++  private activeSpoolSender: SpoolSender | null = null;
++  private activeSpoolLease: {
++    attemptId: string;
++    leaseId: string;
++    leaseEpoch: number;
++  } | null = null;
++  /** Serializes disk spool writes across concurrent stdout/stderr handlers. */
++  private spoolWriteChain: Promise<void> = Promise.resolve();
++  private spoolLimitBreached = false;
++  /** Local lease deadline (ms since epoch) from offer / heartbeat renewals. */
++  private leaseDeadlineMs: number | null = null;
++  private leaseTtlSeconds = 300;
++  private leaseRisk: RiskLevel = 'normal';
++  private leaseTimer: ReturnType<typeof setTimeout> | null = null;
++  private leaseExpired = false;
+ 
+   constructor(
+     private socket: WebSocket,
+     private config: AgentExecutorConfig,
+   ) {
+     this.mirrorManager = new RepoMirrorManager({
+@@ -143,21 +193,33 @@ export class AgentJobExecutor {
+       this.currentOffer.lease_id === leaseId &&
+       this.currentOffer.lease_epoch === leaseEpoch
+     );
+   }
+ 
+   private clearAttempt(): void {
++    if (this.activeAttemptId && this.config.recovery) {
++      this.config.recovery.clearLiveSender(this.activeAttemptId);
++    }
++    this.clearLeaseTimer();
++    this.leaseDeadlineMs = null;
++    this.leaseExpired = false;
++    this.leaseRisk = 'normal';
+     this.activeAttemptId = null;
+     this.currentOffer = null;
+     this.currentPrepare = null;
+     this.prepareReady = false;
+     this.runInProgress = false;
+     this.materializedProjectPath = null;
+     this.overlayRepoUrl = null;
+     this.activeProcessKill = undefined;
+     this.cancelSignal = { cancelled: false };
++    this.activeSpool = null;
++    this.activeSpoolSender = null;
++    this.activeSpoolLease = null;
++    this.spoolWriteChain = Promise.resolve();
++    this.spoolLimitBreached = false;
+     if (this.pendingArtifactUpload) {
+       clearTimeout(this.pendingArtifactUpload.timer);
+       const pending = this.pendingArtifactUpload;
+       this.pendingArtifactUpload = null;
+       pending.reject(new Error('attempt cleared'));
+     }
+@@ -166,38 +228,316 @@ export class AgentJobExecutor {
+       const pending = this.pendingBundleDownload;
+       this.pendingBundleDownload = null;
+       pending.reject(new Error('attempt cleared'));
+     }
+   }
+ 
++  private clearLeaseTimer(): void {
++    if (this.leaseTimer) {
++      clearTimeout(this.leaseTimer);
++      this.leaseTimer = null;
++    }
++  }
++
++  private scheduleLeaseTimer(): void {
++    this.clearLeaseTimer();
++    if (this.leaseDeadlineMs === null) {
++      return;
++    }
++    const delay = Math.max(0, this.leaseDeadlineMs - Date.now());
++    this.leaseTimer = setTimeout(() => {
++      void this.onLeaseExpired();
++    }, delay);
++    this.leaseTimer.unref?.();
++  }
++
++  /**
++   * Arm / re-arm local lease deadline from offer TTL.
++   * Heartbeat renewals call {@link renewLeaseDeadline} while connected.
++   */
++  private armLeaseDeadline(offer: LeaseOfferPayload): void {
++    this.leaseTtlSeconds = offer.lease_ttl_seconds;
++    this.leaseRisk = offer.job_request.risk_level ?? 'normal';
++    this.leaseDeadlineMs = Date.now() + offer.lease_ttl_seconds * 1000;
++    this.leaseExpired = false;
++    this.scheduleLeaseTimer();
++  }
++
++  /** Mirror Controller renewActiveLease while heartbeats succeed. */
++  public renewLeaseDeadline(ttlSeconds?: number): void {
++    if (this.leaseDeadlineMs === null || this.leaseExpired) {
++      return;
++    }
++    const ttl = ttlSeconds ?? this.leaseTtlSeconds;
++    this.leaseDeadlineMs = Date.now() + ttl * 1000;
++    this.scheduleLeaseTimer();
++    const attemptId = this.activeAttemptId;
++    if (attemptId) {
++      const existing = readAttemptMetadata(this.config.stateDir, attemptId);
++      if (existing) {
++        writeAttemptMetadata(this.config.stateDir, {
++          ...existing,
++          lease_deadline: new Date(this.leaseDeadlineMs).toISOString(),
++          updated_at: new Date().toISOString(),
++        });
++      }
++    }
++  }
++
++  private async onLeaseExpired(): Promise<void> {
++    if (this.leaseExpired || this.leaseDeadlineMs === null) {
++      return;
++    }
++    if (Date.now() < this.leaseDeadlineMs) {
++      this.scheduleLeaseTimer();
++      return;
++    }
++    if (!isDestructiveOrHardwareRisk(this.leaseRisk)) {
++      // safe/normal: Controller owns lease expiry / orphan / lost.
++      return;
++    }
++    this.leaseExpired = true;
++    const offer = this.currentOffer;
++    const attemptId = this.activeAttemptId;
++    logger.warn('lease expired ΓÇö self-terminating destructive/hardware attempt', {
++      attemptId,
++      risk: this.leaseRisk,
++    });
++    this.cancelSignal.cancelled = true;
++    if (this.activeProcessKill) {
++      try {
++        await this.activeProcessKill(10);
++      } catch (error) {
++        logger.warn('failed to kill process on lease expiry', { error: String(error) });
++      }
++    }
++    if (attemptId && offer) {
++      const existing = readAttemptMetadata(this.config.stateDir, attemptId);
++      writeAttemptMetadata(this.config.stateDir, {
++        attempt_id: attemptId,
++        job_id: offer.job_id,
++        lease_id: offer.lease_id,
++        lease_epoch: offer.lease_epoch,
++        process_identity: existing?.process_identity ?? null,
++        status: 'terminal',
++        workspace_path:
++          existing?.workspace_path ?? join(this.config.stateDir, 'workspaces', attemptId),
++        spool_dir: existing?.spool_dir ?? join(this.config.stateDir, 'logs', attemptId),
++        risk_level: this.leaseRisk,
++        updated_at: new Date().toISOString(),
++        lease_deadline: new Date(this.leaseDeadlineMs).toISOString(),
++        last_exit: {
++          exit_code: null,
++          outcome: 'failed',
++          failure_category: 'lease_expired',
++          failure_message: 'Lease expired ΓÇö Agent self-terminated destructive/hardware job',
++        },
++        ...(existing?.artifact_manifest ? { artifact_manifest: existing.artifact_manifest } : {}),
++      });
++    }
++    // Terminal frames are emitted from handleRunJob after waitForCompletion observes the kill.
++  }
++
+   private async cleanupOverlayWorktree(): Promise<void> {
+     if (this.overlayRepoUrl && this.materializedProjectPath) {
+       await this.mirrorManager
+         .removeWorktree(this.overlayRepoUrl, this.materializedProjectPath)
+         .catch(() => undefined);
+     }
+     this.overlayRepoUrl = null;
+   }
+ 
+   /**
+-   * On WS disconnect / close: kill any running process and free the one-slot
+-   * registry so a reconnect cannot accept a new lease while work still runs.
+-   * Frames are not sent ΓÇö the Controller already treats disconnect as terminal.
++   * Re-bind the WebSocket after reconnect so frames (including spool replay) use the new socket.
++   */
++  public attachSocket(socket: WebSocket): void {
++    this.socket = socket;
++  }
++
++  public getActiveAttemptId(): string | null {
++    return this.activeAttemptId;
++  }
++
++  /**
++   * On WS disconnect: keep safe/normal (and destructive until lease expiry) process alive.
++   * Persist orphaned metadata; do not kill or clear the attempt registry.
++   * Frames are not sent ΓÇö Controller enters grace/orphan reconciliation.
+    */
+   public async abandonOnDisconnect(): Promise<void> {
++    const attemptId = this.activeAttemptId;
++    if (attemptId && this.config.recovery) {
++      this.config.recovery.onDisconnectPark(attemptId);
++      this.config.recovery.detachSocket();
++    }
++    // Intentionally do NOT kill the process or clearAttempt ΓÇö Phase 6 grace/adopt.
++  }
++
++  /** Operator shutdown / terminate_stale: kill process and free the slot. */
++  public async forceAbandon(): Promise<void> {
+     this.cancelSignal.cancelled = true;
+     if (this.activeProcessKill) {
+       try {
+         await this.activeProcessKill(10);
+       } catch (error) {
+-        logger.warn('failed to kill process on disconnect', { error: String(error) });
++        logger.warn('failed to kill process on force abandon', { error: String(error) });
+       }
+     }
++    if (this.activeAttemptId && this.config.recovery) {
++      this.config.recovery.clearLiveSender(this.activeAttemptId);
++    }
+     this.clearAttempt();
+   }
+ 
++  /** Recovery terminate_stale hook. */
++  public async terminateAttemptForRecovery(attemptId: string): Promise<void> {
++    if (this.activeAttemptId !== attemptId) {
++      return;
++    }
++    await this.forceAbandon();
++  }
++
++  /**
++   * After adopt: if the process already exited, re-send job_exit so the Controller
++   * can leave orphaned / resume collecting_artifacts.
++   */
++  public resendJobExitIfCompleted(meta: AttemptMetadata): void {
++    const exit = meta.last_exit;
++    if (!exit) {
++      return;
++    }
++    const payload: JobExitPayload = {
++      attempt_id: meta.attempt_id,
++      lease_id: meta.lease_id,
++      lease_epoch: meta.lease_epoch,
++      exit_code: exit.exit_code,
++      outcome: exit.outcome,
++      ...(exit.failure_category ? { failure_category: exit.failure_category } : {}),
++      ...(exit.failure_message ? { failure_message: exit.failure_message } : {}),
++    };
++    this.sendFrame(
++      'job_exit',
++      meta.attempt_id,
++      meta.lease_id,
++      meta.lease_epoch,
++      payload as unknown as Record<string, unknown>,
++    );
++    logger.info('re-sent job_exit after adopt', { attemptId: meta.attempt_id });
++  }
++
++  /**
++   * Resume artifact upload from persisted hash-verified staging only.
++   * Never re-collects from a mutable workspace.
++   */
++  public async resumeArtifactUpload(meta: AttemptMetadata): Promise<void> {
++    const items = meta.artifact_manifest;
++    if (!items || items.length === 0) {
++      return;
++    }
++    const verified: AttemptArtifactManifestItem[] = [];
++    for (const item of items) {
++      try {
++        const buf = await readFile(item.path);
++        const hash = createHash('sha256').update(buf).digest('hex');
++        if (hash !== item.sha256 || buf.length !== item.size_bytes) {
++          logger.warn('skipping artifact resume ΓÇö staging hash mismatch', {
++            logical_name: item.logical_name,
++          });
++          continue;
++        }
++        verified.push(item);
++      } catch (error) {
++        logger.warn('skipping missing staging artifact on resume', {
++          logical_name: item.logical_name,
++          error: String(error),
++        });
++      }
++    }
++    if (verified.length === 0) {
++      return;
++    }
++
++    this.activeAttemptId = meta.attempt_id;
++    this.leaseRisk = meta.risk_level;
++    if (meta.lease_deadline) {
++      this.leaseDeadlineMs = Date.parse(meta.lease_deadline);
++    }
++
++    const uploadGrant = await this.requestArtifactUploadTokens(
++      meta.attempt_id,
++      meta.lease_id,
++      meta.lease_epoch,
++      verified.map((f) => ({
++        logical_name: f.logical_name,
++        path: f.path,
++        size_bytes: f.size_bytes,
++        sha256: f.sha256,
++      })),
++    );
++
++    for (const art of uploadGrant.artifacts) {
++      try {
++        await this.uploadArtifactFile(
++          art.upload_url,
++          art.upload_token,
++          art.path,
++          art.logical_name,
++          art.size_bytes,
++          art.sha256,
++        );
++      } catch (error) {
++        logger.error('failed artifact resume upload', {
++          artifact: art.logical_name,
++          error: String(error),
++        });
++      }
++    }
++  }
++
++  private persistCompletedAwaitingUpload(
++    offer: LeaseOfferPayload,
++    run: RunJobPayload,
++    exit: {
++      exit_code: number | null;
++      outcome: JobExitPayload['outcome'];
++      failure_category?: JobExitPayload['failure_category'];
++      failure_message?: string;
++    },
++    artifactManifest?: AttemptArtifactManifestItem[],
++  ): void {
++    const existing = readAttemptMetadata(this.config.stateDir, run.attempt_id);
++    writeAttemptMetadata(this.config.stateDir, {
++      attempt_id: run.attempt_id,
++      job_id: offer.job_id,
++      lease_id: run.lease_id,
++      lease_epoch: run.lease_epoch,
++      process_identity: existing?.process_identity ?? null,
++      status: 'completed_awaiting_upload',
++      workspace_path:
++        existing?.workspace_path ?? join(this.config.stateDir, 'workspaces', run.attempt_id),
++      spool_dir: existing?.spool_dir ?? join(this.config.stateDir, 'logs', run.attempt_id),
++      risk_level: offer.job_request.risk_level ?? existing?.risk_level ?? 'normal',
++      updated_at: new Date().toISOString(),
++      ...(this.leaseDeadlineMs
++        ? { lease_deadline: new Date(this.leaseDeadlineMs).toISOString() }
++        : existing?.lease_deadline
++          ? { lease_deadline: existing.lease_deadline }
++          : {}),
++      last_exit: {
++        exit_code: exit.exit_code,
++        outcome: exit.outcome,
++        ...(exit.failure_category ? { failure_category: exit.failure_category } : {}),
++        ...(exit.failure_message ? { failure_message: exit.failure_message } : {}),
++      },
++      ...(artifactManifest
++        ? { artifact_manifest: artifactManifest }
++        : existing?.artifact_manifest
++          ? { artifact_manifest: existing.artifact_manifest }
++          : {}),
++    });
++  }
++
+   private sendCancelledTerminal(
+     attemptId: string,
+     leaseId: string,
+     leaseEpoch: number,
+     message: string,
+   ): void {
+@@ -274,24 +614,69 @@ export class AgentJobExecutor {
+       leaseEpoch,
+       cleanupPayload as unknown as Record<string, unknown>,
+     );
+   }
+ 
+   public handleLeaseOffer(offer: LeaseOfferPayload): void {
++    if (this.config.recovery?.isRejected(offer.attempt_id)) {
++      return;
++    }
+     if (this.isBusy()) {
+       this.sendFrame('lease_reject', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
+         attempt_id: offer.attempt_id,
+         lease_id: offer.lease_id,
+         lease_epoch: offer.lease_epoch,
+         reason: 'Agent capacity limit reached (1 active job max)',
+       });
+       return;
+     }
+ 
++    const minFree = this.config.diskMinFreeBytes;
++    if (minFree !== undefined && this.config.getFreeDiskBytes) {
++      const free = this.config.getFreeDiskBytes();
++      const freeBytes = typeof free === 'number' ? free : undefined;
++      const spoolPressure = this.config.getSpoolPressure?.() ?? false;
++      if (
++        freeBytes !== undefined &&
++        !isAcceptingJobsUnderDiskPressure({
++          freeBytes,
++          minFreeBytes: minFree,
++          spoolPressure,
++        })
++      ) {
++        this.sendFrame('lease_reject', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
++          attempt_id: offer.attempt_id,
++          lease_id: offer.lease_id,
++          lease_epoch: offer.lease_epoch,
++          reason: spoolPressure
++            ? 'Agent refusing leases under log spool pressure'
++            : 'Agent refusing leases under disk pressure',
++        });
++        return;
++      }
++    }
++
+     this.activeAttemptId = offer.attempt_id;
+     this.currentOffer = offer;
++    this.armLeaseDeadline(offer);
++
++    const risk = offer.job_request.risk_level ?? 'normal';
++    const spoolDir = join(this.config.stateDir, 'logs', offer.attempt_id);
++    writeAttemptMetadata(this.config.stateDir, {
++      attempt_id: offer.attempt_id,
++      job_id: offer.job_id,
++      lease_id: offer.lease_id,
++      lease_epoch: offer.lease_epoch,
++      process_identity: null,
++      status: 'accepted',
++      workspace_path: join(this.config.stateDir, 'workspaces', offer.attempt_id),
++      spool_dir: spoolDir,
++      risk_level: risk,
++      updated_at: new Date().toISOString(),
++      lease_deadline: new Date(this.leaseDeadlineMs ?? Date.now()).toISOString(),
++    });
+ 
+     this.sendFrame('lease_accept', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
+       attempt_id: offer.attempt_id,
+       lease_id: offer.lease_id,
+       lease_epoch: offer.lease_epoch,
+     });
+@@ -658,18 +1043,51 @@ export class AgentJobExecutor {
+     const request = offer.job_request;
+     const attemptDir = join(this.config.stateDir, 'workspaces', run.attempt_id);
+     const isOverlay = this.currentPrepare?.source_mode === 'git_overlay';
+     const workspaceRoot = isOverlay ? attemptDir : join(attemptDir, 'workspace');
+     const controlDir = join(attemptDir, 'control');
+     const artifactsDir = join(attemptDir, 'artifacts');
+-    const logsDir = join(attemptDir, 'logs');
++    // Canonical spool: {stateDir}/logs/<attempt-id>/ (also RBO_LOG_DIR via AttemptLogPaths)
++    const logsDir = join(this.config.stateDir, 'logs', run.attempt_id);
+ 
+     await mkdir(controlDir, { recursive: true });
+     await mkdir(artifactsDir, { recursive: true });
+ 
+-    const logs = await ensureAttemptLogs(logsDir);
++    const spool = await openAttemptSpool(logsDir);
++    const logs = spool.logs;
++    const logSpoolMaxBytes = this.config.logSpoolMaxBytes ?? DEFAULT_LOG_SPOOL_MAX_BYTES;
++    const logSendQueueMax = this.config.logSendQueueMax ?? DEFAULT_LOG_SEND_QUEUE_MAX;
++    this.activeSpool = spool;
++    this.activeSpoolLease = {
++      attemptId: run.attempt_id,
++      leaseId: run.lease_id,
++      leaseEpoch: run.lease_epoch,
++    };
++    this.spoolLimitBreached = false;
++    this.spoolWriteChain = Promise.resolve();
++    const sender = new SpoolSender({
++      maxQueue: logSendQueueMax,
++      getSpool: () => this.activeSpool ?? spool,
++      send: (chunk) => {
++        if (this.socket.readyState !== this.socket.OPEN) {
++          return false;
++        }
++        this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
++          attempt_id: run.attempt_id,
++          lease_id: run.lease_id,
++          lease_epoch: run.lease_epoch,
++          stream: chunk.stream,
++          sequence: chunk.sequence,
++          bytes: chunk.bytes,
++        });
++        return true;
++      },
++    });
++    sender.setAcked(await readAck(spool));
++    this.activeSpoolSender = sender;
++    this.config.recovery?.registerLiveSender(run.attempt_id, sender);
+ 
+     // Toolchain recheck before spawn: path + environment_fingerprint vs current caps
+     const currentProfiles = this.config.toolchainProfiles ?? [];
+     for (const profile of offer.selected_toolchain_profiles ?? []) {
+       const activationPath = profile.activation.path;
+       if (activationPath && !existsSync(activationPath)) {
+@@ -746,13 +1164,12 @@ export class AgentJobExecutor {
+     try {
+       await writeJobScript(controlDir, request.execution);
+ 
+       const projectPath = this.materializedProjectPath ?? join(workspaceRoot, 'main_mount');
+       const projectCwd = await resolveContainedCwd(projectPath, request.source.cwd);
+ 
+-      let sequence = 0;
+       const child = spawnJobScript({
+         attemptId: run.attempt_id,
+         controlDir,
+         workspacePath: workspaceRoot,
+         projectPath: projectCwd,
+         execution: request.execution,
+@@ -771,77 +1188,100 @@ export class AgentJobExecutor {
+         attempt_id: run.attempt_id,
+         lease_id: run.lease_id,
+         lease_epoch: run.lease_epoch,
+         ...(child.pid && child.pid > 0 ? { pid: child.pid } : {}),
+       });
+ 
++      if (child.pid && child.pid > 0) {
++        const identity = processIdentityFromPid(child.pid);
++        const risk = request.risk_level ?? 'normal';
++        writeAttemptMetadata(this.config.stateDir, {
++          attempt_id: run.attempt_id,
++          job_id: offer.job_id,
++          lease_id: run.lease_id,
++          lease_epoch: run.lease_epoch,
++          process_identity: identity,
++          status: 'running',
++          workspace_path: workspaceRoot,
++          spool_dir: logsDir,
++          risk_level: risk,
++          updated_at: new Date().toISOString(),
++        });
++      }
++
+       this.activeProcessKill = (grace) => child.kill(grace ?? 10);
+       // Keep the same cancelSignal object through waitForCompletion so a cancel
+       // that fired during spawn is not wiped.
+ 
++      // If lease already expired before spawn finished, terminate now.
++      if (
++        this.leaseDeadlineMs !== null &&
++        Date.now() >= this.leaseDeadlineMs &&
++        isDestructiveOrHardwareRisk(this.leaseRisk)
++      ) {
++        void this.onLeaseExpired();
++      }
++
++      const appendAndEnqueue = (stream: 'stdout' | 'stderr', text: string): Promise<void> => {
++        const runAppend = async (): Promise<void> => {
++          if (this.spoolLimitBreached) {
++            return;
++          }
++          const { sequence: seq } = await appendChunk(spool, stream, text);
++          sender.enqueue({ sequence: seq, stream, bytes: text });
++          if ((await totalBytes(spool)) >= logSpoolMaxBytes) {
++            this.spoolLimitBreached = true;
++            logger.error('log spool limit breached', {
++              attemptId: run.attempt_id,
++              maxBytes: logSpoolMaxBytes,
++            });
++            void child.kill(request.execution.cancel_grace_seconds);
++          }
++        };
++        this.spoolWriteChain = this.spoolWriteChain.then(runAppend, runAppend);
++        return this.spoolWriteChain;
++      };
++
+       child.stdout.on('data', (rawChunk: Buffer) => {
+         const redacted = stdoutRedactor.redact(rawChunk.toString('utf8'));
+         if (redacted) {
+-          sequence += 1;
+-          void appendLogChunk(logs, 'stdout', redacted);
+-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
+-            attempt_id: run.attempt_id,
+-            lease_id: run.lease_id,
+-            lease_epoch: run.lease_epoch,
+-            stream: 'stdout',
+-            sequence,
+-            bytes: redacted,
+-          });
++          void appendAndEnqueue('stdout', redacted);
+         }
+       });
+ 
+       child.stderr.on('data', (rawChunk: Buffer) => {
+         const redacted = stderrRedactor.redact(rawChunk.toString('utf8'));
+         if (redacted) {
+-          sequence += 1;
+-          void appendLogChunk(logs, 'stderr', redacted);
+-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
+-            attempt_id: run.attempt_id,
+-            lease_id: run.lease_id,
+-            lease_epoch: run.lease_epoch,
+-            stream: 'stderr',
+-            sequence,
+-            bytes: redacted,
+-          });
++          void appendAndEnqueue('stderr', redacted);
+         }
+       });
+ 
+       const result = await waitForCompletion({
+         child,
+         execution: request.execution,
+         logs,
+         signal: this.cancelSignal,
+       });
+ 
++      // Drain in-flight spool writes before flush / exit.
++      await this.spoolWriteChain.catch(() => undefined);
++
+       for (const [stream, redactor] of [
+         ['stdout', stdoutRedactor],
+         ['stderr', stderrRedactor],
+       ] as const) {
+         const flushed = redactor.flush();
+         if (flushed) {
+-          sequence += 1;
+-          void appendLogChunk(logs, stream, flushed);
+-          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
+-            attempt_id: run.attempt_id,
+-            lease_id: run.lease_id,
+-            lease_epoch: run.lease_epoch,
+-            stream,
+-            sequence,
+-            bytes: flushed,
+-          });
++          await appendAndEnqueue(stream, flushed);
+         }
+       }
+ 
+       let timedOut = false;
+       let logFailure = false;
+       let durationComplete = false;
++      const spoolLimit = this.spoolLimitBreached;
+ 
+       if (result.type === 'timeout') {
+         timedOut = true;
+         await child.kill(request.execution.cancel_grace_seconds);
+       } else if (result.type === 'duration_complete') {
+         durationComplete = true;
+@@ -853,52 +1293,135 @@ export class AgentJobExecutor {
+         await child.kill(request.execution.cancel_grace_seconds);
+       }
+ 
+       const exitCode = result.type === 'exit' ? result.exitCode : null;
+       const outcome = this.cancelSignal.cancelled
+         ? 'cancelled'
+-        : timedOut
+-          ? 'timed_out'
+-          : logFailure
+-            ? 'failed'
+-            : durationComplete || result.type === 'log_success'
+-              ? 'succeeded'
+-              : exitCode === 0
++        : spoolLimit
++          ? 'failed'
++          : timedOut
++            ? 'timed_out'
++            : logFailure
++              ? 'failed'
++              : durationComplete || result.type === 'log_success'
+                 ? 'succeeded'
+-                : 'failed';
++                : exitCode === 0
++                  ? 'succeeded'
++                  : 'failed';
++
++      const exitExtras = spoolLimit
++        ? {
++            failure_category: 'log_spool_limit' as const,
++            failure_message: `Log spool exceeded ${logSpoolMaxBytes} bytes`,
++          }
++        : this.leaseExpired
++          ? {
++              failure_category: 'lease_expired' as const,
++              failure_message: 'Lease expired ΓÇö Agent self-terminated destructive/hardware job',
++            }
++          : outcome === 'failed'
++            ? {
++                failure_category: 'process_exit' as const,
++                failure_message: logFailure
++                  ? 'Completion failure_pattern matched in logs'
++                  : `Script exited with code ${exitCode}`,
++              }
++            : outcome === 'timed_out'
++              ? {
++                  failure_category: 'timeout' as const,
++                  failure_message: 'Execution timed out',
++                }
++              : {};
++
++      const effectiveOutcome = this.leaseExpired
++        ? ('failed' as const)
++        : this.cancelSignal.cancelled
++          ? ('cancelled' as const)
++          : outcome;
++
++      if (this.leaseExpired) {
++        // Metadata already written in onLeaseExpired; emit terminals if still connected.
++        const exitPayload: JobExitPayload = {
++          attempt_id: run.attempt_id,
++          lease_id: run.lease_id,
++          lease_epoch: run.lease_epoch,
++          exit_code: null,
++          outcome: 'failed',
++          failure_category: 'lease_expired',
++          failure_message: 'Lease expired ΓÇö Agent self-terminated destructive/hardware job',
++        };
++        this.sendFrame(
++          'job_exit',
++          run.attempt_id,
++          run.lease_id,
++          run.lease_epoch,
++          exitPayload as unknown as Record<string, unknown>,
++        );
++        this.sendFrame('cleanup_complete', run.attempt_id, run.lease_id, run.lease_epoch, {
++          attempt_id: run.attempt_id,
++          lease_id: run.lease_id,
++          lease_epoch: run.lease_epoch,
++          exit_code: null,
++          timed_out: false,
++          message: 'Lease expired ΓÇö Agent self-terminated destructive/hardware job',
++        });
++        return;
++      }
++
++      // Persist before/alongside job_exit so reconnect can recover completion.
++      this.persistCompletedAwaitingUpload(offer, run, {
++        exit_code: exitCode,
++        outcome: effectiveOutcome,
++        ...exitExtras,
++      });
+ 
+       this.sendFrame('job_exit', run.attempt_id, run.lease_id, run.lease_epoch, {
+         attempt_id: run.attempt_id,
+         lease_id: run.lease_id,
+         lease_epoch: run.lease_epoch,
+         exit_code: exitCode,
+-        outcome,
+-        ...(outcome === 'failed'
+-          ? {
+-              failure_category: 'process_exit' as const,
+-              failure_message: logFailure
+-                ? 'Completion failure_pattern matched in logs'
+-                : `Script exited with code ${exitCode}`,
+-            }
+-          : outcome === 'timed_out'
+-            ? {
+-                failure_category: 'timeout' as const,
+-                failure_message: 'Execution timed out',
+-              }
+-            : {}),
++        outcome: effectiveOutcome,
++        ...exitExtras,
+       });
+ 
+       const collection = await collectArtifactFiles({
+         projectPath,
+         rules: request.artifacts ?? [],
+         tempDir: join(artifactsDir, '.collect-tmp'),
+       });
+ 
+-      const artifactItems = collection.files.map((f) => ({
++      // Stage under durable artifacts dir for resume (never re-glob workspace later).
++      const stagingRoot = join(this.config.stateDir, 'artifacts', run.attempt_id);
++      await mkdir(stagingRoot, { recursive: true });
++      const stagedManifest: AttemptArtifactManifestItem[] = [];
++      for (const f of collection.files) {
++        const stagedPath = join(stagingRoot, f.logical_name);
++        await mkdir(join(stagedPath, '..'), { recursive: true });
++        await copyFile(f.sourcePath, stagedPath);
++        stagedManifest.push({
++          logical_name: f.logical_name,
++          path: stagedPath,
++          size_bytes: f.size_bytes,
++          sha256: f.sha256,
++        });
++      }
++
++      this.persistCompletedAwaitingUpload(
++        offer,
++        run,
++        {
++          exit_code: exitCode,
++          outcome: effectiveOutcome,
++          ...exitExtras,
++        },
++        stagedManifest,
++      );
++
++      const artifactItems = stagedManifest.map((f) => ({
+         logical_name: f.logical_name,
+-        path: f.sourcePath,
++        path: f.path,
+         size_bytes: f.size_bytes,
+         sha256: f.sha256,
+       }));
+ 
+       const uploadGrant = await this.requestArtifactUploadTokens(
+         run.attempt_id,
+@@ -966,12 +1489,32 @@ export class AgentJobExecutor {
+       const { resolve } = this.pendingArtifactUpload;
+       this.pendingArtifactUpload = null;
+       resolve(grant);
+     }
+   }
+ 
++  /** Controller contiguous log_ack ΓÇö persist ack.json and advance the sender cursor. */
++  public async handleLogAck(ack: LogAckPayload): Promise<void> {
++    const lease = this.activeSpoolLease;
++    if (
++      !lease ||
++      lease.attemptId !== ack.attempt_id ||
++      lease.leaseId !== ack.lease_id ||
++      lease.leaseEpoch !== ack.lease_epoch
++    ) {
++      return;
++    }
++    const spool = this.activeSpool;
++    const sender = this.activeSpoolSender;
++    if (!spool || !sender) {
++      return;
++    }
++    await writeAck(spool, ack.sequence);
++    sender.onAck(ack.sequence);
++  }
++
+   public async handleCancelJob(cancel: CancelJobPayload): Promise<void> {
+     if (!this.matchesReservedLease(cancel.attempt_id, cancel.lease_id, cancel.lease_epoch)) {
+       return;
+     }
+     this.cancelSignal.cancelled = true;
+     if (this.activeProcessKill) {
+diff --git a/apps/agent/src/recovery/coordinator.ts b/apps/agent/src/recovery/coordinator.ts
+new file mode 100644
+index 0000000..9220825
+--- /dev/null
++++ b/apps/agent/src/recovery/coordinator.ts
+@@ -0,0 +1,295 @@
++import { openAttemptSpool, readAck } from '@rbo/executor';
++import type { ReconcileDecisionPayload, RecoveryReportPayload } from '@rbo/protocol';
++import { createLogger, generateId } from '@rbo/shared';
++import type { WebSocket } from 'ws';
++import { SpoolSender } from '../logs/spool-sender.js';
++import {
++  type AttemptMetadata,
++  listAttemptMetadata,
++  readAttemptMetadata,
++  removeAttemptMetadata,
++  writeAttemptMetadata,
++} from './attempt-metadata.js';
++
++const logger = createLogger('agent.recovery');
++
++export interface AgentRecoveryHooks {
++  /** Kill process tree for an attempt (if still held in-process). */
++  terminateAttempt: (attemptId: string) => Promise<void>;
++  /** Re-bind spool sender send fn after adopt (optional live attempt). */
++  onAdopted?: (decision: ReconcileDecisionPayload, meta: AttemptMetadata) => Promise<void>;
++  /** Re-send job_exit when local process already completed before reconnect. */
++  resendJobExit?: (meta: AttemptMetadata) => void;
++  /** Resume artifact_manifest + PUT from persisted staging (never re-collect). */
++  resumeArtifactUpload?: (meta: AttemptMetadata) => Promise<void>;
++}
++
++export interface AgentRecoveryCoordinatorOptions {
++  stateDir: string;
++  hooks: AgentRecoveryHooks;
++}
++
++/**
++ * Agent-side recovery: persist metadata, emit recovery_report on (re)connect,
++ * honor reconcile_decision (adopt ΓåÆ spool replay; terminate_stale ΓåÆ kill/clean).
++ */
++export class AgentRecoveryCoordinator {
++  private readonly stateDir: string;
++  private readonly hooks: AgentRecoveryHooks;
++  private socket: WebSocket | null = null;
++  /** Attempts told to terminate_stale ΓÇö reject further frames. */
++  private readonly rejectedAttempts = new Set<string>();
++  private readonly liveSenders = new Map<string, SpoolSender>();
++
++  constructor(options: AgentRecoveryCoordinatorOptions) {
++    this.stateDir = options.stateDir;
++    this.hooks = options.hooks;
++  }
++
++  attachSocket(socket: WebSocket): void {
++    this.socket = socket;
++  }
++
++  detachSocket(): void {
++    this.socket = null;
++  }
++
++  isRejected(attemptId: string): boolean {
++    return this.rejectedAttempts.has(attemptId);
++  }
++
++  registerLiveSender(attemptId: string, sender: SpoolSender): void {
++    this.liveSenders.set(attemptId, sender);
++  }
++
++  clearLiveSender(attemptId: string): void {
++    this.liveSenders.delete(attemptId);
++  }
++
++  persist(meta: AttemptMetadata): void {
++    writeAttemptMetadata(this.stateDir, meta);
++  }
++
++  getMetadata(attemptId: string): AttemptMetadata | null {
++    return readAttemptMetadata(this.stateDir, attemptId);
++  }
++
++  /**
++   * After authenticated session: scan disk metadata and emit recovery_report for
++   * each non-terminal attempt. Replay happens only after adopt.
++   */
++  async reportAll(): Promise<void> {
++    const all = await listAttemptMetadata(this.stateDir);
++    for (const meta of all) {
++      if (meta.status === 'terminal') {
++        continue;
++      }
++      await this.emitRecoveryReport(meta);
++    }
++  }
++
++  async emitRecoveryReport(meta: AttemptMetadata): Promise<void> {
++    if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
++      return;
++    }
++    if (!meta.process_identity) {
++      // Cannot fence without process identity ΓÇö report as orphaned with placeholder.
++      logger.warn('skipping recovery_report without process_identity', {
++        attemptId: meta.attempt_id,
++      });
++      return;
++    }
++
++    let lastAcked = 0;
++    let lastSent = 0;
++    try {
++      const spool = await openAttemptSpool(meta.spool_dir);
++      lastAcked = await readAck(spool);
++      lastSent = lastAcked;
++      // Approximate last_sent from ack; live sender may know more.
++      const live = this.liveSenders.get(meta.attempt_id);
++      if (live) {
++        lastAcked = Math.max(lastAcked, live.lastAckedSequence);
++      }
++    } catch {
++      // Spool may not exist yet
++    }
++
++    const status: RecoveryReportPayload['status'] =
++      meta.status === 'completed_awaiting_upload'
++        ? 'completed_awaiting_upload'
++        : meta.status === 'orphaned'
++          ? 'orphaned'
++          : 'running';
++
++    const payload: RecoveryReportPayload = {
++      attempt_id: meta.attempt_id,
++      lease_id: meta.lease_id,
++      lease_epoch: meta.lease_epoch,
++      status,
++      process_identity: meta.process_identity,
++      last_sent_sequence: lastSent,
++      last_acked_sequence: lastAcked,
++      artifact_upload_pending: meta.status === 'completed_awaiting_upload',
++    };
++
++    this.sendJobScoped('recovery_report', meta, payload as unknown as Record<string, unknown>);
++    logger.info('recovery_report sent', {
++      attemptId: meta.attempt_id,
++      status: payload.status,
++    });
++  }
++
++  async handleReconcileDecision(decision: ReconcileDecisionPayload): Promise<void> {
++    const meta = readAttemptMetadata(this.stateDir, decision.attempt_id);
++    if (decision.action === 'terminate_stale') {
++      this.rejectedAttempts.add(decision.attempt_id);
++      await this.hooks.terminateAttempt(decision.attempt_id);
++      if (meta) {
++        writeAttemptMetadata(this.stateDir, { ...meta, status: 'terminal' });
++      }
++      await removeAttemptMetadata(this.stateDir, decision.attempt_id).catch(() => undefined);
++      logger.info('terminate_stale applied', {
++        attemptId: decision.attempt_id,
++        reason: decision.reason,
++      });
++      return;
++    }
++
++    // adopt
++    if (!meta) {
++      logger.warn('adopt for unknown metadata', { attemptId: decision.attempt_id });
++      return;
++    }
++    const wasCompletedAwaitingUpload = meta.status === 'completed_awaiting_upload';
++    writeAttemptMetadata(this.stateDir, {
++      ...meta,
++      status: wasCompletedAwaitingUpload
++        ? 'completed_awaiting_upload'
++        : decision.resume_from_sequence !== undefined
++          ? 'running'
++          : meta.status,
++      updated_at: new Date().toISOString(),
++    });
++
++    const live = this.liveSenders.get(decision.attempt_id);
++    if (live) {
++      if (typeof decision.resume_from_sequence === 'number') {
++        live.setAcked(decision.resume_from_sequence);
++      }
++      await live.startReplay();
++    } else if (this.hooks.onAdopted) {
++      await this.hooks.onAdopted(decision, meta);
++    } else {
++      // Disk-only adopt: open spool and replay via a transient sender if socket is up.
++      await this.replayFromDisk(meta, decision.resume_from_sequence ?? 0);
++    }
++
++    if (wasCompletedAwaitingUpload) {
++      this.hooks.resendJobExit?.(meta);
++      // Fallback: emit job_exit from coordinator when no executor hook is wired.
++      if (!this.hooks.resendJobExit && meta.last_exit) {
++        this.sendJobScoped('job_exit', meta, {
++          attempt_id: meta.attempt_id,
++          lease_id: meta.lease_id,
++          lease_epoch: meta.lease_epoch,
++          exit_code: meta.last_exit.exit_code,
++          outcome: meta.last_exit.outcome,
++          ...(meta.last_exit.failure_category
++            ? { failure_category: meta.last_exit.failure_category }
++            : {}),
++          ...(meta.last_exit.failure_message
++            ? { failure_message: meta.last_exit.failure_message }
++            : {}),
++        });
++      }
++      if (this.hooks.resumeArtifactUpload) {
++        await this.hooks.resumeArtifactUpload(meta);
++      }
++    }
++
++    logger.info('attempt adopted; spool replay started', {
++      attemptId: decision.attempt_id,
++      resume_from_sequence: decision.resume_from_sequence,
++      completed_awaiting_upload: wasCompletedAwaitingUpload,
++    });
++  }
++
++  /**
++   * On WS disconnect: keep safe/normal (and destructive until lease expiry) alive.
++   * Mark metadata orphaned after caller decides; do not kill here.
++   */
++  onDisconnectPark(attemptId: string | null): void {
++    if (!attemptId) {
++      return;
++    }
++    const meta = readAttemptMetadata(this.stateDir, attemptId);
++    if (!meta || meta.status === 'terminal') {
++      return;
++    }
++    if (meta.risk_level === 'destructive' || meta.risk_level === 'hardware') {
++      // Lease-expiry self-termination is owned by AgentJobExecutor lease timer.
++      writeAttemptMetadata(this.stateDir, {
++        ...meta,
++        status: meta.status === 'completed_awaiting_upload' ? meta.status : 'orphaned',
++        updated_at: new Date().toISOString(),
++      });
++      return;
++    }
++    writeAttemptMetadata(this.stateDir, {
++      ...meta,
++      status: meta.status === 'completed_awaiting_upload' ? meta.status : 'orphaned',
++      updated_at: new Date().toISOString(),
++    });
++  }
++
++  private async replayFromDisk(meta: AttemptMetadata, resumeFrom: number): Promise<void> {
++    if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
++      return;
++    }
++    const spool = await openAttemptSpool(meta.spool_dir);
++    const sender = new SpoolSender({
++      maxQueue: 64,
++      getSpool: () => spool,
++      send: (chunk) => {
++        if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
++          return false;
++        }
++        this.sendJobScoped('log_chunk', meta, {
++          attempt_id: meta.attempt_id,
++          lease_id: meta.lease_id,
++          lease_epoch: meta.lease_epoch,
++          stream: chunk.stream,
++          sequence: chunk.sequence,
++          bytes: chunk.bytes,
++        });
++        return true;
++      },
++    });
++    sender.setAcked(resumeFrom);
++    this.liveSenders.set(meta.attempt_id, sender);
++    await sender.startReplay();
++  }
++
++  private sendJobScoped(
++    type: string,
++    meta: Pick<AttemptMetadata, 'attempt_id' | 'lease_id' | 'lease_epoch'>,
++    payload: Record<string, unknown>,
++  ): void {
++    if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
++      return;
++    }
++    this.socket.send(
++      JSON.stringify({
++        protocol: 1,
++        type,
++        message_id: generateId('msg'),
++        sent_at: new Date().toISOString(),
++        attempt_id: meta.attempt_id,
++        lease_id: meta.lease_id,
++        lease_epoch: meta.lease_epoch,
++        payload,
++      }),
++    );
++  }
++}
+
+### FILE apps/agent/src/recovery/disk-pressure.ts
+
+import { readdir, rm, stat } from 'node:fs/promises';
+import { join } from 'node:path';
+import { createLogger } from '@rbo/shared';
+import {
+  type AttemptMetadata,
+  type AttemptMetadataStatus,
+  listAttemptMetadata,
+} from './attempt-metadata.js';
+
+const logger = createLogger('agent.disk-pressure');
+
+export type DiskCleanupKind = 'artifacts' | 'workspaces' | 'spools' | 'repos';
+
+const ACTIVE_STATUSES: ReadonlySet<AttemptMetadataStatus> = new Set([
+  'accepted',
+  'running',
+  'completed_awaiting_upload',
+  'orphaned',
+]);
+
+export interface DiskPressureAdmissionInput {
+  freeBytes: number;
+  minFreeBytes: number;
+  spoolPressure: boolean;
+}
+
+/** True when the Agent should accept new leases (no disk/spool pressure). */
+export function isAcceptingJobsUnderDiskPressure(input: DiskPressureAdmissionInput): boolean {
+  if (input.spoolPressure) {
+    return false;
+  }
+  return input.freeBytes >= input.minFreeBytes;
+}
+
+export interface DiskPressureCleanupOptions {
+  stateDir: string;
+  minFreeBytes: number;
+  /** Injectable free-disk reading for tests. */
+  freeBytes: number;
+  /** Age threshold for "old" terminal attempt cleanup. */
+  retentionMs: number;
+  nowMs?: number;
+  /** Optional delete observer (tests assert order). */
+  onDelete?: (kind: DiskCleanupKind, path: string) => void;
+  /** Optional repo eviction hook; default scans inactive mirrors. */
+  evictInactiveRepos?: () => Promise<string[]>;
+}
+
+export interface DiskPressureCleanupResult {
+  acceptingJobs: boolean;
+  deletedKinds: DiskCleanupKind[];
+  deletedPaths: string[];
+}
+
+function isActiveMeta(meta: AttemptMetadata): boolean {
+  return ACTIVE_STATUSES.has(meta.status);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removePath(
+  kind: DiskCleanupKind,
+  path: string,
+  onDelete?: (kind: DiskCleanupKind, path: string) => void,
+): Promise<boolean> {
+  if (!(await pathExists(path))) {
+    return false;
+  }
+  await rm(path, { recursive: true, force: true });
+  onDelete?.(kind, path);
+  return true;
+}
+
+/**
+ * Disk-pressure cleanup order (Â§31.4 / Phase 6):
+ * refuse new leases â†’ expired artifacts â†’ old terminal workspaces â†’
+ * old terminal logs/spools â†’ inactive repo caches.
+ * Never removes active attempt spool/workspace/mirror.
+ */
+export async function applyDiskPressureCleanup(
+  options: DiskPressureCleanupOptions,
+): Promise<DiskPressureCleanupResult> {
+  const nowMs = options.nowMs ?? Date.now();
+  const acceptingJobs = isAcceptingJobsUnderDiskPressure({
+    freeBytes: options.freeBytes,
+    minFreeBytes: options.minFreeBytes,
+    spoolPressure: false,
+  });
+
+  const deletedKinds: DiskCleanupKind[] = [];
+  const deletedPaths: string[] = [];
+  const record = (kind: DiskCleanupKind, path: string) => {
+    if (!deletedKinds.includes(kind)) {
+      deletedKinds.push(kind);
+    }
+    deletedPaths.push(path);
+    options.onDelete?.(kind, path);
+  };
+
+  if (acceptingJobs) {
+    return { acceptingJobs: true, deletedKinds, deletedPaths };
+  }
+
+  const allMeta = await listAttemptMetadata(options.stateDir);
+  const activeIds = new Set(allMeta.filter(isActiveMeta).map((m) => m.attempt_id));
+  const terminalOld = allMeta.filter(
+    (m) =>
+      m.status === 'terminal' &&
+      nowMs - Date.parse(m.updated_at) >= options.retentionMs &&
+      !activeIds.has(m.attempt_id),
+  );
+
+  // 1. Expired / old terminal artifacts
+  for (const meta of terminalOld) {
+    const artDir = join(options.stateDir, 'artifacts', meta.attempt_id);
+    if (await removePath('artifacts', artDir, record)) {
+      logger.info('disk-pressure removed expired artifacts', { attemptId: meta.attempt_id });
+    }
+  }
+  // Also sweep artifact dirs without metadata that are not active
+  const artifactsRoot = join(options.stateDir, 'artifacts');
+  try {
+    const entries = await readdir(artifactsRoot);
+    for (const name of entries) {
+      if (activeIds.has(name)) {
+        continue;
+      }
+      const already = terminalOld.some((m) => m.attempt_id === name);
+      if (already) {
+        continue;
+      }
+      // Orphan artifact staging without active attempt â€” treat as expired
+      const artDir = join(artifactsRoot, name);
+      if (await removePath('artifacts', artDir, record)) {
+        logger.info('disk-pressure removed orphan artifacts', { attemptId: name });
+      }
+    }
+  } catch {
+    // no artifacts dir
+  }
+
+  // 2. Old terminal workspaces
+  for (const meta of terminalOld) {
+    const ws = meta.workspace_path ?? join(options.stateDir, 'workspaces', meta.attempt_id);
+    if (await removePath('workspaces', ws, record)) {
+      logger.info('disk-pressure removed old workspace', { attemptId: meta.attempt_id });
+    }
+  }
+
+  // 3. Old terminal spools/logs
+  for (const meta of terminalOld) {
+    const spool = meta.spool_dir || join(options.stateDir, 'logs', meta.attempt_id);
+    if (await removePath('spools', spool, record)) {
+      logger.info('disk-pressure removed old spool', { attemptId: meta.attempt_id });
+    }
+  }
+
+  // 4. Inactive repo caches
+  if (options.evictInactiveRepos) {
+    const evicted = await options.evictInactiveRepos();
+    for (const key of evicted) {
+      record('repos', join(options.stateDir, 'repos', key));
+    }
+  } else {
+    const reposDir = join(options.stateDir, 'repos');
+    try {
+      const entries = await readdir(reposDir);
+      for (const name of entries) {
+        const metaPath = join(reposDir, name, 'metadata.json');
+        try {
+          const { readFile } = await import('node:fs/promises');
+          const raw = await readFile(metaPath, 'utf8');
+          const meta = JSON.parse(raw) as {
+            active_worktree_count?: number;
+            last_used_at?: string;
+          };
+          if ((meta.active_worktree_count ?? 0) > 0) {
+            continue;
+          }
+          const lastUsed = meta.last_used_at ? Date.parse(meta.last_used_at) : 0;
+          if (nowMs - lastUsed < options.retentionMs) {
+            continue;
+          }
+          const repoPath = join(reposDir, name);
+          if (await removePath('repos', repoPath, record)) {
+            logger.info('disk-pressure evicted inactive repo', { repoKey: name });
+          }
+        } catch {
+          // skip broken
+        }
+      }
+    } catch {
+      // no repos dir
+    }
+  }
+
+  return { acceptingJobs: false, deletedKinds, deletedPaths };
+}
+
+### FILE apps/agent/test/lease-self-term.test.ts
+
+import { EventEmitter } from 'node:events';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { WebSocket } from 'ws';
+import { AgentJobExecutor } from '../src/executor/index.js';
+import { readAttemptMetadata } from '../src/recovery/attempt-metadata.js';
+
+let killCalls = 0;
+let waitResolve:
+  | ((value: { exitCode: number | null; signal: NodeJS.Signals | null }) => void)
+  | null = null;
+let spawnDone: (() => void) | null = null;
+
+vi.mock('@rbo/executor', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@rbo/executor')>();
+  return {
+    ...actual,
+    spawnJobScript: vi.fn(() => {
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: PassThrough;
+        stderr: PassThrough;
+        pid: number;
+        waitForExit: () => Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
+        kill: (grace?: number) => Promise<void>;
+      };
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.pid = 9001;
+      child.waitForExit = () =>
+        new Promise((resolve) => {
+          waitResolve = resolve;
+        });
+      child.kill = async () => {
+        killCalls += 1;
+        waitResolve?.({ exitCode: null, signal: 'SIGTERM' });
+        waitResolve = null;
+      };
+      spawnDone?.();
+      return child;
+    }),
+    waitForCompletion: vi.fn(
+      async ({ child }: { child: { waitForExit: () => Promise<unknown> } }) => {
+        const result = await child.waitForExit();
+        return {
+          type: 'exit' as const,
+          exitCode: (result as { exitCode: number | null }).exitCode,
+        };
+      },
+    ),
+    writeJobScript: vi.fn(async () => 'script'),
+    ensureAttemptLogs: vi.fn(async () => ({
+      logDir: '/dev/null',
+      stdoutPath: '/dev/null',
+      stderrPath: '/dev/null',
+      eventsPath: '/dev/null',
+    })),
+    openAttemptSpool: vi.fn(async () => ({
+      dir: '/dev/null',
+      logs: {
+        logDir: '/dev/null',
+        stdoutPath: '/dev/null',
+        stderrPath: '/dev/null',
+        eventsPath: '/dev/null',
+      },
+      chunksPath: '/dev/null',
+      ackPath: '/dev/null',
+      nextSequence: 1,
+      streamOffsets: { stdout: 0, stderr: 0 },
+    })),
+    appendChunk: vi.fn(async () => ({ sequence: 1 })),
+    appendLogChunk: vi.fn(async () => undefined),
+    readAck: vi.fn(async () => 0),
+    writeAck: vi.fn(async () => undefined),
+    totalBytes: vi.fn(async () => 0),
+    iterUnacked: vi.fn(async function* () {}),
+    collectArtifactFiles: vi.fn(async () => ({ files: [] })),
+    runCleanupScript: vi.fn(async () => ({ exitCode: 0, timedOut: false })),
+  };
+});
+
+function mockSocket(executorHolder: { current: AgentJobExecutor | null }): WebSocket & {
+  sent: Array<Record<string, unknown>>;
+} {
+  const sent: Array<Record<string, unknown>> = [];
+  return {
+    readyState: 1,
+    OPEN: 1,
+    sent,
+    send(raw: string) {
+      const frame = JSON.parse(raw) as Record<string, unknown>;
+      sent.push(frame);
+      if (frame.type === 'artifact_manifest' && executorHolder.current) {
+        const payload = frame.payload as {
+          attempt_id: string;
+          lease_id: string;
+          lease_epoch: number;
+        };
+        queueMicrotask(() => {
+          executorHolder.current?.handleArtifactUploadGrant({
+            attempt_id: payload.attempt_id,
+            lease_id: payload.lease_id,
+            lease_epoch: payload.lease_epoch,
+            artifacts: [],
+          });
+        });
+      }
+    },
+  } as unknown as WebSocket & { sent: Array<Record<string, unknown>> };
+}
+
+async function waitForSpawn(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    spawnDone = resolve;
+  });
+}
+
+describe('Lease-expiry self-termination (destructive/hardware)', () => {
+  let stateDir: string;
+
+  beforeEach(async () => {
+    stateDir = await mkdtemp(join(tmpdir(), 'rbo-lease-term-'));
+    killCalls = 0;
+    waitResolve = null;
+    spawnDone = null;
+  });
+
+  afterEach(async () => {
+    await rm(stateDir, { recursive: true, force: true });
+    vi.clearAllMocks();
+  });
+
+  it('kills destructive job at lease deadline without Controller cancel', async () => {
+    const holder: { current: AgentJobExecutor | null } = { current: null };
+    const socket = mockSocket(holder);
+    const executor = new AgentJobExecutor(socket, {
+      stateDir,
+      controllerFingerprint: 'sha256:test',
+      gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+      repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
+    });
+    holder.current = executor;
+
+    const projectPath = join(stateDir, 'project');
+    await mkdir(projectPath, { recursive: true });
+    await writeFile(join(projectPath, 'keep.txt'), 'x');
+
+    executor.handleLeaseOffer({
+      attempt_id: 'att_hw',
+      lease_id: 'lease_hw',
+      lease_epoch: 1,
+      job_id: 'job_hw',
+      job_request: {
+        client_request_id: 'req_hw',
+        risk_level: 'hardware',
+        source: { project_root: projectPath, cwd: '.' },
+        execution: {
+          shell: 'bash',
+          script: 'sleep 999',
+          cancel_grace_seconds: 1,
+        },
+      },
+      snapshot_metadata: {
+        snapshot_id: 'snp_1',
+        content_id: 'cid',
+        size_bytes: 1,
+        sha256: 'ab',
+      },
+      // Short TTL â€” real timer; spawn must win the race before expiry.
+      lease_ttl_seconds: 0.25,
+    });
+
+    const exe = executor as unknown as {
+      currentPrepare: unknown;
+      materializedProjectPath: string;
+    };
+    exe.currentPrepare = {
+      source_mode: 'full',
+      attempt_id: 'att_hw',
+      lease_id: 'lease_hw',
+      lease_epoch: 1,
+      download_url: 'https://example.invalid/snapshot',
+      data_token: 'tok',
+      expected_size_bytes: 1,
+      expected_sha256: 'ab',
+    };
+    exe.materializedProjectPath = projectPath;
+
+    const spawnPromise = waitForSpawn();
+    const runPromise = executor.handleRunJob({
+      attempt_id: 'att_hw',
+      lease_id: 'lease_hw',
+      lease_epoch: 1,
+    });
+
+    await spawnPromise;
+    // Re-arm after spawn so kill handler is registered before expiry.
+    executor.renewLeaseDeadline(0.2);
+    // Park as if disconnected â€” self-term must not need Controller.
+    await executor.abandonOnDisconnect();
+    await runPromise;
+
+    expect(killCalls).toBeGreaterThanOrEqual(1);
+    const meta = readAttemptMetadata(stateDir, 'att_hw');
+    expect(meta?.status).toBe('terminal');
+    expect(meta?.last_exit?.failure_category).toBe('lease_expired');
+  });
+
+  it('does not self-kill safe jobs at lease expiry', async () => {
+    const holder: { current: AgentJobExecutor | null } = { current: null };
+    const socket = mockSocket(holder);
+    const executor = new AgentJobExecutor(socket, {
+      stateDir,
+      controllerFingerprint: 'sha256:test',
+      gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+      repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
+    });
+    holder.current = executor;
+
+    const projectPath = join(stateDir, 'project');
+    await mkdir(projectPath, { recursive: true });
+    await writeFile(join(projectPath, 'keep.txt'), 'x');
+
+    executor.handleLeaseOffer({
+      attempt_id: 'att_safe',
+      lease_id: 'lease_safe',
+      lease_epoch: 1,
+      job_id: 'job_safe',
+      job_request: {
+        client_request_id: 'req_safe',
+        risk_level: 'safe',
+        source: { project_root: projectPath, cwd: '.' },
+        execution: {
+          shell: 'bash',
+          script: 'sleep 999',
+          cancel_grace_seconds: 1,
+        },
+      },
+      snapshot_metadata: {
+        snapshot_id: 'snp_1',
+        content_id: 'cid',
+        size_bytes: 1,
+        sha256: 'ab',
+      },
+      lease_ttl_seconds: 0.15,
+    });
+
+    const exe = executor as unknown as {
+      currentPrepare: unknown;
+      materializedProjectPath: string;
+    };
+    exe.currentPrepare = {
+      source_mode: 'full',
+      attempt_id: 'att_safe',
+      lease_id: 'lease_safe',
+      lease_epoch: 1,
+      download_url: 'https://example.invalid/snapshot',
+      data_token: 'tok',
+      expected_size_bytes: 1,
+      expected_sha256: 'ab',
+    };
+    exe.materializedProjectPath = projectPath;
+
+    const spawnPromise = waitForSpawn();
+    const runPromise = executor.handleRunJob({
+      attempt_id: 'att_safe',
+      lease_id: 'lease_safe',
+      lease_epoch: 1,
+    });
+
+    await spawnPromise;
+    await new Promise((r) => setTimeout(r, 300));
+    expect(killCalls).toBe(0);
+    const meta = readAttemptMetadata(stateDir, 'att_safe');
+    // Safe jobs stay non-terminal on lease tick (Controller owns expiry).
+    expect(meta?.status).not.toBe('terminal');
+    expect(meta?.last_exit?.failure_category).not.toBe('lease_expired');
+
+    waitResolve?.({ exitCode: 0, signal: null });
+    await runPromise;
+  });
+});
+
+### FILE apps/agent/test/artifact-resume.test.ts
+
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { WebSocket } from 'ws';
+import { AgentJobExecutor } from '../src/executor/index.js';
+import { type AttemptMetadata, writeAttemptMetadata } from '../src/recovery/attempt-metadata.js';
+import { AgentRecoveryCoordinator } from '../src/recovery/coordinator.js';
+
+const collectSpy = vi.fn(async () => ({ files: [] }));
+
+vi.mock('@rbo/executor', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@rbo/executor')>();
+  return {
+    ...actual,
+    collectArtifactFiles: (...args: unknown[]) => collectSpy(...args),
+    openAttemptSpool: vi.fn(async () => ({
+      dir: '/dev/null',
+      logs: {
+        logDir: '/dev/null',
+        stdoutPath: '/dev/null',
+        stderrPath: '/dev/null',
+        eventsPath: '/dev/null',
+      },
+      chunksPath: '/dev/null',
+      ackPath: '/dev/null',
+      nextSequence: 1,
+      streamOffsets: { stdout: 0, stderr: 0 },
+    })),
+    readAck: vi.fn(async () => 0),
+    writeAck: vi.fn(async () => undefined),
+    iterUnacked: vi.fn(async function* () {}),
+  };
+});
+
+function mockSocket(): WebSocket & { sent: Array<Record<string, unknown>> } {
+  const sent: Array<Record<string, unknown>> = [];
+  return {
+    readyState: 1,
+    OPEN: 1,
+    sent,
+    send(raw: string) {
+      sent.push(JSON.parse(raw) as Record<string, unknown>);
+    },
+  } as unknown as WebSocket & { sent: Array<Record<string, unknown>> };
+}
+
+describe('Artifact upload resume (completed_awaiting_upload)', () => {
+  let stateDir: string;
+
+  beforeEach(async () => {
+    stateDir = await mkdtemp(join(tmpdir(), 'rbo-artifact-resume-'));
+    collectSpy.mockClear();
+  });
+
+  afterEach(async () => {
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  it('on adopt re-sends artifact_manifest from persisted staging; never re-collects workspace', async () => {
+    const content = Buffer.from('artifact-bytes');
+    const sha256 = createHash('sha256').update(content).digest('hex');
+    const stagingPath = join(stateDir, 'artifacts', 'att_1', 'out.txt');
+    await mkdir(join(stagingPath, '..'), { recursive: true });
+    await writeFile(stagingPath, content);
+
+    const meta: AttemptMetadata = {
+      attempt_id: 'att_1',
+      job_id: 'job_1',
+      lease_id: 'lease_1',
+      lease_epoch: 1,
+      process_identity: 'pid:42',
+      status: 'completed_awaiting_upload',
+      workspace_path: join(stateDir, 'workspaces', 'att_1'),
+      spool_dir: join(stateDir, 'logs', 'att_1'),
+      risk_level: 'normal',
+      updated_at: new Date().toISOString(),
+      last_exit: { exit_code: 0, outcome: 'succeeded' },
+      artifact_manifest: [
+        {
+          logical_name: 'out.txt',
+          path: stagingPath,
+          size_bytes: content.length,
+          sha256,
+        },
+      ],
+    };
+    writeAttemptMetadata(stateDir, meta);
+
+    const socket = mockSocket();
+    const executor = new AgentJobExecutor(socket, {
+      stateDir,
+      controllerFingerprint: 'sha256:test',
+      gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+      repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
+    });
+
+    // Grant arrives after manifest â€” resolve upload without network
+    const uploadSpy = vi
+      .spyOn(
+        executor as unknown as {
+          uploadArtifactFile: (...a: unknown[]) => Promise<void>;
+        },
+        'uploadArtifactFile',
+      )
+      .mockResolvedValue(undefined);
+
+    const recovery = new AgentRecoveryCoordinator({
+      stateDir,
+      hooks: {
+        terminateAttempt: async () => undefined,
+        resendJobExit: (m) => executor.resendJobExitIfCompleted(m),
+        resumeArtifactUpload: (m) => executor.resumeArtifactUpload(m),
+      },
+    });
+    recovery.attachSocket(socket);
+    (executor as unknown as { config: { recovery: AgentRecoveryCoordinator } }).config.recovery =
+      recovery;
+
+    // Simulate grant handler wired like connection client
+    const origSend = socket.send.bind(socket);
+    socket.send = (raw: string) => {
+      origSend(raw);
+      const frame = JSON.parse(raw) as { type: string; payload: Record<string, unknown> };
+      if (frame.type === 'artifact_manifest') {
+        queueMicrotask(() => {
+          executor.handleArtifactUploadGrant({
+            attempt_id: 'att_1',
+            lease_id: 'lease_1',
+            lease_epoch: 1,
+            artifacts: [
+              {
+                logical_name: 'out.txt',
+                path: stagingPath,
+                size_bytes: content.length,
+                sha256,
+                upload_url: 'https://example.invalid/upload',
+                upload_token: 'tok',
+              },
+            ],
+          });
+        });
+      }
+    };
+
+    await recovery.handleReconcileDecision({
+      attempt_id: 'att_1',
+      lease_id: 'lease_1',
+      lease_epoch: 1,
+      action: 'adopt',
+      resume_from_sequence: 0,
+    });
+
+    // Allow microtasks for grant + upload
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(collectSpy).not.toHaveBeenCalled();
+    const manifestFrame = socket.sent.find((f) => f.type === 'artifact_manifest');
+    expect(manifestFrame?.payload).toMatchObject({
+      attempt_id: 'att_1',
+      artifacts: [{ logical_name: 'out.txt', sha256, size_bytes: content.length }],
+    });
+    expect(uploadSpy).toHaveBeenCalled();
+  });
+});
+
+### FILE apps/controller/test/disk-pressure.test.ts
+
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  applyDiskPressureCleanup,
+  isAcceptingJobsUnderDiskPressure,
+} from '../../agent/src/recovery/disk-pressure.js';
+import { filterMissingArtifacts } from '../src/http/data-plane.js';
+
+describe('Disk-pressure admission + cleanup order (Â§31.4)', () => {
+  let stateDir: string;
+
+  afterEach(async () => {
+    if (stateDir) {
+      await rm(stateDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  async function seedTree(): Promise<{
+    activeId: string;
+    expiredArtifact: string;
+    oldWorkspace: string;
+    oldSpool: string;
+    inactiveRepo: string;
+    activeRepo: string;
+  }> {
+    stateDir = await mkdtemp(join(tmpdir(), 'rbo-disk-pressure-'));
+    const activeId = 'att_active';
+    const terminalOld = 'att_old';
+    const expiredArtifact = join(stateDir, 'artifacts', terminalOld, 'out.bin');
+    const oldWorkspace = join(stateDir, 'workspaces', terminalOld, 'marker.txt');
+    const oldSpool = join(stateDir, 'logs', terminalOld, 'marker.txt');
+    const inactiveRepo = join(stateDir, 'repos', 'repo_inactive', 'marker.txt');
+    const activeRepo = join(stateDir, 'repos', 'repo_active', 'marker.txt');
+    const activeWorkspace = join(stateDir, 'workspaces', activeId, 'marker.txt');
+    const activeSpool = join(stateDir, 'logs', activeId, 'marker.txt');
+    const activeArtifact = join(stateDir, 'artifacts', activeId, 'live.bin');
+
+    for (const path of [
+      expiredArtifact,
+      oldWorkspace,
+      oldSpool,
+      inactiveRepo,
+      activeRepo,
+      activeWorkspace,
+      activeSpool,
+      activeArtifact,
+    ]) {
+      await mkdir(join(path, '..'), { recursive: true });
+      await writeFile(path, 'keep-or-delete');
+    }
+
+    await writeFile(
+      join(stateDir, 'repos', 'repo_inactive', 'metadata.json'),
+      JSON.stringify({
+        canonical_id: 'inactive',
+        last_used_at: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+        active_worktree_count: 0,
+      }),
+    );
+    await writeFile(
+      join(stateDir, 'repos', 'repo_active', 'metadata.json'),
+      JSON.stringify({
+        canonical_id: 'active',
+        last_used_at: new Date().toISOString(),
+        active_worktree_count: 1,
+      }),
+    );
+
+    await mkdir(join(stateDir, 'attempts', terminalOld), { recursive: true });
+    await writeFile(
+      join(stateDir, 'attempts', terminalOld, 'metadata.json'),
+      JSON.stringify({
+        attempt_id: terminalOld,
+        job_id: 'job_old',
+        lease_id: 'l',
+        lease_epoch: 1,
+        process_identity: 'pid:1',
+        status: 'terminal',
+        workspace_path: join(stateDir, 'workspaces', terminalOld),
+        spool_dir: join(stateDir, 'logs', terminalOld),
+        risk_level: 'normal',
+        updated_at: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+      }),
+    );
+    await mkdir(join(stateDir, 'attempts', activeId), { recursive: true });
+    await writeFile(
+      join(stateDir, 'attempts', activeId, 'metadata.json'),
+      JSON.stringify({
+        attempt_id: activeId,
+        job_id: 'job_live',
+        lease_id: 'l2',
+        lease_epoch: 1,
+        process_identity: 'pid:2',
+        status: 'running',
+        workspace_path: join(stateDir, 'workspaces', activeId),
+        spool_dir: join(stateDir, 'logs', activeId),
+        risk_level: 'normal',
+        updated_at: new Date().toISOString(),
+      }),
+    );
+
+    return { activeId, expiredArtifact, oldWorkspace, oldSpool, inactiveRepo, activeRepo };
+  }
+
+  it('refuses new leases when free disk is below threshold', () => {
+    expect(
+      isAcceptingJobsUnderDiskPressure({
+        freeBytes: 100,
+        minFreeBytes: 1_000,
+        spoolPressure: false,
+      }),
+    ).toBe(false);
+    expect(
+      isAcceptingJobsUnderDiskPressure({
+        freeBytes: 5_000,
+        minFreeBytes: 1_000,
+        spoolPressure: false,
+      }),
+    ).toBe(true);
+    expect(
+      isAcceptingJobsUnderDiskPressure({
+        freeBytes: 5_000,
+        minFreeBytes: 1_000,
+        spoolPressure: true,
+      }),
+    ).toBe(false);
+  });
+
+  it('cleans expired artifacts â†’ old workspaces â†’ old spools â†’ inactive repos; never active', async () => {
+    const seeded = await seedTree();
+    const deletedOrder: string[] = [];
+
+    const result = await applyDiskPressureCleanup({
+      stateDir,
+      minFreeBytes: 10_000,
+      freeBytes: 100,
+      retentionMs: 7 * 24 * 60 * 60 * 1000,
+      nowMs: Date.now(),
+      onDelete: (kind, path) => {
+        deletedOrder.push(`${kind}:${path}`);
+      },
+    });
+
+    expect(result.acceptingJobs).toBe(false);
+    expect(result.deletedKinds).toEqual(['artifacts', 'workspaces', 'spools', 'repos']);
+
+    const kinds = deletedOrder.map((e) => e.split(':')[0]);
+    const firstArt = kinds.indexOf('artifacts');
+    const firstWs = kinds.indexOf('workspaces');
+    const firstSpool = kinds.indexOf('spools');
+    const firstRepo = kinds.indexOf('repos');
+    expect(firstArt).toBeGreaterThanOrEqual(0);
+    expect(firstWs).toBeGreaterThan(firstArt);
+    expect(firstSpool).toBeGreaterThan(firstWs);
+    expect(firstRepo).toBeGreaterThan(firstSpool);
+
+    const { readFile } = await import('node:fs/promises');
+    await expect(readFile(seeded.expiredArtifact, 'utf8')).rejects.toThrow();
+    await expect(readFile(seeded.oldWorkspace, 'utf8')).rejects.toThrow();
+    await expect(readFile(seeded.oldSpool, 'utf8')).rejects.toThrow();
+    await expect(readFile(seeded.inactiveRepo, 'utf8')).rejects.toThrow();
+
+    await expect(
+      readFile(join(stateDir, 'workspaces', seeded.activeId, 'marker.txt'), 'utf8'),
+    ).resolves.toBe('keep-or-delete');
+    await expect(
+      readFile(join(stateDir, 'logs', seeded.activeId, 'marker.txt'), 'utf8'),
+    ).resolves.toBe('keep-or-delete');
+    await expect(
+      readFile(join(stateDir, 'artifacts', seeded.activeId, 'live.bin'), 'utf8'),
+    ).resolves.toBe('keep-or-delete');
+    await expect(readFile(seeded.activeRepo, 'utf8')).resolves.toBe('keep-or-delete');
+  });
+
+  it('artifact resume grants only missing hash-verified objects', async () => {
+    stateDir = await mkdtemp(join(tmpdir(), 'rbo-artifact-missing-'));
+    const attemptId = 'att_resume';
+    const present = Buffer.from('already-there');
+    const missing = Buffer.from('need-upload');
+    const presentHash = createHash('sha256').update(present).digest('hex');
+    const missingHash = createHash('sha256').update(missing).digest('hex');
+    // Controller stores under attempts/<id>/artifacts/
+    const artDir = join(stateDir, 'attempts', attemptId, 'artifacts');
+    await mkdir(artDir, { recursive: true });
+    await writeFile(join(artDir, 'present.bin'), present);
+
+    const filtered = await filterMissingArtifacts(stateDir, attemptId, [
+      { logical_name: 'present.bin', size_bytes: present.length, sha256: presentHash },
+      { logical_name: 'missing.bin', size_bytes: missing.length, sha256: missingHash },
+    ]);
+
+    expect(filtered.map((a) => a.logical_name)).toEqual(['missing.bin']);
+  });
+});

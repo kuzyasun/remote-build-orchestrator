@@ -1,69 +1,49 @@
-# Phase 5 Task 4 — git_overlay Integration Report
+# Task 4 Report — Lease self-term, artifact resume, disk-pressure (Phase 6)
 
-**Status:** Complete  
-**Date:** 2026-07-20  
-**Verification:** `pnpm format` + `pnpm verify` green (229 tests)
+**Status:** DONE (recovered after host reboot; implementation was on disk, report was missing)  
+**Date:** 2026-07-21  
+**Commits:** none
 
 ## Summary
 
-End-to-end `git_overlay` prepare with bundle fallback is wired across Agent and Controller. Full-mode remote execution (Phase 4) remains unchanged and passing.
+Agent self-terminates destructive/hardware jobs at local lease deadline without Controller contact; on adopt after `completed_awaiting_upload`, resumes artifact upload from persisted staging (hash-verified, no workspace re-collect); disk-pressure admission refuses new leases then cleans expired artifacts → old terminal workspaces → old terminal spools → inactive repo caches, never touching active attempts. Capabilities publish `disk_free_*` and `accepting_jobs`.
 
-## Agent
+## Deliverables
 
-| Area | Change |
-|------|--------|
-| `apps/agent/src/executor/index.ts` | `RepoMirrorManager` from config; `handlePrepareGitOverlay` (mirror → fetch → `source_need` → bundle wait → worktree → overlay download → `applyGitOverlay` → `source_ready`); `handleBundleDownload`; overlay worktree cleanup on cancel/run completion |
-| `apps/agent/src/connection/client.ts` | `bundle_download` WS handler; pass `gitAllowlist` / `repoCache` into executor |
-| `apps/agent/src/main.ts` | Pass git config into connection |
+| Item | Location |
+|------|----------|
+| Lease deadline timer + destructive/hardware self-term | `apps/agent/src/executor/index.ts` (`isDestructiveOrHardwareRisk`, `leaseDeadlineMs`, kill + `job_exit`/`lease_expired`) |
+| Artifact resume from staging | `resumeArtifactUpload()`; wired from `apps/agent/src/recovery/coordinator.ts` on adopt |
+| Disk-pressure cleanup order | `apps/agent/src/recovery/disk-pressure.ts` |
+| Config `RBO_DISK_MIN_FREE_BYTES` | `apps/agent/src/config.ts` (`diskMinFreeBytes`) |
+| Capabilities disk fields + `accepting_jobs` | `apps/agent/src/capabilities/probe.ts`, heartbeat in `connection/client.ts` |
 
-### Overlay prepare flow
+## Tests (post-reboot verification)
 
-1. `ensureMirror` + optional `fetchRefs`
-2. `hasCommit` — if missing: `source_need` (`base_commit_missing` or `repo_fetch_failed`)
-3. On `base_commit_missing`: wait for `bundle_download`, `importBundle`, re-check commit
-4. On `repo_fetch_failed`: return and wait for Controller full-mode `prepare_source` fallback
-5. `createWorktree` at `workspaces/<attempt>/project`
-6. Download overlay archive (size/hash verified)
-7. `applyGitOverlay` → `source_ready`
+```bash
+pnpm exec vitest run apps/controller/test/disk-pressure.test.ts apps/agent/test/lease-self-term.test.ts apps/agent/test/artifact-resume.test.ts
+```
 
-## Controller
-
-| Area | Change |
-|------|--------|
-| `apps/controller/src/security/data-tokens.ts` | Ops: `overlay_download`, `bundle_download` |
-| `apps/controller/src/http/data-plane.ts` | `GET .../overlay`, `GET .../bundle`; snapshot route prefers transfer fallback archive |
-| `apps/controller/src/execution/remote-execution.ts` | Mode-aware `sendPrepareSource`; `handleRemoteSourceNeed` (bundle create + full fallback) |
-| `apps/controller/src/execution/runner.ts` | `captureGitOverlaySnapshot` when remote-capable + allowlist passes; `attemptTransferDir` |
-| `apps/controller/src/config.ts` | `gitAllowlist` env parsing (same pattern as agent) |
-| `apps/controller/src/websocket/server.ts` | `source_need` handler |
-| `apps/controller/src/mcp/handlers.ts`, `http/server.ts`, `main.ts` | Plumb `gitAllowlist` through submit/dispatch context |
-
-### source_need handling
-
-| Reason | Controller action |
-|--------|-------------------|
-| `base_present` | No-op (wait for `source_ready`) |
-| `base_commit_missing` / `bundle_required` | Create git bundle from local project (`HEAD` when base matches), store under `transfers/<attempt>/`, send `bundle_download` |
-| `full_snapshot_required` / `repo_fetch_failed` | Re-send full `prepare_source` if full archive exists; else on-demand `captureFullSnapshot` to transfer dir |
-
-## Tests added
+**Result:** 3 files, **6 passed** (exit 0).
 
 | File | Coverage |
 |------|----------|
-| `apps/agent/test/prepare-overlay.test.ts` | Mirror seed → worktree → overlay apply; bundle import into empty mirror |
-| `apps/controller/test/source-need.test.ts` | `source_need` → `bundle_download`; allowlist rejection falls back to full capture |
+| `apps/agent/test/lease-self-term.test.ts` | Hardware kills at deadline; safe does not |
+| `apps/agent/test/artifact-resume.test.ts` | Adopt re-sends manifest from staging; no re-collect |
+| `apps/controller/test/disk-pressure.test.ts` | Cleanup order; never active; artifact grant only missing objects |
 
-## Files touched (primary)
+## Recovery note
 
-- Agent: `executor/index.ts`, `connection/client.ts`, `main.ts`
-- Controller: `remote-execution.ts`, `runner.ts`, `data-plane.ts`, `data-tokens.ts`, `config.ts`, `websocket/server.ts`, `mcp/handlers.ts`, `http/server.ts`, `main.ts`
-- Snapshot: `canonical.ts` (TS union narrowing fix for build)
-- Tests: `prepare-overlay.test.ts`, `source-need.test.ts`, updates to `remote-execution.test.ts`, `agent-connection.test.ts`, `cancel-signal.test.ts`
+Host reboot interrupted the SDD session while Task 4 was marked `in progress`. Code + tests were already present; `.superpowers/sdd/task-4-report.md` still held the Phase 5 git_overlay report and was replaced by this Phase 6 report.
 
-## Concerns / follow-ups
+## Fix pass (post-reboot review)
 
-1. **Git bundle by SHA on Windows:** `git bundle create <sha>` can fail with "empty bundle"; controller uses `HEAD` when it matches `base_commit`, with `--all` fallback.
-2. **repo_fetch_failed path:** Agent does not wait for bundle; relies on Controller sending full `prepare_source`. No automated e2e for this branch yet.
-3. **Transfer snapshot SHA header:** Data-plane may serve transfer fallback with DB overlay sha256 in header; agent verifies against `prepare_source` expected values.
-4. **Task 5 cache affinity:** Not implemented (out of scope).
-5. **No git commit** per instructions.
+Critical: `applyDiskPressureCleanup` was unit-tested but never called at runtime; `spoolPressure` was hardcoded false.
+
+Fixes:
+- Heartbeat path in `apps/agent/src/connection/client.ts` invokes `applyDiskPressureCleanup` when disk or spool pressure is detected
+- `getSpoolPressure` wired from `SpoolSender.isUnderPressure()` via `AgentJobExecutor.isUnderSpoolPressure()`
+- `DiskPressureCleanupOptions.spoolPressure` honored; heartbeat publishes `spool_pressure`
+
+Re-verify: disk-pressure + lease-self-term + artifact-resume → **7 passed**
+

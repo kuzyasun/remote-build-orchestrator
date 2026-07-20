@@ -1,0 +1,593 @@
+﻿# Task 1 review package (uncommitted working tree)
+# Files in scope
+M  apps/controller/src/jobs/lifecycle.ts
+M  apps/controller/src/storage/migrations.ts
+A  apps/controller/test/migration-v3.test.ts
+M  packages/protocol/src/messages.ts
+A  packages/protocol/test/protocol-phase6.test.ts
+M  packages/protocol/test/protocol.test.ts
+M  packages/shared/src/errors.ts
+
+## STAT (HEAD vs working tree incl staged)
+
+ apps/controller/src/jobs/lifecycle.ts          |  59 +++++++++--
+ apps/controller/src/storage/migrations.ts      |  13 +++
+ apps/controller/test/migration-v3.test.ts      |  45 +++++++++
+ packages/protocol/src/messages.ts              |  42 ++++++++
+ packages/protocol/test/protocol-phase6.test.ts | 133 +++++++++++++++++++++++++
+ packages/protocol/test/protocol.test.ts        |   7 +-
+ packages/shared/src/errors.ts                  |   1 +
+ 7 files changed, 290 insertions(+), 10 deletions(-)
+
+## FULL DIFF
+
+diff --git a/apps/controller/src/jobs/lifecycle.ts b/apps/controller/src/jobs/lifecycle.ts
+index a5cba95..71700ef 100644
+--- a/apps/controller/src/jobs/lifecycle.ts
++++ b/apps/controller/src/jobs/lifecycle.ts
+@@ -28,22 +28,30 @@ export interface AttemptRow {
+   job_id: string;
+   ordinal: number;
+   agent_id: string | null;
+   lease_id: string;
+   lease_epoch: number;
+   lease_deadline: string | null;
+   state: string;
+   outcome: string | null;
+   started_at: string | null;
+   finished_at: string | null;
++  log_acked_sequence: number;
++  orphaned_at: string | null;
++  process_identity: string | null;
++  last_reconcile_at: string | null;
+ }
+ 
++/** Phase 6 attempt states/outcomes ΓÇö no SQLite CHECK on state; callers use these literals. */
++export const ATTEMPT_STATE_ORPHANED = 'orphaned' as const;
++export const ATTEMPT_OUTCOME_LOST = 'lost' as const;
++
+ export interface SnapshotRow {
+   id: string;
+   content_id: string;
+   repo_id: string;
+   base_commit: string | null;
+   dirty: number;
+   manifest_path: string;
+   payload_path: string | null;
+   bundle_path: string | null;
+   size_bytes: number | null;
+@@ -148,43 +156,78 @@ export function createAttempt(db: ControllerDatabase, jobId: string, ordinal: nu
+       id, job_id, ordinal, lease_id, lease_epoch, state, started_at
+     ) VALUES (?, ?, ?, ?, 1, 'starting', ?)`,
+   ).run(attemptId, jobId, ordinal, leaseId, timestamp);
+   const row = getAttempt(db, attemptId);
+   if (!row) {
+     throw new Error('Failed to create attempt');
+   }
+   return row;
+ }
+ 
++const ATTEMPT_SELECT_COLUMNS = `id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline,
++              state, outcome, started_at, finished_at, log_acked_sequence, orphaned_at,
++              process_identity, last_reconcile_at`;
++
+ export function getAttempt(db: ControllerDatabase, attemptId: string): AttemptRow | null {
+   const row = db
+-    .prepare(
+-      `SELECT id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline,
+-              state, outcome, started_at, finished_at
+-       FROM job_attempts WHERE id = ?`,
+-    )
++    .prepare(`SELECT ${ATTEMPT_SELECT_COLUMNS} FROM job_attempts WHERE id = ?`)
+     .get(attemptId);
+   return (row as AttemptRow | undefined) ?? null;
+ }
+ 
+ export function getLatestAttempt(db: ControllerDatabase, jobId: string): AttemptRow | null {
+   const row = db
+     .prepare(
+-      `SELECT id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline,
+-              state, outcome, started_at, finished_at
+-       FROM job_attempts WHERE job_id = ?
++      `SELECT ${ATTEMPT_SELECT_COLUMNS} FROM job_attempts WHERE job_id = ?
+        ORDER BY ordinal DESC LIMIT 1`,
+     )
+     .get(jobId);
+   return (row as AttemptRow | undefined) ?? null;
+ }
+ 
++export function updateAttempt(
++  db: ControllerDatabase,
++  attemptId: string,
++  fields: Partial<{
++    log_acked_sequence: number;
++    orphaned_at: string | null;
++    process_identity: string | null;
++    last_reconcile_at: string | null;
++    state: string;
++    outcome: string | null;
++    agent_id: string | null;
++    lease_deadline: string | null;
++    finished_at: string | null;
++  }>,
++): AttemptRow {
++  const sets: string[] = [];
++  const values: unknown[] = [];
++  for (const [key, value] of Object.entries(fields)) {
++    sets.push(`${key} = ?`);
++    values.push(value);
++  }
++  if (sets.length === 0) {
++    const row = getAttempt(db, attemptId);
++    if (!row) {
++      throw new Error(`Attempt not found: ${attemptId}`);
++    }
++    return row;
++  }
++  values.push(attemptId);
++  db.prepare(`UPDATE job_attempts SET ${sets.join(', ')} WHERE id = ?`).run(...values);
++  const row = getAttempt(db, attemptId);
++  if (!row) {
++    throw new Error(`Attempt not found after update: ${attemptId}`);
++  }
++  return row;
++}
++
+ export function transitionAttemptState(
+   db: ControllerDatabase,
+   attemptId: string,
+   state: string,
+   fields: Partial<{ outcome: string | null; finished_at: string }> = {},
+ ): AttemptRow {
+   const sets = ['state = ?'];
+   const values: unknown[] = [state];
+   for (const [key, value] of Object.entries(fields)) {
+     sets.push(`${key} = ?`);
+diff --git a/apps/controller/src/storage/migrations.ts b/apps/controller/src/storage/migrations.ts
+index b5afc5d..eb627a1 100644
+--- a/apps/controller/src/storage/migrations.ts
++++ b/apps/controller/src/storage/migrations.ts
+@@ -162,13 +162,26 @@ ALTER TABLE agents ADD COLUMN device_thumbprint TEXT;
+ ALTER TABLE agents ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 1;
+ ALTER TABLE agents ADD COLUMN revoked_at TEXT;
+ `,
+     down: `
+ DROP INDEX IF EXISTS idx_pairing_state;
+ DROP TABLE IF EXISTS pairing_requests;
+ ALTER TABLE agents DROP COLUMN revoked_at;
+ ALTER TABLE agents DROP COLUMN credential_version;
+ ALTER TABLE agents DROP COLUMN device_thumbprint;
+ ALTER TABLE agents DROP COLUMN device_public_key;
++`,
++  },
++  {
++    version: 3,
++    name: 'phase6-attempt-recovery',
++    up: `
++ALTER TABLE job_attempts ADD COLUMN log_acked_sequence INTEGER NOT NULL DEFAULT 0;
++ALTER TABLE job_attempts ADD COLUMN orphaned_at TEXT;
++ALTER TABLE job_attempts ADD COLUMN process_identity TEXT;
++ALTER TABLE job_attempts ADD COLUMN last_reconcile_at TEXT;
++`,
++    down: `
++-- SQLite cannot DROP COLUMN portably in all versions used here; no-op downgrade.
+ `,
+   },
+ ];
+diff --git a/apps/controller/test/migration-v3.test.ts b/apps/controller/test/migration-v3.test.ts
+new file mode 100644
+index 0000000..d0150d9
+--- /dev/null
++++ b/apps/controller/test/migration-v3.test.ts
+@@ -0,0 +1,45 @@
++import { mkdtempSync, rmSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { afterEach, describe, expect, it } from 'vitest';
++import { getSchemaVersion, migrateToLatest, openDatabase } from '../src/storage/database.js';
++
++function listColumnNames(db: ReturnType<typeof openDatabase>, table: string): string[] {
++  return db
++    .prepare(`PRAGMA table_info(${table})`)
++    .all()
++    .map((row) => (row as { name: string }).name);
++}
++
++describe('Migration v3 ΓÇö phase6 attempt recovery columns', () => {
++  const tempDirs: string[] = [];
++
++  function tempDbPath(): string {
++    const dir = mkdtempSync(join(tmpdir(), 'rbo-mig-v3-'));
++    tempDirs.push(dir);
++    return join(dir, 'controller.db');
++  }
++
++  afterEach(() => {
++    for (const dir of tempDirs.splice(0)) {
++      rmSync(dir, { recursive: true, force: true });
++    }
++  });
++
++  it('adds log_acked_sequence, orphaned_at, process_identity, last_reconcile_at to job_attempts', () => {
++    const db = openDatabase(tempDbPath());
++    try {
++      migrateToLatest(db);
++
++      expect(getSchemaVersion(db)).toBe(3);
++
++      const columns = listColumnNames(db, 'job_attempts');
++      expect(columns).toContain('log_acked_sequence');
++      expect(columns).toContain('orphaned_at');
++      expect(columns).toContain('process_identity');
++      expect(columns).toContain('last_reconcile_at');
++    } finally {
++      db.close();
++    }
++  });
++});
+diff --git a/packages/protocol/src/messages.ts b/packages/protocol/src/messages.ts
+index a7ac513..f9adf62 100644
+--- a/packages/protocol/src/messages.ts
++++ b/packages/protocol/src/messages.ts
+@@ -16,38 +16,41 @@ export const AgentMessageTypeSchema = z.enum([
+   'lease_accept',
+   'lease_reject',
+   'source_need',
+   'source_ready',
+   'job_started',
+   'log_chunk',
+   'job_exit',
+   'artifact_manifest',
+   'cleanup_complete',
+   'agent_error',
++  'recovery_report',
+ ]);
+ 
+ // --- Controller ΓåÆ Agent (┬º20.4) ---
+ 
+ export const ControllerMessageTypeSchema = z.enum([
+   'hello_ack',
+   'pairing_challenge',
+   'lease_offer',
+   'prepare_source',
+   'snapshot_download',
+   'bundle_download',
+   'run_job',
+   'cancel_job',
+   'artifact_upload_grant',
+   'pause',
+   'resume',
+   'refresh_capabilities',
+   'shutdown',
++  'log_ack',
++  'reconcile_decision',
+ ]);
+ 
+ /** All wire message types ΓÇö both directions */
+ export const ProtocolMessageTypeSchema = z.enum([
+   ...AgentMessageTypeSchema.options,
+   ...ControllerMessageTypeSchema.options,
+ ]);
+ 
+ /** Message types that must carry attempt_id, lease_id and lease_epoch (┬º20.2). */
+ export const JOB_SCOPED_MESSAGE_TYPES: ReadonlySet<string> = new Set([
+@@ -60,20 +63,23 @@ export const JOB_SCOPED_MESSAGE_TYPES: ReadonlySet<string> = new Set([
+   'run_job',
+   'cancel_job',
+   'source_need',
+   'source_ready',
+   'job_started',
+   'log_chunk',
+   'job_exit',
+   'artifact_manifest',
+   'artifact_upload_grant',
+   'cleanup_complete',
++  'log_ack',
++  'recovery_report',
++  'reconcile_decision',
+ ]);
+ 
+ // --- Typed Job-Scoped Message Payloads (┬º20.2 - ┬º20.4, ┬º35 Phase 4) ---
+ 
+ export const LeaseOfferPayloadSchema = z.object({
+   attempt_id: z.string().min(1),
+   lease_id: z.string().min(1),
+   lease_epoch: z.number().int().positive(),
+   /** Controller-assigned job id ΓÇö injected as RBO_JOB_ID on the Agent. */
+   job_id: z.string().min(1),
+@@ -253,37 +259,73 @@ export const ArtifactUploadGrantPayloadSchema = z.object({
+ 
+ export const CleanupCompletePayloadSchema = z.object({
+   attempt_id: z.string().min(1),
+   lease_id: z.string().min(1),
+   lease_epoch: z.number().int().positive(),
+   exit_code: z.number().int().nullable(),
+   timed_out: z.boolean(),
+   message: z.string().optional(),
+ });
+ 
++export const LogAckPayloadSchema = z.object({
++  attempt_id: z.string().min(1),
++  lease_id: z.string().min(1),
++  lease_epoch: z.number().int().positive(),
++  sequence: z.number().int().positive(),
++});
++
++export const RecoveryReportStatusSchema = z.enum([
++  'running',
++  'completed_awaiting_upload',
++  'orphaned',
++]);
++
++export const RecoveryReportPayloadSchema = z.object({
++  attempt_id: z.string().min(1),
++  lease_id: z.string().min(1),
++  lease_epoch: z.number().int().positive(),
++  status: RecoveryReportStatusSchema,
++  process_identity: z.string().min(1),
++  last_sent_sequence: z.number().int().nonnegative(),
++  last_acked_sequence: z.number().int().nonnegative(),
++  artifact_upload_pending: z.boolean(),
++});
++
++export const ReconcileDecisionPayloadSchema = z.object({
++  attempt_id: z.string().min(1),
++  lease_id: z.string().min(1),
++  lease_epoch: z.number().int().positive(),
++  action: z.enum(['adopt', 'terminate_stale']),
++  resume_from_sequence: z.number().int().nonnegative().optional(),
++  reason: z.string().optional(),
++});
++
+ export type LeaseOfferPayload = z.infer<typeof LeaseOfferPayloadSchema>;
+ export type LeaseAcceptPayload = z.infer<typeof LeaseAcceptPayloadSchema>;
+ export type LeaseRejectPayload = z.infer<typeof LeaseRejectPayloadSchema>;
+ export type PrepareSourcePayload = z.infer<typeof PrepareSourcePayloadSchema>;
+ export type PrepareSourceFullPayload = z.infer<typeof PrepareSourceFullPayloadSchema>;
+ export type PrepareSourceGitOverlayPayload = z.infer<typeof PrepareSourceGitOverlayPayloadSchema>;
+ export type SourceNeedPayload = z.infer<typeof SourceNeedPayloadSchema>;
+ export type BundleDownloadPayload = z.infer<typeof BundleDownloadPayloadSchema>;
+ export type SourceReadyPayload = z.infer<typeof SourceReadyPayloadSchema>;
+ export type RunJobPayload = z.infer<typeof RunJobPayloadSchema>;
+ export type CancelJobPayload = z.infer<typeof CancelJobPayloadSchema>;
+ export type JobStartedPayload = z.infer<typeof JobStartedPayloadSchema>;
+ export type LogChunkPayload = z.infer<typeof LogChunkPayloadSchema>;
+ export type JobExitPayload = z.infer<typeof JobExitPayloadSchema>;
+ export type ArtifactManifestPayload = z.infer<typeof ArtifactManifestPayloadSchema>;
+ export type ArtifactUploadGrantPayload = z.infer<typeof ArtifactUploadGrantPayloadSchema>;
+ export type CleanupCompletePayload = z.infer<typeof CleanupCompletePayloadSchema>;
++export type LogAckPayload = z.infer<typeof LogAckPayloadSchema>;
++export type RecoveryReportPayload = z.infer<typeof RecoveryReportPayloadSchema>;
++export type ReconcileDecisionPayload = z.infer<typeof ReconcileDecisionPayloadSchema>;
+ 
+ export const WireMessageEnvelopeSchema = z
+   .object({
+     protocol: z.number().int().positive(),
+     type: ProtocolMessageTypeSchema,
+     message_id: z.string(),
+     sent_at: z.string(),
+     attempt_id: z.string().nullable(),
+     lease_id: z.string().nullable(),
+     lease_epoch: z.number().nullable(),
+diff --git a/packages/protocol/test/protocol-phase6.test.ts b/packages/protocol/test/protocol-phase6.test.ts
+new file mode 100644
+index 0000000..d6033b0
+--- /dev/null
++++ b/packages/protocol/test/protocol-phase6.test.ts
+@@ -0,0 +1,133 @@
++import { ErrorCategorySchema } from '@rbo/shared';
++import { describe, expect, it } from 'vitest';
++import {
++  AgentMessageTypeSchema,
++  ControllerMessageTypeSchema,
++  JOB_SCOPED_MESSAGE_TYPES,
++  LogAckPayloadSchema,
++  ReconcileDecisionPayloadSchema,
++  RecoveryReportPayloadSchema,
++  WireMessageEnvelopeSchema,
++} from '../src/messages.js';
++
++describe('Phase 6 Protocol Schemas', () => {
++  it('includes log_spool_limit error category', () => {
++    expect(ErrorCategorySchema.options).toContain('log_spool_limit');
++  });
++
++  it('adds log_ack and reconcile_decision to controller messages', () => {
++    expect(ControllerMessageTypeSchema.options).toContain('log_ack');
++    expect(ControllerMessageTypeSchema.options).toContain('reconcile_decision');
++  });
++
++  it('adds recovery_report to agent messages', () => {
++    expect(AgentMessageTypeSchema.options).toContain('recovery_report');
++  });
++
++  it('marks log_ack, recovery_report, reconcile_decision as job-scoped', () => {
++    for (const t of ['log_ack', 'recovery_report', 'reconcile_decision']) {
++      expect(JOB_SCOPED_MESSAGE_TYPES.has(t)).toBe(true);
++    }
++  });
++
++  it('validates log_ack payload', () => {
++    const ok = LogAckPayloadSchema.safeParse({
++      attempt_id: 'att_1',
++      lease_id: 'lease_1',
++      lease_epoch: 1,
++      sequence: 42,
++    });
++    expect(ok.success).toBe(true);
++    expect(
++      LogAckPayloadSchema.safeParse({
++        attempt_id: 'att_1',
++        lease_id: 'l',
++        lease_epoch: 1,
++        sequence: 0,
++      }).success,
++    ).toBe(false);
++  });
++
++  it('validates recovery_report statuses', () => {
++    const ok = RecoveryReportPayloadSchema.safeParse({
++      attempt_id: 'att_1',
++      lease_id: 'lease_1',
++      lease_epoch: 1,
++      status: 'running',
++      process_identity: 'pid:1234:started:2026-07-20T00:00:00.000Z',
++      last_sent_sequence: 10,
++      last_acked_sequence: 8,
++      artifact_upload_pending: false,
++    });
++    expect(ok.success).toBe(true);
++    for (const status of ['running', 'completed_awaiting_upload', 'orphaned'] as const) {
++      expect(
++        RecoveryReportPayloadSchema.safeParse({
++          attempt_id: 'att_1',
++          lease_id: 'lease_1',
++          lease_epoch: 1,
++          status,
++          process_identity: 'x',
++          last_sent_sequence: 0,
++          last_acked_sequence: 0,
++          artifact_upload_pending: false,
++        }).success,
++      ).toBe(true);
++    }
++    expect(
++      RecoveryReportPayloadSchema.safeParse({
++        attempt_id: 'att_1',
++        lease_id: 'lease_1',
++        lease_epoch: 1,
++        status: 'mystery',
++        process_identity: 'x',
++        last_sent_sequence: 0,
++        last_acked_sequence: 0,
++        artifact_upload_pending: false,
++      }).success,
++    ).toBe(false);
++  });
++
++  it('validates reconcile_decision actions', () => {
++    expect(
++      ReconcileDecisionPayloadSchema.safeParse({
++        attempt_id: 'att_1',
++        lease_id: 'lease_1',
++        lease_epoch: 1,
++        action: 'adopt',
++        resume_from_sequence: 8,
++      }).success,
++    ).toBe(true);
++    expect(
++      ReconcileDecisionPayloadSchema.safeParse({
++        attempt_id: 'att_1',
++        lease_id: 'lease_1',
++        lease_epoch: 1,
++        action: 'terminate_stale',
++        reason: 'newer_epoch',
++      }).success,
++    ).toBe(true);
++    expect(
++      ReconcileDecisionPayloadSchema.safeParse({
++        attempt_id: 'att_1',
++        lease_id: 'lease_1',
++        lease_epoch: 1,
++        action: 'noop',
++      }).success,
++    ).toBe(false);
++  });
++
++  it('rejects job-scoped envelope missing lease fields for log_ack', () => {
++    const bad = WireMessageEnvelopeSchema.safeParse({
++      protocol: 1,
++      type: 'log_ack',
++      message_id: 'msg_1',
++      sent_at: new Date().toISOString(),
++      attempt_id: null,
++      lease_id: null,
++      lease_epoch: null,
++      payload: {},
++    });
++    expect(bad.success).toBe(false);
++  });
++});
+diff --git a/packages/protocol/test/protocol.test.ts b/packages/protocol/test/protocol.test.ts
+index aa35735..d080c40 100644
+--- a/packages/protocol/test/protocol.test.ts
++++ b/packages/protocol/test/protocol.test.ts
+@@ -283,47 +283,50 @@ describe('Wire Protocol (Section 20)', () => {
+       'lease_accept',
+       'lease_reject',
+       'source_need',
+       'source_ready',
+       'job_started',
+       'log_chunk',
+       'job_exit',
+       'artifact_manifest',
+       'cleanup_complete',
+       'agent_error',
++      'recovery_report',
+     ];
+     for (const t of agentTypes) {
+       expect(() => AgentMessageTypeSchema.parse(t)).not.toThrow();
+     }
+-    expect(AgentMessageTypeSchema.options).toHaveLength(14);
++    expect(AgentMessageTypeSchema.options).toHaveLength(15);
+   });
+ 
+   it('should validate ControllerΓåÆAgent message types (┬º20.4)', () => {
+     const controllerTypes = [
+       'hello_ack',
+       'pairing_challenge',
+       'lease_offer',
+       'prepare_source',
+       'snapshot_download',
+       'bundle_download',
+       'run_job',
+       'cancel_job',
+       'artifact_upload_grant',
+       'pause',
+       'resume',
+       'refresh_capabilities',
+       'shutdown',
++      'log_ack',
++      'reconcile_decision',
+     ];
+     for (const t of controllerTypes) {
+       expect(() => ControllerMessageTypeSchema.parse(t)).not.toThrow();
+     }
+-    expect(ControllerMessageTypeSchema.options).toHaveLength(13);
++    expect(ControllerMessageTypeSchema.options).toHaveLength(15);
+   });
+ 
+   it('should validate Section 20.2 WireMessageEnvelope', () => {
+     const envelope = {
+       protocol: 1,
+       type: 'heartbeat',
+       message_id: 'msg_01J1234567890ABCDEFGHJKMNP',
+       sent_at: new Date().toISOString(),
+       attempt_id: null,
+       lease_id: null,
+diff --git a/packages/shared/src/errors.ts b/packages/shared/src/errors.ts
+index 0e8daef..9ca712f 100644
+--- a/packages/shared/src/errors.ts
++++ b/packages/shared/src/errors.ts
+@@ -24,20 +24,21 @@ export const ErrorCategorySchema = z.enum([
+   'timeout',
+   'cancelled',
+   'agent_lost',
+   'artifact_collection',
+   'artifact_upload',
+   'cleanup',
+   'secret_missing',
+   'toolchain_changed',
+   'agent_disconnected',
+   'lease_expired',
++  'log_spool_limit',
+   'internal',
+ ]);
+ 
+ export type ErrorCategory = z.infer<typeof ErrorCategorySchema>;
+ 
+ export interface StructuredErrorDetails {
+   category: ErrorCategory;
+   message: string;
+   retryable: boolean;
+   details?: Record<string, unknown>;
