@@ -1,8 +1,16 @@
 import { z } from 'zod';
+import { JobRequestSchema } from './schemas.js';
 
 // Shared MCP tool registry (§4.3, §23). Both transport adapters (Streamable
 // HTTP inside the Controller and the rbo mcp-stdio proxy) register exactly
 // these tools with exactly these input schemas.
+
+export const JOB_SUBMIT_INPUT = JobRequestSchema.shape;
+
+export const JOB_CONFIRM_INPUT = {
+  job_id: z.string().min(1),
+  confirmation_token: z.string().min(1),
+};
 
 export const AGENTS_LIST_INPUT = {
   include_offline: z.boolean().default(false),
@@ -29,7 +37,7 @@ export const JOB_LOGS_INPUT = {
     .positive()
     .max(1024 * 1024)
     .default(65536),
-  streams: z.array(z.enum(['stdout', 'stderr'])).default(['stdout', 'stderr']),
+  streams: z.array(z.enum(['stdout', 'stderr', 'events'])).default(['stdout', 'stderr']),
 };
 
 export const JOB_CANCEL_INPUT = {
@@ -53,6 +61,8 @@ export const AGENT_PROBE_INPUT = {
 
 export type McpToolName =
   | 'agents_list'
+  | 'job_submit'
+  | 'job_confirm'
   | 'job_get'
   | 'job_wait'
   | 'job_logs'
@@ -72,6 +82,16 @@ export const MCP_TOOL_DEFS: readonly McpToolDef[] = [
     name: 'agents_list',
     description: 'List registered worker agents and their capabilities.',
     inputShape: AGENTS_LIST_INPUT,
+  },
+  {
+    name: 'job_submit',
+    description: 'Submit a build/test job and capture an immutable workspace snapshot.',
+    inputShape: JOB_SUBMIT_INPUT,
+  },
+  {
+    name: 'job_confirm',
+    description: 'Confirm a destructive or hardware-risk job after snapshot capture.',
+    inputShape: JOB_CONFIRM_INPUT,
   },
   {
     name: 'job_get',

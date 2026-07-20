@@ -16,6 +16,7 @@ import {
   CompletionPolicySchema,
   ControllerMessageTypeSchema,
   ExecutionConfigSchema,
+  JobEventSchema,
   JobOutcomeSchema,
   JobRequestSchema,
   JobStateSchema,
@@ -230,6 +231,46 @@ describe('Protocol Schemas (Section 13.1)', () => {
       }),
     ).toThrow();
   });
+
+  it('should reject source.cwd with .. or absolute segments', () => {
+    expect(() =>
+      JobRequestSchema.parse({
+        client_request_id: 'req_1',
+        source: { project_root: '/app', cwd: '../../..' },
+        execution: { script: 'echo ok' },
+      }),
+    ).toThrow(/cwd/i);
+    expect(() =>
+      JobRequestSchema.parse({
+        client_request_id: 'req_1',
+        source: { project_root: '/app', cwd: '/etc' },
+        execution: { script: 'echo ok' },
+      }),
+    ).toThrow(/cwd/i);
+  });
+
+  it('should reject additional_roots.mount_path with .. or UNC/absolute segments', () => {
+    expect(() =>
+      JobRequestSchema.parse({
+        client_request_id: 'req_1',
+        source: {
+          project_root: '/app',
+          additional_roots: [{ source_path: '/shared', mount_path: '../../escape' }],
+        },
+        execution: { script: 'echo ok' },
+      }),
+    ).toThrow(/mount_path/i);
+    expect(() =>
+      JobRequestSchema.parse({
+        client_request_id: 'req_1',
+        source: {
+          project_root: '/app',
+          additional_roots: [{ source_path: '/shared', mount_path: '//unc/share' }],
+        },
+        execution: { script: 'echo ok' },
+      }),
+    ).toThrow(/mount_path/i);
+  });
 });
 
 describe('Wire Protocol (Section 20)', () => {
@@ -351,6 +392,58 @@ describe('Protocol Version Negotiation', () => {
   it('should reject incompatible protocol version', () => {
     const negotiated = negotiateProtocolVersion({ min_version: 2, max_version: 5 });
     expect(negotiated).toBeNull();
+  });
+});
+
+describe('JobEventSchema (§18.1)', () => {
+  it('validates canonical job event variants', () => {
+    const base = {
+      sequence: 1,
+      created_at: '2026-01-01T00:00:00.000Z',
+      job_id: 'job_01J1234567890ABCDEFGHJKMNP',
+      attempt_id: 'att_01J1234567890ABCDEFGHJKMNP',
+    };
+    expect(
+      JobEventSchema.parse({
+        type: 'cancel_requested',
+        ...base,
+        signalled: true,
+      }).type,
+    ).toBe('cancel_requested');
+    expect(
+      JobEventSchema.parse({
+        type: 'error',
+        ...base,
+        category: 'internal',
+        message: 'boom',
+      }).category,
+    ).toBe('internal');
+    expect(
+      JobEventSchema.parse({
+        type: 'artifact_skipped',
+        ...base,
+        path: 'link.txt',
+        reason: 'symlink',
+      }).type,
+    ).toBe('artifact_skipped');
+    expect(
+      JobEventSchema.parse({
+        type: 'artifact_limit_exceeded',
+        ...base,
+        reason: 'file_count',
+        limit: 10,
+        actual: 11,
+      }).reason,
+    ).toBe('file_count');
+    expect(
+      JobEventSchema.parse({
+        type: 'cleanup_error',
+        ...base,
+        exit_code: 1,
+        timed_out: false,
+        message: 'cleanup failed',
+      }).type,
+    ).toBe('cleanup_error');
   });
 });
 

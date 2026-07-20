@@ -1,7 +1,10 @@
+#[cfg(windows)]
+pub mod execute;
+
 use serde::{Deserialize, Serialize};
 
 /// Versioned JSON protocol between the Node.js Agent and this helper (§15.2).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionRequest {
@@ -40,3 +43,6 @@ pub fn parse_request(json_str: &str) -> Result<ExecutionRequest, serde_json::Err
 pub fn format_response(response: &ExecutionResponse) -> Result<String, serde_json::Error> {
     serde_json::to_string(response)
 }
+
+#[cfg(windows)]
+pub use execute::{execute_request, process_exists, write_control_frame};

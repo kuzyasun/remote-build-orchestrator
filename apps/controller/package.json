@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@rbo/executor": "workspace:*",
     "@rbo/protocol": "workspace:*",
     "@rbo/shared": "workspace:*",
     "@rbo/snapshot": "workspace:*",

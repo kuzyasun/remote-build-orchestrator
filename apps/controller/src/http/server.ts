@@ -5,7 +5,7 @@ import type { McpToolName } from '@rbo/protocol';
 import { getMcpToolDef } from '@rbo/protocol';
 import { RboError, createLogger } from '@rbo/shared';
 import type { ControllerIdentity } from '@rbo/shared';
-import type { ClientIdentity } from '../mcp/handlers.js';
+import type { ClientIdentity, ToolContext } from '../mcp/handlers.js';
 import { handleToolCall } from '../mcp/handlers.js';
 import { buildMcpServer } from '../mcp/server.js';
 import type { ControllerDatabase } from '../storage/database.js';
@@ -32,6 +32,10 @@ export interface ControllerServerOptions {
   db: ControllerDatabase;
   identity?: ControllerIdentity;
   connectedAgents?: Map<string, ConnectedAgent>;
+  dataDir?: string;
+  allowedProjectRoots?: string[];
+  allowedArtifactDestinations?: string[];
+  maxConcurrentJobs?: number;
 }
 
 export interface RunningControllerServer {
@@ -72,15 +76,30 @@ function identityFromHeaders(
   };
 }
 
+function buildToolContext(
+  options: ControllerServerOptions,
+  clientIdentity: ToolContext['identity'],
+): ToolContext {
+  return {
+    db: options.db,
+    identity: clientIdentity,
+    dataDir: options.dataDir ?? process.env.RBO_DATA_DIR ?? '',
+    controllerIdentity: options.identity,
+    allowedProjectRoots: options.allowedProjectRoots,
+    allowedArtifactDestinations: options.allowedArtifactDestinations,
+    maxConcurrentJobs: options.maxConcurrentJobs ?? 1,
+  };
+}
+
 async function handleMcpRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  db: ControllerDatabase,
+  options: ControllerServerOptions,
 ): Promise<void> {
   // Stateless mode: one server/transport pair per request keeps the loopback
   // endpoint simple; job state lives in SQLite, not in MCP sessions.
   const identity = identityFromHeaders(req, 'http', 'mcp-http');
-  const mcpServer = buildMcpServer({ db, identity });
+  const mcpServer = buildMcpServer(buildToolContext(options, identity));
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -111,7 +130,7 @@ async function handleMcpRequest(
 async function handleInternalToolRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  db: ControllerDatabase,
+  options: ControllerServerOptions,
   toolName: string,
 ): Promise<void> {
   const def = getMcpToolDef(toolName);
@@ -141,7 +160,11 @@ async function handleInternalToolRequest(
 
   const identity = identityFromHeaders(req, 'stdio', 'mcp-stdio');
   try {
-    const result = await handleToolCall({ db, identity }, def.name as McpToolName, args);
+    const result = await handleToolCall(
+      buildToolContext(options, identity),
+      def.name as McpToolName,
+      args,
+    );
     sendJson(res, 200, result);
   } catch (error) {
     if (error instanceof RboError) {
@@ -206,12 +229,12 @@ export async function startControllerServer(
 
     const run = async () => {
       if (url.pathname === '/mcp') {
-        await handleMcpRequest(req, res, options.db);
+        await handleMcpRequest(req, res, options);
         return;
       }
       if (url.pathname.startsWith('/internal/v1/tools/')) {
         const toolName = url.pathname.slice('/internal/v1/tools/'.length);
-        await handleInternalToolRequest(req, res, options.db, toolName);
+        await handleInternalToolRequest(req, res, options, toolName);
         return;
       }
       if (url.pathname.startsWith('/internal/v1/admin/')) {

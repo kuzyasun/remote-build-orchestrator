@@ -1,4 +1,4 @@
-import { ErrorCategorySchema } from '@rbo/shared';
+import { ErrorCategorySchema, isSafeRelativePath } from '@rbo/shared';
 import { z } from 'zod';
 
 // Re-export from shared — single source of truth (§35.1 rule 3)
@@ -63,6 +63,8 @@ export const ExecutionConfigSchema = z.object({
   timeout_seconds: z.number().positive().default(3600),
   idle_timeout_seconds: z.number().positive().optional(),
   cancel_grace_seconds: z.number().positive().default(10),
+  cleanup_script: z.string().optional(),
+  cleanup_timeout_seconds: z.number().positive().default(60),
   tty: z.boolean().default(false),
   completion: CompletionPolicySchema.default({ type: 'run_to_exit' }),
 });
@@ -71,7 +73,12 @@ export const ExecutionConfigSchema = z.object({
 
 export const JobAdditionalRootSchema = z.object({
   source_path: z.string().min(1),
-  mount_path: z.string().min(1),
+  mount_path: z
+    .string()
+    .min(1)
+    .refine((value) => isSafeRelativePath(value), {
+      message: "mount_path must be a relative path without '..', absolute, or UNC segments",
+    }),
   include: z.array(z.string()).default(['**/*']),
   exclude: z.array(z.string()).default([]),
   mode: z.enum(['read_only', 'read_write']).default('read_only'),
@@ -79,7 +86,13 @@ export const JobAdditionalRootSchema = z.object({
 
 export const SourceConfigSchema = z.object({
   project_root: z.string().min(1),
-  cwd: z.string().default('.'),
+  // Relative path only — no absolute paths or `..` segments (§28.2 isolation).
+  cwd: z
+    .string()
+    .default('.')
+    .refine((value) => isSafeRelativePath(value, { allowDot: true }), {
+      message: "cwd must be a relative path without '..' or absolute segments",
+    }),
   additional_roots: z.array(JobAdditionalRootSchema).default([]),
 });
 
@@ -132,6 +145,99 @@ export const JobRequestSchema = z.object({
 });
 
 export type JobRequest = z.infer<typeof JobRequestSchema>;
+export type ExecutionConfig = z.infer<typeof ExecutionConfigSchema>;
+export type ArtifactRule = z.infer<typeof ArtifactRuleSchema>;
+
+// --- Job events (§18.1, §21.3) — wire contract for events.jsonl and job_logs ---
+
+const jobEventBase = {
+  sequence: z.number().int().positive(),
+  created_at: z.string().min(1),
+  job_id: z.string().min(1),
+  attempt_id: z.string().min(1),
+};
+
+export const JobEventSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('state_transition'),
+    ...jobEventBase,
+    from_state: JobStateSchema,
+    to_state: JobStateSchema,
+  }),
+  z.object({
+    type: z.literal('snapshot_captured'),
+    ...jobEventBase,
+    snapshot_id: z.string().min(1),
+    content_id: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('materialized'),
+    ...jobEventBase,
+    workspace: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('process_started'),
+    ...jobEventBase,
+    workspace: z.string().min(1),
+    pid: z.number().int().positive().optional(),
+  }),
+  z.object({
+    type: z.literal('artifact_collected'),
+    ...jobEventBase,
+    artifact_id: z.string().min(1),
+    path: z.string().min(1),
+    sha256: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('artifact_skipped'),
+    ...jobEventBase,
+    path: z.string().min(1),
+    reason: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('artifact_limit_exceeded'),
+    ...jobEventBase,
+    reason: z.enum(['file_count', 'total_bytes']),
+    limit: z.number().int().positive(),
+    actual: z.number().int().positive(),
+  }),
+  z.object({
+    type: z.literal('secret_warning'),
+    ...jobEventBase,
+    path: z.string().min(1),
+    reason: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('cancel_requested'),
+    ...jobEventBase,
+    reason: z.string().optional(),
+    signalled: z.boolean(),
+  }),
+  z.object({
+    type: z.literal('cleanup_error'),
+    ...jobEventBase,
+    exit_code: z.number().int().nullable(),
+    timed_out: z.boolean(),
+    message: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('error'),
+    ...jobEventBase,
+    category: ErrorCategorySchema,
+    message: z.string().min(1),
+  }),
+]);
+
+export type JobEvent = z.infer<typeof JobEventSchema>;
+
+export function parseJobEventLine(line: string): JobEvent | null {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = JobEventSchema.safeParse(JSON.parse(trimmed));
+  return parsed.success ? parsed.data : null;
+}
 
 // --- Agent capabilities (§9.1) ---
 

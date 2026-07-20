@@ -6,3 +6,19 @@ edition = "2021"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_Security",
+  "Win32_System_Pipes",
+  "Win32_System_Diagnostics_ToolHelp",
+] }
+
+[lib]
+name = "rbo_windows_executor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rbo-windows-executor"
+path = "src/main.rs"

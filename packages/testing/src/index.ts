@@ -1,6 +1,16 @@
 import type { AgentCapabilityReport } from '@rbo/protocol';
 import { generateId } from '@rbo/shared';
 
+export {
+  assertGitStateUnchanged,
+  captureGitState,
+  createGitFixtureRepo,
+  type GitFixtureFileSpec,
+  type GitFixtureRepo,
+  type GitFixtureRepoSpec,
+  type GitStateSnapshot,
+} from './git-fixtures.js';
+
 export function createMockAgentCapability(
   overrides?: Partial<AgentCapabilityReport>,
 ): AgentCapabilityReport {

@@ -17,6 +17,7 @@ export const ErrorCategorySchema = z.enum([
   'snapshot_transfer',
   'snapshot_hash',
   'materialization',
+  'workspace_changed',
   'shell_missing',
   'process_spawn',
   'process_exit',

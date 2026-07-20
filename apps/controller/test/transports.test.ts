@@ -53,7 +53,7 @@ async function connectStdioStyleClient(): Promise<Client> {
 }
 
 describe('MCP transports (Phase 1)', () => {
-  it('exposes the same 8 Phase 1 tools over Streamable HTTP', async () => {
+  it('exposes the same MCP tools over Streamable HTTP', async () => {
     const client = await connectHttpClient();
     const tools = await client.listTools();
     expect(tools.tools.map((t) => t.name).sort()).toEqual(MCP_TOOL_DEFS.map((d) => d.name).sort());
@@ -92,7 +92,7 @@ describe('MCP transports (Phase 1)', () => {
   it('returns a structured not_implemented error for tools whose backend arrives later', async () => {
     const client = await connectHttpClient();
     const result = JSON.parse(
-      textOf(await client.callTool({ name: 'job_cancel', arguments: { job_id: 'job_x' } })),
+      textOf(await client.callTool({ name: 'agent_probe', arguments: { agent_id: 'agt_x' } })),
     );
     expect(result.error.details.not_implemented).toBe(true);
     expect(result.error.retryable).toBe(false);

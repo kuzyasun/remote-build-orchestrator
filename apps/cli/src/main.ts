@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { RBO_CONTROLLER_VERSION } from '@rbo/shared';
 import {
   approveAgentRemote,
@@ -7,6 +8,7 @@ import {
 } from './commands/agents.js';
 import { runControllerFingerprint, runControllerInit } from './commands/controller.js';
 import { runDoctor } from './commands/doctor.js';
+import { cancelJobRemote, getJobLogsRemote, submitJobRemote } from './commands/jobs.js';
 import {
   detectPlatform,
   renderServiceInstallPlan,
@@ -116,14 +118,36 @@ async function main(): Promise<void> {
       return;
     }
 
-    case 'submit':
-    case 'logs':
-    case 'cancel':
-      console.log(
-        `'rbo ${command}' talks to the job MCP tools, which land in Phase 3/4 of the design — not available yet.`,
-      );
-      process.exitCode = 1;
+    case 'submit': {
+      const requestPath = rest[0];
+      if (!requestPath) {
+        throw new Error('Usage: rbo submit <job-request.json>');
+      }
+      const request = JSON.parse(await readFile(requestPath, 'utf8')) as Record<string, unknown>;
+      const result = await submitJobRemote(controllerUrl, request);
+      console.log(JSON.stringify(result, null, 2));
       return;
+    }
+
+    case 'logs': {
+      const jobId = rest[0];
+      if (!jobId) {
+        throw new Error('Usage: rbo logs <job-id>');
+      }
+      const result = await getJobLogsRemote(controllerUrl, jobId);
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    case 'cancel': {
+      const jobId = rest[0];
+      if (!jobId) {
+        throw new Error('Usage: rbo cancel <job-id> [reason]');
+      }
+      const result = await cancelJobRemote(controllerUrl, jobId, rest[1]);
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
 
     default:
       throw new Error(`Unknown command '${command}'.`);

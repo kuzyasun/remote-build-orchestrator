@@ -166,4 +166,24 @@ describe('Snapshot Manifest (Sections 11.4 and 12.1)', () => {
     });
     expect(instance.snapshot_id).toBe('snp_01J1234567890ABCDEFGHJKMNP');
   });
+
+  it('should reject main_mount / additional mount paths that escape the workspace', () => {
+    expect(() =>
+      SnapshotManifestSchema.parse({
+        ...FULL_MANIFEST,
+        workspace: { main_mount: '../../outside', cwd: 'project' },
+      }),
+    ).toThrow();
+    expect(() =>
+      SnapshotManifestSchema.parse({
+        ...GIT_OVERLAY_MANIFEST,
+        additional_roots: [
+          {
+            ...GIT_OVERLAY_MANIFEST.additional_roots[0],
+            mount: '../escape',
+          },
+        ],
+      }),
+    ).toThrow();
+  });
 });

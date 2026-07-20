@@ -3,7 +3,7 @@ use rbo_windows_executor::{format_response, parse_request, ExecutionResponse, PR
 #[test]
 fn test_parse_request_and_format_response() {
     let json_input = r#"{
-        "protocol": 1,
+        "protocol": 2,
         "attempt_id": "att_01J123",
         "command": "powershell.exe",
         "args": ["-Command", "Write-Output 'Hello'"],
@@ -34,7 +34,7 @@ fn test_parse_request_and_format_response() {
     assert!(formatted.contains("att_01J123"));
     assert!(formatted.contains("\"success\":true"));
     assert!(formatted.contains("\"timed_out\":false"));
-    assert!(formatted.contains("\"protocol\":1"));
+    assert!(formatted.contains("\"protocol\":2"));
 }
 
 #[test]

@@ -8,7 +8,7 @@
     "node": ">=22.14.0"
   },
   "scripts": {
-    "build": "pnpm --filter \"@rbo/shared\" build && pnpm --filter \"@rbo/protocol\" build && pnpm --filter \"@rbo/snapshot\" build && pnpm --filter \"@rbo/testing\" build && pnpm --filter \"@rbo/controller\" build && pnpm --filter \"@rbo/agent\" build && pnpm --filter \"@rbo/cli\" build && pnpm --filter \"@rbo/mcp-stdio\" build",
+    "build": "pnpm --filter \"@rbo/shared\" build && pnpm --filter \"@rbo/protocol\" build && pnpm --filter \"@rbo/snapshot\" build && pnpm --filter \"@rbo/executor\" build && pnpm --filter \"@rbo/testing\" build && pnpm --filter \"@rbo/controller\" build && pnpm --filter \"@rbo/agent\" build && pnpm --filter \"@rbo/cli\" build && pnpm --filter \"@rbo/mcp-stdio\" build",
     "test": "vitest run",
     "typecheck": "pnpm -r typecheck",
     "lint": "biome check .",

@@ -27,6 +27,10 @@ async function main(): Promise<void> {
     db,
     identity,
     connectedAgents: agentPlane.connectedAgents,
+    dataDir: config.dataDir,
+    allowedProjectRoots: config.allowedProjectRoots,
+    allowedArtifactDestinations: config.allowedArtifactDestinations,
+    maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
   });
 
   logger.info('controller started', {

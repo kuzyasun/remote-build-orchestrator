@@ -1,10 +1,21 @@
+import { join } from 'node:path';
+import { readEventsFromCursor, readLogsFromCursor } from '@rbo/executor';
 import type { McpToolName } from '@rbo/protocol';
 import { getMcpToolDef } from '@rbo/protocol';
-import type { StructuredErrorDetails } from '@rbo/shared';
+import type { ControllerIdentity, StructuredErrorDetails } from '@rbo/shared';
 import { RboError } from '@rbo/shared';
 import { z } from 'zod';
 import { listAgents } from '../agents/service.js';
-import { getJob } from '../jobs/service.js';
+import { materializeArtifactToDestination } from '../execution/artifacts.js';
+import { attemptLogDir } from '../execution/runner.js';
+import { getJob, getLatestAttempt } from '../jobs/lifecycle.js';
+import {
+  handleJobArtifacts,
+  handleJobCancel,
+  handleJobConfirm,
+  handleJobSubmit,
+  waitForJob,
+} from '../jobs/submit.js';
 import type { ControllerDatabase } from '../storage/database.js';
 
 // Local client identity for audit (§35 Phase 1): who called, over what.
@@ -17,10 +28,36 @@ export interface ClientIdentity {
 export interface ToolContext {
   db: ControllerDatabase;
   identity: ClientIdentity;
+  dataDir: string;
+  controllerIdentity?: ControllerIdentity;
+  allowedProjectRoots?: string[];
+  allowedArtifactDestinations?: string[];
+  maxConcurrentJobs?: number;
 }
 
 export interface ToolErrorResult {
   error: StructuredErrorDetails;
+}
+
+function runnerContext(ctx: ToolContext) {
+  return {
+    db: ctx.db,
+    dataDir: ctx.dataDir,
+    allowedProjectRoots: ctx.allowedProjectRoots ?? [],
+    allowedArtifactDestinations: ctx.allowedArtifactDestinations ?? ctx.allowedProjectRoots ?? [],
+    maxConcurrentJobs: ctx.maxConcurrentJobs ?? 1,
+  };
+}
+
+function submitContext(ctx: ToolContext) {
+  if (!ctx.controllerIdentity) {
+    throw RboError.internal('Controller identity is not configured');
+  }
+  return {
+    ...runnerContext(ctx),
+    clientId: ctx.identity.client_id,
+    controllerIdentity: ctx.controllerIdentity,
+  };
 }
 
 // Tools whose backend arrives in a later phase return a schema-valid
@@ -64,6 +101,15 @@ export async function handleToolCall(
     case 'agents_list':
       return { agents: listAgents(ctx.db, args.include_offline === true) };
 
+    case 'job_submit':
+      return handleJobSubmit(submitContext(ctx), args);
+
+    case 'job_confirm':
+      return handleJobConfirm(submitContext(ctx), {
+        job_id: args.job_id as string,
+        confirmation_token: args.confirmation_token as string,
+      });
+
     case 'job_get': {
       const job = getJob(ctx.db, args.job_id as string);
       if (!job) {
@@ -79,11 +125,94 @@ export async function handleToolCall(
     }
 
     case 'job_wait':
-    case 'job_logs':
+      return waitForJob(
+        runnerContext(ctx),
+        args.job_id as string,
+        args.wait_seconds as number,
+        args.include_log_tail_lines as number,
+      );
+
+    case 'job_logs': {
+      const job = getJob(ctx.db, args.job_id as string);
+      if (!job) {
+        return {
+          error: {
+            category: 'validation',
+            message: `Unknown job_id '${args.job_id}'`,
+            retryable: false,
+          },
+        };
+      }
+      const attemptId =
+        (args.attempt_id as string | null) ?? getLatestAttempt(ctx.db, job.id)?.id ?? null;
+      if (!attemptId) {
+        return {
+          error: {
+            category: 'validation',
+            message: 'No attempt found for job',
+            retryable: false,
+          },
+        };
+      }
+      const logDir = attemptLogDir(ctx.dataDir, attemptId);
+      const logs = {
+        logDir,
+        stdoutPath: join(logDir, 'stdout.log'),
+        stderrPath: join(logDir, 'stderr.log'),
+        eventsPath: join(logDir, 'events.jsonl'),
+      };
+      const streams = args.streams as Array<'stdout' | 'stderr' | 'events'>;
+      const response: Record<string, unknown> = { job_id: job.id, attempt_id: attemptId };
+
+      if (streams.includes('events')) {
+        const maxEvents = Math.max(1, Math.floor((args.max_bytes as number) / 256));
+        const events = await readEventsFromCursor(logs, args.cursor as number, maxEvents);
+        response.events = events.events;
+        response.next_cursor = events.nextCursor;
+      } else {
+        const chunk = await readLogsFromCursor(
+          logs,
+          args.cursor as number,
+          args.max_bytes as number,
+          streams.filter((s): s is 'stdout' | 'stderr' => s !== 'events'),
+        );
+        response.data = chunk.data;
+        response.next_cursor = chunk.nextCursor;
+      }
+      return response;
+    }
+
     case 'job_cancel':
+      return handleJobCancel(
+        runnerContext(ctx),
+        args.job_id as string,
+        args.reason as string | undefined,
+      );
+
     case 'job_artifacts':
+      return handleJobArtifacts(ctx.db, args.job_id as string);
+
     case 'artifact_materialize':
-      return { ...notImplemented(name, 3) };
+      try {
+        const result = await materializeArtifactToDestination({
+          db: ctx.db,
+          artifactId: args.artifact_id as string,
+          destinationPath: args.destination_path as string,
+          allowedDestinations: ctx.allowedArtifactDestinations ?? ctx.allowedProjectRoots ?? [],
+          overwrite: args.overwrite === true,
+          clientId: ctx.identity.client_id,
+          dataDir: ctx.dataDir,
+        });
+        return { artifact_id: args.artifact_id, ...result };
+      } catch (error) {
+        return {
+          error: {
+            category: 'materialization',
+            message: error instanceof Error ? error.message : String(error),
+            retryable: false,
+          },
+        };
+      }
 
     case 'agent_probe':
       return { ...notImplemented(name, 2) };

@@ -1,7 +1,15 @@
+import { isSafeRelativePath } from '@rbo/shared';
 import { z } from 'zod';
 
 const Sha256HexSchema = z.string().regex(/^[0-9a-f]{64}$/i);
 const ContentIdSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/i);
+
+const SafeRelativePathSchema = z
+  .string()
+  .min(1)
+  .refine((value) => isSafeRelativePath(value), {
+    message: "must be a relative path without '..', absolute, or UNC segments",
+  });
 
 // --- File entries (§11.6, §11.7) ---
 
@@ -26,16 +34,22 @@ export type SnapshotFileEntry = z.infer<typeof SnapshotFileEntrySchema>;
 // --- Shared manifest blocks (§11.4) ---
 
 export const SnapshotWorkspaceSchema = z.object({
-  main_mount: z.string().min(1),
-  cwd: z.string().min(1),
+  main_mount: SafeRelativePathSchema,
+  cwd: z
+    .string()
+    .min(1)
+    .refine((value) => isSafeRelativePath(value, { allowDot: true }), {
+      message: "must be a relative path without '..', absolute, or UNC segments",
+    }),
 });
 
 export const SnapshotAdditionalRootSchema = z.object({
   id: z.string().min(1),
-  mount: z.string().min(1),
+  mount: SafeRelativePathSchema,
   file_count: z.number().int().nonnegative(),
   total_size: z.number().int().nonnegative(),
   tree_sha256: Sha256HexSchema,
+  mode: z.enum(['read_only', 'read_write']).default('read_only'),
 });
 
 export const SnapshotRepoSchema = z.object({
@@ -108,3 +122,10 @@ export const SnapshotInstanceSchema = z.object({
 });
 
 export type SnapshotInstance = z.infer<typeof SnapshotInstanceSchema>;
+
+export * from './git-status.js';
+export * from './secret-policy.js';
+export * from './archive.js';
+export * from './canonical.js';
+export * from './capture.js';
+export * from './materialize.js';

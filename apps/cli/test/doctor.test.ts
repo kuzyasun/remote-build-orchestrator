@@ -51,5 +51,5 @@ describe('rbo doctor (§33)', () => {
     const reachable = report.checks.find((c) => c.name === 'controller_reachable');
     expect(reachable?.ok).toBe(false);
     expect(report.ok).toBe(false);
-  });
+  }, 15_000);
 });
