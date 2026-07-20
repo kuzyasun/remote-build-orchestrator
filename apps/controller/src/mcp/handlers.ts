@@ -17,6 +17,7 @@ import {
   waitForJob,
 } from '../jobs/submit.js';
 import type { ControllerDatabase } from '../storage/database.js';
+import type { ConnectedAgent } from '../websocket/server.js';
 
 // Local client identity for audit (§35 Phase 1): who called, over what.
 export interface ClientIdentity {
@@ -33,6 +34,10 @@ export interface ToolContext {
   allowedProjectRoots?: string[];
   allowedArtifactDestinations?: string[];
   maxConcurrentJobs?: number;
+  connectedAgents?: Map<string, ConnectedAgent>;
+  agentPlanePort?: number;
+  controllerPublicHost?: string;
+  dataPlaneBaseUrl?: string;
 }
 
 export interface ToolErrorResult {
@@ -57,6 +62,10 @@ function submitContext(ctx: ToolContext) {
     ...runnerContext(ctx),
     clientId: ctx.identity.client_id,
     controllerIdentity: ctx.controllerIdentity,
+    connectedAgents: ctx.connectedAgents,
+    agentPlanePort: ctx.agentPlanePort,
+    controllerPublicHost: ctx.controllerPublicHost,
+    dataPlaneBaseUrl: ctx.dataPlaneBaseUrl,
   };
 }
 
@@ -184,7 +193,7 @@ export async function handleToolCall(
 
     case 'job_cancel':
       return handleJobCancel(
-        runnerContext(ctx),
+        { ...runnerContext(ctx), connectedAgents: ctx.connectedAgents },
         args.job_id as string,
         args.reason as string | undefined,
       );

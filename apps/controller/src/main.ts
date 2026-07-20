@@ -19,6 +19,15 @@ async function main(): Promise<void> {
     port: config.agentPlanePort,
     db,
     identity,
+    dataDir: config.dataDir,
+    controllerPublicHost: config.controllerPublicHost,
+    dataPlaneBaseUrl: config.dataPlaneBaseUrl,
+    dispatchContext: {
+      dataDir: config.dataDir,
+      allowedProjectRoots: config.allowedProjectRoots,
+      allowedArtifactDestinations: config.allowedArtifactDestinations,
+      maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
+    },
   });
 
   const httpServer = await startControllerServer({
@@ -27,6 +36,9 @@ async function main(): Promise<void> {
     db,
     identity,
     connectedAgents: agentPlane.connectedAgents,
+    agentPlanePort: agentPlane.port,
+    controllerPublicHost: config.controllerPublicHost,
+    dataPlaneBaseUrl: config.dataPlaneBaseUrl,
     dataDir: config.dataDir,
     allowedProjectRoots: config.allowedProjectRoots,
     allowedArtifactDestinations: config.allowedArtifactDestinations,

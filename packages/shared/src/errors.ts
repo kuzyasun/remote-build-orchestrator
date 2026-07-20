@@ -27,6 +27,10 @@ export const ErrorCategorySchema = z.enum([
   'artifact_collection',
   'artifact_upload',
   'cleanup',
+  'secret_missing',
+  'toolchain_changed',
+  'agent_disconnected',
+  'lease_expired',
   'internal',
 ]);
 

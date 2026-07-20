@@ -307,6 +307,7 @@ describe('Wire Protocol (Section 20)', () => {
       'bundle_download',
       'run_job',
       'cancel_job',
+      'artifact_upload_grant',
       'pause',
       'resume',
       'refresh_capabilities',
@@ -315,7 +316,7 @@ describe('Wire Protocol (Section 20)', () => {
     for (const t of controllerTypes) {
       expect(() => ControllerMessageTypeSchema.parse(t)).not.toThrow();
     }
-    expect(ControllerMessageTypeSchema.options).toHaveLength(12);
+    expect(ControllerMessageTypeSchema.options).toHaveLength(13);
   });
 
   it('should validate Section 20.2 WireMessageEnvelope', () => {

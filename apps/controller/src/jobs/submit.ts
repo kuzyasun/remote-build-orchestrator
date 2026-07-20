@@ -2,12 +2,13 @@ import { createHash } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { appendEvent, readLogTail } from '@rbo/executor';
-import type { JobRequest } from '@rbo/protocol';
+import type { AgentCapabilityReport, JobRequest } from '@rbo/protocol';
 import { JobRequestSchema } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
 import { RboError, generateId, signEdDsaJwt, verifyEdDsaJwt } from '@rbo/shared';
 import { stableStringify } from '@rbo/snapshot';
 import { listArtifactsForJob } from '../execution/artifacts.js';
+import { initiateRemoteAttempt, requestRemoteJobCancel } from '../execution/remote-execution.js';
 import {
   type LocalRunnerContext,
   attemptLogDir,
@@ -15,8 +16,14 @@ import {
   requestJobCancel,
   runLocalJob,
 } from '../execution/runner.js';
+import {
+  type SchedulerAgent,
+  getActiveJobsForAgents,
+  selectAgentForJob,
+} from '../scheduler/index.js';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
+import type { ConnectedAgent } from '../websocket/server.js';
 import {
   createJob,
   createJobEvent,
@@ -25,6 +32,7 @@ import {
   isDestructiveRisk,
   isTerminalJobState,
   recordEvent,
+  transitionAttemptState,
   transitionJobState,
 } from './lifecycle.js';
 import { completeSubmission, reserveSubmission } from './submissions.js';
@@ -34,6 +42,10 @@ const CONFIRMATION_TTL_SECONDS = 300;
 export interface SubmitJobContext extends LocalRunnerContext {
   clientId: string;
   controllerIdentity: ControllerIdentity;
+  connectedAgents?: Map<string, ConnectedAgent>;
+  agentPlanePort?: number;
+  controllerPublicHost?: string;
+  dataPlaneBaseUrl?: string;
 }
 
 function requestHash(request: JobRequest): string {
@@ -181,8 +193,8 @@ export async function handleJobSubmit(
       response,
       job.id,
     );
-    void runLocalJob(ctx, job.id).catch((error) => {
-      console.error('local job failed', job.id, error);
+    void dispatchJobExecution(ctx, job.id, request).catch((error) => {
+      console.error('job execution dispatch failed', job.id, error);
     });
     return response;
   } catch (error) {
@@ -203,6 +215,94 @@ export async function handleJobSubmit(
       payload as Record<string, unknown>,
     );
     return { error: payload };
+  }
+}
+
+export async function dispatchJobExecution(
+  ctx: SubmitJobContext,
+  jobId: string,
+  request: JobRequest,
+): Promise<void> {
+  const connectedMap = ctx.connectedAgents ?? new Map();
+  const dbAgents = ctx.db
+    .prepare('SELECT id, capabilities_json, state FROM agents WHERE disabled_at IS NULL')
+    .all() as Array<{ id: string; capabilities_json: string; state: string }>;
+
+  const activeCounts = getActiveJobsForAgents(ctx.db);
+  const candidates: SchedulerAgent[] = [];
+
+  for (const agentRow of dbAgents) {
+    if (!connectedMap.has(agentRow.id)) {
+      continue;
+    }
+    try {
+      const caps = JSON.parse(agentRow.capabilities_json) as AgentCapabilityReport;
+      candidates.push({
+        agentId: agentRow.id,
+        capabilities: caps,
+        activeJobsCount: activeCounts.get(agentRow.id) ?? 0,
+      });
+    } catch {
+      // skip invalid caps
+    }
+  }
+
+  const decision = selectAgentForJob(candidates, request, {
+    allowLocalFallback: true,
+  });
+
+  if (decision.action === 'remote' && decision.selectedAgent && ctx.agentPlanePort) {
+    await initiateRemoteAttempt(
+      {
+        db: ctx.db,
+        identity: ctx.controllerIdentity,
+        dataDir: ctx.dataDir,
+        connectedAgents: connectedMap,
+        serverPort: ctx.agentPlanePort,
+        controllerPublicHost: ctx.controllerPublicHost,
+        dataPlaneBaseUrl: ctx.dataPlaneBaseUrl,
+      },
+      jobId,
+      decision.selectedAgent.agentId,
+      decision.selectedToolchains,
+    );
+    return;
+  }
+
+  if (decision.action === 'local_fallback') {
+    await runLocalJob(ctx, jobId);
+    return;
+  }
+
+  if (decision.action === 'fail_fast') {
+    transitionJobState(ctx.db, jobId, 'completed', {
+      outcome: 'failed',
+      finished_at: nowIso(),
+      failure_category: 'no_matching_agent',
+      failure_message: 'No eligible agent available to execute job',
+    });
+    return;
+  }
+
+  // queue_policy=wait: leave job queued until an eligible agent has capacity.
+}
+
+/** Re-attempt scheduling for jobs left in `queued` (wait policy / capacity). */
+export async function tryDispatchQueuedJobs(ctx: SubmitJobContext): Promise<void> {
+  const rows = ctx.db
+    .prepare(
+      `SELECT id, request_json FROM jobs WHERE state = 'queued' ORDER BY queued_at ASC, id ASC`,
+    )
+    .all() as Array<{ id: string; request_json: string }>;
+
+  for (const row of rows) {
+    let request: JobRequest;
+    try {
+      request = JobRequestSchema.parse(JSON.parse(row.request_json));
+    } catch {
+      continue;
+    }
+    await dispatchJobExecution(ctx, row.id, request);
   }
 }
 
@@ -268,8 +368,8 @@ export async function handleJobConfirm(
   }
 
   transitionJobState(ctx.db, job.id, 'queued', { queued_at: nowIso() });
-  void runLocalJob(ctx, job.id).catch((error) => {
-    console.error('local job failed', job.id, error);
+  void dispatchJobExecution(ctx, job.id, request).catch((error) => {
+    console.error('job execution dispatch failed', job.id, error);
   });
   return { job_id: job.id, state: 'queued' };
 }
@@ -309,7 +409,7 @@ export async function waitForJob(
 }
 
 export async function handleJobCancel(
-  ctx: LocalRunnerContext,
+  ctx: LocalRunnerContext & { connectedAgents?: Map<string, ConnectedAgent> },
   jobId: string,
   reason?: string,
 ): Promise<Record<string, unknown>> {
@@ -322,7 +422,39 @@ export async function handleJobCancel(
   if (isTerminalJobState(job.state)) {
     return { job, cancelled: false, reason: 'already_terminal' };
   }
-  const signalled = requestJobCancel(ctx.db, jobId);
+
+  const attempt = getLatestAttempt(ctx.db, jobId);
+  let signalled = false;
+
+  // Remote attempt: send cancel_job over Agent WS. Do not free Controller
+  // capacity / mark cancelled until Agent reports cancelled exit/cleanup
+  // (or disconnect). If the Agent is already gone, finalize here.
+  if (attempt?.agent_id) {
+    if (ctx.connectedAgents) {
+      signalled = requestRemoteJobCancel(
+        { db: ctx.db, connectedAgents: ctx.connectedAgents },
+        jobId,
+        reason,
+      );
+    }
+    if (!signalled) {
+      transitionAttemptState(ctx.db, attempt.id, 'completed', {
+        outcome: 'cancelled',
+        finished_at: nowIso(),
+      });
+      transitionJobState(ctx.db, jobId, 'completed', {
+        outcome: 'cancelled',
+        finished_at: nowIso(),
+        failure_category: 'cancelled',
+        failure_message: reason ?? 'Job cancelled (agent unreachable)',
+      });
+      signalled = true;
+    }
+    recordCancelEvent(ctx.db, ctx.dataDir, jobId, reason, signalled);
+    return { job_id: jobId, cancel_requested: signalled };
+  }
+
+  signalled = requestJobCancel(ctx.db, jobId);
   recordCancelEvent(ctx.db, ctx.dataDir, jobId, reason, signalled);
   return { job_id: jobId, cancel_requested: signalled };
 }

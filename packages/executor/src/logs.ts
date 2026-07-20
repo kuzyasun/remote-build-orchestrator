@@ -33,6 +33,18 @@ export async function appendStderr(logs: AttemptLogPaths, chunk: string | Buffer
   await appendFile(logs.stderrPath, chunk);
 }
 
+export async function appendLogChunk(
+  logs: AttemptLogPaths,
+  stream: 'stdout' | 'stderr',
+  chunk: string | Buffer,
+): Promise<void> {
+  if (stream === 'stderr') {
+    await appendStderr(logs, chunk);
+  } else {
+    await appendStdout(logs, chunk);
+  }
+}
+
 export async function appendEvent(logs: AttemptLogPaths, event: JobEvent): Promise<void> {
   await appendFile(logs.eventsPath, `${JSON.stringify(event)}\n`);
 }

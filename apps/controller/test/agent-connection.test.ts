@@ -24,7 +24,7 @@ beforeAll(async () => {
   db = openDatabase(':memory:');
   migrateToLatest(db);
   identity = await ensureControllerIdentity(dataDir);
-  plane = await startAgentPlaneServer({ port: 0, db, identity });
+  plane = await startAgentPlaneServer({ port: 0, db, identity, dataDir });
 });
 
 afterAll(async () => {

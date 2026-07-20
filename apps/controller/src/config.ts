@@ -10,6 +10,10 @@ export interface ControllerConfig {
   mcpHost: string;
   mcpPort: number;
   agentPlanePort: number;
+  /** Host/IP Agents use for data-plane HTTPS URLs. Defaults to 127.0.0.1. */
+  controllerPublicHost: string;
+  /** Optional full data-plane base URL override (wins over host+port). */
+  dataPlaneBaseUrl?: string;
   dataDir: string;
   databasePath: string;
   allowedProjectRoots: string[];
@@ -31,6 +35,9 @@ export function loadControllerConfig(overrides: Partial<ControllerConfig> = {}):
     mcpHost: overrides.mcpHost ?? process.env.RBO_MCP_HOST ?? '127.0.0.1',
     mcpPort: overrides.mcpPort ?? Number(process.env.RBO_MCP_PORT ?? 7410),
     agentPlanePort: overrides.agentPlanePort ?? Number(process.env.RBO_AGENT_PORT ?? 7411),
+    controllerPublicHost:
+      overrides.controllerPublicHost ?? process.env.RBO_CONTROLLER_PUBLIC_HOST ?? '127.0.0.1',
+    dataPlaneBaseUrl: overrides.dataPlaneBaseUrl ?? process.env.RBO_DATA_PLANE_BASE_URL,
     dataDir,
     databasePath: overrides.databasePath ?? join(dataDir, 'controller.db'),
     allowedProjectRoots: overrides.allowedProjectRoots ?? [],

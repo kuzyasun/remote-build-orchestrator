@@ -43,7 +43,7 @@ export class ManagedChildProcess extends EventEmitter {
     return this.waitForExitImpl();
   }
 
-  kill(graceSeconds: number): Promise<void> {
+  kill(graceSeconds = 10): Promise<void> {
     return this.killImpl(graceSeconds);
   }
 }
@@ -130,6 +130,7 @@ function spawnNodeProcess(input: {
   cwd: string;
   env: NodeJS.ProcessEnv;
   logs: AttemptLogPaths;
+  attachLogs?: boolean;
   timeoutSeconds?: number;
   cancelGraceSeconds?: number;
   idleTimeoutSeconds?: number;
@@ -244,7 +245,9 @@ function spawnNodeProcess(input: {
     managed.stderr.end();
   });
 
-  attachLogPipes(managed, input.logs);
+  if (input.attachLogs !== false) {
+    attachLogPipes(managed, input.logs);
+  }
   return managed;
 }
 
@@ -255,6 +258,7 @@ function spawnWindowsHelperProcess(input: {
   cwd: string;
   env: NodeJS.ProcessEnv;
   logs: AttemptLogPaths;
+  attachLogs?: boolean;
   timeoutSeconds: number;
   cancelGraceSeconds: number;
   idleTimeoutSeconds?: number;
@@ -388,7 +392,9 @@ function spawnWindowsHelperProcess(input: {
     }
   });
 
-  attachLogPipes(managed, input.logs);
+  if (input.attachLogs !== false) {
+    attachLogPipes(managed, input.logs);
+  }
   return managed;
 }
 
@@ -423,6 +429,8 @@ export function spawnJobScript(input: {
   env: Record<string, string>;
   logs: AttemptLogPaths;
   scriptFileName?: string;
+  /** When false, caller owns redaction/persistence of stdout/stderr. Default true. */
+  attachLogs?: boolean;
 }): SpawnJobScriptResult {
   const defaultName =
     input.execution.shell === 'powershell'
@@ -469,6 +477,7 @@ export function spawnJobScript(input: {
       cwd: input.projectPath,
       env: childEnv,
       logs: input.logs,
+      attachLogs: input.attachLogs,
       timeoutSeconds: input.execution.timeout_seconds,
       cancelGraceSeconds: input.execution.cancel_grace_seconds,
       idleTimeoutSeconds: input.execution.idle_timeout_seconds,
@@ -485,6 +494,7 @@ export function spawnJobScript(input: {
     cwd: input.projectPath,
     env: childEnv,
     logs: input.logs,
+    attachLogs: input.attachLogs,
     timeoutSeconds: input.execution.timeout_seconds,
     cancelGraceSeconds: input.execution.cancel_grace_seconds,
     idleTimeoutSeconds: input.execution.idle_timeout_seconds,

@@ -5,7 +5,6 @@ import { AgentConnection } from './connection/client.js';
 
 const logger = createLogger('agent.main');
 
-const HEARTBEAT_INTERVAL_MS = 10_000;
 const RECONNECT_BASE_DELAY_MS = 2_000;
 const RECONNECT_MAX_DELAY_MS = 60_000;
 
@@ -41,6 +40,7 @@ async function main(): Promise<void> {
       stateDir: config.stateDir,
       displayName: config.displayName,
       capabilities,
+      secretMap: config.secretMap,
     });
 
     try {
@@ -49,16 +49,8 @@ async function main(): Promise<void> {
 
       if (result.status === 'authenticated') {
         logger.info('agent authenticated', { agentId: result.agentId });
-        // Phase 2 delivers pairing + heartbeat; job leases arrive in Phase 4.
-        // Keep the session open with periodic heartbeats until disconnect.
-        await new Promise<void>((resolvePromise) => {
-          const interval = setInterval(() => {
-            if (stopped) {
-              clearInterval(interval);
-              resolvePromise();
-            }
-          }, HEARTBEAT_INTERVAL_MS);
-        });
+        // Heartbeats run inside AgentConnection; wait until disconnect or stop.
+        await Promise.race([connection.waitUntilDisconnected(), waitUntil(() => stopped)]);
       } else if (result.status === 'pairing_pending') {
         logger.info('pairing request pending operator approval');
         await sleep(RECONNECT_BASE_DELAY_MS);
@@ -81,6 +73,18 @@ async function main(): Promise<void> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function waitUntil(predicate: () => boolean): Promise<void> {
+  return new Promise((resolvePromise) => {
+    const interval = setInterval(() => {
+      if (predicate()) {
+        clearInterval(interval);
+        resolvePromise();
+      }
+    }, 250);
+    interval.unref?.();
+  });
 }
 
 main().catch((error) => {

@@ -86,21 +86,22 @@ Always execute commands from the repo root or use `--filter` for targeted operat
   - The project is in **Phase 0**. There is no production fleet requiring backward compatibility.
   - Do not add schema aliases, dual wire format support, or deprecated fallback paths.
   - When changing a contract, replace it with the single new contract cleanly.
+- **Final gate after code changes**: After completing implementation or fixes, MUST run `pnpm format` then `pnpm verify` before claiming work complete. Use targeted tests during iteration; do not skip this final gate.
 
 ## Token Economy & Context Strategy
 
 - **Avoid reading generated/build outputs**: Do not inspect contents of `dist/`, `node_modules/`, `target/`, `.turbo/`, `.vitest/`, or build caches.
 - **Use targeted searches**: Use ripgrep / grep search tool to locate definitions before reading whole files.
-- **Targeted validation**: Run narrow vitest/cargo checks first during development, then run full `pnpm verify` before finalizing.
+- **Targeted validation**: Run narrow vitest/cargo checks first during development. Before claiming work complete, apply the final gate (`pnpm format` then `pnpm verify`).
 
 ## Task Workflow
 
-- **Simple tasks**: Inspect nearby files + package manifest, implement directly, run targeted test, summarize leanly.
+- **Simple tasks**: Inspect nearby files + package manifest, implement directly, run targeted tests during iteration, then apply the final gate (`pnpm format` then `pnpm verify`) before summarizing.
 - **Medium / Risky tasks**:
   - Outline a brief plan.
   - Break implementation into small steps (e.g. `packages/protocol` Zod schema -> `packages/shared` -> `apps/controller` -> `native/windows-executor`).
   - Run targeted tests after each milestone.
-  - Run `pnpm verify` once implementation is complete.
+  - Apply the final gate (`pnpm format` then `pnpm verify`) once implementation is complete.
 
 ## Safety & Guardrails
 

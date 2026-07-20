@@ -1,4 +1,10 @@
 import { z } from 'zod';
+import {
+  ErrorCategorySchema,
+  JobOutcomeSchema,
+  JobRequestSchema,
+  ToolchainProfileSchema,
+} from './schemas.js';
 
 // --- Agent → Controller (§20.3) ---
 
@@ -30,6 +36,7 @@ export const ControllerMessageTypeSchema = z.enum([
   'bundle_download',
   'run_job',
   'cancel_job',
+  'artifact_upload_grant',
   'pause',
   'resume',
   'refresh_capabilities',
@@ -41,8 +48,6 @@ export const ProtocolMessageTypeSchema = z.enum([
   ...AgentMessageTypeSchema.options,
   ...ControllerMessageTypeSchema.options,
 ]);
-
-// --- Wire envelope (§20.2) ---
 
 /** Message types that must carry attempt_id, lease_id and lease_epoch (§20.2). */
 export const JOB_SCOPED_MESSAGE_TYPES: ReadonlySet<string> = new Set([
@@ -60,8 +65,153 @@ export const JOB_SCOPED_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'log_chunk',
   'job_exit',
   'artifact_manifest',
+  'artifact_upload_grant',
   'cleanup_complete',
 ]);
+
+// --- Typed Job-Scoped Message Payloads (§20.2 - §20.4, §35 Phase 4) ---
+
+export const LeaseOfferPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  /** Controller-assigned job id — injected as RBO_JOB_ID on the Agent. */
+  job_id: z.string().min(1),
+  job_request: JobRequestSchema,
+  snapshot_metadata: z.object({
+    snapshot_id: z.string().min(1),
+    content_id: z.string().min(1),
+    size_bytes: z.number().int().nonnegative(),
+    sha256: z.string().min(1),
+  }),
+  selected_toolchain_profiles: z.array(ToolchainProfileSchema).optional(),
+  lease_ttl_seconds: z.number().positive(),
+});
+
+export const LeaseAcceptPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+});
+
+export const LeaseRejectPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  reason: z.string().min(1),
+});
+
+export const PrepareSourcePayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  download_url: z.string().min(1),
+  data_token: z.string().min(1),
+  expected_size_bytes: z.number().int().nonnegative(),
+  expected_sha256: z.string().min(1),
+  manifest: z.unknown().optional(),
+});
+
+export const SourceReadyPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+});
+
+export const RunJobPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+});
+
+export const CancelJobPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  grace_seconds: z.number().positive().default(10),
+  reason: z.string().optional(),
+});
+
+export const JobStartedPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  pid: z.number().int().positive().optional(),
+});
+
+export const LogChunkPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  stream: z.enum(['stdout', 'stderr']),
+  sequence: z.number().int().positive(),
+  bytes: z.string(),
+});
+
+export const JobExitPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  exit_code: z.number().int().nullable(),
+  outcome: JobOutcomeSchema,
+  failure_category: ErrorCategorySchema.optional(),
+  failure_message: z.string().optional(),
+});
+
+/** Agent → Controller: declared artifacts before upload (§20.3). */
+export const ArtifactManifestPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  artifacts: z.array(
+    z.object({
+      logical_name: z.string().min(1),
+      path: z.string().min(1),
+      size_bytes: z.number().int().nonnegative(),
+      sha256: z.string().min(1),
+    }),
+  ),
+});
+
+/** Controller → Agent: per-artifact upload URL + short-lived token. */
+export const ArtifactUploadGrantPayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  artifacts: z.array(
+    z.object({
+      logical_name: z.string().min(1),
+      path: z.string().min(1),
+      size_bytes: z.number().int().nonnegative(),
+      sha256: z.string().min(1),
+      upload_url: z.string().min(1),
+      upload_token: z.string().min(1),
+    }),
+  ),
+});
+
+export const CleanupCompletePayloadSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+  exit_code: z.number().int().nullable(),
+  timed_out: z.boolean(),
+  message: z.string().optional(),
+});
+
+export type LeaseOfferPayload = z.infer<typeof LeaseOfferPayloadSchema>;
+export type LeaseAcceptPayload = z.infer<typeof LeaseAcceptPayloadSchema>;
+export type LeaseRejectPayload = z.infer<typeof LeaseRejectPayloadSchema>;
+export type PrepareSourcePayload = z.infer<typeof PrepareSourcePayloadSchema>;
+export type SourceReadyPayload = z.infer<typeof SourceReadyPayloadSchema>;
+export type RunJobPayload = z.infer<typeof RunJobPayloadSchema>;
+export type CancelJobPayload = z.infer<typeof CancelJobPayloadSchema>;
+export type JobStartedPayload = z.infer<typeof JobStartedPayloadSchema>;
+export type LogChunkPayload = z.infer<typeof LogChunkPayloadSchema>;
+export type JobExitPayload = z.infer<typeof JobExitPayloadSchema>;
+export type ArtifactManifestPayload = z.infer<typeof ArtifactManifestPayloadSchema>;
+export type ArtifactUploadGrantPayload = z.infer<typeof ArtifactUploadGrantPayloadSchema>;
+export type CleanupCompletePayload = z.infer<typeof CleanupCompletePayloadSchema>;
 
 export const WireMessageEnvelopeSchema = z
   .object({

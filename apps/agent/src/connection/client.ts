@@ -3,6 +3,13 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 import type { AgentCapabilityReport } from '@rbo/protocol';
 import {
+  ArtifactUploadGrantPayloadSchema,
+  CancelJobPayloadSchema,
+  LeaseOfferPayloadSchema,
+  PrepareSourcePayloadSchema,
+  RunJobPayloadSchema,
+} from '@rbo/protocol';
+import {
   certificateFingerprint,
   createLogger,
   generateDeviceKeyPair,
@@ -10,13 +17,11 @@ import {
   signNonce,
 } from '@rbo/shared';
 import WebSocket from 'ws';
+import { AgentJobExecutor } from '../executor/index.js';
 
 const logger = createLogger('agent.connection');
 
-// Agent-side pairing and authentication (§8.1):
-//  1. verify pinned Controller TLS fingerprint before sending anything;
-//  2. no credential yet → pairing_request, wait for operator approval;
-//  3. credential stored → hello + nonce challenge signed with the device key.
+const HEARTBEAT_INTERVAL_MS = 20_000;
 
 export interface AgentConnectionOptions {
   controllerUrl: string;
@@ -24,6 +29,8 @@ export interface AgentConnectionOptions {
   stateDir: string;
   displayName: string;
   capabilities: AgentCapabilityReport;
+  /** Maps store ref → env var name holding the secret (optional). */
+  secretMap?: Record<string, string>;
 }
 
 export interface ConnectResult {
@@ -46,6 +53,8 @@ interface StoredState {
 export class AgentConnection {
   private readonly options: AgentConnectionOptions;
   private socket: WebSocket | null = null;
+  private executor: AgentJobExecutor | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: AgentConnectionOptions) {
     this.options = options;
@@ -70,7 +79,6 @@ export class AgentConnection {
 
   private saveState(state: StoredState): void {
     mkdirSync(this.options.stateDir, { recursive: true });
-    // OS-protected state directory (§8.1): private key never leaves this file.
     writeFileSync(this.statePath(), JSON.stringify(state), { mode: 0o600 });
   }
 
@@ -84,7 +92,7 @@ export class AgentConnection {
 
     return new Promise<ConnectResult>((resolvePromise, rejectPromise) => {
       const socket = new WebSocket(this.options.controllerUrl, {
-        rejectUnauthorized: false, // trust is the pinned fingerprint, not a CA
+        rejectUnauthorized: false,
       });
       this.socket = socket;
 
@@ -92,6 +100,7 @@ export class AgentConnection {
         resolvePromise(result);
       };
       const fail = (error: Error) => {
+        this.stopHeartbeats();
         socket.terminate();
         rejectPromise(error);
       };
@@ -107,7 +116,6 @@ export class AgentConnection {
         }
         const actual = certificateFingerprint(cert.raw);
         if (actual !== this.options.expectedFingerprint) {
-          // §8.1 step 3: fingerprint checked before any pairing traffic.
           fail(
             new Error(
               `Controller certificate fingerprint mismatch: expected ${this.options.expectedFingerprint}, got ${actual}`,
@@ -162,7 +170,6 @@ export class AgentConnection {
             const credential = String(message.payload?.credential ?? '');
             const agentId = String(message.payload?.agent_id ?? '');
             this.saveState({ ...state, credential, agentId });
-            // Re-hello on the same socket with the fresh credential.
             state.credential = credential;
             state.agentId = agentId;
             this.send(socket, 'hello', {
@@ -180,7 +187,14 @@ export class AgentConnection {
               ...this.options.capabilities,
               agent_id: agentId,
             });
-            this.send(socket, 'heartbeat', { state: 'idle', active_jobs: [] });
+
+            this.executor = new AgentJobExecutor(socket, {
+              stateDir: this.options.stateDir,
+              controllerFingerprint: this.options.expectedFingerprint,
+              secretMap: this.options.secretMap,
+              toolchainProfiles: this.options.capabilities.toolchain_profiles,
+            });
+            this.startHeartbeats(socket);
             finish({ status: 'authenticated', agentId });
             return;
           }
@@ -192,12 +206,109 @@ export class AgentConnection {
 
           finish({ status: 'rejected' });
         }
+
+        if (this.executor) {
+          switch (message.type) {
+            case 'lease_offer': {
+              const parsed = LeaseOfferPayloadSchema.safeParse(message.payload);
+              if (parsed.success) {
+                this.executor.handleLeaseOffer(parsed.data);
+              } else {
+                logger.warn('invalid lease_offer payload', { issues: parsed.error.issues });
+              }
+              break;
+            }
+            case 'prepare_source': {
+              const parsed = PrepareSourcePayloadSchema.safeParse(message.payload);
+              if (parsed.success) {
+                void this.executor.handlePrepareSource(parsed.data);
+              } else {
+                logger.warn('invalid prepare_source payload', { issues: parsed.error.issues });
+              }
+              break;
+            }
+            case 'run_job': {
+              const parsed = RunJobPayloadSchema.safeParse(message.payload);
+              if (parsed.success) {
+                void this.executor.handleRunJob(parsed.data);
+              } else {
+                logger.warn('invalid run_job payload', { issues: parsed.error.issues });
+              }
+              break;
+            }
+            case 'artifact_upload_grant': {
+              const parsed = ArtifactUploadGrantPayloadSchema.safeParse(message.payload);
+              if (parsed.success) {
+                this.executor.handleArtifactUploadGrant(parsed.data);
+              } else {
+                logger.warn('invalid artifact_upload_grant payload', {
+                  issues: parsed.error.issues,
+                });
+              }
+              break;
+            }
+            case 'cancel_job': {
+              const parsed = CancelJobPayloadSchema.safeParse(message.payload);
+              if (parsed.success) {
+                void this.executor.handleCancelJob(parsed.data);
+              } else {
+                logger.warn('invalid cancel_job payload', { issues: parsed.error.issues });
+              }
+              break;
+            }
+          }
+        }
+      });
+
+      socket.on('close', () => {
+        this.stopHeartbeats();
+        void this.executor?.abandonOnDisconnect();
+        this.executor = null;
       });
 
       socket.on('error', (error) => {
         fail(error instanceof Error ? error : new Error(String(error)));
       });
     });
+  }
+
+  /** Resolves when the authenticated WebSocket closes (or is already closed). */
+  waitUntilDisconnected(): Promise<void> {
+    return new Promise((resolvePromise) => {
+      if (!this.socket || this.socket.readyState === WebSocket.CLOSED) {
+        resolvePromise();
+        return;
+      }
+      this.socket.once('close', () => resolvePromise());
+    });
+  }
+
+  private startHeartbeats(socket: WebSocket): void {
+    this.stopHeartbeats();
+    this.sendHeartbeat(socket);
+    this.heartbeatTimer = setInterval(() => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        this.stopHeartbeats();
+        return;
+      }
+      this.sendHeartbeat(socket);
+    }, HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private sendHeartbeat(socket: WebSocket): void {
+    const busy = this.executor?.isBusy() ?? false;
+    this.send(socket, 'heartbeat', {
+      state: busy ? 'busy' : 'idle',
+      active_jobs: [],
+    });
+  }
+
+  private stopHeartbeats(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
   private send(socket: WebSocket, type: string, payload: Record<string, unknown>): void {
@@ -216,6 +327,10 @@ export class AgentConnection {
   }
 
   close(): void {
+    this.stopHeartbeats();
+    const executor = this.executor;
+    this.executor = null;
+    void executor?.abandonOnDisconnect();
     if (this.socket) {
       this.socket.close();
       this.socket = null;

@@ -32,6 +32,9 @@ export interface ControllerServerOptions {
   db: ControllerDatabase;
   identity?: ControllerIdentity;
   connectedAgents?: Map<string, ConnectedAgent>;
+  agentPlanePort?: number;
+  controllerPublicHost?: string;
+  dataPlaneBaseUrl?: string;
   dataDir?: string;
   allowedProjectRoots?: string[];
   allowedArtifactDestinations?: string[];
@@ -88,6 +91,10 @@ function buildToolContext(
     allowedProjectRoots: options.allowedProjectRoots,
     allowedArtifactDestinations: options.allowedArtifactDestinations,
     maxConcurrentJobs: options.maxConcurrentJobs ?? 1,
+    connectedAgents: options.connectedAgents,
+    agentPlanePort: options.agentPlanePort,
+    controllerPublicHost: options.controllerPublicHost,
+    dataPlaneBaseUrl: options.dataPlaneBaseUrl,
   };
 }
 

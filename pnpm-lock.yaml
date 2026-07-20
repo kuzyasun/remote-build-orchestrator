@@ -23,12 +23,18 @@ importers:
 
   apps/agent:
     dependencies:
+      '@rbo/executor':
+        specifier: workspace:*
+        version: link:../../packages/executor
       '@rbo/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@rbo/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@rbo/snapshot':
+        specifier: workspace:*
+        version: link:../../packages/snapshot
       '@rbo/testing':
         specifier: workspace:^
         version: link:../../packages/testing

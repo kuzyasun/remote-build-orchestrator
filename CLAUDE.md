@@ -64,12 +64,13 @@ Run commands from repo root or with `--filter`:
 - **No Git Index modification**: Never run `git add`, `git reset`, or `git restore --staged` on your own. Leave staging control to the user.
 - **Documentation language**: Write all committed files (`README.md`, `AGENTS.md`, `CLAUDE.md`, code comments, docstrings, commit messages) in **English**. User chat responses may use the user's language.
 - **First version — No migration shims**: Phase 0 product; replace schemas cleanly with single new contract rather than writing backward compatibility wrappers.
+- **Final gate after code changes**: After completing implementation or fixes, MUST run `pnpm format` then `pnpm verify` before claiming work complete. Use targeted tests during iteration; do not skip this final gate.
 
 ## Token Economy & Context Strategy
 
 - Avoid reading generated output directories (`dist/`, `node_modules/`, `target/`, `.turbo/`, `.vitest/`).
 - Use grep/ripgrep to locate definitions before reading whole files.
-- Prefer targeted validation (`pnpm test`, `cargo test`) before broad `pnpm verify`.
+- Prefer targeted validation (`pnpm test`, `cargo test`) during development. Before claiming work complete, apply the final gate (`pnpm format` then `pnpm verify`).
 
 ## Safety & Guardrails
 
