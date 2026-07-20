@@ -1,8 +1,29 @@
-import type { AgentCapabilityReport, JobRequest, ToolchainProfileSchema } from '@rbo/protocol';
+import type {
+  AgentCapabilityReport,
+  BuildCacheKind,
+  JobRequest,
+  ToolchainProfileSchema,
+} from '@rbo/protocol';
+import { computeBuildCacheKey } from '@rbo/shared';
 import type { z } from 'zod';
 import type { ControllerDatabase } from '../storage/database.js';
 
 type ToolchainProfile = z.infer<typeof ToolchainProfileSchema>;
+
+/** Soft preference scores (§19.2) — applied only after hard filters. */
+export const SCHEDULER_SCORE_REPOSITORY_CACHE_HIT = 500;
+/** build_cache_hit preference — weaker than repository_cache_hit (* 500). */
+export const SCHEDULER_SCORE_BUILD_CACHE_HIT = 250;
+
+const TOOL_NAME_TO_BUILD_CACHE_KIND: Record<string, BuildCacheKind> = {
+  ccache: 'ccache',
+  sccache: 'sccache',
+  npm: 'npm',
+  pnpm: 'pnpm',
+  pip: 'pip',
+};
+
+const TOOLCHAIN_REQUIRED_KINDS = new Set<BuildCacheKind>(['ccache', 'sccache']);
 
 export interface SchedulerAgent {
   agentId: string;
@@ -17,6 +38,11 @@ export interface SchedulingDecision {
   reason?: string;
 }
 
+export interface ExpectedBuildCacheKey {
+  kind: BuildCacheKind;
+  key: string;
+}
+
 export interface SchedulerOptions {
   allowLocalFallback?: boolean;
   /**
@@ -27,6 +53,17 @@ export interface SchedulerOptions {
   repoCanonicalId?: string | null;
   /** Optional base commit — bonus only if agent reports the commit OR omits commits (fetch path allowed). */
   baseCommit?: string | null;
+  /**
+   * Opaque build-cache identities expected for this job (tests / explicit).
+   * When set with prefer_build_cache, agents advertising a matching kind+key receive
+   * the build_cache_hit bonus (+250).
+   */
+  buildCacheKeys?: readonly ExpectedBuildCacheKey[] | null;
+  /**
+   * Project identity for per-agent build-cache key computation when
+   * `buildCacheKeys` is not provided (`repo_key` or `local:<content_id>`).
+   */
+  buildCacheProjectIdentity?: string | null;
 }
 
 function matchesOs(requestOs?: string[], agentOs?: string): boolean {
@@ -96,6 +133,71 @@ export function agentHasRepoCacheHit(
     return entry.commits.includes(baseCommit);
   }
   return false;
+}
+
+/**
+ * Phase 7 build_cache_hit: kind + opaque key equality for at least one expected entry.
+ * Preference only — never a hard filter.
+ */
+export function agentHasBuildCacheHit(
+  caps: AgentCapabilityReport,
+  expected: readonly ExpectedBuildCacheKey[],
+): boolean {
+  if (expected.length === 0) {
+    return false;
+  }
+  const ads = caps.build_caches ?? [];
+  for (const want of expected) {
+    const entry = ads.find((a) => a.kind === want.kind);
+    if (entry?.keys?.includes(want.key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Compute opaque keys this agent would serve for the job (kind ∩ tools / all kinds).
+ * ccache/sccache skipped without a selected toolchain profile.
+ */
+export function computeExpectedBuildCacheKeysForAgent(input: {
+  caps: AgentCapabilityReport;
+  selectedToolchains: ToolchainProfile[];
+  projectIdentity: string;
+  requiredTools?: Record<string, string>;
+}): ExpectedBuildCacheKey[] {
+  const tools = input.requiredTools;
+  let kinds: BuildCacheKind[];
+  if (!tools || Object.keys(tools).length === 0) {
+    kinds = ['ccache', 'sccache', 'npm', 'pnpm', 'pip'];
+  } else {
+    const fromTools = new Set<BuildCacheKind>();
+    for (const toolName of Object.keys(tools)) {
+      const kind = TOOL_NAME_TO_BUILD_CACHE_KIND[toolName.toLowerCase()];
+      if (kind) {
+        fromTools.add(kind);
+      }
+    }
+    kinds = [...fromTools];
+  }
+
+  const primary = input.selectedToolchains[0];
+  const out: ExpectedBuildCacheKey[] = [];
+  for (const kind of kinds) {
+    if (TOOLCHAIN_REQUIRED_KINDS.has(kind) && !primary) {
+      continue;
+    }
+    const key = computeBuildCacheKey({
+      kind,
+      toolchainProfileId: primary?.id ?? 'none',
+      toolchainFingerprint: primary?.environment_fingerprint ?? 'none',
+      osFamily: input.caps.os.family,
+      arch: input.caps.os.arch,
+      projectIdentity: input.projectIdentity,
+    });
+    out.push({ kind, key });
+  }
+  return out;
 }
 
 /** Compare dotted numeric versions; non-numeric segments compared as strings. */
@@ -198,7 +300,11 @@ export function selectAgentForJob(
   options: SchedulerOptions = {},
 ): SchedulingDecision {
   const reqs = request.requirements ?? {};
-  const prefs = request.preferences ?? { prefer_repo_cache: true, allow_local_fallback: true };
+  const prefs = request.preferences ?? {
+    prefer_repo_cache: true,
+    prefer_build_cache: true,
+    allow_local_fallback: true,
+  };
 
   // Gather required secret store refs (requirements list + execution map values).
   // Wire form for execution.secret_refs is { ENV_NAME: "store_ref" } (§13.4).
@@ -288,9 +394,29 @@ export function selectAgentForJob(
     score += Math.floor(caps.resources.memory_free_mb / 1024);
 
     // Repository cache affinity (§19.2) — preference only, after hard filters.
+    // repository_cache_hit * 500
     if (prefs.prefer_repo_cache !== false && options.repoCanonicalId) {
       if (agentHasRepoCacheHit(caps, options.repoCanonicalId, options.baseCommit ?? null)) {
-        score += 500;
+        score += SCHEDULER_SCORE_REPOSITORY_CACHE_HIT;
+      }
+    }
+
+    // Build cache affinity (Phase 7) — preference only, after hard filters.
+    // build_cache_hit +250 (weaker than repository_cache_hit * 500)
+    if (prefs.prefer_build_cache !== false) {
+      const expected =
+        options.buildCacheKeys && options.buildCacheKeys.length > 0
+          ? options.buildCacheKeys
+          : options.buildCacheProjectIdentity
+            ? computeExpectedBuildCacheKeysForAgent({
+                caps,
+                selectedToolchains: toolMatch.selectedProfiles,
+                projectIdentity: options.buildCacheProjectIdentity,
+                requiredTools: reqs.tools,
+              })
+            : [];
+      if (expected.length > 0 && agentHasBuildCacheHit(caps, expected)) {
+        score += SCHEDULER_SCORE_BUILD_CACHE_HIT;
       }
     }
 

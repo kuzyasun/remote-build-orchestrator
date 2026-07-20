@@ -22,6 +22,11 @@ export interface AgentRecoveryHooks {
   resendJobExit?: (meta: AttemptMetadata) => void;
   /** Resume artifact_manifest + PUT from persisted staging (never re-collect). */
   resumeArtifactUpload?: (meta: AttemptMetadata) => Promise<void>;
+  /**
+   * Label-scoped resource cleanup (e.g. Docker `rbo.attempt=<id>`) after
+   * terminate_stale or verified orphan cleanup. Must be idempotent.
+   */
+  cleanupAttemptResources?: (attemptId: string) => Promise<void>;
 }
 
 export interface AgentRecoveryCoordinatorOptions {
@@ -145,6 +150,8 @@ export class AgentRecoveryCoordinator {
     if (decision.action === 'terminate_stale') {
       this.rejectedAttempts.add(decision.attempt_id);
       await this.hooks.terminateAttempt(decision.attempt_id);
+      // Verified orphan / stale cleanup: label-scoped resources (Docker, etc.).
+      await this.invokeCleanupAttemptResources(decision.attempt_id);
       if (meta) {
         writeAttemptMetadata(this.stateDir, { ...meta, status: 'terminal' });
       }
@@ -213,6 +220,28 @@ export class AgentRecoveryCoordinator {
       resume_from_sequence: decision.resume_from_sequence,
       completed_awaiting_upload: wasCompletedAwaitingUpload,
     });
+  }
+
+  /**
+   * Verified orphan cleanup path: invoke optional label-scoped resource cleanup.
+   * Safe to call repeatedly (hook + Docker helpers are idempotent).
+   */
+  async cleanupVerifiedOrphan(attemptId: string): Promise<void> {
+    await this.invokeCleanupAttemptResources(attemptId);
+  }
+
+  private async invokeCleanupAttemptResources(attemptId: string): Promise<void> {
+    if (!this.hooks.cleanupAttemptResources) {
+      return;
+    }
+    try {
+      await this.hooks.cleanupAttemptResources(attemptId);
+    } catch (error) {
+      logger.warn('cleanupAttemptResources failed', {
+        attemptId,
+        error: String(error),
+      });
+    }
   }
 
   /**

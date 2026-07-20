@@ -3,7 +3,8 @@ import { readFile, readdir, statfs } from 'node:fs/promises';
 import { arch, cpus, freemem, hostname, platform, release, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import type { AgentCapabilityReport } from '@rbo/protocol';
+import type { AgentCapabilityReport, BuildCacheKind } from '@rbo/protocol';
+import { listPresentBuildCacheKeys } from '../build-cache/index.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -71,6 +72,30 @@ export interface ProbeInput {
   stateDir?: string;
   /** Phase 6 disk admission floor. */
   diskMinFreeBytes?: number;
+  /** Build-cache kinds enabled on this agent (filters capability ads). */
+  enabledBuildCacheKinds?: readonly BuildCacheKind[];
+}
+
+export type BuildCacheCapabilityAds = NonNullable<AgentCapabilityReport['build_caches']>;
+
+export async function refreshBuildCacheCapabilityAds(input: {
+  stateDir: string;
+  enabledKinds: readonly BuildCacheKind[];
+}): Promise<BuildCacheCapabilityAds | undefined> {
+  const ads = await listPresentBuildCacheKeys(input.stateDir, input.enabledKinds);
+  return ads.length > 0 ? ads : undefined;
+}
+
+export function applyRefreshedBuildCacheAds(
+  current: Pick<AgentCapabilityReport, 'build_caches'>,
+  refreshed: BuildCacheCapabilityAds | undefined,
+): { changed: boolean; build_caches: BuildCacheCapabilityAds | undefined } {
+  const prevJson = JSON.stringify(current.build_caches ?? null);
+  const nextJson = JSON.stringify(refreshed ?? null);
+  if (prevJson === nextJson) {
+    return { changed: false, build_caches: refreshed };
+  }
+  return { changed: true, build_caches: refreshed };
 }
 
 async function loadRepositoryCache(
@@ -104,6 +129,10 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
   const shells = await detectShells();
   const gitVersions = await detectGitVersion();
   const repository_cache = input.stateDir ? await loadRepositoryCache(input.stateDir) : [];
+  const enabledKinds = input.enabledBuildCacheKinds;
+  const build_caches = input.stateDir
+    ? await listPresentBuildCacheKeys(input.stateDir, enabledKinds)
+    : [];
   const diskFreeBytes = input.stateDir ? await probeFreeDiskBytes(input.stateDir) : 0;
   const diskMinFreeBytes = input.diskMinFreeBytes ?? 0;
   const diskPressure = diskMinFreeBytes > 0 && diskFreeBytes < diskMinFreeBytes;
@@ -138,5 +167,6 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
     secret_refs: [],
     accepting_jobs: !diskPressure,
     ...(repository_cache.length > 0 ? { repository_cache } : {}),
+    ...(build_caches.length > 0 ? { build_caches } : {}),
   };
 }

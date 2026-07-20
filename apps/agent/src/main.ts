@@ -34,6 +34,7 @@ async function main(): Promise<void> {
     maxJobs: config.maxJobs,
     stateDir: config.stateDir,
     diskMinFreeBytes: config.diskMinFreeBytes,
+    enabledBuildCacheKinds: config.buildCache.enabledKinds,
   });
 
   logger.info('agent starting', {
@@ -60,6 +61,7 @@ async function main(): Promise<void> {
     secretMap: config.secretMap,
     gitAllowlist: config.gitAllowlist,
     repoCache: config.repoCache,
+    buildCache: config.buildCache,
     logSpoolMaxBytes: config.logSpoolMaxBytes,
     logSendQueueMax: config.logSendQueueMax,
     diskMinFreeBytes: config.diskMinFreeBytes,

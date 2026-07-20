@@ -37,6 +37,7 @@ export const JobOutcomeSchema = z.enum(['succeeded', 'failed', 'timed_out', 'can
 // --- Risk / queue policy ---
 
 export const RiskLevelSchema = z.enum(['safe', 'normal', 'destructive', 'hardware']);
+export type RiskLevel = z.infer<typeof RiskLevelSchema>;
 export const QueuePolicySchema = z.enum(['local_fallback', 'wait', 'fail_fast']);
 
 // --- Execution (§13.1) ---
@@ -118,6 +119,7 @@ export const PreferencesConfigSchema = z.object({
   agent_ids: z.array(z.string()).optional(),
   os_order: z.array(z.string()).optional(),
   prefer_repo_cache: z.boolean().default(true),
+  prefer_build_cache: z.boolean().default(true),
   allow_local_fallback: z.boolean().default(true),
 });
 
@@ -254,6 +256,10 @@ export const ToolchainProfileSchema = z.object({
   environment_fingerprint: z.string(),
 });
 
+/** Fixed named build-cache kinds — never arbitrary host paths from JobRequest. */
+export const BuildCacheKindSchema = z.enum(['ccache', 'sccache', 'npm', 'pnpm', 'pip']);
+export type BuildCacheKind = z.infer<typeof BuildCacheKindSchema>;
+
 export const AgentCapabilityReportSchema = z.object({
   agent_id: z.string(),
   display_name: z.string(),
@@ -293,6 +299,18 @@ export const AgentCapabilityReportSchema = z.object({
         canonical_id: z.string().min(1),
         /** Optional known commits present in the mirror (best-effort). */
         commits: z.array(z.string().min(1)).optional(),
+      }),
+    )
+    .optional(),
+  /**
+   * Optional Phase 7 named build-cache advertisement for scheduler affinity.
+   * Opaque cache identity keys currently present (hashes only — no secrets).
+   */
+  build_caches: z
+    .array(
+      z.object({
+        kind: BuildCacheKindSchema,
+        keys: z.array(z.string().min(1)).optional(),
       }),
     )
     .optional(),

@@ -20,6 +20,7 @@ import {
 import type {
   ArtifactManifestPayload,
   ArtifactUploadGrantPayload,
+  BuildCacheKind,
   BundleDownloadPayload,
   CancelJobPayload,
   CleanupCompletePayload,
@@ -35,7 +36,18 @@ import { certificateFingerprint, createLogger, generateId, resolveContainedCwd }
 import type { GitUrlAllowlist } from '@rbo/shared';
 import { applyGitOverlay, materializeFullSnapshot } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
+import {
+  type AcquireResult,
+  type BuildCacheConfig,
+  BuildCacheStore,
+  DEFAULT_BUILD_CACHE_CONFIG,
+  buildCacheEnvForKind,
+  resolveBuildCacheInjection,
+  resolveBuildCachesDir,
+  stripUserBuildCacheEnv,
+} from '../build-cache/index.js';
 import { DEFAULT_LOG_SEND_QUEUE_MAX, DEFAULT_LOG_SPOOL_MAX_BYTES } from '../config.js';
+import { cleanupDockerResourcesForAttempt } from '../docker/cleanup.js';
 import { SpoolSender } from '../logs/spool-sender.js';
 import {
   type AttemptArtifactManifestItem,
@@ -71,6 +83,8 @@ export interface AgentExecutorConfig {
   toolchainProfiles?: ToolchainProfile[];
   gitAllowlist: GitUrlAllowlist;
   repoCache: RepoCacheConfig;
+  /** Named build-cache policy (Phase 7). */
+  buildCache?: BuildCacheConfig;
   /** Max attempt spool bytes (stdout+stderr); default 512 MiB. */
   logSpoolMaxBytes?: number;
   /** Max in-memory log send queue; default 64. */
@@ -83,6 +97,23 @@ export interface AgentExecutorConfig {
   getFreeDiskBytes?: () => number | Promise<number>;
   /** Injectable spool-pressure flag. */
   getSpoolPressure?: () => boolean;
+}
+
+function agentOsFamily(): string {
+  const p = process.platform;
+  if (p === 'darwin') return 'macos';
+  if (p === 'win32') return 'windows';
+  return 'linux';
+}
+
+function resolveProjectIdentity(
+  offer: LeaseOfferPayload,
+  prepare: PrepareSourcePayload | null,
+): string {
+  if (prepare?.source_mode === 'git_overlay') {
+    return prepare.repo.canonical_id;
+  }
+  return `local:${offer.snapshot_metadata.content_id}`;
 }
 
 function assertPinnedPeerCert(
@@ -1166,24 +1197,75 @@ export class AgentJobExecutor {
     const stdoutRedactor = new StreamRedactor(secretValuesToRedact);
     const stderrRedactor = new StreamRedactor(secretValuesToRedact);
 
+    const buildCacheConfig = this.config.buildCache ?? DEFAULT_BUILD_CACHE_CONFIG;
+    const cacheStore = new BuildCacheStore(
+      resolveBuildCachesDir(this.config.stateDir),
+      buildCacheConfig,
+    );
+    const acquiredCaches: Array<{
+      cacheKey: string;
+      kind: BuildCacheKind;
+      result: AcquireResult;
+    }> = [];
+
     try {
       await writeJobScript(controlDir, request.execution);
 
       const projectPath = this.materializedProjectPath ?? join(workspaceRoot, 'main_mount');
       const projectCwd = await resolveContainedCwd(projectPath, request.source.cwd);
 
+      const selectedToolchain = offer.selected_toolchain_profiles?.[0];
+      const riskLevel = request.risk_level ?? 'normal';
+      const cacheInjection = resolveBuildCacheInjection({
+        stateDir: this.config.stateDir,
+        config: buildCacheConfig,
+        preferBuildCache: request.preferences?.prefer_build_cache !== false,
+        riskLevel,
+        osFamily: agentOsFamily(),
+        arch: process.arch,
+        projectIdentity: resolveProjectIdentity(offer, this.currentPrepare),
+        selectedToolchain: selectedToolchain
+          ? {
+              id: selectedToolchain.id,
+              environment_fingerprint: selectedToolchain.environment_fingerprint,
+            }
+          : null,
+        requiredTools: request.requirements?.tools,
+      });
+
+      const cacheEnv: Record<string, string> = {};
+      for (const target of cacheInjection.targets) {
+        const result = await cacheStore.acquireForJob({
+          cacheKey: target.cacheKey,
+          kind: target.kind,
+          attemptId: run.attempt_id,
+          riskLevel,
+        });
+        acquiredCaches.push({ cacheKey: target.cacheKey, kind: target.kind, result });
+        if (result.mode === 'hit' || result.mode === 'miss') {
+          Object.assign(cacheEnv, buildCacheEnvForKind(target.kind, result.path));
+        }
+      }
+
+      const strippedUserEnv = stripUserBuildCacheEnv(request.execution.env);
+      const executionForSpawn = {
+        ...request.execution,
+        env: strippedUserEnv,
+      };
+
       const child = spawnJobScript({
         attemptId: run.attempt_id,
         controlDir,
         workspacePath: workspaceRoot,
         projectPath: projectCwd,
-        execution: request.execution,
+        execution: executionForSpawn,
         env: {
-          ...request.execution.env,
+          ...strippedUserEnv,
           ...secretEnv,
+          ...cacheEnv,
           RBO_JOB_ID: offer.job_id,
           RBO_ATTEMPT_ID: run.attempt_id,
-          RBO_ARTIFACTS_DIR: artifactsDir,
+          RBO_ARTIFACT_DIR: artifactsDir,
         },
         logs,
         attachLogs: false,
@@ -1462,7 +1544,7 @@ export class AgentJobExecutor {
         env: {
           RBO_JOB_ID: offer.job_id,
           RBO_ATTEMPT_ID: run.attempt_id,
-          RBO_ARTIFACTS_DIR: artifactsDir,
+          RBO_ARTIFACT_DIR: artifactsDir,
         },
         logs,
       }).catch(() => ({ exitCode: null, timedOut: false }));
@@ -1474,10 +1556,43 @@ export class AgentJobExecutor {
         exit_code: cleanup.exitCode,
         timed_out: cleanup.timedOut,
       });
+
+      // Promote miss caches only on successful job outcome (risk-gated inside store).
+      for (const entry of acquiredCaches) {
+        if (entry.result.mode !== 'miss') {
+          continue;
+        }
+        await cacheStore
+          .publishIfAllowed({
+            cacheKey: entry.cacheKey,
+            kind: entry.kind,
+            attemptId: run.attempt_id,
+            riskLevel: request.risk_level ?? 'normal',
+            outcome: effectiveOutcome,
+            tempPath: entry.result.path,
+          })
+          .catch((error) => {
+            logger.warn('build-cache publish failed', {
+              attemptId: run.attempt_id,
+              cacheKey: entry.cacheKey,
+              error: String(error),
+            });
+          });
+      }
     } catch (error) {
       logger.error('run_job failed', { attemptId: run.attempt_id, error: String(error) });
       this.failTerminal(run.attempt_id, run.lease_id, run.lease_epoch, 'internal', String(error));
     } finally {
+      for (const entry of acquiredCaches) {
+        await entry.result.release().catch(() => undefined);
+      }
+      // Label-scoped Docker cleanup before workspace rm (idempotent; skips if no docker).
+      await cleanupDockerResourcesForAttempt({ attemptId: run.attempt_id }).catch((error) => {
+        logger.warn('docker cleanup after job terminal failed', {
+          attemptId: run.attempt_id,
+          error: String(error),
+        });
+      });
       if (this.overlayRepoUrl && this.materializedProjectPath) {
         await this.mirrorManager
           .removeWorktree(this.overlayRepoUrl, this.materializedProjectPath)

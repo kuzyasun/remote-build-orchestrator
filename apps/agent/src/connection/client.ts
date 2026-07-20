@@ -21,6 +21,17 @@ import {
 } from '@rbo/shared';
 import type { GitUrlAllowlist } from '@rbo/shared';
 import WebSocket from 'ws';
+import {
+  type BuildCacheConfig,
+  BuildCacheStore,
+  DEFAULT_BUILD_CACHE_CONFIG,
+  resolveBuildCachesDir,
+} from '../build-cache/index.js';
+import {
+  applyRefreshedBuildCacheAds,
+  refreshBuildCacheCapabilityAds,
+} from '../capabilities/probe.js';
+import { cleanupDockerResourcesForAttempt } from '../docker/cleanup.js';
 import { AgentJobExecutor } from '../executor/index.js';
 import { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
 import { applyDiskPressureCleanup } from '../recovery/disk-pressure.js';
@@ -40,6 +51,7 @@ export interface AgentConnectionOptions {
   secretMap?: Record<string, string>;
   gitAllowlist: GitUrlAllowlist;
   repoCache?: RepoCacheConfig;
+  buildCache?: BuildCacheConfig;
   logSpoolMaxBytes?: number;
   logSendQueueMax?: number;
   /** Disk admission floor (Phase 6). */
@@ -85,6 +97,9 @@ export class AgentConnection {
         },
         resumeArtifactUpload: async (meta) => {
           await this.executor?.resumeArtifactUpload(meta);
+        },
+        cleanupAttemptResources: async (attemptId) => {
+          await cleanupDockerResourcesForAttempt({ attemptId });
         },
       },
     });
@@ -213,6 +228,7 @@ export class AgentConnection {
           if (status === 'authenticated') {
             const agentId = String(message.payload?.agent_id ?? state.agentId ?? '');
             this.saveState({ ...state, agentId });
+            this.options.capabilities.agent_id = agentId;
             this.send(socket, 'capabilities', {
               ...this.options.capabilities,
               agent_id: agentId,
@@ -230,6 +246,7 @@ export class AgentConnection {
                 toolchainProfiles: this.options.capabilities.toolchain_profiles,
                 gitAllowlist: this.options.gitAllowlist,
                 repoCache: this.options.repoCache ?? DEFAULT_REPO_CACHE_CONFIG,
+                buildCache: this.options.buildCache ?? DEFAULT_BUILD_CACHE_CONFIG,
                 logSpoolMaxBytes: this.options.logSpoolMaxBytes,
                 logSendQueueMax: this.options.logSendQueueMax,
                 recovery: this.recovery,
@@ -385,12 +402,32 @@ export class AgentConnection {
 
     if (underPressure) {
       const retentionDays = this.options.repoCache?.retention_days ?? 14;
+      const buildCache = this.options.buildCache ?? DEFAULT_BUILD_CACHE_CONFIG;
+      // Wire heartbeat free-disk measurement so min-free eviction can trigger.
+      const buildCacheStore = new BuildCacheStore(
+        resolveBuildCachesDir(this.options.stateDir),
+        buildCache,
+        {
+          getFreeBytes: async () => this.options.getFreeDiskBytes?.() ?? freeBytes,
+        },
+      );
       void applyDiskPressureCleanup({
         stateDir: this.options.stateDir,
         minFreeBytes: minFree > 0 ? minFree : 1,
         freeBytes,
         spoolPressure,
         retentionMs: retentionDays * 24 * 60 * 60 * 1000,
+        cleanupAttemptResources: async (attemptId) => {
+          await this.recovery.cleanupVerifiedOrphan(attemptId);
+        },
+        // After inactive repo caches: evict LRU inactive build-cache keys (never locked/in-use).
+        evictInactiveBuildCaches: async () => {
+          const result = await buildCacheStore.evictInactive({
+            maxSizeBytes: buildCache.maxSizeGb * 1024 ** 3,
+            minFreeBytes: buildCache.minFreeDiskGb * 1024 ** 3,
+          });
+          return result.evictedKeys;
+        },
       }).catch((error) => {
         logger.warn('disk-pressure cleanup failed', { error: String(error) });
       });
@@ -404,6 +441,41 @@ export class AgentConnection {
       disk_min_free_bytes: minFree,
       disk_pressure: diskPressure,
       spool_pressure: spoolPressure,
+    });
+
+    void this.refreshBuildCacheCapabilities(socket).catch((error) => {
+      logger.warn('build-cache capability refresh failed', { error: String(error) });
+    });
+  }
+
+  private async refreshBuildCacheCapabilities(socket: WebSocket): Promise<void> {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const agentId = this.options.capabilities.agent_id;
+    if (!agentId) {
+      return;
+    }
+    const buildCache = this.options.buildCache ?? DEFAULT_BUILD_CACHE_CONFIG;
+    const refreshed = await refreshBuildCacheCapabilityAds({
+      stateDir: this.options.stateDir,
+      enabledKinds: buildCache.enabledKinds,
+    });
+    const { changed, build_caches } = applyRefreshedBuildCacheAds(
+      this.options.capabilities,
+      refreshed,
+    );
+    if (!changed) {
+      return;
+    }
+    if (build_caches) {
+      this.options.capabilities.build_caches = build_caches;
+    } else {
+      this.options.capabilities.build_caches = undefined;
+    }
+    this.send(socket, 'capabilities', {
+      ...this.options.capabilities,
+      agent_id: agentId,
     });
   }
 

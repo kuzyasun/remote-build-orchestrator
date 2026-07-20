@@ -1,8 +1,13 @@
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import type { BuildCacheKind, RiskLevel } from '@rbo/protocol';
+import { BuildCacheKindSchema } from '@rbo/protocol';
 import type { GitUrlAllowlist } from '@rbo/shared';
+import { type BuildCacheConfig, DEFAULT_BUILD_CACHE_CONFIG } from './build-cache/index.js';
 import { DEFAULT_REPO_CACHE_CONFIG, type RepoCacheConfig } from './repos/mirror.js';
+
+export type { BuildCacheConfig };
 
 export interface AgentConfig {
   controllerUrl: string;
@@ -16,6 +21,8 @@ export interface AgentConfig {
   gitAllowlist: GitUrlAllowlist;
   /** On-disk bare mirror cache limits (§10.10). */
   repoCache: RepoCacheConfig;
+  /** Named build-cache quotas and risk policy (Phase 7). */
+  buildCache: BuildCacheConfig;
   /** Max bytes for attempt log spool (stdout+stderr). Breach → log_spool_limit. */
   logSpoolMaxBytes: number;
   /** Max in-memory pending log_chunk send queue depth. */
@@ -106,6 +113,64 @@ function parseRepoCache(overrides?: RepoCacheConfig): RepoCacheConfig {
   };
 }
 
+function parseBuildCacheKinds(raw: string | undefined): BuildCacheKind[] | undefined {
+  if (!raw?.trim()) {
+    return undefined;
+  }
+  const kinds: BuildCacheKind[] = [];
+  for (const part of parseCsv(raw)) {
+    const parsed = BuildCacheKindSchema.safeParse(part);
+    if (!parsed.success) {
+      throw new Error(
+        `Invalid RBO_BUILD_CACHE_ENABLED_KINDS entry '${part}' — expected ccache|sccache|npm|pnpm|pip`,
+      );
+    }
+    kinds.push(parsed.data);
+  }
+  return kinds;
+}
+
+function parseRiskLevels(raw: string | undefined): RiskLevel[] | undefined {
+  if (!raw?.trim()) {
+    return undefined;
+  }
+  const allowed = new Set(['safe', 'normal', 'destructive', 'hardware']);
+  const levels: RiskLevel[] = [];
+  for (const part of parseCsv(raw)) {
+    if (!allowed.has(part)) {
+      throw new Error(`Invalid risk level '${part}' — expected safe|normal|destructive|hardware`);
+    }
+    levels.push(part as RiskLevel);
+  }
+  return levels;
+}
+
+function parseBuildCache(overrides?: BuildCacheConfig): BuildCacheConfig {
+  if (overrides) {
+    return overrides;
+  }
+  return {
+    enabledKinds: parseBuildCacheKinds(process.env.RBO_BUILD_CACHE_ENABLED_KINDS) ?? [
+      ...DEFAULT_BUILD_CACHE_CONFIG.enabledKinds,
+    ],
+    maxSizeGb: Number(
+      process.env.RBO_BUILD_CACHE_MAX_SIZE_GB ?? DEFAULT_BUILD_CACHE_CONFIG.maxSizeGb,
+    ),
+    minFreeDiskGb: Number(
+      process.env.RBO_BUILD_CACHE_MIN_FREE_DISK_GB ?? DEFAULT_BUILD_CACHE_CONFIG.minFreeDiskGb,
+    ),
+    retentionDays: Number(
+      process.env.RBO_BUILD_CACHE_RETENTION_DAYS ?? DEFAULT_BUILD_CACHE_CONFIG.retentionDays,
+    ),
+    allowReadRiskLevels: parseRiskLevels(process.env.RBO_BUILD_CACHE_ALLOW_READ_RISKS) ?? [
+      ...DEFAULT_BUILD_CACHE_CONFIG.allowReadRiskLevels,
+    ],
+    allowWriteRiskLevels: parseRiskLevels(process.env.RBO_BUILD_CACHE_ALLOW_WRITE_RISKS) ?? [
+      ...DEFAULT_BUILD_CACHE_CONFIG.allowWriteRiskLevels,
+    ],
+  };
+}
+
 export function resolveDefaultStateDir(): string {
   if (process.platform === 'win32' && process.env.ProgramData) {
     return join(process.env.ProgramData, 'RBO');
@@ -161,6 +226,7 @@ export function loadAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
     secretMap: overrides.secretMap ?? parseSecretMap(process.env.RBO_SECRET_MAP),
     gitAllowlist: parseGitAllowlist(overrides.gitAllowlist),
     repoCache: parseRepoCache(overrides.repoCache),
+    buildCache: parseBuildCache(overrides.buildCache),
     logSpoolMaxBytes:
       overrides.logSpoolMaxBytes ??
       Number(process.env.RBO_LOG_SPOOL_MAX_BYTES ?? DEFAULT_LOG_SPOOL_MAX_BYTES),
@@ -193,6 +259,11 @@ export function loadAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
 /** Resolved path for bare repository mirrors (§10.1). */
 export function resolveReposDir(config: AgentConfig): string {
   return join(config.stateDir, 'repos');
+}
+
+/** Resolved path for named build caches (Phase 7). */
+export function resolveBuildCachesDir(config: AgentConfig): string {
+  return join(config.stateDir, 'build-caches');
 }
 
 export function ensureStateDir(config: AgentConfig): void {

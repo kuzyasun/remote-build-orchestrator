@@ -9,7 +9,7 @@ import {
 
 const logger = createLogger('agent.disk-pressure');
 
-export type DiskCleanupKind = 'artifacts' | 'workspaces' | 'spools' | 'repos';
+export type DiskCleanupKind = 'artifacts' | 'workspaces' | 'spools' | 'repos' | 'build_caches';
 
 const ACTIVE_STATUSES: ReadonlySet<AttemptMetadataStatus> = new Set([
   'accepted',
@@ -44,8 +44,19 @@ export interface DiskPressureCleanupOptions {
   nowMs?: number;
   /** Optional delete observer (tests assert order). */
   onDelete?: (kind: DiskCleanupKind, path: string) => void;
+  /**
+   * Label-scoped resource cleanup (e.g. Docker `rbo.attempt=<id>`) before
+   * removing attempt workspaces or sweeping orphan attempt artifact dirs.
+   */
+  cleanupAttemptResources?: (attemptId: string) => Promise<void>;
   /** Optional repo eviction hook; default scans inactive mirrors. */
   evictInactiveRepos?: () => Promise<string[]>;
+  /**
+   * Optional build-cache eviction hook.
+   * Runs **after** inactive repo-cache eviction (never before).
+   * Must never remove keys with an active lock / in-use marker.
+   */
+  evictInactiveBuildCaches?: () => Promise<string[]>;
 }
 
 export interface DiskPressureCleanupResult {
@@ -67,6 +78,23 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+async function invokeAttemptResourceCleanup(
+  attemptId: string,
+  cleanup?: (attemptId: string) => Promise<void>,
+): Promise<void> {
+  if (!cleanup) {
+    return;
+  }
+  try {
+    await cleanup(attemptId);
+  } catch (error) {
+    logger.warn('disk-pressure cleanupAttemptResources failed', {
+      attemptId,
+      error: String(error),
+    });
+  }
+}
+
 async function removePath(
   kind: DiskCleanupKind,
   path: string,
@@ -81,10 +109,10 @@ async function removePath(
 }
 
 /**
- * Disk-pressure cleanup order (§31.4 / Phase 6):
+ * Disk-pressure cleanup order (§31.4 / Phase 6 + Phase 7):
  * refuse new leases → expired artifacts → old terminal workspaces →
- * old terminal logs/spools → inactive repo caches.
- * Never removes active attempt spool/workspace/mirror.
+ * old terminal logs/spools → inactive repo caches → inactive build caches.
+ * Never removes active attempt spool/workspace/mirror, nor locked/in-use build-cache keys.
  */
 export async function applyDiskPressureCleanup(
   options: DiskPressureCleanupOptions,
@@ -140,6 +168,7 @@ export async function applyDiskPressureCleanup(
       }
       // Orphan artifact staging without active attempt — treat as expired
       const artDir = join(artifactsRoot, name);
+      await invokeAttemptResourceCleanup(name, options.cleanupAttemptResources);
       if (await removePath('artifacts', artDir, record)) {
         logger.info('disk-pressure removed orphan artifacts', { attemptId: name });
       }
@@ -150,6 +179,7 @@ export async function applyDiskPressureCleanup(
 
   // 2. Old terminal workspaces
   for (const meta of terminalOld) {
+    await invokeAttemptResourceCleanup(meta.attempt_id, options.cleanupAttemptResources);
     const ws = meta.workspace_path ?? join(options.stateDir, 'workspaces', meta.attempt_id);
     if (await removePath('workspaces', ws, record)) {
       logger.info('disk-pressure removed old workspace', { attemptId: meta.attempt_id });
@@ -200,6 +230,14 @@ export async function applyDiskPressureCleanup(
       }
     } catch {
       // no repos dir
+    }
+  }
+
+  // 5. Inactive build caches (AFTER repo caches). Never evict locked / active_users > 0.
+  if (options.evictInactiveBuildCaches) {
+    const evicted = await options.evictInactiveBuildCaches();
+    for (const key of evicted) {
+      record('build_caches', join(options.stateDir, 'build-caches', key));
     }
   }
 

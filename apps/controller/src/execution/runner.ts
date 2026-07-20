@@ -302,7 +302,7 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
     const injectedEnv = {
       RBO_JOB_ID: jobId,
       RBO_ATTEMPT_ID: attempt.id,
-      RBO_ARTIFACTS_DIR: artifactsDir,
+      RBO_ARTIFACT_DIR: artifactsDir,
     };
     const child = spawnJobScript({
       attemptId: attempt.id,
@@ -514,7 +514,7 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
         env: {
           RBO_JOB_ID: jobId,
           RBO_ATTEMPT_ID: attempt.id,
-          RBO_ARTIFACTS_DIR: artifactsDir,
+          RBO_ARTIFACT_DIR: artifactsDir,
         },
         logs,
       }).catch(() => ({ exitCode: null, timedOut: false }));

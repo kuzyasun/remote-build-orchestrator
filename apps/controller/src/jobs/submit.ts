@@ -254,15 +254,25 @@ export async function dispatchJobExecution(
 
   const snapshotMeta = ctx.db
     .prepare(
-      'SELECT repo_id, base_commit FROM snapshots WHERE id = (SELECT snapshot_id FROM jobs WHERE id = ?)',
+      'SELECT repo_id, base_commit, content_id FROM snapshots WHERE id = (SELECT snapshot_id FROM jobs WHERE id = ?)',
     )
-    .get(jobId) as { repo_id: string | null; base_commit: string | null } | undefined;
+    .get(jobId) as
+    | { repo_id: string | null; base_commit: string | null; content_id: string }
+    | undefined;
+
+  const buildCacheProjectIdentity =
+    snapshotMeta?.repo_id && snapshotMeta.repo_id !== 'local'
+      ? snapshotMeta.repo_id
+      : snapshotMeta?.content_id
+        ? `local:${snapshotMeta.content_id}`
+        : null;
 
   const decision = selectAgentForJob(candidates, request, {
     allowLocalFallback: true,
     repoCanonicalId:
       snapshotMeta?.repo_id && snapshotMeta.repo_id !== 'local' ? snapshotMeta.repo_id : null,
     baseCommit: snapshotMeta?.base_commit ?? null,
+    buildCacheProjectIdentity,
   });
 
   if (decision.action === 'remote' && decision.selectedAgent && ctx.agentPlanePort) {

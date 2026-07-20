@@ -10,6 +10,7 @@ import type { ExecutionConfig } from '@rbo/protocol';
 import { RboError } from '@rbo/shared';
 import type { AttemptLogPaths } from './logs.js';
 import { appendStderr, appendStdout } from './logs.js';
+import { buildReservedRboEnv } from './runtime-env.js';
 import { WindowsHelperFrameReader } from './windows-frames.js';
 
 const execFileAsync = promisify(execFile);
@@ -441,14 +442,23 @@ export function spawnJobScript(input: {
   const scriptPath = join(input.controlDir, input.scriptFileName ?? defaultName);
   const shell = resolveShellCommand(input.execution.shell);
 
+  const extra: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input.env)) {
+    if (!key.startsWith('RBO_')) {
+      extra[key] = value;
+    }
+  }
   const { env: childEnv, ignoredRboEnvKeys } = buildChildEnv({
     execution: input.execution,
-    injected: {
-      ...input.env,
-      RBO_WORKSPACE: input.workspacePath,
-      RBO_PROJECT_DIR: input.projectPath,
-      RBO_LOG_DIR: input.logs.logDir,
-    },
+    injected: buildReservedRboEnv({
+      jobId: input.env.RBO_JOB_ID ?? '',
+      attemptId: input.env.RBO_ATTEMPT_ID ?? input.attemptId,
+      workspacePath: input.workspacePath,
+      projectPath: input.projectPath,
+      logDir: input.logs.logDir,
+      artifactDir: input.env.RBO_ARTIFACT_DIR ?? '',
+      extra,
+    }),
   });
 
   let command: string;
