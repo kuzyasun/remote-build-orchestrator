@@ -1,10 +1,18 @@
-import { RBO_CONTROLLER_VERSION, createLogger, ensureControllerIdentity } from '@rbo/shared';
+import {
+  HostCpuMonitor,
+  RBO_CONTROLLER_VERSION,
+  createLogger,
+  ensureControllerIdentity,
+} from '@rbo/shared';
 import { ensureDataDir, loadControllerConfig } from './config.js';
 import { startControllerServer } from './http/server.js';
 import { migrateToLatest, openDatabase } from './storage/database.js';
 import { startAgentPlaneServer } from './websocket/server.js';
 
 const logger = createLogger('controller.main');
+
+/** How often the host CPU sampler takes a fresh reading (host-aware local fallback). */
+const HOST_CPU_SAMPLE_INTERVAL_MS = 5_000;
 
 async function main(): Promise<void> {
   const config = loadControllerConfig();
@@ -14,6 +22,10 @@ async function main(): Promise<void> {
   migrateToLatest(db);
 
   const identity = await ensureControllerIdentity(config.dataDir);
+
+  const hostCpuMonitor = new HostCpuMonitor();
+  hostCpuMonitor.start(HOST_CPU_SAMPLE_INTERVAL_MS);
+  const getHostCpuBusyFraction = () => hostCpuMonitor.currentBusyFraction();
 
   const agentPlane = await startAgentPlaneServer({
     port: config.agentPlanePort,
@@ -33,6 +45,8 @@ async function main(): Promise<void> {
       maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
       gitAllowlist: config.gitAllowlist,
       allowLocalFallback: config.allowLocalFallback,
+      getHostCpuBusyFraction,
+      maxHostCpuBusyFraction: config.maxHostCpuBusyFraction,
     },
   });
 
@@ -51,6 +65,8 @@ async function main(): Promise<void> {
     maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
     gitAllowlist: config.gitAllowlist,
     allowLocalFallback: config.allowLocalFallback,
+    getHostCpuBusyFraction,
+    maxHostCpuBusyFraction: config.maxHostCpuBusyFraction,
   });
 
   logger.info('controller started', {
@@ -63,6 +79,7 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     logger.info('controller shutting down');
+    hostCpuMonitor.stop();
     await httpServer.close();
     await agentPlane.close();
     db.close();

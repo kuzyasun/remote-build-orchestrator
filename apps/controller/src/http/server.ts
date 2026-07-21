@@ -41,6 +41,9 @@ export interface ControllerServerOptions {
   maxConcurrentJobs?: number;
   gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
   allowLocalFallback?: boolean;
+  /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
+  getHostCpuBusyFraction?: () => number;
+  maxHostCpuBusyFraction?: number;
 }
 
 export interface RunningControllerServer {
@@ -99,6 +102,8 @@ function buildToolContext(
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
     gitAllowlist: options.gitAllowlist,
     allowLocalFallback: options.allowLocalFallback,
+    getHostCpuBusyFraction: options.getHostCpuBusyFraction,
+    maxHostCpuBusyFraction: options.maxHostCpuBusyFraction,
   };
 }
 

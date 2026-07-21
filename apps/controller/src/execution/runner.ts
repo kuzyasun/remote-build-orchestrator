@@ -59,6 +59,11 @@ const pendingCancels = new Set<string>();
 let admissionActive = 0;
 const admissionWaiters: Array<() => void> = [];
 
+/** Currently-running local-fallback jobs on this Controller's own host (host-aware fallback). */
+export function getLocalRunningJobsCount(): number {
+  return admissionActive;
+}
+
 async function acquireAdmission(maxConcurrentJobs: number): Promise<() => void> {
   while (admissionActive >= maxConcurrentJobs) {
     await new Promise<void>((resolvePromise) => {

@@ -289,6 +289,13 @@ export const AgentCapabilityReportSchema = z.object({
     disk_free_bytes: z.number().nonnegative().optional(),
     disk_min_free_bytes: z.number().nonnegative().optional(),
     disk_pressure: z.boolean().optional(),
+    /**
+     * Primary-core clock speed (MHz) from os.cpus()[0].speed, for host-aware scheduling's
+     * capacity score (cpu_logical * cpu_speed_mhz). Optional — missing is treated as an
+     * unknown/lowest-priority capacity by the Controller, same spirit as cpu_load's pessimistic
+     * default above.
+     */
+    cpu_speed_mhz: z.number().nonnegative().optional(),
   }),
   execution: z.object({
     max_jobs: z.number(),

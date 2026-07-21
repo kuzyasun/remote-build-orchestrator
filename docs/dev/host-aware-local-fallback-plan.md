@@ -1,15 +1,27 @@
 # Plan: host-CPU-aware local fallback
 
-Status: **plan only, not implemented.** v1 defines "host busy" as CPU% only (per explicit decision);
-disk/memory/user-input signals are out of scope for v1.
+Status: **v1 implemented**, corrected after review (see note below). "Host busy" is CPU% only, per
+explicit decision; disk/memory/user-input signals remain out of scope. A real micro-benchmark
+capacity score (noted below as a stronger v2 option) is not implemented — v1 uses the
+`cores * clock speed` proxy.
 
 **Revision:** the original draft treated the host purely as a last-resort, threshold-gated fallback
-(used only when no Agent is eligible at all). Follow-up direction changed the shape of this:
-instead of a flat "yes/no" gate, rank the host among the same candidate pool as Agents, weighted by
-a rough capacity score (not just current busy%) — a strong, idle host can still take a job even
-near the naive threshold, because it'll finish faster than a weaker machine would anyway. And when
-literally every candidate (host + every Agent) is over its threshold, don't fail/queue — pick
-whichever one has the fewest currently running jobs. The sections below reflect this.
+(used only when no Agent is eligible at all). Follow-up direction asked for something more: a
+strong host should get to exceed the naive threshold, since it finishes the same job faster than a
+weaker machine would.
+
+**Correction (post-implementation review):** the first implementation pass wired `cpu_speed_mhz`
+and `computeCapacityScore` all the way through the protocol schema, the Agent probe, and the
+Controller's submit path into `HostLoadSnapshot.capacityScore` — but `decideLocalFallback` never
+actually read that field. The threshold check and the fewest-running-jobs tie-break (§4) were both
+real and well-tested; the "strong machine gets real headroom" half of the requirement was not
+implemented at all, and a test named for exactly that scenario computed its assertion inline
+instead of calling any production code, which is why this went unnoticed initially. Fixed by
+`computeEffectiveMaxHostCpuBusyFraction` (§2/§3 below) — a deliberately narrower mechanism than the
+original "rank host in the same scored pool as Agents" idea (see why in §3), but one that does
+genuinely implement the requirement: a host more powerful than a reference baseline gets a raised
+effective threshold, proportional to how much more powerful it is, capped so no host is ever
+treated as having no limit at all.
 
 ## What's actually happening today
 
@@ -71,38 +83,54 @@ capacityScore = os.cpus().length * (os.cpus()[0]?.speed ?? 0)
 ```
 
 This is already close to free — `cpu_logical` is already reported in `AgentCapabilityReport`
-(`apps/agent/src/capabilities/probe.ts:177`), just needs `speed` added alongside it. Memory factors
-in as a secondary, smaller weight (a fast CPU starved for RAM still thrashes) rather than an equal
-partner — e.g. `capacityScore * min(1, memory_free_mb / memoryReferenceMb)`. A real micro-benchmark
-(e.g., a few ms of synthetic CPU work timed at Agent/Controller startup) would be a materially more
-accurate power signal than "cores × clock" — flagging it as a stronger v2 option, not proposing it
-for v1 given the added complexity (needs to run once per boot, cache the result, and be comparable
-across machines consistently).
+(`apps/agent/src/capabilities/probe.ts:177`), just needed `speed` added alongside it
+(`cpu_speed_mhz`, same object). Memory factors in as a secondary, smaller weight (a fast CPU
+starved for RAM still thrashes) rather than an equal partner — `capacityScore * min(1,
+memory_free_mb / memoryReferenceMb)`. A real micro-benchmark (e.g., a few ms of synthetic CPU work
+timed at Agent/Controller startup) would be a materially more accurate power signal than "cores ×
+clock" — flagging it as a stronger v2 option, not proposing it for v1 given the added complexity
+(needs to run once per boot, cache the result, and be comparable across machines consistently).
 
-### 3. Rank host alongside Agents instead of gating it as last resort
+### 3. What actually consumes the capacity score: a threshold boost, not a ranking
 
-Today `selectAgentForJob` only considers the host once no Agent passes hard-filtering — the host
-is not part of the same competition. Change this: after hard-filtering (OS/arch/labels/memory/
-disk/toolchain/secrets — unchanged), build one candidate list containing every eligible Agent *and*
-the host itself (host is excluded from this list entirely for `destructive`/`hardware` jobs, same
-safety rule as today — that constraint doesn't change, only *how* the safe/normal case ranks).
+The original idea here was to fold the host into `selectAgentForJob`'s scored candidate pool
+alongside Agents (`effectiveScore = capacityScore * (1 - currentLoadFraction)`, pick the highest).
+That was **not built** — it would mean restructuring the already-verified §19.2 Agent scoring loop
+to also rank a structurally different kind of candidate (no OS/labels/tools/secrets matching
+applies to "the Controller's own process"), a materially bigger and riskier change than this
+feature needed. It would also cut against the product's own stated motivation: an agent is the
+*default* preferred worker specifically so the host stays free; letting a powerful-but-busy host
+outrank an available idle Agent would work against that, not reinforce it.
 
-For each candidate compute an **effective score**:
+What's actually implemented is narrower and stays entirely inside the existing last-resort fallback
+branch — `selectAgentForJob` reaches it exactly like before, only once no Agent is eligible at all:
 
 ```ts
-effectiveScore = capacityScore * (1 - currentLoadFraction)
+// apps/controller/src/scheduler/index.ts
+function computeEffectiveMaxHostCpuBusyFraction(
+  capacityScore: number,
+  baseMaxFraction: number,
+  referenceCapacityScore: number, // DEFAULT_REFERENCE_CAPACITY_SCORE: an 8-core/3GHz baseline
+): number {
+  if (referenceCapacityScore <= 0 || capacityScore <= referenceCapacityScore) {
+    return baseMaxFraction; // average-or-weaker host: unchanged, no regression
+  }
+  const powerRatio = capacityScore / referenceCapacityScore;
+  return Math.min(0.97, baseMaxFraction * powerRatio); // capped — never effectively "no limit"
+}
 ```
 
-`currentLoadFraction` is the existing `cpu_load` heartbeat value for Agents (already tracked, was
-already fed into §19.2's `-cpu_load*100` term) and the new `HostCpuMonitor` reading for the host.
-Pick the candidate with the highest `effectiveScore`. This is what lets "our strong machine" win a
-job over a weaker idle one even at moderate load — its *available* throughput (power × headroom)
-is still higher — without needing a separate carve-out or a raised threshold just for it.
+`decideLocalFallback` compares the host's live `cpuBusyFraction` against this *effective* ceiling
+instead of the flat `maxHostCpuBusyFraction` directly. A host at or below the reference power gets
+exactly the configured base threshold (identical to pre-feature behavior); a host stronger than the
+baseline gets a proportionally higher ceiling, capped at 0.97 so an extreme outlier is never treated
+as having no limit at all. This genuinely satisfies "a strong machine can take a job despite being
+over the naive threshold" without touching Agent-vs-Agent scoring or the "Agent preferred over
+host" default at all.
 
-**Threshold's remaining job**: `RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT` becomes a floor, not the
-whole decision — a candidate above it is excluded from consideration entirely regardless of score
-(a machine at 95% CPU shouldn't take a job just because its raw specs are good), narrowing the
-"who's even eligible" set before ranking by effective score within it.
+**Threshold's role, restated accurately**: `RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT` is the
+*baseline* ceiling for an average machine, not a universal cutoff — the effective ceiling actually
+applied is host-specific, scaled by that host's own capacity score.
 
 ### 4. When everyone is over threshold: fewest running jobs, not a blind failure
 
@@ -114,31 +142,34 @@ equivalent is the existing local-execution admission count in
 tie-break for the "nothing is actually free" case — least-bad rather than best, since nothing
 qualifies as good right now.
 
-### 5. Close the "host cools down with no new Agent" gap
+### 5. "Host cools down with no new Agent" gap — already closed, no new code needed
 
-`tryDispatchQueuedJobs` already re-fires on Agent connect/heartbeat (`maybeDispatchQueued`,
-`websocket/server.ts:184`), but nothing re-fires purely because the host got less busy. Add a
-periodic timer (same pattern as the existing lease-expiry `setInterval` at
-`websocket/server.ts:210`) that calls `maybeDispatchQueued()` on an interval — but only bother
-doing so when at least one job is actually queued for this reason, to avoid a busy-loop when the
-queue is empty.
+Turned out to already be covered: the existing `leaseSweep` `setInterval` in
+`websocket/server.ts` (originally added for lease-expiry sweeping) already calls
+`maybeDispatchQueued()` unconditionally every 15s, and `tryDispatchQueuedJobs` re-evaluates
+*every* queued job from scratch (not just ones tied to a specific reason) on each call. So a job
+queued for `host_busy` gets re-tried on this same cadence with no additional plumbing — implemented
+as originally planned turned out to be "nothing to add here."
 
 ### 6. Observability
 
-Emit a distinct `job_events` entry when every candidate is over threshold and the queue-then-
-least-loaded tie-break (§4) had to be used, separate from the normal "picked by effective score"
-dispatch — so an AI client watching `job_logs` can tell "everything was busy, went with the least-
-bad option" apart from a normal, healthy dispatch, and an operator can see it in the observability
-report's terminal-outcome breakdown (also record which candidates were considered and their scores,
-for auditing a scheduling decision after the fact).
+Originally planned as a distinct `job_events` entry — turned out not to fit: `JobEventSchema`
+requires a real `attempt_id` (FK to `job_attempts`), and a job stuck in `wait`/`host_busy` has no
+attempt yet (that's the whole point — nothing started). Implemented instead as Controller-side
+structured logging (`logger.info('local fallback deferred — host over CPU threshold...', {...})`
+in `jobs/submit.ts`) when the tie-break resolves against the host — operator-visible, not
+surfaced through `job_logs` to the AI client, since there's no attempt for that log to be scoped
+to. A future observability-report pass could still aggregate these log lines into a terminal-
+outcome-style metric without needing a schema change.
 
 ## Open questions (need a decision before implementing)
 
-1. **Threshold default, and the score formula's weights.** 80% CPU as the exclusion floor and
-   `cores * speed` as the capacity proxy are both placeholders — need validating against what
-   actually feels right in practice, not picked blind. In particular, how much should memory factor
-   in vs. CPU (the plan above treats it as a smaller secondary multiplier — is that right for the
-   workloads this actually runs)?
+1. **Threshold default, the reference capacity score, and the 0.97 cap.** 80% CPU as the baseline
+   ceiling, an 8-core/3GHz reference machine, and a 0.97 hard cap on the boosted ceiling are all
+   placeholders — need validating against what actually feels right in practice, not picked blind.
+   In particular, how much should memory factor into the capacity score vs. CPU (currently a
+   smaller secondary multiplier — is that right for the workloads this actually runs), and is a
+   linear `baseMaxFraction * powerRatio` boost the right curve, or should it flatten out sooner?
 2. ~~What if the host is busy and no Agent is ever available?~~ **Resolved by §4**: if the host is
    the only candidate and it's over threshold, "pick fewest running jobs among all candidates"
    still picks the host (there's nothing else to compare it to) rather than queuing forever — no
@@ -161,11 +192,14 @@ for auditing a scheduling decision after the fact).
    as a small, independently unit-testable pure function — add `cpu_speed_mhz` alongside the
    already-reported `cpu_logical` in `AgentCapabilityReport`, and compute the host's own via the
    same function.
-3. Controller: `HostCpuMonitor` wrapper + config threshold, and the effective-score ranking inside
-   `selectAgentForJob` — host becomes one more entry in the candidate list rather than a separate
-   branch. Unit tests directly on `selectAgentForJob` with fake candidates (varied score/load
-   combinations), no real timers/load needed — including the "everyone over threshold → fewest
-   running jobs" tie-break as its own explicit test case.
+3. Controller: `HostCpuMonitor` wrapper + config threshold, and
+   `computeEffectiveMaxHostCpuBusyFraction` consulted inside `decideLocalFallback` (still reached
+   only via `selectAgentForJob`'s existing last-resort fallback branch — see §3's correction). Unit
+   tests directly on `decideLocalFallback`/`selectAgentForJob` with fake host/Agent load
+   combinations, no real timers/load needed — including the "everyone over threshold → fewest
+   running jobs" tie-break and the "stronger-than-reference host gets real headroom" case as their
+   own explicit tests (the latter is the one a self-review initially missed, caught only because an
+   independent review agent noticed the capacity score was computed but never read).
 4. Periodic re-dispatch timer for "everything was over threshold, re-check later," gated on "is
    anything actually queued for this reason" to avoid a no-op busy loop.
 5. New `job_events` type for the least-loaded tie-break outcome (§6) in `packages/protocol`'s

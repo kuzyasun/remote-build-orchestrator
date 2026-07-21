@@ -78,6 +78,7 @@ Other env vars you may want (all optional, sane defaults shown):
 | `RBO_ALLOW_LOCAL_FALLBACK` | `true` | Allow the Controller itself to run a job locally when no eligible Agent is available and the job's `queue_policy`/`preferences.allow_local_fallback` permit it |
 | `RBO_LOCAL_MAX_CONCURRENT_JOBS` | `1` | Cap on concurrent locally-executed jobs |
 | `RBO_ALLOWED_ARTIFACT_DESTINATIONS` | (empty) | Comma-separated absolute paths `artifact_materialize` is allowed to write to — same shape as `RBO_ALLOWED_PROJECT_ROOTS`, checked independently |
+| `RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT` | `80` | Host-aware local fallback: above this CPU busy%, the Controller's own host is excluded from local fallback and the job queues instead — unless the host is still the least-loaded option available right now (see [`docs/dev/host-aware-local-fallback-plan.md`](../dev/host-aware-local-fallback-plan.md)) |
 
 > **Naming trap**: the `rbo` CLI (`agents`/`agent`/`submit`/`logs`/`cancel`/`doctor` — anything
 > talking to the Controller's HTTP admin/tool API) reads **`RBO_CONTROLLER_URL_HTTP`** (default

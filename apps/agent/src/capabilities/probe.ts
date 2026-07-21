@@ -182,6 +182,7 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
       disk_free_bytes: diskFreeBytes,
       ...(diskMinFreeBytes > 0 ? { disk_min_free_bytes: diskMinFreeBytes } : {}),
       disk_pressure: diskPressure,
+      cpu_speed_mhz: cpus()[0]?.speed ?? undefined,
     },
     execution: {
       max_jobs: input.maxJobs,
