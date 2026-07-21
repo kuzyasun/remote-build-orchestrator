@@ -11,3 +11,4 @@ export * from './build-cache-key.js';
 export * from './process-identity.js';
 export * from './packaging.js';
 export * from './backup-restore.js';
+export * from './host-load.js';

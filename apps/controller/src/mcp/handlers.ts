@@ -41,6 +41,9 @@ export interface ToolContext {
   dataPlaneBaseUrl?: string;
   gitAllowlist?: GitUrlAllowlist;
   allowLocalFallback?: boolean;
+  /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
+  getHostCpuBusyFraction?: () => number;
+  maxHostCpuBusyFraction?: number;
 }
 
 export interface ToolErrorResult {
@@ -71,6 +74,8 @@ function submitContext(ctx: ToolContext) {
     controllerPublicHost: ctx.controllerPublicHost,
     dataPlaneBaseUrl: ctx.dataPlaneBaseUrl,
     allowLocalFallback: ctx.allowLocalFallback,
+    getHostCpuBusyFraction: ctx.getHostCpuBusyFraction,
+    maxHostCpuBusyFraction: ctx.maxHostCpuBusyFraction,
   };
 }
 

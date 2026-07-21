@@ -13,4 +13,14 @@ describe('probeCapabilities git-lfs advertisement (§11.15)', () => {
       expect(caps.tools['git-lfs'].length).toBeGreaterThan(0);
     }
   });
+
+  it('reports cpu_speed_mhz for host-aware scheduling capacity scoring', async () => {
+    const caps = await probeCapabilities({
+      agentId: 'agt_live',
+      displayName: 'live',
+      maxJobs: 1,
+    });
+    expect(caps.resources.cpu_speed_mhz).toBeTypeOf('number');
+    expect(caps.resources.cpu_speed_mhz).toBeGreaterThan(0);
+  });
 });

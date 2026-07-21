@@ -54,6 +54,9 @@ export interface AgentPlaneDispatchContext {
   maxConcurrentJobs?: number;
   gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
   allowLocalFallback?: boolean;
+  /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
+  getHostCpuBusyFraction?: () => number;
+  maxHostCpuBusyFraction?: number;
 }
 
 export interface AgentPlaneOptions {
@@ -178,6 +181,8 @@ export async function startAgentPlaneServer(
       controllerPublicHost: options.controllerPublicHost,
       dataPlaneBaseUrl: options.dataPlaneBaseUrl,
       allowLocalFallback: options.dispatchContext.allowLocalFallback,
+      getHostCpuBusyFraction: options.dispatchContext.getHostCpuBusyFraction,
+      maxHostCpuBusyFraction: options.dispatchContext.maxHostCpuBusyFraction,
     };
   };
 

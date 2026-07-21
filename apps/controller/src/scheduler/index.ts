@@ -4,7 +4,7 @@ import type {
   JobRequest,
   ToolchainProfileSchema,
 } from '@rbo/protocol';
-import { computeBuildCacheKey } from '@rbo/shared';
+import { DEFAULT_REFERENCE_CAPACITY_SCORE, computeBuildCacheKey } from '@rbo/shared';
 import type { z } from 'zod';
 import type { ControllerDatabase } from '../storage/database.js';
 
@@ -20,6 +20,9 @@ export const SCHEDULER_SCORE_RUNNING_JOBS_PENALTY = 300;
 export const SCHEDULER_SCORE_CPU_LOAD_PENALTY = 100;
 /** Phase 7 build_cache_hit preference — weaker than repository_cache_hit (* 500). */
 export const SCHEDULER_SCORE_BUILD_CACHE_HIT = 250;
+
+/** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md) — v1 CPU-only threshold. */
+export const DEFAULT_MAX_HOST_CPU_BUSY_FRACTION = 0.8;
 
 /** §19.3 OS-family defaults when configured_priority is unset on the capability report. */
 export const SCHEDULER_DEFAULT_PRIORITY_MACOS = 20;
@@ -93,6 +96,99 @@ export interface SchedulerOptions {
   estimatedTransferBytes?: number | null;
   /** Controller-computed recent_failure_penalty per agent id (§19.2). */
   recentFailurePenalties?: ReadonlyMap<string, number>;
+  /**
+   * Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). When omitted, local
+   * fallback behaves exactly as before (host load is not considered) — fully backward compatible.
+   */
+  hostLoad?: HostLoadSnapshot;
+  /** CPU busy-fraction floor above which the host is excluded from local fallback consideration. */
+  maxHostCpuBusyFraction?: number;
+}
+
+export interface HostLoadSnapshot {
+  /** [0,1] — see packages/shared's sampleCpuBusyFraction. */
+  cpuBusyFraction: number;
+  /** packages/shared's computeCapacityScore(cpuLogical, cpuSpeedMhz, memoryFreeMb). */
+  capacityScore: number;
+  /** Currently-running local-fallback jobs on this Controller's own host. */
+  runningJobs: number;
+}
+
+export interface LocalFallbackDecisionInput {
+  allowLocalFallback: boolean;
+  riskLevel: JobRequest['risk_level'];
+  host: HostLoadSnapshot;
+  maxHostCpuBusyFraction: number;
+  /** Running-job counts of Agents currently excluded from selection only because they're at capacity. */
+  busyAgentRunningJobs: readonly number[];
+  /** Baseline capacity score a host is judged against; defaults to DEFAULT_REFERENCE_CAPACITY_SCORE. */
+  referenceCapacityScore?: number;
+}
+
+export interface LocalFallbackDecision {
+  eligible: boolean;
+  /** Present whenever the host was over its effective CPU threshold, whichever way it landed. */
+  reason?: 'host_busy';
+}
+
+/** Ceiling on the boosted threshold — a very powerful host still isn't treated as having no limit. */
+const MAX_EFFECTIVE_HOST_CPU_BUSY_FRACTION = 0.97;
+
+/**
+ * A host stronger than `referenceCapacityScore` (an 8-core/3GHz baseline) earns headroom past the
+ * flat `baseMaxFraction` threshold, scaled by how much more powerful it is — it finishes the same
+ * job faster than an average machine would, so a higher busy reading is still an acceptable time
+ * to take on local work. A host at or below the reference gets no boost (identical to pre-feature
+ * behavior). Capped so an extreme outlier is never effectively unbounded.
+ */
+export function computeEffectiveMaxHostCpuBusyFraction(
+  capacityScore: number,
+  baseMaxFraction: number,
+  referenceCapacityScore: number,
+): number {
+  if (referenceCapacityScore <= 0 || capacityScore <= referenceCapacityScore) {
+    return baseMaxFraction;
+  }
+  const powerRatio = capacityScore / referenceCapacityScore;
+  return Math.min(MAX_EFFECTIVE_HOST_CPU_BUSY_FRACTION, baseMaxFraction * powerRatio);
+}
+
+/**
+ * Pure decision: should this job run on the Controller's own host right now?
+ *
+ * Below the host's *effective* CPU threshold (the flat threshold, boosted for a more-powerful-
+ * than-average host via computeEffectiveMaxHostCpuBusyFraction), yes. At or above it, the host is
+ * excluded from consideration UNLESS it's still the least-loaded of everything currently available
+ * (including itself when no Agent exists at all) — running the job on an over-threshold-but-least-
+ * bad host beats leaving it stuck in queue forever with nothing better to compare against.
+ * Destructive/hardware risk jobs are excluded from local fallback regardless of load, exactly as
+ * before — host load and power never weaken that safety rule.
+ */
+export function decideLocalFallback(input: LocalFallbackDecisionInput): LocalFallbackDecision {
+  if (
+    !input.allowLocalFallback ||
+    input.riskLevel === 'destructive' ||
+    input.riskLevel === 'hardware'
+  ) {
+    return { eligible: false };
+  }
+
+  const effectiveMaxFraction = computeEffectiveMaxHostCpuBusyFraction(
+    input.host.capacityScore,
+    input.maxHostCpuBusyFraction,
+    input.referenceCapacityScore ?? DEFAULT_REFERENCE_CAPACITY_SCORE,
+  );
+
+  if (input.host.cpuBusyFraction < effectiveMaxFraction) {
+    return { eligible: true };
+  }
+
+  const leastBusyOther =
+    input.busyAgentRunningJobs.length > 0 ? Math.min(...input.busyAgentRunningJobs) : undefined;
+  if (leastBusyOther === undefined || input.host.runningJobs <= leastBusyOther) {
+    return { eligible: true, reason: 'host_busy' };
+  }
+  return { eligible: false, reason: 'host_busy' };
 }
 
 function matchesOs(requestOs?: string[], agentOs?: string): boolean {
@@ -535,6 +631,9 @@ export function selectAgentForJob(
     toolchains: ToolchainProfile[];
     score: number;
   }> = [];
+  // Agents excluded ONLY for being at capacity right now — used by the host-aware local-fallback
+  // tie-break (§4 of the plan) as "who's the least-loaded of everything currently unavailable".
+  const busyAgentRunningJobs: number[] = [];
 
   for (const candidate of agents) {
     const caps = candidate.capabilities;
@@ -542,6 +641,9 @@ export function selectAgentForJob(
     // 1. Effective capacity check (§35 Phase 4 rule 3: min(max_jobs, 1))
     const effectiveCapacity = Math.min(caps.execution.max_jobs, 1);
     if (effectiveCapacity <= 0 || candidate.activeJobsCount >= effectiveCapacity) {
+      if (effectiveCapacity > 0) {
+        busyAgentRunningJobs.push(candidate.activeJobsCount);
+      }
       continue;
     }
 
@@ -642,11 +744,26 @@ export function selectAgentForJob(
   // local_fallback — hardware/destructive remain ineligible (§19 / Phase 4)
   const riskLevel = request.risk_level ?? 'normal';
   const allowLocalFallback =
-    (prefs.allow_local_fallback ?? true) &&
-    (options.allowLocalFallback ?? true) &&
-    riskLevel !== 'destructive' &&
-    riskLevel !== 'hardware';
-  if (allowLocalFallback) {
+    (prefs.allow_local_fallback ?? true) && (options.allowLocalFallback ?? true);
+
+  if (options.hostLoad) {
+    const decision = decideLocalFallback({
+      allowLocalFallback,
+      riskLevel,
+      host: options.hostLoad,
+      maxHostCpuBusyFraction: options.maxHostCpuBusyFraction ?? DEFAULT_MAX_HOST_CPU_BUSY_FRACTION,
+      busyAgentRunningJobs,
+    });
+    if (decision.eligible) {
+      return { action: 'local_fallback' };
+    }
+    return decision.reason === 'host_busy'
+      ? { action: 'wait', reason: 'host_busy' }
+      : { action: 'fail_fast', reason: 'no_eligible_agent' };
+  }
+
+  // No host load reading supplied — unchanged, backward-compatible behavior.
+  if (allowLocalFallback && riskLevel !== 'destructive' && riskLevel !== 'hardware') {
     return { action: 'local_fallback' };
   }
 

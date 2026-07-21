@@ -24,7 +24,10 @@ makes it safe to run genuinely destructive or hardware-risk jobs: they come back
 
 - **Keep your host free while agents work.** Route the build/test/QEMU/Docker load an AI agent
   generates onto other available machines instead of competing with it for your own CPU/disk —
-  local execution stays available as a fallback, not disabled.
+  local execution stays available as a fallback, not disabled. When it does fall back to your own
+  machine, it checks your host's real CPU load first and prefers queuing (or another machine)
+  over piling onto an already-busy host — see
+  [`docs/dev/host-aware-local-fallback-plan.md`](docs/dev/host-aware-local-fallback-plan.md).
 - **Faster agents, more comfortable host.** Spreading work across host + Agents means an agent
   doesn't have to wait its turn behind whatever else you're doing on the same machine, and you
   don't have to wait behind the agent.
@@ -117,9 +120,6 @@ for an `AGENTS.md`/`CLAUDE.md` snippet to drop into your own project.
   `rbo agent start` / `rbo submit ...`) instead of extracting a per-OS archive. Not built yet — see
   [`docs/dev/global-cli-packaging-plan.md`](docs/dev/global-cli-packaging-plan.md) for what's
   actually required to get there.
-- Host-CPU-aware local fallback: don't run a job on your own machine when it's already busy, and
-  queue it instead of falling back unconditionally. Not built yet — see
-  [`docs/dev/host-aware-local-fallback-plan.md`](docs/dev/host-aware-local-fallback-plan.md).
 
 ## Contributing
 

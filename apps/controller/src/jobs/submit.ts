@@ -1,11 +1,19 @@
 import { createHash } from 'node:crypto';
 import { rm } from 'node:fs/promises';
+import { cpus, freemem } from 'node:os';
 import { join } from 'node:path';
 import { appendEvent, readLogTail } from '@rbo/executor';
 import type { AgentCapabilityReport, JobRequest } from '@rbo/protocol';
 import { JobRequestSchema } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
-import { RboError, generateId, signEdDsaJwt, verifyEdDsaJwt } from '@rbo/shared';
+import {
+  RboError,
+  computeCapacityScore,
+  createLogger,
+  generateId,
+  signEdDsaJwt,
+  verifyEdDsaJwt,
+} from '@rbo/shared';
 import { stableStringify } from '@rbo/snapshot';
 import { listArtifactsForJob } from '../execution/artifacts.js';
 import { initiateRemoteAttempt, requestRemoteJobCancel } from '../execution/remote-execution.js';
@@ -13,12 +21,14 @@ import {
   type LocalRunnerContext,
   attemptLogDir,
   captureAndPersistSnapshot,
+  getLocalRunningJobsCount,
   mergeGitSourceToolRequirements,
   readGitSourceRequirements,
   requestJobCancel,
   runLocalJob,
 } from '../execution/runner.js';
 import {
+  type HostLoadSnapshot,
   type SchedulerAgent,
   getActiveJobsForAgents,
   getRecentFailurePenaltiesForAgents,
@@ -40,6 +50,8 @@ import {
 } from './lifecycle.js';
 import { completeSubmission, reserveSubmission } from './submissions.js';
 
+const logger = createLogger('controller.jobs.submit');
+
 const CONFIRMATION_TTL_SECONDS = 300;
 
 export interface SubmitJobContext extends LocalRunnerContext {
@@ -50,6 +62,12 @@ export interface SubmitJobContext extends LocalRunnerContext {
   controllerPublicHost?: string;
   dataPlaneBaseUrl?: string;
   allowLocalFallback?: boolean;
+  /**
+   * Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). Omitted means
+   * unchanged, backward-compatible behavior (host load not considered).
+   */
+  getHostCpuBusyFraction?: () => number;
+  maxHostCpuBusyFraction?: number;
 }
 
 function requestHash(request: JobRequest): string {
@@ -280,6 +298,18 @@ export async function dispatchJobExecution(
   const gitSourceRequirements = await readGitSourceRequirements(ctx.dataDir, jobId);
   const schedulingRequest = mergeGitSourceToolRequirements(request, gitSourceRequirements);
 
+  const hostLoad: HostLoadSnapshot | undefined = ctx.getHostCpuBusyFraction
+    ? {
+        cpuBusyFraction: ctx.getHostCpuBusyFraction(),
+        capacityScore: computeCapacityScore({
+          cpuLogical: cpus().length,
+          cpuSpeedMhz: cpus()[0]?.speed ?? 0,
+          memoryFreeMb: Math.round(freemem() / (1024 * 1024)),
+        }),
+        runningJobs: getLocalRunningJobsCount(),
+      }
+    : undefined;
+
   const decision = selectAgentForJob(candidates, schedulingRequest, {
     allowLocalFallback: ctx.allowLocalFallback,
     repoCanonicalId:
@@ -288,6 +318,8 @@ export async function dispatchJobExecution(
     buildCacheProjectIdentity,
     estimatedTransferBytes: snapshotMeta?.size_bytes ?? null,
     recentFailurePenalties,
+    hostLoad,
+    maxHostCpuBusyFraction: ctx.maxHostCpuBusyFraction,
   });
 
   if (decision.action === 'remote' && decision.selectedAgent && ctx.agentPlanePort) {
@@ -323,7 +355,18 @@ export async function dispatchJobExecution(
     return;
   }
 
-  // queue_policy=wait: leave job queued until an eligible agent has capacity.
+  // queue_policy=wait: leave job queued until an eligible agent has capacity, or (reason ===
+  // 'host_busy') until the host cools down or an agent connects — no attempt exists yet for this
+  // job, so there's nowhere to record a per-attempt job_event; this is operator-facing only.
+  if (decision.reason === 'host_busy') {
+    logger.info(
+      'local fallback deferred — host over CPU threshold and not the least-loaded option',
+      {
+        jobId,
+        hostCpuBusyFraction: hostLoad?.cpuBusyFraction,
+      },
+    );
+  }
 }
 
 /** Re-attempt scheduling for jobs left in `queued` (wait policy / capacity). */

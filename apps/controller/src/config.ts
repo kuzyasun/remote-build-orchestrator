@@ -32,6 +32,12 @@ export interface ControllerConfig {
   allowLocalFallback: boolean;
   /** Max git bundle bytes for local-only base commits (Phase 5). Default 512 MiB. */
   maxGitBundleBytes: number;
+  /**
+   * Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md): CPU busy-fraction
+   * [0,1] above which the host is excluded from local-fallback consideration (unless it's still
+   * the least-loaded option available — see `decideLocalFallback`). Default 0.8.
+   */
+  maxHostCpuBusyFraction: number;
 }
 
 /** Default max git bundle size when RBO_MAX_GIT_BUNDLE_BYTES is unset (512 MiB). */
@@ -123,6 +129,9 @@ export function loadControllerConfig(overrides: Partial<ControllerConfig> = {}):
     maxGitBundleBytes:
       overrides.maxGitBundleBytes ??
       Number(process.env.RBO_MAX_GIT_BUNDLE_BYTES ?? DEFAULT_MAX_GIT_BUNDLE_BYTES),
+    maxHostCpuBusyFraction:
+      overrides.maxHostCpuBusyFraction ??
+      Number(process.env.RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT ?? 80) / 100,
   };
 }
 
