@@ -1,97 +1,106 @@
-# Plan: single global install (`npm install -g rbo-cli` → `rbo ...`)
+# Plan: single global install (`npm install -g @gemslibe/rbo` → `rbo ...`)
 
 Status: **plan only, not implemented.** This document analyzes what changes today's architecture
 actually needs to reach a Fusion-style install UX (`npm install -g <pkg>`, then `rbo ...` for
 everything), and proposes a phased path there. Nothing here should be read as already working.
 
+This is the **first** public distribution of RBO. Do **not** add migration shims for today's
+ad-hoc default paths (`%LOCALAPPDATA%/RBO`, `%ProgramData%/RBO`, `~/.rbo-agent`, etc.) — replace
+them with the layout below in one clean cut (same rule as `AGENTS.md`: no migration shims).
+
+## Decisions (locked)
+
+| Topic | Decision |
+| --- | --- |
+| Published package | `@gemslibe/rbo` (npm org `gemslibe`) |
+| Publish root in monorepo | **`apps/cli`** becomes the publish package (`"name": "@gemslibe/rbo"`); replace today's `@rbo/cli` name. Other workspace packages stay `@rbo/*` and are **not** published |
+| Bins / bundle shape | Two esbuild entry points: `dist/rbo.js` + `dist/rbo-mcp-stdio.js`; `bin`: `rbo` and `rbo-mcp-stdio` |
+| Internal packages | **Bundle** workspace `@rbo/*` (and controller/agent/mcp-stdio) into those artifacts; leave genuine npm externals as `dependencies` |
+| Package contents | **One package** ships CLI + Controller + Agent + mcp-stdio |
+| Background mode | `--daemon` = **detached process** only (PID file + log redirect) |
+| OS service install | **Deferred** for this effort: leave `rbo agent install|--execute` as today's dry-run/placeholder paths; do not block npm v1 on wiring services to the global `rbo` bin |
+| Windows Job Object binary | `optionalDependencies` → `@gemslibe/rbo-windows-executor-win32-x64` (esbuild/swc-style). Built and published alongside the main package |
+| Windows arches (v1) | **win32-x64 only**; other Windows arches run without the helper (same class of limitation as macOS/Linux today); `rbo doctor` must warn |
+| Versioning | **Single product semver**: `@gemslibe/rbo@x.y.z` matches all runtime version constants and the windows-executor optional package. Update `docs/dev/release-builds.md` (today it still allows independent controller/agent bumps) |
+| Data/config root | Single tree: `~/.rbo/` on Unix; `%USERPROFILE%\.rbo\` on Windows |
+| Layout under that root | Controller under `~/.rbo/` (exact subdirs TBD). **Agent under `~/.rbo/agent/`** |
+| Path overrides | If unset: controller `~/.rbo`, agent `~/.rbo/agent`. If `RBO_DATA_DIR=X`: controller `X`, agent `X/agent`. If `RBO_AGENT_STATE_DIR=Y`: agent `Y` (always wins over the derived path). CLI flags may override the same way |
+| First run | **Explicit init**: extend existing `rbo controller init`; add `rbo agent init`. `start` fails with a clear hint if init was not done |
+| Distribution channels | **npm is primary**; OS archives remain the offline/air-gap fallback at the same semver. Archives should ship the **same bundled bits** (plus platform notes), not a divergent multi-entry layout that drifts from npm |
+| First registry publish | **Public** (`npm publish --access public`) on the first tagged release |
+| Who publishes (v1) | **Manual** publish from a maintainer machine. The windows-executor optional package requires a **Windows-built** `rbo-windows-executor.exe` (build on Windows, then publish both packages in one checklist). CI automation can come later |
+| License | **MIT** (`LICENSE` + `"license": "MIT"` on the published package) |
+| Acceptance before first public | Full clean-machine E2E required on **Windows x64** only; other OS best-effort / follow-up with honest release-note limitations |
+
 ## Current state vs. the target
 
-Today, `rbo` (the `@rbo/cli` workspace package) is a **thin client**: it talks to an already-
-running Controller over loopback HTTP. The Controller and Agent are separate processes you start
-by directly invoking their own built entry points (`node apps/controller/dist/main.js`, `node
-apps/agent/dist/main.js`), each with their own `package.json` and workspace dependencies
-(`better-sqlite3`, `ws`, `selfsigned`, etc.), currently linked via pnpm's `workspace:*` protocol —
-which only resolves inside this monorepo, not from a published npm package.
+Today, `rbo` lives in `apps/cli` as workspace package `@rbo/cli` (will be renamed to
+`@gemslibe/rbo` for publish). It is mostly a **thin client**: it talks to an already-running
+Controller over loopback HTTP. `rbo controller init|fingerprint|restore` already exist; there is
+**no** `rbo controller start` / `rbo agent start` / `rbo agent init`. Controller and Agent still
+start via their own entry points (`node apps/controller/dist/main.js`,
+`node apps/agent/dist/main.js`), each with workspace dependencies linked via pnpm `workspace:*` —
+which only resolves inside this monorepo.
 
-The target: `npm install -g rbo-cli` (name TBD — see Open questions), then `rbo controller start`,
-`rbo agent start`, `rbo submit ...` all work from one globally-installed package, with no separate
-archive to extract and no monorepo checkout required.
+Default paths today are inconsistent across components (CLI/controller often
+`%LOCALAPPDATA%/RBO` or `~/.rbo`; agent often `~/.rbo-agent` or OS-specific ProgramData/Library
+paths). v1 replaces all of that with the single `~/.rbo/` tree above.
+
+The target: `npm install -g @gemslibe/rbo`, then `rbo controller init` / `rbo agent init`,
+`rbo controller start`, `rbo agent start`, `rbo submit ...`, and MCP via `rbo-mcp-stdio`, all from
+one globally-installed package — no archive extract and no monorepo checkout required for the
+happy path.
 
 ## What actually blocks this today
 
-1. **Controller/Agent aren't CLI subcommands.** `apps/controller/src/main.ts` and
-   `apps/agent/src/main.ts` are independent entry points, not functions the CLI's `main.ts` can
-   call. Needs: extract each into an exported `runController(options)` / `runAgent(options)`
-   function the CLI can import and invoke under `rbo controller start` / `rbo agent start`
-   subcommands, with a foreground mode (current behavior) and a real daemonized mode (detached
-   process + PID file + redirected log file — today's Controller only runs in the foreground).
+1. **Controller/Agent aren't startable as CLI subcommands.** Extract
+   `runController(options)` / `runAgent(options)`; keep standalone `main.ts` as thin wrappers for
+   from-source. Add `rbo controller start` / `rbo agent start` (foreground default; `--daemon` =
+   detached + PID + log). Extend `rbo controller init`; add `rbo agent init` that scaffolds
+   `~/.rbo/agent/`. Refuse `start` if the relevant init has not been done.
 
-2. **Five internal `@rbo/*` packages aren't publishable as-is.** `workspace:*` version specifiers
-   only resolve inside this pnpm workspace. A published `rbo-cli` package needs everything it
-   depends on (`@rbo/protocol`, `@rbo/shared`, `@rbo/snapshot`, `@rbo/executor`, plus the
-   Controller/Agent/mcp-stdio logic) available at install time. Two real options:
-   - **(a) Publish all workspace packages to the npm registry** under a real scope, with pinned
-     (not `workspace:*`) version ranges. Simplest conceptually, but means versioning and publishing
-     6+ packages in lockstep on every release.
-   - **(b) Bundle.** Use a bundler (esbuild is already implicitly compatible with this repo's
-     ESM/TS setup) to produce one self-contained `dist/rbo.cjs` (or `.mjs`) per published artifact,
-     inlining every `@rbo/*` workspace import and leaving only genuinely external npm packages
-     (`ws`, `better-sqlite3`, `selfsigned`, `ulid`, `zod`, `@modelcontextprotocol/sdk`) as real
-     `dependencies` of the published package. Recommended — one package to publish, no lockstep
-     versioning problem, and it's the pattern most CLI tools with an internal monorepo use.
+2. **Internal `@rbo/*` packages aren't publishable as-is.** `workspace:*` only resolves inside
+   this pnpm workspace. **Decision: bundle** with esbuild (or equivalent) into `@gemslibe/rbo`,
+   inlining workspace imports and leaving genuine externals (`ws`, `better-sqlite3`, `selfsigned`,
+   `ulid`, `zod`, `@modelcontextprotocol/sdk`, …) as real `dependencies`.
 
-3. **`better-sqlite3` is a native module.** It needs a prebuilt binary per Node ABI/OS/arch at
-   install time. This already works via pnpm in this repo; confirm the same prebuild-fetch path
-   works under plain `npm install -g` (it should, via `node-gyp-build`/`prebuildify`'s standard
-   resolution) — call this out explicitly as a thing to verify, not assume.
+3. **`better-sqlite3` is a native module.** Confirm prebuild fetch works under plain
+   `npm install -g` (do not assume). Keep it external — do not bundle.
 
-4. **The Windows Job Object helper is a compiled Rust binary, not JS.** `npm install -g` can't
-   compile it in place (no guarantee of a Rust toolchain on the install machine) or the current
-   packaging model doesn't cross-compile for a package published from one CI runner. Options,
-   roughly in order of effort: (a) ship a per-platform optional dependency package containing a
-   prebuilt binary for each supported OS/arch (the pattern `esbuild`/`swc` use — `rbo-cli` depends
-   on `optionalDependencies: { "rbo-windows-executor-win32-x64": "..." }` etc., built and published
-   from CI); (b) a postinstall script that downloads the correct prebuilt binary from a GitHub
-   Release for the detected platform, with a documented offline/air-gapped fallback. Needs a CI
-   pipeline change (build the release binary once per tag, upload it, whichever mechanism is
-   chosen) — out of scope for a docs-only pass.
+4. **Windows Job Object helper is a compiled Rust binary.** **Decision: optionalDependency**
+   `@gemslibe/rbo-windows-executor-win32-x64`. Runtime resolves the exe from that package's install
+   path (not only the old `packaging/*/MANIFEST` layout).
 
-5. **Package identity.** `@rbo/cli`'s current npm scope (`@rbo`) may or may not be available/owned
-   on the public registry — this needs an actual registry check before picking a final published
-   name (e.g. `rbo-cli`, `@yourorg/rbo`, etc.); don't assume `@rbo` is free.
+5. **Package identity — decided.** Publish from `apps/cli` as `@gemslibe/rbo`. Other workspace
+   packages remain private `@rbo/*` and are inlined by the bundle.
 
 ## Phased plan
 
-1. **Extract `runController`/`runAgent` as callable functions**, keep the existing standalone
-   entry points as thin wrappers around them (`main.ts` calls `runController(loadControllerConfig())`
-   then handles process signals) so nothing regresses for the current from-source workflow. Add
-   `rbo controller start`/`rbo agent start` subcommands that call these directly, with a
-   `--daemon` flag for detached/PID-file/log-redirected operation (foreground stays the default,
-   matching current documented behavior).
-2. **Prototype the esbuild bundle** for `apps/cli` alone first (smallest surface), producing one
-   file with `@rbo/protocol`/`@rbo/shared` inlined; verify `pnpm pack` → local `npm install -g
-   ./rbo-cli-0.1.0.tgz` → `rbo doctor` actually works from a machine outside this monorepo/pnpm
-   context.
-3. **Extend the bundle to include Controller + Agent** (using the extracted functions from step 1)
-   in the same published package, keeping `better-sqlite3`/`ws`/etc. as real external deps of the
-   published package (not bundled — native modules can't be bundled).
-4. **Solve the Windows Job Object binary distribution** (pick one of the options in point 4 above)
-   — do this only once steps 1–3 prove the JS side works end to end, since it's the highest-effort,
-   most platform-specific piece.
-5. **Publish an actual test release** to a real (or a scoped/private) registry and validate the
-   whole `npm install -g` → `rbo controller start` → `rbo agent start` → pair → `rbo submit` flow
-   on a clean machine with none of this repo's toolchain installed — the real acceptance bar, not
-   "it builds."
-6. Update `README.md`'s Install section and `docs/ops/getting-started.md` to lead with the new
-   global-install path once step 5 is verified; keep the archive/from-source paths as the
-   documented fallback for restricted/offline environments.
+1. **Unify defaults + lifecycle CLI.** Point controller/CLI/agent defaults at `~/.rbo/` and
+   `~/.rbo/agent/`. Extract `runController`/`runAgent`; add `start` (+ `--daemon`) and `agent init`;
+   make `start` require prior init. Keep from-source `main.ts` wrappers.
+2. **Rename `apps/cli` → `@gemslibe/rbo`** and prototype esbuild for the CLI entry
+   (`dist/rbo.js`); verify `pnpm pack` → `npm install -g ./gemslibe-rbo-0.1.0.tgz` → `rbo doctor`
+   outside this monorepo.
+3. **Extend the bundle** to Controller + Agent + second entry `dist/rbo-mcp-stdio.js`; wire both
+   `bin`s. One product semver across published `package.json` and `packages/shared` version
+   constants. Add MIT `LICENSE`.
+4. **Ship `@gemslibe/rbo-windows-executor-win32-x64`**; wire path resolution + `doctor` warnings
+   when missing.
+5. **Manual public publish** (Windows host for the exe + both npm publishes). Clean **Windows x64**
+   E2E: `npm install -g @gemslibe/rbo` → inits → start → pair → submit. That is the acceptance bar.
+6. **Docs:** README + `getting-started.md` lead with global install; archives as offline fallback
+   (same bundled bits). `release-builds.md`: single-semver rule + manual npm publish checklist
+   (including “build exe on Windows before publishing the optional package”).
 
-## Open questions (need a decision, not guesses)
+## Implementation notes (not open product questions)
 
-- Final published package name/scope (see point 5 above — needs an actual registry check).
-- Daemon strategy per OS for `--daemon` mode (a real Windows Service/launchd/systemd install is
-  already dry-run-only today per `docs/ops/runbook.md`; decide whether `--daemon` targets that
-  same mechanism or a simpler detached-process model as a first step).
-- Whether Controller and Agent ship in the *same* published package (simplest for users, larger
-  install) or as separate optional packages (`rbo-cli` + `rbo-agent`) a user opts into per machine
-  role.
+- Declare `"engines": { "node": ">=22.14" }` on `@gemslibe/rbo`; surface mismatches in `rbo doctor`.
+- Fix an allowlist of externals that must never be bundled (at least `better-sqlite3` and other
+  native/CJS-sensitive deps).
+- Concrete subdirs under `~/.rbo/` (e.g. logs, pid files) are an implementation detail; agent
+  state must live under `~/.rbo/agent/` (or `$RBO_DATA_DIR/agent` per the override table).
+- When `stateDir` is `~/.rbo/agent`, existing “sibling of stateDir” helpers (e.g. repo-cache) will
+  naturally land under `~/.rbo/` — confirm that in implementation, no separate product decision.
+- OS service → global `rbo` bin is a follow-up; not part of the npm v1 acceptance bar.
+- Automating publish via CI is deferred; v1 is maintainer-driven publish.
