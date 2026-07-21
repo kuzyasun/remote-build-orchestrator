@@ -1,8 +1,11 @@
 # Plan: single global install (`npm install -g @gemslibe/rbo` → `rbo ...`)
 
-Status: **plan only, not implemented.** This document analyzes what changes today's architecture
-actually needs to reach a Fusion-style install UX (`npm install -g <pkg>`, then `rbo ...` for
-everything), and proposes a phased path there. Nothing here should be read as already working.
+Status: **Phases 1–4 implemented in tree** (unified `~/.rbo` paths, CLI lifecycle
+`init`/`start`/`--daemon`, `@gemslibe/rbo` esbuild dual bins, AGPL + commercial README note,
+`@gemslibe/rbo-windows-executor-win32-x64` optionalDependency + doctor warnings).
+Phase 5 (manual public publish + Windows x64 E2E) remains — follow the step-by-step checklist in
+[`docs/dev/release-builds.md`](./release-builds.md) (do not duplicate it here). This document
+remains the locked decision record — do not reopen product questions.
 
 This is the **first** public distribution of RBO. Do **not** add migration shims for today's
 ad-hoc default paths (`%LOCALAPPDATA%/RBO`, `%ProgramData%/RBO`, `~/.rbo-agent`, etc.) — replace
@@ -21,7 +24,7 @@ them with the layout below in one clean cut (same rule as `AGENTS.md`: no migrat
 | OS service install | **Deferred** for this effort: leave `rbo agent install|--execute` as today's dry-run/placeholder paths; do not block npm v1 on wiring services to the global `rbo` bin |
 | Windows Job Object binary | `optionalDependencies` → `@gemslibe/rbo-windows-executor-win32-x64` (esbuild/swc-style). Built and published alongside the main package |
 | Windows arches (v1) | **win32-x64 only**; other Windows arches run without the helper (same class of limitation as macOS/Linux today); `rbo doctor` must warn |
-| Versioning | **Single product semver**: `@gemslibe/rbo@x.y.z` matches all runtime version constants and the windows-executor optional package. Update `docs/dev/release-builds.md` (today it still allows independent controller/agent bumps) |
+| Versioning | **Single product semver**: `@gemslibe/rbo@x.y.z` matches all runtime version constants and the windows-executor optional package. Bump sites and publish order are documented in [`docs/dev/release-builds.md`](./release-builds.md) |
 | Data/config root | Single tree: `~/.rbo/` on Unix; `%USERPROFILE%\.rbo\` on Windows |
 | Layout under that root | Controller under `~/.rbo/` (exact subdirs TBD). **Agent under `~/.rbo/agent/`** |
 | Path overrides | If unset: controller `~/.rbo`, agent `~/.rbo/agent`. If `RBO_DATA_DIR=X`: controller `X`, agent `X/agent`. If `RBO_AGENT_STATE_DIR=Y`: agent `Y` (always wins over the derived path). CLI flags may override the same way |
@@ -29,7 +32,7 @@ them with the layout below in one clean cut (same rule as `AGENTS.md`: no migrat
 | Distribution channels | **npm is primary**; OS archives remain the offline/air-gap fallback at the same semver. Archives should ship the **same bundled bits** (plus platform notes), not a divergent multi-entry layout that drifts from npm |
 | First registry publish | **Public** (`npm publish --access public`) on the first tagged release |
 | Who publishes (v1) | **Manual** publish from a maintainer machine. The windows-executor optional package requires a **Windows-built** `rbo-windows-executor.exe` (build on Windows, then publish both packages in one checklist). CI automation can come later |
-| License | **MIT** (`LICENSE` + `"license": "MIT"` on the published package) |
+| License | **Dual licensing.** Default public terms: **AGPL-3.0-only** (`LICENSE` + `"license": "AGPL-3.0-only"`). Intent: local use of RBO as a tool is fine under AGPL; offering RBO (or a modified/embedded form) **as a service**, or **embedding it into a proprietary product** without AGPL compliance, requires a **separate commercial license** from the copyright holder (gemslibe / agreed contract). README must state how to request commercial licensing. (AGPL-3.0-only chosen over -or-later so future FSF versions are not auto-accepted.) |
 | Acceptance before first public | Full clean-machine E2E required on **Windows x64** only; other OS best-effort / follow-up with honest release-note limitations |
 
 ## Current state vs. the target
@@ -41,6 +44,12 @@ Controller over loopback HTTP. `rbo controller init|fingerprint|restore` already
 start via their own entry points (`node apps/controller/dist/main.js`,
 `node apps/agent/dist/main.js`), each with workspace dependencies linked via pnpm `workspace:*` —
 which only resolves inside this monorepo.
+
+The Controller already includes **host-CPU-aware local fallback** (merged; see
+`docs/dev/host-aware-local-fallback-plan.md`, env `RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT`). That
+logic lives in `@rbo/controller` + `@rbo/shared` (`host-load`) + a small protocol field — it does
+**not** change this packaging plan: it ships inside the same `@gemslibe/rbo` bundle with no extra
+published package.
 
 Default paths today are inconsistent across components (CLI/controller often
 `%LOCALAPPDATA%/RBO` or `~/.rbo`; agent often `~/.rbo-agent` or OS-specific ProgramData/Library
@@ -84,14 +93,16 @@ happy path.
    outside this monorepo.
 3. **Extend the bundle** to Controller + Agent + second entry `dist/rbo-mcp-stdio.js`; wire both
    `bin`s. One product semver across published `package.json` and `packages/shared` version
-   constants. Add MIT `LICENSE`.
+   constants. Add AGPL-3.0-only `LICENSE` + short README note on commercial licensing.
 4. **Ship `@gemslibe/rbo-windows-executor-win32-x64`**; wire path resolution + `doctor` warnings
-   when missing.
+   when missing. **Done in tree** (`packages/rbo-windows-executor-win32-x64`, optionalDep,
+   `packages/executor` resolve + `rbo doctor` WARN).
 5. **Manual public publish** (Windows host for the exe + both npm publishes). Clean **Windows x64**
    E2E: `npm install -g @gemslibe/rbo` → inits → start → pair → submit. That is the acceptance bar.
+   **How:** [`docs/dev/release-builds.md`](./release-builds.md) (single checklist — optional package
+   first, then `@gemslibe/rbo`, then clean-machine E2E).
 6. **Docs:** README + `getting-started.md` lead with global install; archives as offline fallback
-   (same bundled bits). `release-builds.md`: single-semver rule + manual npm publish checklist
-   (including “build exe on Windows before publishing the optional package”).
+   (same bundled bits). Maintainer publish steps live only in `release-builds.md`.
 
 ## Implementation notes (not open product questions)
 
@@ -104,3 +115,6 @@ happy path.
   naturally land under `~/.rbo/` — confirm that in implementation, no separate product decision.
 - OS service → global `rbo` bin is a follow-up; not part of the npm v1 acceptance bar.
 - Automating publish via CI is deferred; v1 is maintainer-driven publish.
+- Licensing is dual: ship the full AGPL-3.0 text in `LICENSE`; do not invent a custom “SSPL-like” SPDX string. The commercial path is a separate bilateral agreement (not an npm `license` field). npm `license` stays `AGPL-3.0-only`.
+- Host-aware local fallback is orthogonal to install/packaging; keep documenting its env vars in
+  ops docs. No separate optionalDependency or bin for it.

@@ -35,10 +35,24 @@ export function getPairingRequest(db: ControllerDatabase, id: string): PairingRe
   return (row as PairingRequestRow | undefined) ?? null;
 }
 
+/** Flip pending/approved rows past `expires_at` to `expired` (lazy GC on list/create). */
+export function expireStalePairingRequests(db: ControllerDatabase): number {
+  const now = nowIso();
+  const result = db
+    .prepare(
+      `UPDATE pairing_requests
+       SET state = 'expired', resolved_at = COALESCE(resolved_at, ?)
+       WHERE state IN ('pending', 'approved') AND expires_at <= ?`,
+    )
+    .run(now, now);
+  return result.changes;
+}
+
 export function listPairingRequests(
   db: ControllerDatabase,
   state?: PairingRequestRow['state'],
 ): PairingRequestRow[] {
+  expireStalePairingRequests(db);
   const rows = state
     ? db.prepare('SELECT * FROM pairing_requests WHERE state = ? ORDER BY created_at').all(state)
     : db.prepare('SELECT * FROM pairing_requests ORDER BY created_at').all();
@@ -49,6 +63,7 @@ export function createPairingRequest(
   db: ControllerDatabase,
   input: CreatePairingInput,
 ): PairingRequestRow {
+  expireStalePairingRequests(db);
   const thumbprint = publicKeyThumbprint(input.devicePublicKeyPem);
 
   // One live request per device key: reuse an existing pending/approved one so

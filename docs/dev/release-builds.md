@@ -1,140 +1,406 @@
-# Building an RBO release (developer guide)
+# Release & publish
 
-Audience: someone building and packaging RBO itself from source — not an operator installing an
-already-built package (that's [`docs/ops/getting-started.md`](../ops/getting-started.md)).
+How to cut an RBO release from this monorepo and publish to npm.
+
+Audience: maintainers releasing from this repo. Operators installing an already-published package
+should use [`docs/ops/getting-started.md`](../ops/getting-started.md).
+
+| Package | Monorepo path | What it ships |
+| --- | --- | --- |
+| `@gemslibe/rbo` | `apps/cli/` | Bundled `rbo` + `rbo-mcp-stdio` (CLI, Controller, Agent, MCP) |
+| `@gemslibe/rbo-windows-executor-win32-x64` | `packages/rbo-windows-executor-win32-x64/` | `bin/rbo-windows-executor.exe` (win32-x64 only) |
+
+Other workspace packages (`@rbo/*`) are **not** published; they are inlined into the `@gemslibe/rbo`
+esbuild bundle. OS archives (see [Offline archives](#offline-archives)) are an offline/air-gap
+fallback at the **same** product semver.
+
+Product packaging decisions live in
+[`docs/dev/global-cli-packaging-plan.md`](./global-cli-packaging-plan.md). This document is the
+publish runbook only.
+
+There is **no** mega-script that bumps, packs, and publishes in one shot. Bump is interactive;
+publish is gated. Run the four commands below in order.
+
+---
+
+## Quick release
+
+From the repo root on a **Windows x64** machine (required for the optional package):
+
+```powershell
+pnpm format          # optional but recommended before verify
+pnpm verify
+pnpm bump-version    # or: pnpm bump-version 1.2.3
+pnpm release:pack
+$env:RELEASE_CONFIRM=1; pnpm release:publish
+# equivalent: pnpm release:publish --yes
+```
+
+`pnpm verify` already runs lint (Biome check). Format is separate; run `pnpm format` when you want
+autofix before the gate.
+
+After publish, smoke on a clean Windows x64 host:
+
+```powershell
+npm install -g @gemslibe/rbo
+rbo --help
+rbo doctor   # expect: OK windows_executor
+```
+
+Then follow [`docs/ops/getting-started.md`](../ops/getting-started.md) (init → start → pair → submit).
+
+---
 
 ## Prerequisites
 
-- Node.js ≥ 22.14 (`.nvmrc`), pnpm 10.5.2 (pinned via `packageManager` in `package.json`)
-- Rust 1.93.0 (`rust-toolchain.toml`) — only needed to produce the Windows Job Object helper
-  (`rbo-windows-executor.exe`); build on Windows to get a real binary. macOS/Linux packages ship
-  without it (§15.2 containment is Windows-only today; see Known limitations).
-- Git on `PATH`
+| Tool | Requirement |
+| --- | --- |
+| Node.js | ≥ 22.14 (see `.nvmrc`) |
+| pnpm | 10.5.2 (pinned via `"packageManager"` in root `package.json`) |
+| Git | on `PATH` |
+| Rust | 1.93.0 (`rust-toolchain.toml`) — **required on the Windows x64 host that packs/publishes the optional package** |
+| npm | logged in with permission to publish under the **`gemslibe`** org |
 
-## One-time setup
+```powershell
+node -v          # v22.14.x or newer
+pnpm -v          # 10.5.2
+npm whoami       # must succeed; account must publish under @gemslibe
+```
 
-```bash
+First-time clone:
+
+```powershell
 git clone <this repo>
 cd rm-builder
 pnpm install
 ```
 
-## Version numbers
+> **Windows host for the optional package.** That package's `prepack` hard-requires a real
+> `rbo-windows-executor.exe`. Build and publish from Windows x64. You can develop elsewhere, but do
+> not skip the Windows step for a public release.
 
-All version constants live in one place: `packages/shared/src/versions.ts`.
+---
+
+## Detailed steps
+
+### 1. Verify
+
+```powershell
+pnpm format   # optional autofix
+pnpm verify
+```
+
+`pnpm verify` must exit `0`. It runs, in order (root `package.json` → `scripts.verify`):
+
+1. `lint` — Biome check
+2. `build` — tsc + `@gemslibe/rbo` esbuild (`apps/cli` → `dist/rbo.js`, `dist/rbo-mcp-stdio.js`)
+3. `test` — all Vitest suites
+4. `rust:verify` — `cargo fmt --check`, `cargo test`, then `cargo build --release` for
+   `native/windows-executor`
+5. `package:archives` — refresh `packaging/{windows,macos,linux}/MANIFEST.json` hashes/sizes
+6. `package:verify` — re-check manifests (forbidden paths, required files, checksums on disk)
+
+If `package:verify` fails with `sha256 mismatch ... manifest is stale`, re-run
+`pnpm package:archives` after source changes — `pnpm verify` already does this, so you should only
+see that when running `package:verify` alone after hand-editing manifests.
+
+Confirm CLI bundles after a successful verify:
+
+```powershell
+Test-Path .\apps\cli\dist\rbo.js
+Test-Path .\apps\cli\dist\rbo-mcp-stdio.js
+# expect: True / True
+```
+
+### 2. Bump version (single product semver)
+
+One semver `x.y.z` for the product. Bump **all** lockstep sites together — never ship mismatched
+runtime constants vs published package versions.
+
+```powershell
+pnpm bump-version          # interactive: prints current, asks for new x.y.z
+pnpm bump-version 1.2.3    # non-interactive override
+```
+
+That runs `scripts/bump-version.mjs`. Internal `@rbo/*` workspace packages are not published and are
+left alone.
+
+| Location | Field(s) |
+| --- | --- |
+| `packages/shared/src/versions.ts` | `RBO_CONTROLLER_VERSION`, `RBO_AGENT_VERSION`, `RBO_STDIO_ADAPTER_VERSION` |
+| `apps/cli/package.json` | `"version"` **and** `optionalDependencies["@gemslibe/rbo-windows-executor-win32-x64"]` |
+| `packages/rbo-windows-executor-win32-x64/package.json` | `"version"` |
+| Root `package.json` | `"version"` (workspace label; not read at runtime) |
+| `packaging/{windows,macos,linux}/MANIFEST.json` | `package_version` and `components.*` |
+
+Example constants (keep the three runtime strings identical):
 
 ```ts
 export const RBO_CONTROLLER_VERSION = '0.1.0';
 export const RBO_AGENT_VERSION = '0.1.0';
 export const RBO_STDIO_ADAPTER_VERSION = '0.1.0';
-
-export const RBO_WIRE_PROTOCOL_MIN_VERSION = 1;
-export const RBO_WIRE_PROTOCOL_MAX_VERSION = 1;
-
-export const RBO_CONTROLLER_SCHEMA_VERSION = 3; // must equal MIGRATIONS.length — guarded by a test
 ```
 
-- `RBO_CONTROLLER_VERSION` / `RBO_AGENT_VERSION` / `RBO_STDIO_ADAPTER_VERSION`: bump per release.
-  They're independent — the Controller, Agent, and stdio adapter don't need to move in lockstep.
-- `RBO_WIRE_PROTOCOL_MIN_VERSION` / `MAX_VERSION`: bump **only** when the actual wire contract
-  changes (new/changed message schema an old peer can't parse). Per `AGENTS.md`'s no-migration-shim
-  rule, don't add compatibility shims — an incompatible peer stays diagnostic-only by design.
-- `RBO_CONTROLLER_SCHEMA_VERSION`: bump together with adding a new entry to
-  `apps/controller/src/storage/migrations.ts`'s `MIGRATIONS` array. A test in
-  `apps/controller/test/storage.test.ts` fails the build if these two drift apart.
+Also in `versions.ts` (bump only when the contract/schema actually changes — not every release;
+`pnpm bump-version` does **not** touch these):
 
-The root `package.json` `"version"` field is the workspace/monorepo version and isn't read by any
-runtime code — keep it in sync with the constants above for humans reading `git tag`/`npm view`,
-but nothing enforces it.
+- `RBO_WIRE_PROTOCOL_MIN_VERSION` / `MAX_VERSION` — only when the wire contract changes. No
+  migration shims (`AGENTS.md`).
+- `RBO_CONTROLLER_SCHEMA_VERSION` — bump together with a new entry in
+  `apps/controller/src/storage/migrations.ts` (`MIGRATIONS`). A test fails if these drift.
 
-## Full verification gate
+`bump-version` does **not** pack or publish. Commit the version bump before tagging/publishing
+(human judgment on commit/tag message).
 
-```bash
-pnpm format   # biome autofix — always run before verify
-pnpm verify   # the only command that decides "ready to release"
+### 3. Build and pack (`pnpm release:pack`)
+
+Preferred (Windows x64, repo root):
+
+```powershell
+pnpm release:pack
 ```
 
-`pnpm verify` runs, in order: `lint` (biome check) → `build` (tsc across all 9 workspace
-packages/apps) → `test` (all vitest suites) → `rust:verify` (`cargo fmt --check`, `cargo test`,
-then `cargo build --release` for `native/windows-executor`) → `package:archives` (recompute real
-sha256/size for every file in `packaging/{windows,macos,linux}/MANIFEST.json` from the just-built
-`dist/` output and the just-built release `.exe`) → `package:verify` (re-check those manifests:
-forbidden-path exclusions, required components present, and — critically — every checksum
-re-verified against the actual file on disk, not just checked for hex-looking shape).
+What it does:
 
-Must exit `0` before a release is considered ready. If `package:verify` fails with `sha256
-mismatch ... manifest is stale`, you forgot to re-run `pnpm package:archives` after a source change
-— `pnpm verify` does this for you, so in practice you should never see this outside of manually
-running `package:verify` in isolation after editing `packaging/*/MANIFEST.json` by hand (don't).
+1. `cargo build --release --manifest-path native/windows-executor/Cargo.toml` (Windows x64 only)
+2. `pnpm --filter @gemslibe/rbo-windows-executor-win32-x64 prepare-binary:require` — stages
+   `packages/rbo-windows-executor-win32-x64/bin/rbo-windows-executor.exe` (fails if missing)
+3. Checks CLI `dist/` bundles exist
+4. Packs optional package, then `@gemslibe/rbo`, via `pnpm --dir <path> pack`
 
-## What's actually in a package
+> **Do not use `pnpm --filter … pack`.** On pnpm 10.x, `--filter` implies recursive mode, and
+> `pack` rejects that (`Unknown option: 'recursive'`). Root scripts use `pnpm --dir … pack`.
 
-Each `packaging/<os>/MANIFEST.json` lists, per file: its in-archive `path`, real `sha256`,
-`size_bytes`, and the repo-relative `source` it was hashed from. Windows lists 6 files (adds
-`bin/rbo-windows-executor.exe`); macOS/Linux list 5 (no native binary — see Known limitations).
+Success: tarballs under the package directories, e.g.
 
 ```text
-bin/rbo-controller.js      ← apps/controller/dist/main.js
-bin/rbo-agent.js           ← apps/agent/dist/main.js
-bin/rbo.js                 ← apps/cli/dist/main.js  (the `rbo` CLI)
-bin/rbo-mcp-stdio.js       ← apps/mcp-stdio/dist/main.js
-bin/rbo-windows-executor.exe ← native/windows-executor/target/release/rbo-windows-executor.exe (Windows only)
-config/controller.example.json ← packaging/<os>/config/controller.example.json (reference only, not loaded by any code — see getting-started.md)
+packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-0.1.0.tgz
+apps\cli\gemslibe-rbo-0.1.0.tgz
 ```
 
-`packages/shared/src/packaging.ts`'s `PACKAGING_FORBIDDEN_PATH_PATTERNS` is the single source of
-truth for what must never ship: identity keys, `.env`, credentials, caches, logs, snapshots,
-attempts, `node_modules`, `.pem`/`.key` files. `scripts/package-archives.mjs` imports it directly
-(not a duplicated copy) and both `refreshManifest`/`verifyOnly` reject any listed file that matches.
+#### Manual pack (one piece at a time)
 
-## Assembling the actual archive
+If `release:pack` fails mid-way, or you only need one package:
 
-`pnpm package:archives`/`pnpm package:verify` produce and verify the **manifest** (a hashed,
-audited list of what belongs in the package) — they do not yet zip/tar anything. To produce a real
-distributable archive today:
+```powershell
+# 1. Cargo release binary
+cargo build --release --manifest-path native/windows-executor/Cargo.toml
+Test-Path .\native\windows-executor\target\release\rbo-windows-executor.exe
+# expect: True
 
-```bash
-# from repo root, after `pnpm verify` has passed
-mkdir -p /tmp/rbo-windows-0.1.0
-node -e "
-  const fs = require('fs'); const path = require('path');
-  const m = JSON.parse(fs.readFileSync('packaging/windows/MANIFEST.json', 'utf8'));
-  for (const f of m.files) {
-    const dest = path.join('/tmp/rbo-windows-0.1.0', f.path);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.copyFileSync(f.source, dest);
-  }
-  fs.copyFileSync('packaging/windows/MANIFEST.json', '/tmp/rbo-windows-0.1.0/MANIFEST.json');
-"
-# then zip/tar /tmp/rbo-windows-0.1.0 as rbo-windows-0.1.0.zip and publish its own sha256 alongside it
+# 2. Stage exe (hard-require; do not use soft prepare-binary for a release)
+pnpm --filter @gemslibe/rbo-windows-executor-win32-x64 prepare-binary:require
+Test-Path .\packages\rbo-windows-executor-win32-x64\bin\rbo-windows-executor.exe
+# expect: True
+
+# 3. Pack optional package
+pnpm pack:windows-executor
+# equivalent: pnpm --dir packages/rbo-windows-executor-win32-x64 pack
+
+# 4. Ensure CLI bundles (skip if verify just succeeded)
+pnpm --filter @gemslibe/rbo build
+
+# 5. Pack main package
+pnpm pack:rbo
+# equivalent: pnpm --dir apps/cli pack
 ```
 
-Repeat per OS, substituting the manifest path. Scripting this loop into
-`scripts/package-archives.mjs` (a `--archive` mode) would be a reasonable follow-up if this becomes
-a frequent manual step — it isn't built yet, so don't claim otherwise in release notes.
+Optional inspect (lists included files; optional tarball must include
+`bin/rbo-windows-executor.exe`):
 
-## Known limitations (be honest about these when writing release notes)
+```powershell
+cd .\packages\rbo-windows-executor-win32-x64
+npm pack --dry-run
+cd ..\..
 
-- **Windows-only native containment.** `native/windows-executor` (Win32 Job Objects) is the only
-  real process-tree containment; macOS/Linux packages run scripts without an equivalent isolation
-  layer today.
-- **Service install is dry-run by default everywhere.** `rbo agent install`/`uninstall`/`status`
-  print the exact `sc.exe`/`launchctl`/`systemctl` commands; they only execute with an explicit
-  `--execute` flag (and elevation). There is no fully-automated, un-flagged service install path.
-- **Wire protocol is a single version today** (`min = max = 1`). Upgrade/downgrade tests are
-  correspondingly a two-case check (accept the one supported version, reject anything else), not a
-  multi-version matrix — that's inherent to there being only one version defined, not a test gap.
-- **AI client compatibility is `not_verified` for every real product client** (Codex, Claude,
-  Cursor, Antigravity) until someone actually runs the smoke workflow against that client
-  and records the evidence in `docs/compatibility/evidence/`. See
+cd .\apps\cli
+npm pack --dry-run
+cd ..\..
+```
+
+Package scripts for the Windows executor:
+
+| Script | Behavior |
+| --- | --- |
+| `prepare-binary` | Soft copy from Cargo `target/` — warns and exits 0 if missing |
+| `prepare-binary:require` | Hard require — exits 1 unless Cargo output **or** staged `bin/…exe` exists |
+| `prepack` | Same as `--require` — runs automatically on `pnpm pack` / `npm pack` / `npm publish` |
+
+`apps/cli` has **no** `prepack` hook — build (via `verify` or `pnpm --filter @gemslibe/rbo build`)
+before packing. Published `"files"`: `dist/rbo.js`, `dist/rbo-mcp-stdio.js`,
+`config/controller.json`, `config/agent.json`, `scripts/stop-running-rbo.mjs`, `LICENSE`,
+`README.md`. The stop script is the `preinstall` / `preuninstall` hook that terminates running
+Controller/Agent processes before global reinstall (see `docs/ops/getting-started.md`).
+
+#### Dry-run smoke from local tarballs
+
+Prefer optional package published (or its `.tgz` installed) before installing the main `.tgz`:
+
+```powershell
+# Optional local dry-run of both on Windows x64:
+npm install -g .\packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-0.1.0.tgz
+npm install -g .\apps\cli\gemslibe-rbo-0.1.0.tgz
+rbo --help
+rbo doctor
+npm uninstall -g @gemslibe/rbo
+```
+
+### 4. Publish (`pnpm release:publish`)
+
+Publish `@gemslibe/rbo-windows-executor-win32-x64` **before** `@gemslibe/rbo`. The main package pins
+that optionalDependency at the **same** semver; publishing main first leaves Windows installs unable
+to fetch a matching helper.
+
+**Safety gate:** publish refuses to run unless you confirm:
+
+```powershell
+$env:RELEASE_CONFIRM=1; pnpm release:publish
+# or:
+pnpm release:publish --yes
+```
+
+Requires `npm login` to an account that can publish under the **`gemslibe`** org (2FA/OTP as npm
+requires). The script publishes from each package directory (`npm publish --access public`):
+optional first, then main.
+
+Confirm on the registry:
+
+```powershell
+npm view @gemslibe/rbo-windows-executor-win32-x64 version
+npm view @gemslibe/rbo version
+# expect: the same product semver you bumped
+```
+
+#### Manual publish (one package at a time)
+
+```powershell
+cd .\packages\rbo-windows-executor-win32-x64
+npm publish --access public
+cd ..\..
+
+cd .\apps\cli
+npm publish --access public
+cd ..\..
+```
+
+Or publish the packed tarballs (replace the version in the filename):
+
+```powershell
+npm publish --access public .\packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-0.1.0.tgz
+npm publish --access public .\apps\cli\gemslibe-rbo-0.1.0.tgz
+```
+
+### 5. Post-publish smoke
+
+On a **clean Windows x64** machine (no monorepo checkout required):
+
+1. Node.js ≥ 22.14 installed.
+2. `npm install -g @gemslibe/rbo`
+3. Confirm bins: `rbo --help`, `rbo-mcp-stdio` on `PATH`.
+4. Follow [`docs/ops/getting-started.md`](../ops/getting-started.md):
+   - `rbo controller init` and `rbo agent init`
+   - `rbo controller start` / `rbo agent start`
+   - Pair Agent → Controller
+   - Submit a trivial job
+5. `rbo doctor` — expect **`OK windows_executor`** (not WARN). A WARN on win32-x64 after a
+   successful global install usually means the optional package failed to download or was skipped.
+
+Treat the release as incomplete until this smoke path passes.
+
+---
+
+## Offline archives
+
+`pnpm package:archives` / `pnpm package:verify` refresh and check **manifests**; they do not zip/tar
+yet. Each `packaging/<os>/MANIFEST.json` lists in-archive `path`, `sha256`, `size_bytes`, and
+repo-relative `source`.
+
+Typical layout:
+
+```text
+bin/rbo.js                      ← apps/cli/dist/rbo.js
+bin/rbo-mcp-stdio.js            ← apps/cli/dist/rbo-mcp-stdio.js
+bin/rbo-windows-executor.exe    ← Windows only (Cargo release output)
+config/controller.json          ← apps/cli/config/… (template; live copy is ~/.rbo/controller.json)
+config/agent.json               ← apps/cli/config/… (template; live copy is ~/.rbo/agent/agent.json)
+```
+
+Forbidden paths (identity keys, `.env`, credentials, caches, logs, `node_modules`, …) are defined
+once in `packages/shared/src/packaging.ts` (`PACKAGING_FORBIDDEN_PATH_PATTERNS`) and enforced by
+`scripts/package-archives.mjs`.
+
+Assemble a distributable after `pnpm verify` (PowerShell, Windows example):
+
+```powershell
+$dest = Join-Path $env:TEMP "rbo-windows-0.1.0"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+$env:RBO_ARCHIVE_DEST = $dest
+node -e "const fs=require('fs');const path=require('path');const dest=process.env.RBO_ARCHIVE_DEST;const m=JSON.parse(fs.readFileSync('packaging/windows/MANIFEST.json','utf8'));for (const f of m.files){const out=path.join(dest,f.path);fs.mkdirSync(path.dirname(out),{recursive:true});fs.copyFileSync(f.source,out);}fs.copyFileSync('packaging/windows/MANIFEST.json',path.join(dest,'MANIFEST.json'));"
+Compress-Archive -Path (Join-Path $dest '*') -DestinationPath "$dest.zip" -Force
+# publish the zip + its own sha256 alongside it
+```
+
+Archives are the air-gap fallback; **npm remains the primary** distribution channel.
+
+---
+
+## License reminder
+
+- Default public terms: **AGPL-3.0-only** (`LICENSE` in both published packages;
+  `"license": "AGPL-3.0-only"` in each `package.json`).
+- Local use as a tool is fine under AGPL; offering RBO (or a modified/embedded form) **as a
+  service**, or embedding it into a proprietary product without AGPL compliance, needs a
+  **separate commercial license** (see `apps/cli/README.md`).
+- Do not invent a custom SPDX string. Do not publish without `LICENSE` in the tarball.
+
+---
+
+## Common failures
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `prepack` / `prepare-binary:require` / `release:pack` exits 1 | No `.exe` in Cargo `target/{release,debug}/` and none staged under `bin/` | Build on Windows x64: `cargo build --release --manifest-path native/windows-executor/Cargo.toml`, then `prepare-binary:require` |
+| `release:publish` refuses without confirmation | Missing safety gate | `$env:RELEASE_CONFIRM=1; pnpm release:publish` or `pnpm release:publish --yes` |
+| `npm publish` 403 / forbidden | Not logged in, missing `gemslibe` org rights, or 2FA/OTP required | `npm login`; complete org invite; provide OTP if prompted |
+| `engines` / install warnings | Node &lt; 22.14 | Upgrade Node; `rbo doctor` also surfaces mismatches |
+| Optional package skipped | Non-Windows or non-x64 host (`os`/`cpu` in package.json) | Expected; `rbo doctor` WARNs. Only win32-x64 gets the helper automatically |
+| `windows_executor` WARN on win32-x64 after `npm install -g` | Optional package not published yet, wrong semver pin, or network/registry failure | Publish optional package first at matching semver; reinstall; check `npm ls -g @gemslibe/rbo-windows-executor-win32-x64` |
+| Main pack missing `dist/*.js` | Forgot build / verify before pack | `pnpm --filter @gemslibe/rbo build` or full `pnpm verify` |
+| `pnpm --filter … pack` → `Unknown option: 'recursive'` | pnpm 10.x: `--filter` implies recursive; `pack` does not support it | Use `pnpm release:pack`, `pnpm pack:windows-executor` / `pnpm pack:rbo`, or `pnpm --dir <pkg-path> pack` |
+| `package:verify` sha256 mismatch | Stale manifest after edits | Run `pnpm package:archives` (or full `pnpm verify`) |
+| Mismatched versions at runtime vs npm | Bumped only one of `versions.ts` / two package.json files / `optionalDependencies` | Re-run `pnpm bump-version` so all sites match |
+
+---
+
+## Known limitations (release notes)
+
+Be honest when writing release notes:
+
+- **Windows-only native containment.** Job Objects helper is win32-x64 only; other arches/OSes run
+  without equivalent isolation.
+- **Service install is dry-run by default / best-effort.** Prefer `rbo agent start --daemon`.
+  `rbo agent install`/`uninstall`/`status` print platform commands targeting `node` + bundled
+  `rbo.js agent start --state-dir …`; `--execute` (and elevation) required for real changes.
+  Unit/plist files are not shipped yet — operators must create them from the printed hints.
+- **Wire protocol** is a single version today (`min = max = 1`).
+- **AI client compatibility** stays `not_verified` until someone records evidence in
   [`docs/compatibility/report.md`](../compatibility/report.md).
+
+---
 
 ## Pre-release checklist
 
-1. Bump version constants (see above) in a dedicated commit.
-2. `pnpm format && pnpm verify` — exit 0.
-3. Assemble and smoke-test at least one real archive per supported OS (extract it somewhere clean,
-   follow [`docs/ops/getting-started.md`](../ops/getting-started.md) end-to-end).
-4. Tag the commit; publish the archives + their own sha256 sums.
-5. Update `docs/compatibility/report.md`/`matrix.json` with any new real client evidence gathered
-   before or during the release — don't infer compatibility that wasn't actually tested.
+- [ ] `pnpm format` (optional) then `pnpm verify` exit 0
+- [ ] `pnpm bump-version` (or `pnpm bump-version x.y.z`) — lockstep sites updated
+- [ ] Semver matches in `versions.ts`, `apps/cli/package.json` (including `optionalDependencies`),
+      `packages/rbo-windows-executor-win32-x64/package.json`, and root `package.json`
+- [ ] `LICENSE` + AGPL/`README` commercial note present on both publish packages
+- [ ] `pnpm release:pack` on Windows x64 (or manual cargo → prepare-binary:require → pack steps)
+- [ ] Optional `.tgz` contains `bin\rbo-windows-executor.exe`
+- [ ] Dry-run smoke from tarballs (optional)
+- [ ] `npm whoami` — logged in as a `gemslibe` publisher
+- [ ] `$env:RELEASE_CONFIRM=1; pnpm release:publish` (optional package first, then main)
+- [ ] Registry versions match: `npm view` both packages
+- [ ] Clean Windows x64: global install → init → start → pair → submit
+- [ ] `rbo doctor` shows `OK windows_executor`
+- [ ] Tag / release notes updated; compatibility evidence only if actually tested

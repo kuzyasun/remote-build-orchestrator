@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
-import type { IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
 import {
@@ -34,7 +33,7 @@ import type {
   RunJobPayload,
   SourceNeedReason,
 } from '@rbo/protocol';
-import { certificateFingerprint, createLogger, generateId, resolveContainedCwd } from '@rbo/shared';
+import { createLogger, generateId, resolveContainedCwd } from '@rbo/shared';
 import type { GitUrlAllowlist } from '@rbo/shared';
 import {
   applyGitOverlay,
@@ -72,6 +71,7 @@ import { applyControlledGitSource } from '../repos/controlled-git.js';
 import { type RepoCacheConfig, RepoMirrorManager } from '../repos/mirror.js';
 import { StreamRedactor } from './redactor.js';
 import { streamDownloadWithLimits } from './stream-download-with-limits.js';
+import { assertPinnedPeerCert, pinnedTlsRequestOptions } from './tls-pin.js';
 
 const logger = createLogger('agent.executor');
 const ARTIFACT_TOKEN_TIMEOUT_MS = 60_000;
@@ -128,26 +128,6 @@ function resolveProjectIdentity(
     return prepare.repo.canonical_id;
   }
   return `local:${offer.snapshot_metadata.content_id}`;
-}
-
-function assertPinnedPeerCert(
-  res: IncomingMessage,
-  expectedFingerprint: string,
-): Error | undefined {
-  const socket = res.socket as unknown as {
-    getPeerCertificate?: (detailed?: boolean) => { raw?: Buffer };
-  };
-  const cert = socket.getPeerCertificate?.(true);
-  if (!cert?.raw) {
-    return new Error('Controller did not present a TLS certificate');
-  }
-  const actual = certificateFingerprint(cert.raw);
-  if (actual !== expectedFingerprint) {
-    return new Error(
-      `Controller certificate fingerprint mismatch: expected ${expectedFingerprint}, got ${actual}`,
-    );
-  }
-  return undefined;
 }
 
 export class AgentJobExecutor {
@@ -1784,30 +1764,6 @@ export class AgentJobExecutor {
     });
   }
 
-  private pinnedTlsOptions(): {
-    rejectUnauthorized: false;
-    checkServerIdentity: (_host: string, cert: { raw?: Buffer }) => Error | undefined;
-  } {
-    // Self-signed Controller certs are not in the system trust store. Disable
-    // CA trust and pin the peer certificate fingerprint (same model as WS).
-    const expected = this.config.controllerFingerprint;
-    return {
-      rejectUnauthorized: false,
-      checkServerIdentity: (_host, cert) => {
-        if (!cert.raw) {
-          return new Error('Controller did not present a TLS certificate');
-        }
-        const actual = certificateFingerprint(cert.raw);
-        if (actual !== expected) {
-          return new Error(
-            `Controller certificate fingerprint mismatch: expected ${expected}, got ${actual}`,
-          );
-        }
-        return undefined;
-      },
-    };
-  }
-
   private downloadSnapshotFile(
     downloadUrl: string,
     dataToken: string,
@@ -1823,7 +1779,7 @@ export class AgentJobExecutor {
           headers: {
             Authorization: `Bearer ${dataToken}`,
           },
-          ...this.pinnedTlsOptions(),
+          ...pinnedTlsRequestOptions(this.config.controllerFingerprint),
         },
         (res) => {
           const pinError = assertPinnedPeerCert(res, this.config.controllerFingerprint);
@@ -1870,7 +1826,7 @@ export class AgentJobExecutor {
                 'X-RBO-SHA256': sha256,
                 'X-RBO-Artifact-Name': logicalName,
               },
-              ...this.pinnedTlsOptions(),
+              ...pinnedTlsRequestOptions(this.config.controllerFingerprint),
             },
             (res) => {
               const pinError = assertPinnedPeerCert(res, this.config.controllerFingerprint);

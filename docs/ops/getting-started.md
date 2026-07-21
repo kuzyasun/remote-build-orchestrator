@@ -2,7 +2,9 @@
 
 Audience: an operator setting up RBO for the first time — a Controller, one or more Agents, and
 one or more AI coding clients (Codex, Claude, Cursor, Antigravity) talking to it over MCP.
-For building RBO itself from source, see [`docs/dev/release-builds.md`](../dev/release-builds.md).
+For building a release from this monorepo or publishing `@gemslibe/rbo` to npm, see
+[`docs/dev/release-builds.md`](../dev/release-builds.md) (maintainer guide — not required for
+operators installing from npm).
 For day-2 operations (drain/revoke/repair/update/backup), see [`runbook.md`](./runbook.md).
 
 ## 1. What you're setting up
@@ -11,9 +13,10 @@ For day-2 operations (drain/revoke/repair/update/backup), see [`runbook.md`](./r
   client talks to, and the TLS endpoint Agents connect to.
 - **Agent(s)** — a worker process on each machine that should actually run builds/tests/QEMU/Docker
   jobs. Can run on the same machine as the Controller, or on remote machines.
-- **`rbo-mcp-stdio`** — a separate binary (`bin/rbo-mcp-stdio.js`, not a subcommand of the `rbo`
-  CLI) that your AI client launches directly; it's a small stdio↔HTTP proxy so clients that only
-  speak stdio MCP can still reach the Controller's loopback HTTP endpoint.
+- **`rbo-mcp-stdio`** — a separate binary (not a subcommand of the `rbo` CLI) that your AI client
+  launches directly; it's a small stdio↔HTTP proxy so clients that only speak stdio MCP can still
+  reach the Controller's loopback HTTP endpoint. After `npm install -g` it is on `PATH` as
+  `rbo-mcp-stdio`; archives ship the same file as `bin/rbo-mcp-stdio.js`.
 
 Nothing here executes a job until you finish pairing at least one Agent (or explicitly allow local
 fallback — see step 4).
@@ -22,100 +25,155 @@ fallback — see step 4).
 
 - Node.js ≥ 22.14 on every machine (Controller and every Agent)
 - Git on `PATH` on every machine that will run a job (snapshot capture shells out to `git`)
-- Windows Agents: nothing extra — the Job Object helper (`rbo-windows-executor.exe`) ships prebuilt
-  in the Windows package
+- Windows Agents: nothing extra on **win32-x64** — with `npm install -g @gemslibe/rbo`, the Job
+  Object helper arrives via optionalDependency `@gemslibe/rbo-windows-executor-win32-x64`
+  (`rbo-windows-executor.exe`). Archives ship the same exe under `bin/`. Other Windows arches /
+  OSes run without the helper; `rbo doctor` warns.
 - macOS/Linux Agents: scripts run without the equivalent process-tree containment layer today (see
   Known limitations in the release guide) — fine for trusted local dev use, be aware for anything
   more adversarial
 
 ## 3. Install the package
 
-Extract the archive for your OS (built per [`docs/dev/release-builds.md`](../dev/release-builds.md)
-or provided by whoever built your release). Layout:
+**Preferred — global npm install** (ships CLI + Controller + Agent + `rbo-mcp-stdio` in one package):
+
+```bash
+npm install -g @gemslibe/rbo
+```
+
+Requires Node.js ≥ 22.14. After install, `rbo` and `rbo-mcp-stdio` are on your `PATH`.
+
+> **Reinstall / upgrade:** global `npm install -g` / `npm uninstall -g` run a `preinstall` /
+> `preuninstall` hook that stops any running Controller/Agent (`rbo.js … start`, including
+> `--daemon` via pid files) so Windows can replace locked `better-sqlite3` natives. The hook
+> only runs for **global** installs (not monorepo `pnpm install`). Set
+> `RBO_SKIP_INSTALL_STOP=1` to skip. OS services are not stopped.
+
+**Offline / air-gap fallback:** extract an OS archive built per
+[`docs/dev/release-builds.md`](../dev/release-builds.md) (same bundled bits at the same semver). Layout:
 
 ```text
-bin/rbo-controller.js
-bin/rbo-agent.js
-bin/rbo.js                    ← the `rbo` CLI
-bin/rbo-mcp-stdio.js
+bin/rbo.js                    ← the `rbo` CLI (bundled Controller + Agent + CLI)
+bin/rbo-mcp-stdio.js          ← MCP stdio proxy (bundled)
 bin/rbo-windows-executor.exe  ← Windows only
-config/controller.example.json ← reference only, see step 4
+config/controller.json        ← template of the live operator config (init writes ~/.rbo/controller.json)
+config/agent.json             ← template of the live agent config (init writes ~/.rbo/agent/agent.json)
 ```
+
+Archives ship the **same bundled bits** as `npm install -g @gemslibe/rbo` (including the
+`config/*.json` templates). Start Controller/Agent with
+`node bin/rbo.js controller start` / `node bin/rbo.js agent start` (or `rbo ...` after a global
+install). There are no separate thin `rbo-controller` / `rbo-agent` archive entrypoints.
 
 ## 4. Set up the Controller
 
-The Controller reads **all** configuration from environment variables — `config/
-controller.example.json` is a documentation reference, not a file it loads. Set at least:
+The Controller loads **`~/.rbo/controller.json`** (or `$RBO_DATA_DIR/controller.json`) on start.
+`rbo controller init` writes a complete default config there if missing (use `--force` to rewrite).
+**Precedence:** built-in defaults → config file → environment variables → programmatic overrides.
+Edit the file for day-to-day setup; use env vars only when scripting/CI needs a temporary override.
 
 ```bash
-export RBO_DATA_DIR="$HOME/.rbo"                         # default: ~/.rbo (Windows: %LOCALAPPDATA%/RBO)
-export RBO_ALLOWED_PROJECT_ROOTS="/home/you/projects/app-a,/home/you/projects/app-b"
-export RBO_ALLOWED_ARTIFACT_DESTINATIONS="/home/you/build-out"
+rbo controller init         # TLS identity + ~/.rbo/controller.json (defaults)
+# Windows: same paths under %USERPROFILE%\.rbo
 ```
 
-`RBO_ALLOWED_PROJECT_ROOTS` is not optional in practice: it defaults to empty, and `job_submit`
-rejects every job whose `source.project_root` isn't inside one of these roots. List every
-repository you intend to build through RBO.
+Then edit `~/.rbo/controller.json` (or `%USERPROFILE%\.rbo\controller.json` on Windows). At minimum
+fill the allowlists — they default to empty and `job_submit` rejects every project root until you set them:
 
-Then, once per machine (the CLI reads `$RBO_DATA_DIR` from the environment set above — there is no
-`--data-dir` flag, so make sure it's exported in the same shell):
+| Field | Default | Purpose |
+|---|---|---|
+| `allowed_project_roots` | `[]` | Absolute paths whose trees may be used as `source.project_root` — **you must fill this** |
+| `allowed_artifact_destinations` | `[]` | Absolute paths `artifact_materialize` may write into |
+| `mcp_host` / `mcp_port` | `127.0.0.1` / `7410` | MCP endpoint your AI client / `rbo-mcp-stdio` connects to |
+| `agent_plane_port` | `7411` | TLS port Agents connect to |
+| `controller_public_host` | `127.0.0.1` | Host Agents use in data-plane HTTPS URLs (set to a reachable address for remote Agents) |
+| `allow_local_fallback` | `true` | Allow the Controller to run a job locally when no eligible Agent matches |
+| `local_max_concurrent_jobs` | `1` | Cap on concurrent locally-executed jobs |
+| `local_fallback_max_host_cpu_percent` | `80` | Host-aware local fallback CPU busy% threshold |
+
+Example (Linux/macOS paths):
+
+```json
+{
+  "allowed_project_roots": ["/home/you/projects/app-a", "/home/you/projects/app-b"],
+  "allowed_artifact_destinations": ["/home/you/build-out"]
+}
+```
+
+Windows example:
+
+```json
+{
+  "allowed_project_roots": ["C:\\Users\\you\\projects\\app-a"],
+  "allowed_artifact_destinations": ["C:\\Users\\you\\build-out"]
+}
+```
+
+Then start (defaults already use `~/.rbo`; override with `RBO_DATA_DIR` or `--data-dir <dir>` on
+**every** `rbo controller` subcommand — init, fingerprint, start, restore — so init and start
+always target the same tree):
 
 ```bash
-node bin/rbo.js controller init         # generates the pinned TLS cert + signing keys under $RBO_DATA_DIR
-node bin/rbo.js controller fingerprint  # print it — you'll need this on every Agent
-node bin/rbo-controller.js   # foreground; Ctrl-C to stop. See runbook.md for a real service install.
+rbo controller fingerprint  # print it — you'll need this on every Agent
+rbo controller start        # foreground; Ctrl-C to stop. Pass --daemon for detached PID+log.
+# Archive alternative: node bin/rbo.js controller start
 ```
 
-Confirm it's up: `node bin/rbo.js doctor` (checks git, data dir permissions, shell availability,
+Confirm it's up: `rbo doctor` (checks git, data dir permissions, shell availability,
 and Controller reachability at `http://127.0.0.1:7410`).
 
-Other env vars you may want (all optional, sane defaults shown):
-
-| Env var | Default | Purpose |
-|---|---|---|
-| `RBO_MCP_HOST` / `RBO_MCP_PORT` | `127.0.0.1` / `7410` | MCP endpoint your AI client/`rbo-mcp-stdio` connects to |
-| `RBO_AGENT_PORT` | `7411` | TLS port Agents connect to |
-| `RBO_ALLOW_LOCAL_FALLBACK` | `true` | Allow the Controller itself to run a job locally when no eligible Agent is available and the job's `queue_policy`/`preferences.allow_local_fallback` permit it |
-| `RBO_LOCAL_MAX_CONCURRENT_JOBS` | `1` | Cap on concurrent locally-executed jobs |
-| `RBO_ALLOWED_ARTIFACT_DESTINATIONS` | (empty) | Comma-separated absolute paths `artifact_materialize` is allowed to write to — same shape as `RBO_ALLOWED_PROJECT_ROOTS`, checked independently |
-| `RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT` | `80` | Host-aware local fallback: above this CPU busy%, the Controller's own host is excluded from local fallback and the job queues instead — unless the host is still the least-loaded option available right now (see [`docs/dev/host-aware-local-fallback-plan.md`](../dev/host-aware-local-fallback-plan.md)) |
+Optional env overrides (same names as before; they win over the file when set):
+`RBO_MCP_HOST`, `RBO_MCP_PORT`, `RBO_AGENT_PORT`, `RBO_ALLOWED_PROJECT_ROOTS` (comma-separated),
+`RBO_ALLOWED_ARTIFACT_DESTINATIONS`, `RBO_ALLOW_LOCAL_FALLBACK`, `RBO_LOCAL_MAX_CONCURRENT_JOBS`,
+`RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT`, `RBO_CONTROLLER_PUBLIC_HOST`, `RBO_DATA_DIR`.
 
 > **Naming trap**: the `rbo` CLI (`agents`/`agent`/`submit`/`logs`/`cancel`/`doctor` — anything
 > talking to the Controller's HTTP admin/tool API) reads **`RBO_CONTROLLER_URL_HTTP`** (default
 > `http://127.0.0.1:7410`) for that endpoint. This is a *different* variable from the Agent's
-> `RBO_CONTROLLER_URL` (a `wss://...:7411/agent` WebSocket URL, step 5) — don't set one expecting
-> it to satisfy the other. If you're running `rbo` from a machine other than the Controller itself,
-> export `RBO_CONTROLLER_URL_HTTP=http://<controller-host>:7410` first.
+> `controller_url` / `RBO_CONTROLLER_URL` (a `wss://...:7411/agent` WebSocket URL, step 5) — don't
+> set one expecting it to satisfy the other. If you're running `rbo` from a machine other than the
+> Controller itself, export `RBO_CONTROLLER_URL_HTTP=http://<controller-host>:7410` first.
 
 ## 5. Set up an Agent and pair it
 
-On the Agent machine (same or different from the Controller):
+On the Agent machine (same or different from the Controller). The Agent loads
+`~/.rbo/agent/agent.json` (or `$RBO_AGENT_STATE_DIR/agent.json` /
+`$RBO_DATA_DIR/agent/agent.json`). `rbo agent init` writes a complete default config if missing
+(`--force` to rewrite). Same precedence as the Controller: **file first for operators, env
+overrides the file**.
 
 ```bash
-export RBO_CONTROLLER_URL="wss://<controller-host>:7411/agent"
-export RBO_CONTROLLER_FINGERPRINT="<value printed by 'controller fingerprint' above>"
-export RBO_AGENT_NAME="my-laptop"          # default: rbo-agent
-export RBO_MAX_JOBS=1                       # Phase 4: effective capacity is min(this, 1) anyway
+rbo agent init
+# Edit ~/.rbo/agent/agent.json (Windows: %USERPROFILE%\.rbo\agent\agent.json):
+#   controller_url         → wss://<controller-host>:7411/agent
+#   controller_fingerprint → value from `rbo controller fingerprint`
+#   display_name           → e.g. "my-laptop" (default: rbo-agent)
+#   max_jobs               → default 1
 
-node bin/rbo-agent.js
+rbo agent start          # foreground; pass --daemon for detached PID+log
+# Archive alternative: node bin/rbo.js agent start
 ```
+
+Agent state defaults to `~/.rbo/agent` (or `$RBO_DATA_DIR/agent`). Override with
+`RBO_AGENT_STATE_DIR` or `--state-dir <dir>` on `rbo agent init` / `rbo agent start` (same flag
+for both). You can also set `RBO_CONTROLLER_URL` / `RBO_CONTROLLER_FINGERPRINT` /
+`RBO_AGENT_NAME` / `RBO_MAX_JOBS` to override the file for a single run.
 
 The Agent connects, presents its device identity, and sits in `pairing_pending` until an operator
 approves it. Back on the Controller machine (or any other machine with `rbo` and network access to
 it — remember to `export RBO_CONTROLLER_URL_HTTP=http://<controller-host>:7410` there first):
 
 ```bash
-node bin/rbo.js agents                      # list agents — the new one shows as unpaired/pending
-# find its pairing_request_id via the admin API, then:
-node bin/rbo.js agent approve <pairing_request_id>
-node bin/rbo.js agents                      # confirm it now appears with reported capabilities
+rbo agents                      # { agents, pending_pairings } — pending shows pairing id
+rbo agent approve <pairing_request_id>   # id from pending_pairings[].id
+rbo agents                      # confirm it moved into agents[] with reported capabilities
 ```
 
 Verify the wrong-fingerprint case is actually rejected once, on purpose, before trusting the setup:
-start an Agent with a deliberately wrong `RBO_CONTROLLER_FINGERPRINT` and confirm it never
+start an Agent with a deliberately wrong `controller_fingerprint` and confirm it never
 authenticates — this is the whole point of pinning it out-of-band instead of trusting DNS/TLS CA.
 
-To revoke later: `node bin/rbo.js agent revoke <agent_id>` (see [`runbook.md`](./runbook.md) for
+To revoke later: `rbo agent revoke <agent_id>` (see [`runbook.md`](./runbook.md) for
 the full lifecycle — drain/revoke/repair/update/backup/restore).
 
 ## 6. Connect an AI coding client over MCP
@@ -139,9 +197,32 @@ your client rather than retyping it:
 | Cursor | [`snippets/cursor.md`](../compatibility/snippets/cursor.md) |
 | Antigravity | [`snippets/antigravity.md`](../compatibility/snippets/antigravity.md) |
 
-Every snippet uses `${RBO_ROOT}` as a placeholder for wherever you extracted the package — replace
-it with your real path before pasting it into the client's MCP config. None of these have been
-smoke-tested against the real product client yet (see
+The snippets use `command: "rbo-mcp-stdio"` — that matches a global npm install (`rbo-mcp-stdio` on
+`PATH`). Other install modes need a path to the same proxy binary:
+
+| Install | How to launch MCP stdio |
+|---|---|
+| `npm install -g @gemslibe/rbo` | `rbo-mcp-stdio` on `PATH` (what the snippets use) |
+| From-source monorepo (`pnpm install` + build / `pnpm verify`) | `node <REPO>/apps/cli/dist/rbo-mcp-stdio.js` |
+| OS archive extract | `node <RBO_ROOT>/bin/rbo-mcp-stdio.js` |
+
+For from-source or archive, replace the snippet's `command` with `node` and put the absolute path
+in `args` (keep the same `env`):
+
+```json
+{
+  "command": "node",
+  "args": ["<REPO>/apps/cli/dist/rbo-mcp-stdio.js"],
+  "env": {
+    "RBO_CONTROLLER_URL": "http://127.0.0.1:7410"
+  }
+}
+```
+
+Use `<RBO_ROOT>/bin/rbo-mcp-stdio.js` instead of the `<REPO>/…` path when running from an OS
+archive.
+
+None of the product clients have been smoke-tested against the real product yet (see
 [`docs/compatibility/report.md`](../compatibility/report.md) — status `not_verified` is honest, not
 a bug); the harness itself (the same `job_submit → job_wait → job_logs → job_artifacts →
 artifact_materialize` + cancel workflow, over both transports) is what's actually verified today.
@@ -161,54 +242,59 @@ cat > job.json <<'EOF'
   "artifacts": [{ "glob": "out.txt", "required": true }]
 }
 EOF
-node bin/rbo.js submit job.json          # → { "job_id": "job_..." }
-node bin/rbo.js logs <job_id>
-node bin/rbo.js cancel <job_id> "changed my mind"   # only if it's still running
+rbo submit job.json          # → { "job_id": "job_..." }  (archive: node bin/rbo.js …)
+rbo logs <job_id>
+rbo cancel <job_id> "changed my mind"   # only if it's still running
 ```
 
-Via an AI client, the same workflow is the `job_submit` → `job_wait` → `job_logs` →
-`job_artifacts` → `artifact_materialize` tool calls — the AI client drives this, you don't type it
-yourself. `risk_level: "destructive"` or `"hardware"` jobs come back `awaiting_confirmation` with a
-short-lived `confirmation_token`; the client must call `job_confirm` with that exact token before
-the job actually queues (this is a deliberate, non-bypassable safety gate — see
-`remote-build-orchestrator-design.md` §23.2.1).
+Via an AI client, prefer **`job_run`** (one call: submit + wait + summary). Keep `job_submit` /
+`job_wait` / `job_logs` for CI or advanced workflows. `risk_level: "destructive"` or `"hardware"`
+jobs come back `awaiting_confirmation` with a short-lived `confirmation_token`; the client must
+call `job_confirm` before the job queues (see `remote-build-orchestrator-design.md` §23.2.1).
 
 ## 8. Tell your AI coding assistant to actually use RBO
 
-RBO only routes jobs your AI client explicitly submits through it. If you want Codex/Claude
-Code/Cursor to *default* to using RBO for builds/tests instead of running them inline in your
-project's own working tree, add something like this to that project's own `AGENTS.md` /
-`CLAUDE.md` (not this repo's — the project you're building with RBO's help):
+MCP (§6) only exposes the tools. Without project guidance, the assistant still runs builds/tests in
+the live tree. Paste this into that project's `AGENTS.md` / `CLAUDE.md` (not this repo's):
 
 ```markdown
 ## Remote builds via RBO
 
-This project has an RBO Controller + Agent available (see `<path-to-your-notes>` for the
-Controller URL and allowed project roots). For any build, test, or long-running/destructive
-command:
+For build/test/long commands, call MCP `job_run` (server `rbo`) with:
+- `project_root`: this repo (absolute path)
+- `command`: the shell command to run
 
-- Prefer the `job_submit` MCP tool (server name `rbo`) over running the command directly, so it
-  runs against an isolated snapshot instead of your live working tree.
-- Use `job_wait` / `job_logs` to follow progress; don't poll faster than a few seconds.
-- Materialize needed outputs with `artifact_materialize` rather than assuming the job ran in-place
-  — it didn't, by design (§0.2: the job's snapshot is isolated from your live tree).
-- Destructive or hardware-risk commands come back `awaiting_confirmation`; call `job_confirm` with
-  the returned token before assuming the job will run.
-- If no RBO Agent is reachable, ask before falling back to running the command locally.
+Optional `artifacts`: only when you need outputs back — choose globs for the files that matter
+for *this* task (binaries, logs, reports, configs, etc.). Skip artifacts when you only need
+`outcome` / `exit_code` / `log_tail`. Avoid scooping an entire huge build tree unless you
+really need it.
+
+Use `outcome` / `exit_code` / `log_tail` / `artifacts`. If the response has `resume: true`, call
+`job_run` again with the same `job_id` until `resume` is false (keeps each MCP call under ~60s).
+
+Do not run the same command in the live tree unless `job_run` fails and the user approves a local
+fallback.
+
+Destructive or hardware-risk jobs return `awaiting_confirmation`; call `job_confirm` with the
+token, then `job_wait` / `job_get` as needed.
 ```
 
-Adjust the specifics (server name, which commands should route through RBO) to match your actual
-`mcpServers` config name and workflow.
+If your `mcpServers` entry is not named `rbo`, change the server name in the first line.
 
 ## 9. Troubleshooting
 
-- `node bin/rbo.js doctor` first, always — it checks git, data dir writability, shell
-  availability, and Controller reachability in one shot.
+- `rbo doctor` first, always (archive: `node bin/rbo.js doctor`) — it checks git, data dir
+  writability, shell availability, and Controller reachability in one shot.
+- MCP client can't start `rbo-mcp-stdio` (command not found): GUI apps on Windows often miss the
+  shell's npm-global `PATH`. Restart the client after install, confirm the npm global bin dir is on
+  the user/system `PATH`, or use the `node` + absolute-path form from §6 instead.
 - `job_submit` rejects with `"Project root is not under allowed roots: ..."`: add the path to
-  `RBO_ALLOWED_PROJECT_ROOTS` on the Controller and restart it.
-- Agent stuck at `pairing_pending`: confirm you approved the right `pairing_request_id` (list
-  pending requests via the admin API) and that the Agent's `RBO_CONTROLLER_FINGERPRINT` exactly
-  matches `controller fingerprint`'s current output.
-- Agent connects but never gets work: check `node bin/rbo.js agents` for its reported capacity/
-  capabilities, and confirm your job's `requirements` (OS, labels, toolchain) actually match it.
+  `allowed_project_roots` in `~/.rbo/controller.json` (or set `RBO_ALLOWED_PROJECT_ROOTS`) and
+  restart the Controller.
+- Agent stuck at `pairing_pending`: run `rbo agents` and approve the id under
+  `pending_pairings` (`rbo agent approve <id>`). Confirm the Agent's `controller_fingerprint` in
+  `agent.json` (or `RBO_CONTROLLER_FINGERPRINT`) exactly matches `controller fingerprint`'s
+  current output.
+- Agent connects but never gets work: check `rbo agents` for its reported capacity/capabilities,
+  and confirm your job's `requirements` (OS, labels, toolchain) actually match it.
 - For anything else, see [`runbook.md`](./runbook.md)'s Repair section.

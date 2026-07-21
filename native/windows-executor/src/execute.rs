@@ -6,9 +6,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -133,7 +139,11 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
-fn create_inheritable_pipe() -> windows::core::Result<(HANDLE, HANDLE)> {
+/// Create a stdout/stderr pipe. The child inherits only the write end; the parent
+/// keeps a non-inheritable read end. Leaving both ends inheritable breaks `cmd.exe`
+/// `FOR /F` (used by tools like `flutter.bat`) because nested processes inherit the
+/// read end and corrupt redirected console I/O.
+fn create_output_pipe() -> windows::core::Result<(HANDLE, HANDLE)> {
     unsafe {
         let mut read = HANDLE::default();
         let mut write = HANDLE::default();
@@ -143,7 +153,27 @@ fn create_inheritable_pipe() -> windows::core::Result<(HANDLE, HANDLE)> {
             bInheritHandle: true.into(),
         };
         CreatePipe(&mut read, &mut write, Some(&mut sa), 0)?;
+        SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, Default::default())?;
         Ok((read, write))
+    }
+}
+
+fn open_nul_stdin() -> windows::core::Result<HANDLE> {
+    unsafe {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: true.into(),
+        };
+        CreateFileW(
+            w!("NUL"),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(&sa),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
     }
 }
 
@@ -184,7 +214,7 @@ pub fn execute_request(request: ExecutionRequest, cancel: Arc<AtomicBool>) -> Ex
     let mut command_line = build_command_line(&request.command, &request.args);
     let cwd = to_wide(&request.cwd);
 
-    let (stdout_read, stdout_write) = match create_inheritable_pipe() {
+    let (stdout_read, stdout_write) = match create_output_pipe() {
         Ok(pair) => pair,
         Err(error) => {
             return ExecutionResponse {
@@ -197,7 +227,7 @@ pub fn execute_request(request: ExecutionRequest, cancel: Arc<AtomicBool>) -> Ex
             };
         }
     };
-    let (stderr_read, stderr_write) = match create_inheritable_pipe() {
+    let (stderr_read, stderr_write) = match create_output_pipe() {
         Ok(pair) => pair,
         Err(error) => {
             unsafe {
@@ -214,13 +244,32 @@ pub fn execute_request(request: ExecutionRequest, cancel: Arc<AtomicBool>) -> Ex
             };
         }
     };
+    let stdin_nul = match open_nul_stdin() {
+        Ok(handle) => handle,
+        Err(error) => {
+            unsafe {
+                let _ = CloseHandle(stdout_read);
+                let _ = CloseHandle(stdout_write);
+                let _ = CloseHandle(stderr_read);
+                let _ = CloseHandle(stderr_write);
+            }
+            return ExecutionResponse {
+                protocol: PROTOCOL_VERSION,
+                attempt_id: request.attempt_id,
+                exit_code: None,
+                success: false,
+                timed_out: false,
+                error_message: Some(format!("Failed to open NUL for stdin: {error}")),
+            };
+        }
+    };
 
     let mut startup_info = STARTUPINFOW::default();
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     startup_info.dwFlags = STARTF_USESTDHANDLES;
     startup_info.hStdOutput = stdout_write;
     startup_info.hStdError = stderr_write;
-    startup_info.hStdInput = HANDLE::default();
+    startup_info.hStdInput = stdin_nul;
 
     let mut process_info = PROCESS_INFORMATION::default();
     let create_result = unsafe {
@@ -241,6 +290,7 @@ pub fn execute_request(request: ExecutionRequest, cancel: Arc<AtomicBool>) -> Ex
     unsafe {
         let _ = CloseHandle(stdout_write);
         let _ = CloseHandle(stderr_write);
+        let _ = CloseHandle(stdin_nul);
     }
 
     if create_result.is_err() {

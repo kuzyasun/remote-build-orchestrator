@@ -20,10 +20,10 @@
 - `packages/testing/`: Shared test fixtures and harness helpers.
 - `native/windows-executor/`: Rust Job Object process isolation helper for Windows (§15.2).
 - `packaging/`: Per-OS packaging manifests and config templates (see `docs/dev/release-builds.md`).
-- `docs/dev/release-builds.md`: How to build and package a release from source.
+- `docs/dev/release-builds.md`: How to build a release and publish `@gemslibe/rbo` to npm.
 - `docs/ops/getting-started.md`: Operator walkthrough — Controller/Agent setup, pairing, MCP client wiring.
 - `docs/ops/runbook.md`: Day-2 operator procedures (install/pair/drain/revoke/repair/update/backup/restore/uninstall).
-- `remote-build-orchestrator-design.md`: Canonical architectural design specification (implementation phases tracked in `PHASE_HANDOFFS.md`).
+- `remote-build-orchestrator-design.md`: Canonical architectural design specification.
 
 ## Stack Summary
 

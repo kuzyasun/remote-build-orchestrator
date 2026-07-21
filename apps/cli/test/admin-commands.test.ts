@@ -18,9 +18,10 @@ import {
 let running: RunningControllerServer;
 let db: ControllerDatabase;
 let baseUrl: string;
+let dataDir: string;
 
 beforeAll(async () => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'rbo-cli-admin-'));
+  dataDir = mkdtempSync(join(tmpdir(), 'rbo-cli-admin-'));
   db = openDatabase(':memory:');
   migrateToLatest(db);
   const identity = await ensureControllerIdentity(dataDir);
@@ -30,12 +31,31 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await running.close();
+  rmSync(dataDir, { recursive: true, force: true });
 });
 
 describe('CLI agent admin commands (§33)', () => {
-  it('rbo agents lists agents via the admin API', async () => {
+  it('rbo agents lists registered agents and pending pairing requests', async () => {
+    const device = generateDeviceKeyPair();
+    const request = createPairingRequest(db, {
+      devicePublicKeyPem: device.publicKeyPem,
+      displayName: 'cli-pending-agent',
+      hostname: 'host-a',
+    });
+
     const result = await listAgentsRemote(baseUrl);
+
     expect(Array.isArray(result.agents)).toBe(true);
+    expect(result.pending_pairings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: request.id,
+          display_name: 'cli-pending-agent',
+          hostname: 'host-a',
+          state: 'pending',
+        }),
+      ]),
+    );
   });
 
   it('rbo agent approve approves a pending pairing request by ID', async () => {

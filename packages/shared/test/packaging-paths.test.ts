@@ -46,7 +46,7 @@ describe('Packaging forbidden paths', () => {
     const manifest = buildBaseManifest('windows');
     manifest.files = [
       {
-        path: 'bin/rbo-controller.js',
+        path: 'bin/rbo.js',
         sha256: 'b'.repeat(64),
         size_bytes: 10,
       },

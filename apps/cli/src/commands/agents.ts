@@ -15,6 +15,16 @@ export interface AgentSummary {
   tools: Record<string, string[]>;
 }
 
+/** Pending (or otherwise listed) pairing request — id is what `rbo agent approve` takes. */
+export interface PendingPairingSummary {
+  id: string;
+  display_name: string;
+  hostname: string | null;
+  state: string;
+  one_time_code: string;
+  expires_at: string;
+}
+
 async function postAdmin<T>(baseUrl: string, action: string, body: unknown): Promise<T> {
   const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/internal/v1/admin/${action}`, {
     method: 'POST',
@@ -29,8 +39,33 @@ async function postAdmin<T>(baseUrl: string, action: string, body: unknown): Pro
   return json as T;
 }
 
-export function listAgentsRemote(baseUrl: string): Promise<{ agents: AgentSummary[] }> {
-  return postAdmin(baseUrl, 'agents/list', {});
+/**
+ * Fleet view for `rbo agents`: registered agents plus pending pairing requests.
+ * Pending rows live in `pairing_requests`, not `agents` — without this join the
+ * CLI prints `[]` while an Agent is sitting in pairing_pending (docs expect them
+ * to show up here so the operator can copy the id into `rbo agent approve`).
+ */
+export async function listAgentsRemote(baseUrl: string): Promise<{
+  agents: AgentSummary[];
+  pending_pairings: PendingPairingSummary[];
+}> {
+  const [agentsResult, pairingResult] = await Promise.all([
+    postAdmin<{ agents: AgentSummary[] }>(baseUrl, 'agents/list', {}),
+    postAdmin<{ requests: PendingPairingSummary[] }>(baseUrl, 'pairing/list', {
+      state: 'pending',
+    }),
+  ]);
+  return {
+    agents: agentsResult.agents,
+    pending_pairings: pairingResult.requests.map((row) => ({
+      id: row.id,
+      display_name: row.display_name,
+      hostname: row.hostname,
+      state: row.state,
+      one_time_code: row.one_time_code,
+      expires_at: row.expires_at,
+    })),
+  };
 }
 
 export function approveAgentRemote(

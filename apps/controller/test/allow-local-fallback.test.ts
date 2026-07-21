@@ -21,7 +21,7 @@ function makeRequest(overrides: Partial<JobRequest> = {}): JobRequest {
 
 describe('allowLocalFallback config (§2.3)', () => {
   it('loadControllerConfig defaults allowLocalFallback to true', () => {
-    const config = loadControllerConfig({ dataDir: '/tmp/rbo-test' });
+    const config = loadControllerConfig({ dataDir: '/tmp/rbo-test', configPath: null });
     expect(config.allowLocalFallback).toBe(true);
   });
 
@@ -29,7 +29,7 @@ describe('allowLocalFallback config (§2.3)', () => {
     const prev = process.env.RBO_ALLOW_LOCAL_FALLBACK;
     process.env.RBO_ALLOW_LOCAL_FALLBACK = 'false';
     try {
-      const config = loadControllerConfig({ dataDir: '/tmp/rbo-test' });
+      const config = loadControllerConfig({ dataDir: '/tmp/rbo-test', configPath: null });
       expect(config.allowLocalFallback).toBe(false);
     } finally {
       if (prev === undefined) {

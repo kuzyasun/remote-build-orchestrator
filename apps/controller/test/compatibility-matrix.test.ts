@@ -35,7 +35,7 @@ describe('Compatibility matrix', () => {
       expect(text).not.toMatch(/BEGIN (OPENSSH |RSA )?PRIVATE KEY/);
       expect(text).not.toMatch(/[A-Za-z]:\\Users\\[^\\\s]+\\/);
       expect(text).not.toMatch(/\/home\/[^/\s]+\//);
-      expect(text).toMatch(/\$\{RBO_ROOT\}|127\.0\.0\.1:7410/);
+      expect(text).toMatch(/rbo-mcp-stdio|127\.0\.0\.1:7410/);
     }
   });
 });

@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { writeDefaultControllerConfigFile } from '@rbo/controller/config';
+import { runController } from '@rbo/controller/run';
 import {
   type BackupManifest,
   RBO_CONTROLLER_SCHEMA_VERSION,
@@ -8,30 +10,44 @@ import {
   ensureControllerIdentity,
   validateRestore,
 } from '@rbo/shared';
+import { controllerLogPath, controllerPidPath, spawnDetachedDaemon } from './daemon.js';
 
 export interface ControllerInitOptions {
   dataDir: string;
+  /** Rewrite `controller.json` even if it already exists. */
+  force?: boolean;
 }
 
 export interface ControllerIdentitySummary {
   controllerId: string;
   fingerprint: string;
+  /** Operator config path loaded at runtime (`controller.json`). */
+  configPath: string;
+  /** Whether init wrote (or rewrote) the operator config. */
+  configWritten: boolean;
 }
 
 // `rbo controller init` (§33, Phase 2): generate the pinned TLS certificate
 // and signing keys once; safe to re-run — it reuses the existing identity.
+// Also writes a complete default `controller.json` if missing (or with --force).
 export async function runControllerInit(
   options: ControllerInitOptions,
 ): Promise<ControllerIdentitySummary> {
   const identity = await ensureControllerIdentity(options.dataDir);
-  return { controllerId: identity.controllerId, fingerprint: identity.fingerprint };
+  const config = writeDefaultControllerConfigFile(options.dataDir, { force: options.force });
+  return {
+    controllerId: identity.controllerId,
+    fingerprint: identity.fingerprint,
+    configPath: config.path,
+    configWritten: config.written,
+  };
 }
 
 // `rbo controller fingerprint`: display the fingerprint out-of-band so the
 // operator can compare it on the Agent side before approving pairing.
 export async function runControllerFingerprint(
   options: ControllerInitOptions,
-): Promise<ControllerIdentitySummary> {
+): Promise<Pick<ControllerIdentitySummary, 'controllerId' | 'fingerprint'>> {
   const identity = await ensureControllerIdentity(options.dataDir);
   return { controllerId: identity.controllerId, fingerprint: identity.fingerprint };
 }
@@ -61,6 +77,42 @@ async function readExistingControllerId(dataDir: string): Promise<string | undef
   }
   const meta = JSON.parse(await readFile(metaPath, 'utf8')) as { controller_id: string };
   return meta.controller_id;
+}
+
+export async function isControllerInitialized(dataDir: string): Promise<boolean> {
+  return (await readExistingControllerId(dataDir)) !== undefined;
+}
+
+export interface ControllerStartOptions {
+  dataDir: string;
+  daemon?: boolean;
+  /** CLI script path (`process.argv[1]`) for daemon re-exec. */
+  cliScriptPath?: string;
+}
+
+export async function runControllerStart(
+  options: ControllerStartOptions,
+): Promise<number | undefined> {
+  if (!(await isControllerInitialized(options.dataDir))) {
+    throw new Error('Controller is not initialized. Run `rbo controller init` first.');
+  }
+
+  if (options.daemon) {
+    const cliScript = options.cliScriptPath;
+    if (!cliScript) {
+      throw new Error('cliScriptPath is required for daemon start');
+    }
+    const pid = await spawnDetachedDaemon({
+      command: process.execPath,
+      args: [cliScript, 'controller', 'start', '--data-dir', options.dataDir],
+      pidFile: controllerPidPath(options.dataDir),
+      logFile: controllerLogPath(options.dataDir),
+      label: 'Controller',
+    });
+    return pid;
+  }
+
+  await runController({ dataDir: options.dataDir });
 }
 
 // `rbo controller restore <staging-dir>` (§26, Phase 8 runbook step "Run restore validation"):

@@ -17,9 +17,11 @@ export function updateAgentCapabilities(
   agentId: string,
   report: AgentCapabilityReport,
 ): void {
+  // Keep agents.max_jobs in sync with the live capability report (agent.json max_jobs).
+  // Pairing inserts a default of 1; without this, `rbo agents` stays stuck at 1 forever.
   db.prepare(
-    'UPDATE agents SET capabilities_json = ?, hostname = ?, last_seen_at = ? WHERE id = ?',
-  ).run(JSON.stringify(report), report.hostname, nowIso(), agentId);
+    'UPDATE agents SET capabilities_json = ?, hostname = ?, max_jobs = ?, last_seen_at = ? WHERE id = ?',
+  ).run(JSON.stringify(report), report.hostname, report.execution.max_jobs, nowIso(), agentId);
 }
 
 /** Merge heartbeat cpu_load into stored capabilities for §19.2 scoring. */

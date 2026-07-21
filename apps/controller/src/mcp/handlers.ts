@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { readEventsFromCursor, readLogsFromCursor } from '@rbo/executor';
-import type { McpToolName } from '@rbo/protocol';
+import type { ArtifactRule, McpToolName, RiskLevel } from '@rbo/protocol';
 import { getMcpToolDef } from '@rbo/protocol';
 import type { ControllerIdentity, GitUrlAllowlist, StructuredErrorDetails } from '@rbo/shared';
 import { RboError } from '@rbo/shared';
@@ -9,6 +9,8 @@ import { requestAgentProbe } from '../agents/probe.js';
 import { listAgents } from '../agents/service.js';
 import { materializeArtifactToDestination } from '../execution/artifacts.js';
 import { attemptLogDir } from '../execution/runner.js';
+import { handleJobRun } from '../jobs/job-run.js';
+import type { JobRunOptions } from '../jobs/job-run.js';
 import { getJob, getLatestAttempt } from '../jobs/lifecycle.js';
 import {
   handleJobArtifacts,
@@ -44,6 +46,8 @@ export interface ToolContext {
   /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
   getHostCpuBusyFraction?: () => number;
   maxHostCpuBusyFraction?: number;
+  /** Optional progress sink for job_run (MCP notifications/progress). */
+  jobRunOptions?: JobRunOptions;
 }
 
 export interface ToolErrorResult {
@@ -113,6 +117,26 @@ export async function handleToolCall(
 
     case 'job_submit':
       return handleJobSubmit(submitContext(ctx), args);
+
+    case 'job_run':
+      return handleJobRun(
+        submitContext(ctx),
+        {
+          command: args.command as string | undefined,
+          project_root: args.project_root as string | undefined,
+          job_id: args.job_id as string | undefined,
+          cwd: args.cwd as string | undefined,
+          timeout_seconds: args.timeout_seconds as number | undefined,
+          wait_seconds: args.wait_seconds as number | undefined,
+          mcp_wait_slice_seconds: args.mcp_wait_slice_seconds as number | undefined,
+          artifacts: args.artifacts as ArtifactRule[] | undefined,
+          risk_level: args.risk_level as RiskLevel | undefined,
+          client_request_id: args.client_request_id as string | undefined,
+          name: args.name as string | undefined,
+          include_log_tail_lines: args.include_log_tail_lines as number | undefined,
+        },
+        ctx.jobRunOptions,
+      );
 
     case 'job_confirm':
       return handleJobConfirm(submitContext(ctx), {

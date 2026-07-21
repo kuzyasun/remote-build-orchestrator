@@ -107,8 +107,9 @@ function summarize(value: unknown): string {
 
 /**
  * Canonical Phase 8 smoke workflow: submit → wait → logs → artifacts → optional materialize.
- * Records a real, redacted request/response transcript so callers can persist it as evidence
- * instead of a fixed template — see docs/compatibility/evidence/*.md.
+ * Records a real, redacted request/response transcript for in-memory / temp-dir assertions.
+ * Do not write per-run transcripts into tracked docs/compatibility/evidence/ (those files
+ * are stable committed pointers; product-client evidence is recorded manually).
  */
 export async function runPhase8SmokeWorkflow(
   client: Phase8McpClient,
@@ -184,7 +185,7 @@ export async function runPhase8SmokeWorkflow(
   };
 }
 
-/** Render a captured transcript as committable markdown evidence — real calls, not a template. */
+/** Render a captured transcript as markdown (for tests / manual recording — not auto-committed). */
 export function renderSmokeEvidence(transport: string, result: Phase8SmokeResult): string {
   const lines = [
     `# Evidence: test-mcp-client / ${transport}`,

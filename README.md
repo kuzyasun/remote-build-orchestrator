@@ -57,7 +57,12 @@ makes it safe to run genuinely destructive or hardware-risk jobs: they come back
 
 ## Install
 
-RBO isn't published as a single global package yet — see [Roadmap](#roadmap) below. Today:
+**Global npm package** (when published):
+
+```bash
+npm install -g @gemslibe/rbo
+rbo controller init && rbo agent init   # see docs/ops/getting-started.md
+```
 
 **Option A — download a release archive** (fastest, no build toolchain needed):
 extract the archive for your OS, then follow
@@ -71,7 +76,8 @@ yet for your platform):
 git clone <this repo> && cd rm-builder
 pnpm install
 pnpm verify                 # build + full test gate — should exit 0
-node apps/controller/dist/main.js   # start the Controller (see getting-started.md for env vars)
+node apps/cli/dist/rbo.js controller start   # or: rbo controller start after global install
+# from-source monorepo alternative: node apps/controller/dist/main.js
 ```
 
 Then continue from step 4 of [`docs/ops/getting-started.md`](docs/ops/getting-started.md) (pairing
@@ -101,7 +107,7 @@ for an `AGENTS.md`/`CLAUDE.md` snippet to drop into your own project.
 | Setting up a Controller + Agent(s) and connecting an AI client | [`docs/ops/getting-started.md`](docs/ops/getting-started.md) |
 | Day-2 operations (pair/drain/revoke/repair/update/backup/restore) | [`docs/ops/runbook.md`](docs/ops/runbook.md) |
 | Modifying RBO itself — architecture, component interaction, tech stack | [`docs/dev/architecture.md`](docs/dev/architecture.md) |
-| Building and packaging a release | [`docs/dev/release-builds.md`](docs/dev/release-builds.md) |
+| Building a release and publishing to npm | [`docs/dev/release-builds.md`](docs/dev/release-builds.md) |
 | The full architectural design spec (§-numbered, canonical) | [`remote-build-orchestrator-design.md`](remote-build-orchestrator-design.md) |
 
 ## Known limitations
@@ -113,13 +119,6 @@ for an `AGENTS.md`/`CLAUDE.md` snippet to drop into your own project.
 - AI client compatibility is honestly `not_verified` for every real product client until someone
   runs the smoke workflow against it and records evidence — see
   [`docs/compatibility/report.md`](docs/compatibility/report.md).
-
-## Roadmap
-
-- A single global install (`npm install -g rbo-cli` or similar, then `rbo controller start` /
-  `rbo agent start` / `rbo submit ...`) instead of extracting a per-OS archive. Not built yet — see
-  [`docs/dev/global-cli-packaging-plan.md`](docs/dev/global-cli-packaging-plan.md) for what's
-  actually required to get there.
 
 ## Contributing
 

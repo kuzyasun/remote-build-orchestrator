@@ -22,6 +22,7 @@ import type { WebSocket } from 'ws';
 import type { z } from 'zod';
 import { patchAgentCpuLoad, updateAgentCapabilities } from '../agents/registry.js';
 import {
+  enqueueRemoteLogChunk,
   expireStaleLeases,
   handleRemoteArtifactManifest,
   handleRemoteCleanupComplete,
@@ -29,7 +30,6 @@ import {
   handleRemoteJobStarted,
   handleRemoteLeaseAccept,
   handleRemoteLeaseReject,
-  handleRemoteLogChunk,
   handleRemoteSourceNeed,
   handleRemoteSourceReady,
   renewActiveLease,
@@ -401,7 +401,7 @@ export async function startAgentPlaneServer(
             if (!authenticated) return;
             const payload = parsePayload(LogChunkPayloadSchema, message.payload, message.type);
             if (!payload) return;
-            void handleRemoteLogChunk(remoteOpts(), authenticated.agentId, payload);
+            void enqueueRemoteLogChunk(remoteOpts(), authenticated.agentId, payload);
             return;
           }
 

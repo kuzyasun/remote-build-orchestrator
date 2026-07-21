@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -8,6 +8,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ensureControllerIdentity } from '@rbo/shared';
 import {
+  type Phase8SmokeResult,
   longRunningCancelJobRequest,
   renderSmokeEvidence,
   runPhase8SmokeWorkflow,
@@ -32,6 +33,8 @@ let db: ControllerDatabase;
 let fixtureDir: string;
 let artifactDestRoot: string;
 let cleanupFixture: () => Promise<void>;
+let lastHttpSmoke: Phase8SmokeResult | undefined;
+let lastStdioSmoke: Phase8SmokeResult | undefined;
 
 beforeAll(async () => {
   dataDir = await mkdtemp(join(tmpdir(), 'rbo-phase8-ctrl-'));
@@ -82,16 +85,6 @@ async function connectHttpClient(clientId: string): Promise<Client> {
   return client;
 }
 
-async function writeEvidence(
-  transport: string,
-  result: Parameters<typeof renderSmokeEvidence>[1],
-): Promise<void> {
-  const evidenceDir = join(process.cwd(), 'docs', 'compatibility', 'evidence');
-  await mkdir(evidenceDir, { recursive: true });
-  const path = join(evidenceDir, `test-mcp-client-${transport === 'stdio' ? 'stdio' : 'http'}.md`);
-  await writeFile(path, renderSmokeEvidence(transport, result), 'utf8');
-}
-
 async function connectStdioClient(clientId: string): Promise<Client> {
   const proxy = createStdioProxyServer({
     controllerUrl: `http://127.0.0.1:${running.port}`,
@@ -102,6 +95,16 @@ async function connectStdioClient(clientId: string): Promise<Client> {
   const client = new Client({ name: 'phase8-stdio', version: '0.0.1' });
   await client.connect(clientTransport);
   return client;
+}
+
+function assertEvidenceBody(body: string, transport: string): void {
+  expect(body).toMatch(/job_id: job_/);
+  expect(body).toMatch(/## Raw call transcript/);
+  expect(body).toMatch(/job_submit/);
+  expect(body).toMatch(/artifact_materialize/);
+  expect(body).toContain(`transport: ${transport}`);
+  expect(body).not.toMatch(/BEGIN (OPENSSH |RSA )?PRIVATE KEY/);
+  expect(body).not.toMatch(/[A-Za-z]:\\Users\\/);
 }
 
 describe('MCP smoke workflow harness', () => {
@@ -116,7 +119,7 @@ describe('MCP smoke workflow harness', () => {
     expect(result.artifactIds.length).toBeGreaterThan(0);
     expect(result.logBytes).toBeGreaterThanOrEqual(0);
     expect((await readFile(dest, 'utf8')).trim()).toBe('phase8-artifact');
-    await writeEvidence('streamable_http', result);
+    lastHttpSmoke = result;
     await client.close();
   }, 120_000);
 
@@ -130,7 +133,7 @@ describe('MCP smoke workflow harness', () => {
     expect(result.jobId).toMatch(/^job_/);
     expect(result.artifactIds.length).toBeGreaterThan(0);
     expect((await readFile(dest, 'utf8')).trim()).toBe('phase8-artifact');
-    await writeEvidence('stdio', result);
+    lastStdioSmoke = result;
     await client.close();
   }, 120_000);
 
@@ -185,26 +188,24 @@ describe('MCP smoke workflow harness', () => {
     await stdio.close();
   });
 
-  it("persisted evidence files carry this run's real transcript, not a template, and no secrets", async () => {
-    // The two workflow tests above already wrote these files from their own real transcripts
-    // (see writeEvidence / renderSmokeEvidence) — this only audits what actually landed on disk.
-    const evidenceDir = join(process.cwd(), 'docs', 'compatibility', 'evidence');
-    const stdioPath = join(evidenceDir, 'test-mcp-client-stdio.md');
-    const httpPath = join(evidenceDir, 'test-mcp-client-http.md');
-    await access(stdioPath);
-    await access(httpPath);
-    const stdioBody = await readFile(stdioPath, 'utf8');
-    const httpBody = await readFile(httpPath, 'utf8');
-    for (const body of [stdioBody, httpBody]) {
-      expect(body).toMatch(/job_id: job_/);
-      expect(body).toMatch(/## Raw call transcript/);
-      expect(body).toMatch(/job_submit/);
-      expect(body).toMatch(/artifact_materialize/);
+  it('renders real redacted transcripts in memory without mutating committed docs', async () => {
+    // Committed docs/compatibility/evidence/*.md stay stable; ephemeral run transcripts
+    // are asserted here (and optionally written under os.tmpdir), never under tracked docs/.
+    expect(lastHttpSmoke).toBeDefined();
+    expect(lastStdioSmoke).toBeDefined();
+    const httpBody = renderSmokeEvidence('streamable_http', lastHttpSmoke as Phase8SmokeResult);
+    const stdioBody = renderSmokeEvidence('stdio', lastStdioSmoke as Phase8SmokeResult);
+    assertEvidenceBody(httpBody, 'streamable_http');
+    assertEvidenceBody(stdioBody, 'stdio');
+
+    const scratch = await mkdtemp(join(tmpdir(), 'rbo-phase8-evidence-'));
+    try {
+      await writeFile(join(scratch, 'http.md'), httpBody, 'utf8');
+      await writeFile(join(scratch, 'stdio.md'), stdioBody, 'utf8');
+      assertEvidenceBody(await readFile(join(scratch, 'http.md'), 'utf8'), 'streamable_http');
+      assertEvidenceBody(await readFile(join(scratch, 'stdio.md'), 'utf8'), 'stdio');
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
     }
-    expect(stdioBody).toMatch(/transport: stdio/);
-    expect(httpBody).toMatch(/transport: streamable_http/);
-    const combined = stdioBody + httpBody;
-    expect(combined).not.toMatch(/BEGIN (OPENSSH |RSA )?PRIVATE KEY/);
-    expect(combined).not.toMatch(/[A-Za-z]:\\Users\\/);
   });
 });

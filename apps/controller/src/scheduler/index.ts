@@ -638,8 +638,8 @@ export function selectAgentForJob(
   for (const candidate of agents) {
     const caps = candidate.capabilities;
 
-    // 1. Effective capacity check (§35 Phase 4 rule 3: min(max_jobs, 1))
-    const effectiveCapacity = Math.min(caps.execution.max_jobs, 1);
+    // 1. Capacity: honor agent-reported execution.max_jobs (from agent.json / capabilities).
+    const effectiveCapacity = caps.execution.max_jobs;
     if (effectiveCapacity <= 0 || candidate.activeJobsCount >= effectiveCapacity) {
       if (effectiveCapacity > 0) {
         busyAgentRunningJobs.push(candidate.activeJobsCount);

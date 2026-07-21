@@ -1,21 +1,50 @@
 {
-  "name": "@rbo/cli",
-  "version": "0.1.0",
+  "name": "@gemslibe/rbo",
+  "version": "0.4.0",
   "type": "module",
-  "main": "./dist/main.js",
+  "main": "./dist/rbo.js",
   "bin": {
-    "rbo": "./dist/main.js"
+    "rbo": "./dist/rbo.js",
+    "rbo-mcp-stdio": "./dist/rbo-mcp-stdio.js"
+  },
+  "files": [
+    "dist/rbo.js",
+    "dist/rbo-mcp-stdio.js",
+    "config/controller.json",
+    "config/agent.json",
+    "scripts/stop-running-rbo.mjs",
+    "LICENSE",
+    "README.md"
+  ],
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=22.14"
   },
   "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "preinstall": "node ./scripts/stop-running-rbo.mjs",
+    "preuninstall": "node ./scripts/stop-running-rbo.mjs"
   },
   "dependencies": {
-    "@rbo/protocol": "workspace:*",
-    "@rbo/shared": "workspace:*"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^13.0.1",
+    "selfsigned": "^5.5.0",
+    "ulid": "^2.3.0",
+    "ws": "^8.21.1",
+    "zod": "^3.24.2"
+  },
+  "optionalDependencies": {
+    "@gemslibe/rbo-windows-executor-win32-x64": "0.4.0"
   },
   "devDependencies": {
+    "@rbo/agent": "workspace:*",
+    "@rbo/controller": "workspace:*",
+    "@rbo/executor": "workspace:*",
+    "@rbo/protocol": "workspace:*",
+    "@rbo/shared": "workspace:*",
     "@types/node": "^22.13.4",
+    "esbuild": "^0.25.0",
     "typescript": "^5.7.3"
   }
 }

@@ -456,11 +456,17 @@ export async function handleJobConfirm(
   return { job_id: job.id, state: 'queued' };
 }
 
+export interface WaitForJobOptions {
+  /** Called after each poll while waiting (for MCP progress heartbeats). */
+  onTick?: (job: NonNullable<ReturnType<typeof getJob>>) => void | Promise<void>;
+}
+
 export async function waitForJob(
   ctx: LocalRunnerContext,
   jobId: string,
   waitSeconds: number,
   includeLogTailLines: number,
+  options?: WaitForJobOptions,
 ): Promise<Record<string, unknown>> {
   const deadline = Date.now() + waitSeconds * 1000;
   let job = getJob(ctx.db, jobId);
@@ -471,6 +477,9 @@ export async function waitForJob(
   }
 
   while (job && !isTerminalJobState(job.state) && Date.now() < deadline) {
+    if (options?.onTick) {
+      await options.onTick(job);
+    }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
     job = getJob(ctx.db, jobId);
   }

@@ -5,6 +5,8 @@ import { defineConfig } from 'vitest/config';
 // against a stale dist build.
 const pkg = (name: string) =>
   fileURLToPath(new URL(`./packages/${name}/src/index.ts`, import.meta.url));
+const appSrc = (app: string, file: string) =>
+  fileURLToPath(new URL(`./apps/${app}/src/${file}`, import.meta.url));
 
 export default defineConfig({
   test: {
@@ -20,6 +22,10 @@ export default defineConfig({
       '@rbo/snapshot': pkg('snapshot'),
       '@rbo/executor': pkg('executor'),
       '@rbo/testing': pkg('testing'),
+      '@rbo/controller/config': appSrc('controller', 'config.ts'),
+      '@rbo/controller/run': appSrc('controller', 'run.ts'),
+      '@rbo/agent/config': appSrc('agent', 'config.ts'),
+      '@rbo/agent/run': appSrc('agent', 'run.ts'),
     },
   },
 });

@@ -75,15 +75,50 @@ describe('Scheduler Engine (§19.2)', () => {
     expect(decision.selectedAgent?.agentId).toBe('agt_mac');
   });
 
-  it('filters out agents with active jobs exceeding capacity (capacity=1 in Phase 4)', () => {
-    const busy = makeAgent('agt_busy', {}, 1);
-    const idle = makeAgent('agt_idle', {}, 0);
+  it('filters out agents at capacity using reported max_jobs (not a hard cap of 1)', () => {
+    const busyAtOne = makeAgent(
+      'agt_busy_one',
+      {
+        execution: {
+          max_jobs: 1,
+          shells: ['powershell', 'cmd', 'bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      1,
+    );
+    const stillHasSlot = makeAgent(
+      'agt_has_slot',
+      {
+        execution: {
+          max_jobs: 2,
+          shells: ['powershell', 'cmd', 'bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      1,
+    );
+    const fullAtTwo = makeAgent(
+      'agt_full_two',
+      {
+        execution: {
+          max_jobs: 2,
+          shells: ['powershell', 'cmd', 'bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      2,
+    );
 
     const req = makeRequest();
-    const decision = selectAgentForJob([busy, idle], req);
-
-    expect(decision.action).toBe('remote');
-    expect(decision.selectedAgent?.agentId).toBe('agt_idle');
+    expect(selectAgentForJob([busyAtOne, stillHasSlot], req).selectedAgent?.agentId).toBe(
+      'agt_has_slot',
+    );
+    expect(selectAgentForJob([busyAtOne, fullAtTwo], req).selectedAgent?.agentId).toBeUndefined();
+    expect(selectAgentForJob([busyAtOne, fullAtTwo], req).action).not.toBe('remote');
   });
 
   it('filters candidates missing required secret refs', () => {

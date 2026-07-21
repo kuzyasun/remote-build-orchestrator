@@ -25,6 +25,7 @@ import {
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { cleanupDockerResourcesForAttempt } from '../src/docker/cleanup.js';
 import { AgentRecoveryCoordinator } from '../src/recovery/coordinator.js';
+import { dockerIdListContains, dockerListOutputContains } from './helpers/docker-ids.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -277,9 +278,9 @@ describe('Docker gated workloads', () => {
         jobId: `job_${ctx}`,
       });
       expect(result.skipped).toBe(false);
-      expect(result.containersRemoved).toContain(clean.container);
-      expect(result.networksRemoved).toContain(clean.network);
-      expect(result.volumesRemoved).toContain(clean.volume);
+      expect(dockerIdListContains(result.containersRemoved, clean.container)).toBe(true);
+      expect(dockerIdListContains(result.networksRemoved, clean.network)).toBe(true);
+      expect(dockerIdListContains(result.volumesRemoved, clean.volume)).toBe(true);
     }
 
     const remainingClean = await docker([
@@ -296,7 +297,7 @@ describe('Docker gated workloads', () => {
       '--filter',
       `label=rbo.attempt=${attemptKeep}`,
     ]);
-    expect(remainingKeep).toContain(keep.container);
+    expect(dockerListOutputContains(remainingKeep, keep.container)).toBe(true);
 
     markCleaned([clean.container, clean.network, clean.volume]);
   }

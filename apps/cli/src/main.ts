@@ -1,5 +1,10 @@
 import { readFile } from 'node:fs/promises';
-import { RBO_CONTROLLER_VERSION } from '@rbo/shared';
+import {
+  RBO_CONTROLLER_VERSION,
+  resolveAgentStateDir,
+  resolveControllerDataDir,
+} from '@rbo/shared';
+import { runAgentInit, runAgentStart } from './commands/agent.js';
 import {
   approveAgentRemote,
   listAgentsRemote,
@@ -10,8 +15,11 @@ import {
   runControllerFingerprint,
   runControllerInit,
   runControllerRestore,
+  runControllerStart,
 } from './commands/controller.js';
-import { runDoctor } from './commands/doctor.js';
+import { stripDaemonFlag } from './commands/daemon.js';
+import { formatDoctorCheckLine, runDoctor } from './commands/doctor.js';
+import { parseDataDirFlag, parseForceFlag, parseStateDirFlag } from './commands/flags.js';
 import { cancelJobRemote, getJobLogsRemote, submitJobRemote } from './commands/jobs.js';
 import {
   type ServiceAction,
@@ -22,13 +30,6 @@ import {
   renderServiceActionPlan,
 } from './commands/service.js';
 
-function defaultDataDir(): string {
-  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
-    return `${process.env.LOCALAPPDATA}/RBO`;
-  }
-  return `${process.env.HOME ?? '.'}/.rbo`;
-}
-
 function defaultControllerUrl(): string {
   return process.env.RBO_CONTROLLER_URL_HTTP ?? 'http://127.0.0.1:7410';
 }
@@ -37,11 +38,10 @@ function printPlan(action: string, plan: Parameters<typeof formatDryRunPlan>[1])
   console.log(formatDryRunPlan(action, plan));
 }
 
-const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'status', 'start', 'stop']);
+const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'status', 'stop']);
 
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
-  const dataDir = process.env.RBO_DATA_DIR ?? defaultDataDir();
   const controllerUrl = defaultControllerUrl();
 
   switch (command) {
@@ -52,9 +52,12 @@ async function main(): Promise<void> {
       return;
 
     case 'controller': {
-      const sub = rest[0];
+      const { dataDir: flagDataDir, rest: controllerArgs } = parseDataDirFlag(rest);
+      const dataDir = flagDataDir ?? resolveControllerDataDir();
+      const sub = controllerArgs[0];
       if (sub === 'init') {
-        const result = await runControllerInit({ dataDir });
+        const { force } = parseForceFlag(controllerArgs.slice(1));
+        const result = await runControllerInit({ dataDir, force });
         console.log(JSON.stringify(result, null, 2));
         return;
       }
@@ -64,7 +67,7 @@ async function main(): Promise<void> {
         return;
       }
       if (sub === 'restore') {
-        const stagingDir = rest[1];
+        const stagingDir = controllerArgs[1];
         if (!stagingDir) {
           throw new Error('Usage: rbo controller restore <staging-dir> [--data-dir <dir>]');
         }
@@ -75,42 +78,76 @@ async function main(): Promise<void> {
         console.log(JSON.stringify(result, null, 2));
         return;
       }
-      throw new Error(`Unknown 'controller' subcommand '${sub}'. Use init|fingerprint|restore.`);
+      if (sub === 'start') {
+        const { daemon } = stripDaemonFlag(controllerArgs.slice(1));
+        const result = await runControllerStart({
+          dataDir,
+          daemon,
+          cliScriptPath: process.argv[1],
+        });
+        if (typeof result === 'number') {
+          console.log(result);
+        }
+        return;
+      }
+      throw new Error(
+        `Unknown 'controller' subcommand '${sub}'. Use init|fingerprint|restore|start.`,
+      );
     }
 
     case 'agents': {
       const result = await listAgentsRemote(controllerUrl);
-      console.log(JSON.stringify(result.agents, null, 2));
+      console.log(JSON.stringify(result, null, 2));
       return;
     }
 
     case 'agent': {
-      const sub = rest[0];
+      const { stateDir: flagStateDir, rest: agentArgs } = parseStateDirFlag(rest);
+      const stateDir = flagStateDir ?? resolveAgentStateDir();
+      const sub = agentArgs[0];
       if (sub === 'approve') {
-        const requestId = rest[1];
+        const requestId = agentArgs[1];
         if (!requestId) throw new Error('Usage: rbo agent approve <pairing-request-id>');
         const result = await approveAgentRemote(controllerUrl, requestId);
         console.log(JSON.stringify(result));
         return;
       }
       if (sub === 'revoke') {
-        const agentId = rest[1];
+        const agentId = agentArgs[1];
         if (!agentId) throw new Error('Usage: rbo agent revoke <agent-id>');
         await revokeAgentRemote(controllerUrl, agentId);
         console.log(`revoked ${agentId}`);
         return;
       }
       if (sub === 'probe') {
-        const agentId = rest[1];
+        const agentId = agentArgs[1];
         if (!agentId) throw new Error('Usage: rbo agent probe <agent-id>');
         const result = await probeAgentRemote(controllerUrl, agentId);
         console.log(JSON.stringify(result));
         return;
       }
+      if (sub === 'init') {
+        const { force } = parseForceFlag(agentArgs.slice(1));
+        const result = await runAgentInit({ stateDir, force });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      if (sub === 'start') {
+        const { daemon } = stripDaemonFlag(agentArgs.slice(1));
+        const result = await runAgentStart({
+          stateDir,
+          daemon,
+          cliScriptPath: process.argv[1],
+        });
+        if (typeof result === 'number') {
+          console.log(result);
+        }
+        return;
+      }
       if (SERVICE_ACTIONS.has(sub as ServiceAction)) {
         const platform = detectPlatform(process.platform);
         const action = sub as ServiceAction;
-        const extraArgs = rest.slice(1);
+        const extraArgs = agentArgs.slice(1);
         const execute = hasExecuteFlag(extraArgs);
         const plan = renderServiceActionPlan(platform, action);
         const label = `agent ${action}`;
@@ -126,14 +163,16 @@ async function main(): Promise<void> {
         return;
       }
       throw new Error(
-        `Unknown 'agent' subcommand '${sub}'. Use approve|revoke|probe|install|status|start|stop|uninstall.`,
+        `Unknown 'agent' subcommand '${sub}'. Use approve|revoke|probe|init|start|install|status|stop|uninstall.`,
       );
     }
 
     case 'doctor': {
+      const { dataDir: flagDataDir } = parseDataDirFlag(rest);
+      const dataDir = flagDataDir ?? resolveControllerDataDir();
       const report = await runDoctor({ dataDir, controllerUrl });
       for (const check of report.checks) {
-        console.log(`${check.ok ? 'OK  ' : 'FAIL'} ${check.name}: ${check.detail}`);
+        console.log(formatDoctorCheckLine(check));
       }
       process.exitCode = report.ok ? 0 : 1;
       return;

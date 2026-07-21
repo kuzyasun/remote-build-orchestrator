@@ -3,5 +3,7 @@ packages:
   - packages/*
 ignoredBuiltDependencies:
   - '@biomejs/biome'
-onlyBuiltDependencies:
+  # better-sqlite3@13+ ships platform prebuilds in-package (N-API); skip the
+  # package-manager-injected `node-gyp rebuild` so installs don't require a
+  # global node-gyp. Recompile only if you need a custom build.
   - better-sqlite3

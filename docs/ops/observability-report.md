@@ -19,5 +19,5 @@ Structured metrics for release hardening. Correlation may include job/attempt/ag
 | terminal_outcome | succeeded/failed/timed_out/cancelled/lost | job outcome |
 
 Generator helpers: `apps/controller/src/ops/observability.ts` (`redactObservabilityObject`,
-`buildObservabilityReportSkeleton`). Phase 7 benchmark output may populate cold/warm/cache fields
-when available under `.superpowers/` (gitignored).
+`buildObservabilityReportSkeleton`). Cold/warm/cache fields may be filled from
+`build-cache-benchmark` test output when that suite is run.

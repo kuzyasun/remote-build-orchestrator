@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { ensureAttemptLogs, readLogsFromCursor } from '@rbo/executor';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { WebSocket } from 'ws';
-import { handleRemoteLogChunk } from '../src/execution/remote-execution.js';
+import { enqueueRemoteLogChunk, handleRemoteLogChunk } from '../src/execution/remote-execution.js';
 import { attemptLogDir } from '../src/execution/runner.js';
 import { createJob, getAttempt, transitionJobState } from '../src/jobs/lifecycle.js';
 import { migrateToLatest, nowIso, openDatabase } from '../src/storage/database.js';
@@ -170,6 +170,45 @@ describe('Controller idempotent log_chunk + log_ack', () => {
     const chunk = await readLogsFromCursor(logs, 0, 10_000, ['stdout']);
     expect(chunk.data).toBe('hello world');
     expect(chunk.nextCursor).toBe(Buffer.byteLength('hello world'));
+
+    db.close();
+  });
+
+  it('serializes concurrent log_chunk handlers so contiguous sequences are not dropped', async () => {
+    const { db, opts, attemptId, leaseId } = await setup();
+
+    // Fire overlapping handlers the way the WS plane does (`void` dispatch).
+    // Without enqueueRemoteLogChunk, both can read log_acked_sequence=0 and seq=2 is dropped.
+    await Promise.all([
+      enqueueRemoteLogChunk(opts, 'agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        stream: 'stdout',
+        sequence: 1,
+        bytes: 'one',
+      }),
+      enqueueRemoteLogChunk(opts, 'agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        stream: 'stdout',
+        sequence: 2,
+        bytes: 'two',
+      }),
+      enqueueRemoteLogChunk(opts, 'agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        stream: 'stdout',
+        sequence: 3,
+        bytes: 'three',
+      }),
+    ]);
+
+    const logDir = attemptLogDir(dataDir, attemptId);
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('onetwothree');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(3);
 
     db.close();
   });

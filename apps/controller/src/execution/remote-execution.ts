@@ -1004,6 +1004,32 @@ export async function handleRemoteLogChunk(
   sendAck();
 }
 
+/** Per-attempt chain so concurrent WS handlers cannot race log_acked_sequence. */
+const logChunkChains = new Map<string, Promise<void>>();
+
+/**
+ * Serialize log_chunk handling per attempt. The agent plane dispatches WS
+ * messages with `void` (non-blocking); without this queue, two in-flight
+ * handlers can both observe the same log_acked_sequence and drop contiguous
+ * chunks as "out-of-order".
+ */
+export function enqueueRemoteLogChunk(
+  opts: RemoteExecutionOptions,
+  agentId: string,
+  payload: LogChunkPayload,
+): Promise<void> {
+  const key = payload.attempt_id;
+  const prev = logChunkChains.get(key) ?? Promise.resolve();
+  const next = prev.catch(() => undefined).then(() => handleRemoteLogChunk(opts, agentId, payload));
+  logChunkChains.set(key, next);
+  void next.finally(() => {
+    if (logChunkChains.get(key) === next) {
+      logChunkChains.delete(key);
+    }
+  });
+  return next;
+}
+
 export function handleRemoteJobStarted(
   opts: RemoteExecutionOptions,
   agentId: string,

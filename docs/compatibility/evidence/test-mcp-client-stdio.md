@@ -2,35 +2,12 @@
 
 - client: test-mcp-client (Vitest MCP SDK harness)
 - transport: stdio
-- workflow: submit → wait → logs → artifacts → materialize
-- job_id: job_01KY27C3SX2HFTMG4P8BGS9X82
-- attempt_id: att_01KY27C6SBHG87DZDCQ5B3KYTX
-- artifact_ids: art_01KY27C7JSJ8PGE4835SSGESZ3
+- workflow: submit → wait → logs → artifacts → materialize; cancel
+- verified_by: `apps/controller/test/mcp-smoke-workflow.test.ts`
 - known limitation: not a Codex/Claude/Cursor/Antigravity UI client
 
-## Raw call transcript (this run, redacted)
+## Notes
 
-### 2026-07-21T11:36:00.549Z — job_submit
-
-- request: `{"client_request_id":"phase8-smoke-1784633757492-ayiey9","name":"phase8-smoke","source":{"project_root":"[REDACTED_PATH]","cwd":".","additional_roots":[]},"execution":{"shell":"powershell","script":"Write-Output \"phase8-smoke\"; Set-Content -Path out.txt -Value \"phase8-artifact\"","env":{},"timeout_seconds":60,"cancel_grace_seconds":2,"cleanup_timeout_seconds":60,"tty":false,"completion":{"type":"run_to_exit"}},"queue_policy":"local_fallback","risk_level":"safe","artifacts":[{"glob":"out.txt",…`
-- response: `{"job_id":"job_01KY27C3SX2HFTMG4P8BGS9X82","state":"queued","snapshot_id":"snp_01KY27C3WCJCV6T9YZKN5XHT6E","content_id":"sha256:ed342a64a35001fcaa3a95def774d2b2e8a1b1ff63e25017c27d414701c64607","snapshot_captured":true,"selected_agent":null,"secret_warnings":[]}`
-
-### 2026-07-21T11:36:01.417Z — job_wait
-
-- request: `{"job_id":"job_01KY27C3SX2HFTMG4P8BGS9X82","wait_seconds":60,"include_log_tail_lines":20}`
-- response: `{"job":{"id":"job_01KY27C3SX2HFTMG4P8BGS9X82","client_id":"phase8-stdio-smoke","client_request_id":"phase8-smoke-1784633757492-ayiey9","name":"phase8-smoke","state":"completed","outcome":"succeeded","created_at":"2026-07-21T11:36:00.530Z","updated_at":"2026-07-21T11:36:01.383Z","queued_at":"2026-07-21T11:36:00.530Z","started_at":"2026-07-21T11:36:00.608Z","finished_at":"2026-07-21T11:36:01.383Z","agent_id":null,"snapshot_id":"snp_01KY27C3WCJCV6T9YZKN5XHT6E","exit_code":0,"failure_category":null,…`
-
-### 2026-07-21T11:36:01.424Z — job_logs
-
-- request: `{"job_id":"job_01KY27C3SX2HFTMG4P8BGS9X82","attempt_id":null,"cursor":0,"max_bytes":65536,"streams":["stdout","stderr","events"]}`
-- response: `{"job_id":"job_01KY27C3SX2HFTMG4P8BGS9X82","attempt_id":"att_01KY27C6SBHG87DZDCQ5B3KYTX","events":[{"type":"snapshot_captured","sequence":1,"created_at":"2026-07-21T11:36:00.695Z","job_id":"job_01KY27C3SX2HFTMG4P8BGS9X82","attempt_id":"att_01KY27C6SBHG87DZDCQ5B3KYTX","snapshot_id":"snp_01KY27C3WCJCV6T9YZKN5XHT6E","content_id":"sha256:ed342a64a35001fcaa3a95def774d2b2e8a1b1ff63e25017c27d414701c64607"},{"type":"materialized","sequence":2,"created_at":"2026-07-21T11:36:00.706Z","job_id":"job_01KY27C…`
-
-### 2026-07-21T11:36:01.432Z — job_artifacts
-
-- request: `{"job_id":"job_01KY27C3SX2HFTMG4P8BGS9X82"}`
-- response: `{"job_id":"job_01KY27C3SX2HFTMG4P8BGS9X82","artifacts":[{"id":"art_01KY27C7JSJ8PGE4835SSGESZ3","attempt_id":"att_01KY27C6SBHG87DZDCQ5B3KYTX","logical_name":"out.txt","size_bytes":17,"sha256":"8256dd877d06464275842c7657de36a3179320907947c8c6d13e7a06609968d0"}],"attempts":["att_01KY27C6SBHG87DZDCQ5B3KYTX"],"terminal_attempt_id":"att_01KY27C6SBHG87DZDCQ5B3KYTX"}`
-
-### 2026-07-21T11:36:01.503Z — artifact_materialize
-
-- request: `{"artifact_id":"art_01KY27C7JSJ8PGE4835SSGESZ3","destination_path":"[REDACTED_PATH]","overwrite":false}`
-- response: `{"artifact_id":"art_01KY27C7JSJ8PGE4835SSGESZ3","destination_path":"[REDACTED_PATH]","sha256":"8256dd877d06464275842c7657de36a3179320907947c8c6d13e7a06609968d0"}`
+Harness compatibility is proven by the automated MCP smoke workflow under
+`pnpm verify` / CI. Per-run job IDs, timestamps, and call transcripts are
+ephemeral and must not be written into this tracked evidence directory.

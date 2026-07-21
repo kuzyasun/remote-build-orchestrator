@@ -11,6 +11,7 @@ import {
   claimApprovedPairing,
   createPairingRequest,
   getPairingRequest,
+  listPairingRequests,
   rejectPairingRequest,
 } from '../src/security/pairing.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
@@ -96,6 +97,37 @@ describe('Pairing lifecycle (§8.1)', () => {
     rejectPairingRequest(db, request.id);
     expect(getPairingRequest(db, request.id)?.state).toBe('rejected');
     expect(claimApprovedPairing(db, identity, device.publicKeyPem)).toBeNull();
+  });
+
+  it('listPairingRequests marks TTL-elapsed pending rows expired and omits them', () => {
+    const db = newDb();
+    const device = generateDeviceKeyPair();
+    const request = createPairingRequest(db, {
+      devicePublicKeyPem: device.publicKeyPem,
+      displayName: 'stale-pending',
+      hostname: 'host',
+    });
+    // Simulate TTL elapsed while state is still pending (reconnect after 15m).
+    const expiredAt = '2020-01-01T00:00:00.000Z';
+    const updated = db
+      .prepare('UPDATE pairing_requests SET expires_at = ? WHERE id = ?')
+      .run(expiredAt, request.id);
+    expect(updated.changes).toBe(1);
+    expect(getPairingRequest(db, request.id)?.expires_at).toBe(expiredAt);
+
+    const pending = listPairingRequests(db, 'pending');
+    expect(pending.find((row) => row.id === request.id)).toBeUndefined();
+    expect(getPairingRequest(db, request.id)?.state).toBe('expired');
+    expect(getPairingRequest(db, request.id)?.resolved_at).toBeTruthy();
+
+    // Fresh reconnect creates a new live pending request for the same device.
+    const next = createPairingRequest(db, {
+      devicePublicKeyPem: device.publicKeyPem,
+      displayName: 'stale-pending',
+      hostname: 'host',
+    });
+    expect(next.id).not.toBe(request.id);
+    expect(listPairingRequests(db, 'pending').map((row) => row.id)).toEqual([next.id]);
   });
 });
 

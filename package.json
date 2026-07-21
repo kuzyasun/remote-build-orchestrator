@@ -1,20 +1,25 @@
 {
   "name": "rbo-monorepo",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.4.0",
   "type": "module",
   "packageManager": "pnpm@10.5.2",
   "engines": {
     "node": ">=22.14.0"
   },
   "scripts": {
-    "build": "pnpm --filter \"@rbo/shared\" build && pnpm --filter \"@rbo/protocol\" build && pnpm --filter \"@rbo/snapshot\" build && pnpm --filter \"@rbo/executor\" build && pnpm --filter \"@rbo/testing\" build && pnpm --filter \"@rbo/controller\" build && pnpm --filter \"@rbo/agent\" build && pnpm --filter \"@rbo/cli\" build && pnpm --filter \"@rbo/mcp-stdio\" build",
+    "build": "pnpm --filter \"@rbo/shared\" build && pnpm --filter \"@rbo/protocol\" build && pnpm --filter \"@rbo/snapshot\" build && pnpm --filter \"@rbo/executor\" build && pnpm --filter \"@rbo/testing\" build && pnpm --filter \"@rbo/controller\" build && pnpm --filter \"@rbo/agent\" build && pnpm --filter \"@gemslibe/rbo\" build && pnpm --filter \"@rbo/mcp-stdio\" build",
     "test": "vitest run",
     "typecheck": "pnpm -r typecheck",
     "lint": "biome check .",
     "format": "biome check --write .",
+    "bump-version": "node scripts/bump-version.mjs",
     "package:archives": "node scripts/package-archives.mjs",
     "package:verify": "node scripts/package-archives.mjs --verify",
+    "pack:windows-executor": "pnpm --dir packages/rbo-windows-executor-win32-x64 pack",
+    "pack:rbo": "pnpm --dir apps/cli pack",
+    "release:pack": "node scripts/release-pack.mjs",
+    "release:publish": "node scripts/release-publish.mjs",
     "rust:verify": "cargo fmt --manifest-path native/windows-executor/Cargo.toml -- --check && cargo test --manifest-path native/windows-executor/Cargo.toml && cargo build --release --manifest-path native/windows-executor/Cargo.toml",
     "verify": "pnpm run lint && pnpm run build && pnpm run test && pnpm run rust:verify && pnpm run package:archives && pnpm run package:verify"
   },

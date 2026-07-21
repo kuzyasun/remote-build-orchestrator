@@ -4,8 +4,7 @@
 {
   "mcpServers": {
     "rbo": {
-      "command": "node",
-      "args": ["${RBO_ROOT}/apps/mcp-stdio/dist/main.js"],
+      "command": "rbo-mcp-stdio",
       "env": {
         "RBO_CONTROLLER_URL": "http://127.0.0.1:7410"
       }

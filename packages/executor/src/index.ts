@@ -3,5 +3,6 @@ export * from './spool.js';
 export * from './script.js';
 export * from './artifacts.js';
 export * from './windows-frames.js';
+export * from './windows-executor-path.js';
 export * from './completion.js';
 export * from './runtime-env.js';

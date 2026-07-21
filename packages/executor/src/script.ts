@@ -1,16 +1,15 @@
 import { execFile, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync } from 'node:fs';
 import { chmod, mkdir, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
-import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { ExecutionConfig } from '@rbo/protocol';
 import { RboError } from '@rbo/shared';
 import type { AttemptLogPaths } from './logs.js';
 import { appendStderr, appendStdout } from './logs.js';
 import { buildReservedRboEnv } from './runtime-env.js';
+import { resolveWindowsExecutorPath } from './windows-executor-path.js';
 import { WindowsHelperFrameReader } from './windows-frames.js';
 
 const execFileAsync = promisify(execFile);
@@ -87,10 +86,13 @@ export async function writeJobScript(
     scriptName === 'cleanup.ps1' || scriptName === 'cleanup.sh' || scriptName === 'cleanup.cmd';
   const scriptBody = isCleanup ? (execution.cleanup_script ?? '') : execution.script;
   // Ensure Unix direct exec has a shebang when the user did not provide one.
-  const body =
+  let body =
     isDirect && process.platform !== 'win32' && !scriptBody.startsWith('#!')
       ? `#!/usr/bin/env bash\n${scriptBody}`
       : scriptBody;
+  if (isPowerShell) {
+    body = `${POWERSHELL_JOB_PRELUDE}${body}`;
+  }
   await writeFile(scriptPath, body, 'utf8');
   if (process.platform !== 'win32') {
     await chmod(scriptPath, 0o755);
@@ -98,23 +100,24 @@ export async function writeJobScript(
   return scriptPath;
 }
 
-function resolveWindowsExecutorPath(): string | null {
-  const fromEnv = process.env.RBO_WINDOWS_EXECUTOR;
-  if (fromEnv && existsSync(fromEnv)) {
-    return fromEnv;
-  }
-  const here = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    join(here, '../../../native/windows-executor/target/debug/rbo-windows-executor.exe'),
-    join(here, '../../../native/windows-executor/target/release/rbo-windows-executor.exe'),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return null;
-}
+/**
+ * Injected ahead of every PowerShell job/cleanup script.
+ *
+ * Windows PowerShell leaves `$LASTEXITCODE` as `$null` until a console-subsystem
+ * native executable runs. GUI-subsystem CLIs (PE subsystem 2 — e.g. eim.exe) often
+ * never populate it. Then `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` becomes
+ * `$null -ne 0` → immediate `exit $null` (process exit 0) and later commands never run.
+ *
+ * Seeding `$global:LASTEXITCODE = 0` makes the usual fail-closed pattern safe when the
+ * variable was never set. Operators should still write normal scripts; RBO owns this fix.
+ */
+export const POWERSHELL_JOB_PRELUDE = [
+  '# RBO PowerShell runtime prelude (injected; do not remove)',
+  '$global:LASTEXITCODE = 0',
+  '# --- end RBO prelude ---',
+  '',
+  '',
+].join('\n');
 
 function attachLogPipes(child: ManagedChildProcess, logs: AttemptLogPaths): void {
   child.stdout.on('data', (chunk: Buffer | string) => {

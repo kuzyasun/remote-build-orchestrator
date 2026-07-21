@@ -119,6 +119,108 @@ async function connectClient(clientId: string): Promise<Client> {
 }
 
 describe('Local job execution', () => {
+  it('runs a command via job_run and returns outcome + artifacts', async () => {
+    const client = await connectClient('client-job-run');
+    const command =
+      process.platform === 'win32'
+        ? 'Write-Output "hello"; Set-Content -Path out.txt -Value "artifact-data"'
+        : 'echo hello && printf artifact-data > out.txt';
+    const result = JSON.parse(
+      textOf(
+        await client.callTool({
+          name: 'job_run',
+          arguments: {
+            command,
+            project_root: fixtureDir,
+            client_request_id: `job-run-${Date.now()}`,
+            timeout_seconds: 60,
+            artifacts: [{ glob: 'out.txt', required: true }],
+            risk_level: 'safe',
+          },
+        }),
+      ),
+    );
+    expect(result.job_id).toMatch(/^job_/);
+    expect(result.state).toBe('completed');
+    expect(result.outcome).toBe('succeeded');
+    expect(result.exit_code).toBe(0);
+    expect(result.resume).toBe(false);
+    expect(result.artifacts.length).toBeGreaterThan(0);
+    expect(result.log_tail?.stdout?.length).toBeGreaterThan(0);
+    await client.close();
+  }, 120_000);
+
+  it('returns resume:true when mcp wait slice expires before the job finishes', async () => {
+    const client = await connectClient('client-job-run-slice');
+    const command =
+      process.platform === 'win32'
+        ? 'Start-Sleep -Seconds 8; Write-Output done'
+        : 'sleep 8; echo done';
+    const first = JSON.parse(
+      textOf(
+        await client.callTool({
+          name: 'job_run',
+          arguments: {
+            command,
+            project_root: fixtureDir,
+            client_request_id: `job-run-slice-${Date.now()}`,
+            timeout_seconds: 60,
+            mcp_wait_slice_seconds: 2,
+            risk_level: 'safe',
+          },
+        }),
+      ),
+    );
+    expect(first.job_id).toMatch(/^job_/);
+    expect(first.resume).toBe(true);
+    expect(first.state).not.toBe('completed');
+
+    // Resume until terminal (a few short slices).
+    let final = first;
+    for (let i = 0; i < 10 && final.resume === true; i++) {
+      final = JSON.parse(
+        textOf(
+          await client.callTool({
+            name: 'job_run',
+            arguments: {
+              job_id: first.job_id,
+              mcp_wait_slice_seconds: 5,
+              include_log_tail_lines: 20,
+            },
+          }),
+        ),
+      );
+    }
+    expect(final.resume).toBe(false);
+    expect(final.state).toBe('completed');
+    expect(final.outcome).toBe('succeeded');
+    await client.close();
+  }, 120_000);
+
+  it('returns awaiting_confirmation from job_run without waiting', async () => {
+    const client = await connectClient('client-job-run-destructive');
+    const result = JSON.parse(
+      textOf(
+        await client.callTool({
+          name: 'job_run',
+          arguments: {
+            command: process.platform === 'win32' ? 'Write-Output ok' : 'echo ok',
+            project_root: fixtureDir,
+            client_request_id: `job-run-dest-${Date.now()}`,
+            risk_level: 'destructive',
+            timeout_seconds: 30,
+          },
+        }),
+      ),
+    );
+    expect(result.state).toBe('awaiting_confirmation');
+    expect(result.confirmation_token).toBeTruthy();
+    expect(result.resume).toBe(false);
+    expect(result.outcome).toBeNull();
+    expect(result.artifacts).toEqual([]);
+    await client.close();
+  }, 60_000);
+
   it('submits a safe job, waits for completion, and collects artifacts', async () => {
     const client = await connectClient('client-a');
     const request = baseJobRequest(fixtureDir);

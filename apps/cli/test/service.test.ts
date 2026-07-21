@@ -21,6 +21,7 @@ describe('rbo agent service CLI (§2.9)', () => {
     const plan = renderServiceActionPlan('linux', 'status');
     const output = formatDryRunPlan('agent status', plan);
     expect(output).toContain('dry run');
+    expect(output).toContain('best-effort');
     expect(output).toContain('systemctl status rbo-agent');
     expect(hasExecuteFlag(['--execute'])).toBe(true);
     expect(hasExecuteFlag([])).toBe(false);

@@ -14,8 +14,30 @@ export function buildMcpServer(ctx: ToolContext): McpServer {
     server.registerTool(
       def.name,
       { description: def.description, inputSchema: def.inputShape },
-      async (args: Record<string, unknown>) => {
-        const result = await handleToolCall(ctx, def.name, args);
+      async (args: Record<string, unknown>, extra) => {
+        const toolCtx: ToolContext =
+          def.name === 'job_run'
+            ? {
+                ...ctx,
+                jobRunOptions: {
+                  onProgress: async (update) => {
+                    const progressToken = extra._meta?.progressToken;
+                    if (progressToken === undefined) {
+                      return;
+                    }
+                    await extra.sendNotification({
+                      method: 'notifications/progress',
+                      params: {
+                        progressToken,
+                        progress: update.progress,
+                        message: update.message,
+                      },
+                    });
+                  },
+                },
+              }
+            : ctx;
+        const result = await handleToolCall(toolCtx, def.name, args);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(result) }],
         };

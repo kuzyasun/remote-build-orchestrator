@@ -3,10 +3,11 @@ import { describe, expect, it } from 'vitest';
 import { MCP_TOOL_DEFS } from '../src/mcp-tools.js';
 import { negotiateProtocolVersion } from '../src/versions.js';
 
-/** Phase 8 frozen MCP tool set — do not extend without updating this fixture. */
+/** Frozen MCP tool set — do not extend without updating this fixture + design spec. */
 const PHASE8_FROZEN_TOOL_NAMES = [
   'agents_list',
   'job_submit',
+  'job_run',
   'job_confirm',
   'job_get',
   'job_wait',

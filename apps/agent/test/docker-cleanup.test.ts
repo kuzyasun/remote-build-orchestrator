@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { afterAll, describe, expect, it } from 'vitest';
 import { type DockerRunner, cleanupDockerResourcesForAttempt } from '../src/docker/cleanup.js';
 import { AgentRecoveryCoordinator } from '../src/recovery/coordinator.js';
+import { dockerIdListContains, dockerListOutputContains } from './helpers/docker-ids.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -265,9 +266,9 @@ describe('cleanupDockerResourcesForAttempt (real Docker)', () => {
       const result = await cleanupDockerResourcesForAttempt({ attemptId: attemptClean });
 
       expect(result.skipped).toBe(false);
-      expect(result.containersRemoved).toContain(ctrClean);
-      expect(result.networksRemoved).toContain(netClean);
-      expect(result.volumesRemoved).toContain(volClean);
+      expect(dockerIdListContains(result.containersRemoved, ctrClean)).toBe(true);
+      expect(dockerIdListContains(result.networksRemoved, netClean)).toBe(true);
+      expect(dockerIdListContains(result.volumesRemoved, volClean)).toBe(true);
 
       const remainingCtr = await docker([
         'ps',
@@ -275,7 +276,7 @@ describe('cleanupDockerResourcesForAttempt (real Docker)', () => {
         '--filter',
         `label=rbo.attempt=${attemptKeep}`,
       ]);
-      expect(remainingCtr).toContain(ctrKeep);
+      expect(dockerListOutputContains(remainingCtr, ctrKeep)).toBe(true);
 
       const remainingNet = await docker([
         'network',
@@ -284,7 +285,7 @@ describe('cleanupDockerResourcesForAttempt (real Docker)', () => {
         '--filter',
         `label=rbo.attempt=${attemptKeep}`,
       ]);
-      expect(remainingNet).toContain(netKeep);
+      expect(dockerListOutputContains(remainingNet, netKeep)).toBe(true);
 
       const remainingVol = await docker([
         'volume',
@@ -293,7 +294,7 @@ describe('cleanupDockerResourcesForAttempt (real Docker)', () => {
         '--filter',
         `label=rbo.attempt=${attemptKeep}`,
       ]);
-      expect(remainingVol.split('\n')).toContain(volKeep);
+      expect(dockerListOutputContains(remainingVol, volKeep)).toBe(true);
 
       // Mark cleaned resources as already removed so afterAll does not fail loudly.
       for (const item of created) {
@@ -356,7 +357,7 @@ describe('cleanupDockerResourcesForAttempt (real Docker)', () => {
             jobId: `job_${ctx}`,
           });
           expect(result.skipped).toBe(false);
-          expect(result.containersRemoved).toContain(ctr);
+          expect(dockerIdListContains(result.containersRemoved, ctr)).toBe(true);
         }
 
         const remaining = await docker(['ps', '-aq', '--filter', `label=rbo.attempt=${attemptId}`]);
@@ -373,7 +374,7 @@ describe('cleanupDockerResourcesForAttempt (real Docker)', () => {
         '--filter',
         `label=rbo.attempt=${attemptKeep}`,
       ]);
-      expect(keepRemaining).toContain(keepCtr);
+      expect(dockerListOutputContains(keepRemaining, keepCtr)).toBe(true);
     },
   );
 });

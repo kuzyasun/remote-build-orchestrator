@@ -121,10 +121,12 @@ algorithm, the scheduler formula, or the reconciliation state machine, read:
 
 - [`remote-build-orchestrator-design.md`](../../remote-build-orchestrator-design.md) — the
   canonical, section-numbered design spec (§ references throughout the codebase point here).
-- [`PHASE_HANDOFFS.md`](../../PHASE_HANDOFFS.md) — the phase-by-phase implementation history:
-  what each phase's scope was, the decisions that got locked in, and known gaps left for later.
 - [`AGENTS.md`](../../AGENTS.md) / `CLAUDE.md` — working conventions for an AI agent (or human)
   modifying this repo: canonical commands, the final `pnpm format && pnpm verify` gate, and rules
   about not weakening wire contracts or security/path checks for convenience.
-- [`docs/dev/release-builds.md`](./release-builds.md) — how to cut and package a release once
-  you're ready to ship a change.
+- [`docs/dev/release-builds.md`](./release-builds.md) — how to cut a release and publish
+  `@gemslibe/rbo` (+ Windows optional package) to npm.
+- [`docs/dev/global-cli-packaging-plan.md`](./global-cli-packaging-plan.md) — unfinished packaging /
+  global-CLI work plan (still the design record for remaining publish steps).
+- [`docs/dev/host-aware-local-fallback-plan.md`](./host-aware-local-fallback-plan.md) — design
+  record for host-CPU-aware local fallback (v1 shipped; open questions / stronger v2 options noted).

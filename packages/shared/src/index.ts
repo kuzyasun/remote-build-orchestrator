@@ -12,3 +12,4 @@ export * from './process-identity.js';
 export * from './packaging.js';
 export * from './backup-restore.js';
 export * from './host-load.js';
+export * from './layout.js';

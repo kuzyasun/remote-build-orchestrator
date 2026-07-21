@@ -1,47 +1,41 @@
 {
   "schema_version": 1,
   "os": "macos",
-  "package_version": "0.1.0",
+  "package_version": "0.4.0",
   "wire_protocol": {
     "min": 1,
     "max": 1
   },
   "components": {
-    "controller": "0.1.0",
-    "agent": "0.1.0",
-    "cli": "0.1.0",
-    "mcp_stdio": "0.1.0"
+    "controller": "0.4.0",
+    "agent": "0.4.0",
+    "cli": "0.4.0",
+    "mcp_stdio": "0.4.0"
   },
   "files": [
     {
-      "path": "bin/rbo-controller.js",
-      "sha256": "631f7ae2a6a0f1b598826b93ccad29c22f058ba67e008873b2042280ee7a7e8b",
-      "size_bytes": 2959,
-      "source": "apps/controller/dist/main.js"
-    },
-    {
-      "path": "bin/rbo-agent.js",
-      "sha256": "2376f2aea994e927813047ac2863b34632ed670eccf2e2bb4c8d737317e67ece",
-      "size_bytes": 4330,
-      "source": "apps/agent/dist/main.js"
-    },
-    {
       "path": "bin/rbo.js",
-      "sha256": "3914a6ac102cab13aa49e150ad10249e314ebdd86ed613d4183d0b804c46793a",
-      "size_bytes": 6466,
-      "source": "apps/cli/dist/main.js"
+      "sha256": "5d2c7eccbef75c7fd666473d76e63024a059207e1cccf4c4e4a872ef2e375f2c",
+      "size_bytes": 531454,
+      "source": "apps/cli/dist/rbo.js"
     },
     {
       "path": "bin/rbo-mcp-stdio.js",
-      "sha256": "6216e0cf8883b1af0707637f57a6b1548ecba4182e223429a5bb8c1cd5461aa7",
-      "size_bytes": 1021,
-      "source": "apps/mcp-stdio/dist/main.js"
+      "sha256": "a51eb436df86433044e4b92b8c229b9b5a6d6d5fc7f2cbd6dd5841594720c00b",
+      "size_bytes": 27755,
+      "source": "apps/cli/dist/rbo-mcp-stdio.js"
     },
     {
-      "path": "config/controller.example.json",
-      "sha256": "21081f961110b6693674a652948a12d3c810e66680578c1f39ea7a2b98e098d7",
-      "size_bytes": 1018,
-      "source": "packaging/macos/config/controller.example.json"
+      "path": "config/controller.json",
+      "sha256": "5d641ca1455360318b5ac0ce2e8cb87199e6d1c76fd49a5e013e46b3b6ccb6ec",
+      "size_bytes": 559,
+      "source": "apps/cli/config/controller.json"
+    },
+    {
+      "path": "config/agent.json",
+      "sha256": "e2860442a2b87ee752063b8ca95c420918c8620511fc35456852814c3c062008",
+      "size_bytes": 909,
+      "source": "apps/cli/config/agent.json"
     }
   ],
   "forbidden_path_patterns": [
@@ -54,5 +48,5 @@
     "attempts/",
     "node_modules/"
   ],
-  "install_notes": "See docs/ops/runbook.md. Elevated launchd install is PLATFORM-GAP on non-macOS CI."
+  "install_notes": "See docs/ops/runbook.md. Elevated launchd install is PLATFORM-GAP on non-macOS CI. Start via: node bin/rbo.js controller start / agent start."
 }

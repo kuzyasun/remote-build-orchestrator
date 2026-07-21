@@ -16,10 +16,10 @@ identity keys, `.env`, credentials, caches, logs, and snapshots.
 
 1. Stop the Controller.
 2. Stage backup files into a restore directory containing `BACKUP_MANIFEST.json`.
-3. With `$RBO_DATA_DIR` exported (the CLI reads it from the environment — there is no `--data-dir`
-   flag), run `node bin/rbo.js controller restore <staging-dir>`. This is an enforced code path,
+3. With `$RBO_DATA_DIR` exported and/or `--data-dir <dir>`, run
+   `node bin/rbo.js controller restore <staging-dir>`. This is an enforced code path,
    not a manual step: it runs restore validation (ownership + hashes + required paths + schema
-   version check) and only copies files into `$RBO_DATA_DIR` if validation passes — it never
+   version check) and only copies files into the target data dir if validation passes — it never
    partially applies a failed restore.
 4. On validation failure: the command exits non-zero with a structured error code
    (`ownership_mismatch`, `hash_mismatch`, `missing_file`, `missing_manifest`, or
