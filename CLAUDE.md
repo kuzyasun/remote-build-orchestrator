@@ -14,16 +14,21 @@ Instructions for Claude and other AI tools working in this repository.
 
 ## Repository Map
 
-- `apps/controller/`: Controller / Orchestrator daemon (MCP server, scheduler, dirty workspace snapshots) — *stub phase*.
-- `apps/agent/`: Remote worker agent daemon — *stub phase*.
-- `apps/cli/`: `rbo` CLI executable — *stub phase*.
-- `apps/mcp-stdio/`: Stdio to loopback Controller MCP proxy — *stub phase*.
+- `apps/controller/`: Controller / Orchestrator daemon (MCP server, scheduler, snapshots, remote execution, reconciliation, ops).
+- `apps/agent/`: Remote worker agent daemon (execution, recovery, build cache, Docker cleanup, repo mirrors).
+- `apps/cli/`: `rbo` CLI executable (controller init/fingerprint/restore, agent pairing/service lifecycle, job submit/logs/cancel, doctor).
+- `apps/mcp-stdio/`: Stdio to loopback Controller MCP proxy.
 - `packages/protocol/`: Canonical Zod schemas and wire messages (Source of truth for wire contracts, §13/§20).
-- `packages/snapshot/`: Workspace snapshot manifest and transfer schemas (§11/§12).
-- `packages/shared/`: Shared errors, ID generators, hashing utilities, path helpers, and logger.
+- `packages/snapshot/`: Workspace snapshot manifest, capture, and materialization (§11/§12).
+- `packages/executor/`: Shared platform execution adapters (Unix/Windows process lifecycle, artifacts, logs) used by both Controller-local and Agent-remote execution.
+- `packages/shared/`: Shared errors, ID generators, hashing utilities, path/packaging helpers, crypto, controller identity, and logger.
 - `packages/testing/`: Shared test fixtures and harness helpers.
 - `native/windows-executor/`: Rust Job Object process isolation helper for Windows (§15.2).
-- `remote-build-orchestrator-design.md`: Canonical architectural design specification.
+- `packaging/`: Per-OS packaging manifests and config templates (see `docs/dev/release-builds.md`).
+- `docs/dev/release-builds.md`: How to build and package a release from source.
+- `docs/ops/getting-started.md`: Operator walkthrough — Controller/Agent setup, pairing, MCP client wiring.
+- `docs/ops/runbook.md`: Day-2 operator procedures (install/pair/drain/revoke/repair/update/backup/restore/uninstall).
+- `remote-build-orchestrator-design.md`: Canonical architectural design specification (implementation phases tracked in `PHASE_HANDOFFS.md`).
 
 ## Stack Summary
 
@@ -63,7 +68,7 @@ Run commands from repo root or with `--filter`:
 - **Preserve wire contracts**: Do not change Zod schemas in `packages/protocol` or message structures without updating tests and matching Rust protocol helpers in `native/windows-executor`.
 - **No Git Index modification**: Never run `git add`, `git reset`, or `git restore --staged` on your own. Leave staging control to the user.
 - **Documentation language**: Write all committed files (`README.md`, `AGENTS.md`, `CLAUDE.md`, code comments, docstrings, commit messages) in **English**. User chat responses may use the user's language.
-- **First version — No migration shims**: Phase 0 product; replace schemas cleanly with single new contract rather than writing backward compatibility wrappers.
+- **First version — No migration shims**: no production fleet requiring backward compatibility yet; replace schemas cleanly with single new contract rather than writing backward compatibility wrappers.
 - **Final gate after code changes**: After completing implementation or fixes, MUST run `pnpm format` then `pnpm verify` before claiming work complete. Use targeted tests during iteration; do not skip this final gate.
 
 ## Token Economy & Context Strategy

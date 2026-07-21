@@ -10,6 +10,48 @@ export function normalizePath(pathStr: string): string {
   return normalized;
 }
 
+/** Windows reserved device names (§34.5) — reject as path segments. */
+const WINDOWS_RESERVED_NAMES = new Set([
+  'CON',
+  'PRN',
+  'AUX',
+  'NUL',
+  'COM1',
+  'COM2',
+  'COM3',
+  'COM4',
+  'COM5',
+  'COM6',
+  'COM7',
+  'COM8',
+  'COM9',
+  'LPT1',
+  'LPT2',
+  'LPT3',
+  'LPT4',
+  'LPT5',
+  'LPT6',
+  'LPT7',
+  'LPT8',
+  'LPT9',
+]);
+
+/**
+ * True when any path segment is a Windows reserved device name (case-insensitive),
+ * optionally with an extension (`NUL.txt`).
+ */
+export function containsWindowsReservedName(pathStr: string): boolean {
+  const normalized = pathStr.replace(/\\/g, '/');
+  for (const segment of normalized.split('/')) {
+    if (!segment) continue;
+    const base = segment.includes('.') ? segment.slice(0, segment.indexOf('.')) : segment;
+    if (WINDOWS_RESERVED_NAMES.has(base.toUpperCase())) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Safe relative path for job cwd / additional_roots.mount_path (§28.2).
  * Rejects absolute, drive-letter, UNC (`//` / `\\`), empty segments, and `..`.
@@ -31,6 +73,9 @@ export function isSafeRelativePath(value: string, options?: { allowDot?: boolean
   }
   const parts = normalized.split('/');
   if (parts.some((part) => part === '' || part === '.' || part === '..')) {
+    return false;
+  }
+  if (containsWindowsReservedName(normalized)) {
     return false;
   }
   return true;

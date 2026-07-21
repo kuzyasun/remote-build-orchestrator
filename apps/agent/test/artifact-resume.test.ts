@@ -163,4 +163,62 @@ describe('Artifact upload resume (completed_awaiting_upload)', () => {
     });
     expect(uploadSpy).toHaveBeenCalled();
   });
+
+  it('ignores an artifact_upload_grant with a stale/mismatched lease_epoch, then accepts the correct one', async () => {
+    const content = Buffer.from('artifact-bytes-2');
+    const sha256 = createHash('sha256').update(content).digest('hex');
+    const stagingPath = join(stateDir, 'artifacts', 'att_2', 'out.txt');
+    await mkdir(join(stagingPath, '..'), { recursive: true });
+    await writeFile(stagingPath, content);
+
+    const socket = mockSocket();
+    const executor = new AgentJobExecutor(socket, {
+      stateDir,
+      controllerFingerprint: 'sha256:test',
+      gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+      repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
+    });
+
+    const requestPromise = (
+      executor as unknown as {
+        requestArtifactUploadTokens: (
+          attemptId: string,
+          leaseId: string,
+          leaseEpoch: number,
+          artifacts: unknown[],
+        ) => Promise<unknown>;
+      }
+    ).requestArtifactUploadTokens('att_2', 'lease_2', 2, [
+      { logical_name: 'out.txt', path: stagingPath, size_bytes: content.length, sha256 },
+    ]);
+
+    const grantArgs = {
+      attempt_id: 'att_2',
+      artifacts: [
+        {
+          logical_name: 'out.txt',
+          path: stagingPath,
+          size_bytes: content.length,
+          sha256,
+          upload_url: 'https://example.invalid/upload',
+          upload_token: 'tok',
+        },
+      ],
+    };
+
+    // Stale epoch (1, not the outstanding request's 2) and a wrong lease_id — both must be ignored.
+    // If either were wrongly accepted, the promise would resolve with ITS lease tuple instead of
+    // staying pending for the correct one.
+    executor.handleArtifactUploadGrant({ ...grantArgs, lease_id: 'lease_2', lease_epoch: 1 });
+    executor.handleArtifactUploadGrant({ ...grantArgs, lease_id: 'lease_stale', lease_epoch: 2 });
+    expect(
+      (executor as unknown as { pendingArtifactUpload: unknown }).pendingArtifactUpload,
+    ).not.toBeNull();
+
+    // The correct grant, matching the outstanding request's own lease tuple, resolves it.
+    executor.handleArtifactUploadGrant({ ...grantArgs, lease_id: 'lease_2', lease_epoch: 2 });
+    const grant = (await requestPromise) as { lease_id: string; lease_epoch: number };
+    expect(grant.lease_id).toBe('lease_2');
+    expect(grant.lease_epoch).toBe(2);
+  });
 });

@@ -11,6 +11,22 @@ export {
   type GitStateSnapshot,
 } from './git-fixtures.js';
 
+export {
+  CompatibilityCellSchema,
+  CompatibilityMatrixSchema,
+  baseSmokeJobRequest,
+  longRunningCancelJobRequest,
+  renderSmokeEvidence,
+  runPhase8SmokeWorkflow,
+  textOf,
+  type CompatibilityCell,
+  type CompatibilityMatrix,
+  type Phase8McpClient,
+  type Phase8SmokeOptions,
+  type Phase8SmokeResult,
+  type Phase8SmokeTranscriptEntry,
+} from './phase8-smoke.js';
+
 export function createMockAgentCapability(
   overrides?: Partial<AgentCapabilityReport>,
 ): AgentCapabilityReport {

@@ -8,3 +8,4 @@ native/windows-executor/target/
 tmp/
 .superpowers
 docs/superpowers
+packaging/*/dist/

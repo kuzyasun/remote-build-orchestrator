@@ -165,6 +165,8 @@ export class AgentJobExecutor {
   private cancelSignal = { cancelled: false };
   private pendingArtifactUpload: {
     attemptId: string;
+    leaseId: string;
+    leaseEpoch: number;
     resolve: (grant: ArtifactUploadGrantPayload) => void;
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -1661,7 +1663,16 @@ export class AgentJobExecutor {
   }
 
   public handleArtifactUploadGrant(grant: ArtifactUploadGrantPayload): void {
-    if (this.pendingArtifactUpload && this.pendingArtifactUpload.attemptId === grant.attempt_id) {
+    // Fence against the exact outstanding request's own lease tuple (captured when it was sent),
+    // not the offer-flow-only matchesReservedLease/currentOffer — a resumed upload after Agent
+    // restart (resumeArtifactUpload) never goes through handleLeaseOffer, so currentOffer is null
+    // there even though the request is legitimate.
+    if (
+      this.pendingArtifactUpload &&
+      this.pendingArtifactUpload.attemptId === grant.attempt_id &&
+      this.pendingArtifactUpload.leaseId === grant.lease_id &&
+      this.pendingArtifactUpload.leaseEpoch === grant.lease_epoch
+    ) {
       clearTimeout(this.pendingArtifactUpload.timer);
       const { resolve } = this.pendingArtifactUpload;
       this.pendingArtifactUpload = null;
@@ -1756,7 +1767,7 @@ export class AgentJobExecutor {
         this.pendingArtifactUpload = null;
         reject(new Error('timed out waiting for artifact upload tokens'));
       }, ARTIFACT_TOKEN_TIMEOUT_MS);
-      this.pendingArtifactUpload = { attemptId, resolve, reject, timer };
+      this.pendingArtifactUpload = { attemptId, leaseId, leaseEpoch, resolve, reject, timer };
       const manifest: ArtifactManifestPayload = {
         attempt_id: attemptId,
         lease_id: leaseId,

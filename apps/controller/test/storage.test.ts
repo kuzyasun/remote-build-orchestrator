@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { RBO_CONTROLLER_SCHEMA_VERSION } from '@rbo/shared';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   getSchemaVersion,
@@ -28,6 +29,14 @@ function listTables(db: ReturnType<typeof openDatabase>): string[] {
 }
 
 describe('Controller persistence (Section 25, Phase 1)', () => {
+  it('keeps @rbo/shared RBO_CONTROLLER_SCHEMA_VERSION in sync with MIGRATIONS.length', () => {
+    // apps/cli validates a restore against RBO_CONTROLLER_SCHEMA_VERSION without importing
+    // MIGRATIONS directly (cross-app source imports aren't supported by this repo's tsconfig
+    // rootDir layout) — this guard fails loudly the moment someone adds a migration here without
+    // bumping the shared constant, instead of the two silently drifting apart.
+    expect(RBO_CONTROLLER_SCHEMA_VERSION).toBe(MIGRATIONS.length);
+  });
+
   const tempDirs: string[] = [];
 
   function tempDbPath(): string {

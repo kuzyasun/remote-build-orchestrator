@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "path_traversal": {
+      "test_refs": [
+        "packages/protocol/test/protocol.test.ts",
+        "packages/snapshot/test/capture-scenarios.test.ts"
+      ]
+    },
+    "absolute_archive_path": {
+      "test_refs": [
+        "packages/snapshot/test/materialize.test.ts",
+        "packages/snapshot/test/snapshot.test.ts"
+      ]
+    },
+    "symlink_escape": {
+      "test_refs": [
+        "packages/snapshot/test/capture-scenarios.test.ts",
+        "packages/snapshot/test/materialize.test.ts"
+      ],
+      "environment_gated": "PLATFORM-GAP: POSIX symlink semantics on Unix/macOS runner"
+    },
+    "tar_bomb": {
+      "test_refs": [
+        "packages/executor/test/artifacts.test.ts",
+        "apps/controller/test/phase8-threat-regression.test.ts"
+      ]
+    },
+    "duplicate_normalized_path": {
+      "test_refs": [
+        "packages/snapshot/test/capture-scenarios.test.ts",
+        "packages/shared/test/packaging-paths.test.ts"
+      ]
+    },
+    "windows_reserved_name": {
+      "test_refs": ["packages/shared/test/packaging-paths.test.ts"]
+    },
+    "oversized_file": {
+      "test_refs": [
+        "packages/executor/test/artifacts.test.ts",
+        "apps/controller/test/remote-execution.test.ts"
+      ]
+    },
+    "expired_token": {
+      "test_refs": [
+        "apps/controller/test/data-plane-security.test.ts",
+        "apps/controller/test/job-confirm-negatives.test.ts"
+      ]
+    },
+    "forged_agent_id": {
+      "test_refs": [
+        "apps/controller/test/security.test.ts",
+        "apps/controller/test/agent-connection.test.ts"
+      ]
+    },
+    "replayed_lease": {
+      "test_refs": ["apps/controller/test/lease-epoch.test.ts"]
+    },
+    "hash_mismatch": {
+      "test_refs": [
+        "packages/snapshot/test/materialize.test.ts",
+        "apps/controller/test/data-plane-security.test.ts"
+      ]
+    },
+    "secret_blocked": {
+      "test_refs": [
+        "packages/snapshot/test/secret-policy.test.ts",
+        "packages/snapshot/test/capture-scenarios.test.ts"
+      ]
+    },
+    "cert_fingerprint_mismatch": {
+      "test_refs": ["apps/controller/test/agent-connection.test.ts"]
+    },
+    "artifact_destination_symlink_swap": {
+      "test_refs": ["apps/controller/test/phase8-threat-regression.test.ts"]
+    },
+    "git_allowlist": {
+      "test_refs": [
+        "packages/shared/test/git-allowlist.test.ts",
+        "apps/controller/test/source-need.test.ts"
+      ]
+    },
+    "cross_client_idempotency": {
+      "test_refs": [
+        "apps/controller/test/idempotency.test.ts",
+        "apps/controller/test/job-execution.test.ts"
+      ]
+    }
+  }
+}

@@ -6,7 +6,11 @@ import {
   probeAgentRemote,
   revokeAgentRemote,
 } from './commands/agents.js';
-import { runControllerFingerprint, runControllerInit } from './commands/controller.js';
+import {
+  runControllerFingerprint,
+  runControllerInit,
+  runControllerRestore,
+} from './commands/controller.js';
 import { runDoctor } from './commands/doctor.js';
 import { cancelJobRemote, getJobLogsRemote, submitJobRemote } from './commands/jobs.js';
 import {
@@ -59,7 +63,19 @@ async function main(): Promise<void> {
         console.log(result.fingerprint);
         return;
       }
-      throw new Error(`Unknown 'controller' subcommand '${sub}'. Use init|fingerprint.`);
+      if (sub === 'restore') {
+        const stagingDir = rest[1];
+        if (!stagingDir) {
+          throw new Error('Usage: rbo controller restore <staging-dir> [--data-dir <dir>]');
+        }
+        console.error(
+          'Stop the Controller before restoring — this command does not check for one running.',
+        );
+        const result = await runControllerRestore({ stagingDir, dataDir });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      throw new Error(`Unknown 'controller' subcommand '${sub}'. Use init|fingerprint|restore.`);
     }
 
     case 'agents': {

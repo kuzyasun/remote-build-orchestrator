@@ -13,8 +13,10 @@
     "typecheck": "pnpm -r typecheck",
     "lint": "biome check .",
     "format": "biome check --write .",
-    "rust:verify": "cargo fmt --manifest-path native/windows-executor/Cargo.toml -- --check && cargo test --manifest-path native/windows-executor/Cargo.toml",
-    "verify": "pnpm run lint && pnpm run build && pnpm run test && pnpm run rust:verify"
+    "package:archives": "node scripts/package-archives.mjs",
+    "package:verify": "node scripts/package-archives.mjs --verify",
+    "rust:verify": "cargo fmt --manifest-path native/windows-executor/Cargo.toml -- --check && cargo test --manifest-path native/windows-executor/Cargo.toml && cargo build --release --manifest-path native/windows-executor/Cargo.toml",
+    "verify": "pnpm run lint && pnpm run build && pnpm run test && pnpm run rust:verify && pnpm run package:archives && pnpm run package:verify"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

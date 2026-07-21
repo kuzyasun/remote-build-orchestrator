@@ -100,8 +100,11 @@ export function loadControllerConfig(overrides: Partial<ControllerConfig> = {}):
     dataPlaneBaseUrl: overrides.dataPlaneBaseUrl ?? process.env.RBO_DATA_PLANE_BASE_URL,
     dataDir,
     databasePath: overrides.databasePath ?? join(dataDir, 'controller.db'),
-    allowedProjectRoots: overrides.allowedProjectRoots ?? [],
-    allowedArtifactDestinations: overrides.allowedArtifactDestinations ?? [],
+    allowedProjectRoots:
+      overrides.allowedProjectRoots ?? parseCsv(process.env.RBO_ALLOWED_PROJECT_ROOTS),
+    allowedArtifactDestinations:
+      overrides.allowedArtifactDestinations ??
+      parseCsv(process.env.RBO_ALLOWED_ARTIFACT_DESTINATIONS),
     gitAllowlist: parseGitAllowlist(overrides.gitAllowlist),
     localExecutor: {
       maxConcurrentJobs:
