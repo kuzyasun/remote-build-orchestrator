@@ -32,7 +32,7 @@ afterAll(async () => {
   await running.close();
 });
 
-describe('CLI agent admin commands (§33, Phase 2)', () => {
+describe('CLI agent admin commands (§33)', () => {
   it('rbo agents lists agents via the admin API', async () => {
     const result = await listAgentsRemote(baseUrl);
     expect(Array.isArray(result.agents)).toBe(true);

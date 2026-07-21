@@ -5,7 +5,7 @@ import {
   PreferencesConfigSchema,
 } from '../src/schemas.js';
 
-describe('Phase 7 Protocol Schemas — build caches', () => {
+describe('Protocol schemas — build caches', () => {
   it('exports BuildCacheKindSchema with fixed kinds only', () => {
     expect(BuildCacheKindSchema.options).toEqual(['ccache', 'sccache', 'npm', 'pnpm', 'pip']);
     expect(BuildCacheKindSchema.safeParse('ccache').success).toBe(true);

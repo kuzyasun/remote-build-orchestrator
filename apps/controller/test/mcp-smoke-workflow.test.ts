@@ -104,7 +104,7 @@ async function connectStdioClient(clientId: string): Promise<Client> {
   return client;
 }
 
-describe('Phase 8 MCP smoke harness', () => {
+describe('MCP smoke workflow harness', () => {
   it('runs submit→wait→logs→artifacts→materialize over Streamable HTTP', async () => {
     const client = await connectHttpClient('phase8-http-smoke');
     const dest = join(artifactDestRoot, 'http-out.txt');

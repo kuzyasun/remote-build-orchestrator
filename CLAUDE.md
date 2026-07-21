@@ -8,7 +8,7 @@ Instructions for Claude and other AI tools working in this repository.
 ## Purpose & Scope
 
 - **Remote Build Orchestrator (RBO)**: A local distributed system for executing build, test, QEMU, and Docker jobs for interactive AI development.
-- AI coding clients (Fusion, Codex, Claude, Cursor, Antigravity) submit jobs via MCP. The Controller creates dirty workspace snapshots and executes them on remote worker Agents.
+- AI coding clients (Codex, Claude, Cursor, Antigravity) submit jobs via MCP. The Controller creates dirty workspace snapshots and executes them on remote worker Agents.
 - Optimize for correctness, safety, and maintainability first; keep context and tool outputs lean.
 - Apply local monorepo package conventions and prefer focused, minimal diffs over broad refactors.
 

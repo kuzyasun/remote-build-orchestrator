@@ -13,7 +13,7 @@ import {
   materializeFullSnapshot,
 } from '../src/index.js';
 
-describe('Phase 5 review fixes', () => {
+describe('Review fixes', () => {
   it('overlay capture emits fetch_refs from branch', async () => {
     const repo = await createGitFixtureRepo({
       committed: [{ path: 'a.txt', content: 'a' }],

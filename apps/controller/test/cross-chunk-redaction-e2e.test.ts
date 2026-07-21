@@ -101,7 +101,7 @@ function mockSocket(executorHolder: { current: AgentJobExecutor | null }): WebSo
   } as unknown as WebSocket & { sent: Array<Record<string, unknown>> };
 }
 
-describe('Phase 4 cross-chunk secret redaction e2e (§1.8)', () => {
+describe('Cross-chunk secret redaction e2e (§1.8)', () => {
   let agentStateDir: string;
   let controllerDataDir: string;
 

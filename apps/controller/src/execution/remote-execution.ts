@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { appendLogChunk, ensureAttemptLogs } from '@rbo/executor';
@@ -281,10 +281,18 @@ export async function createGitBundle(
       windowsHide: true,
     });
   }
-  const data = await readFile(bundlePath);
-  if (data.length > maxBytes) {
-    throw new GitBundleSizeExceededError(data.length, maxBytes);
+  // Check the on-disk size first — `git bundle create` already wrote the whole bundle
+  // unconditionally, but a stat is cheap; it lets an oversized bundle be rejected and deleted
+  // without also loading the entire (potentially multi-GB) file into a Buffer just to throw it
+  // away. This bounds Controller memory even though disk usage during the git subprocess's own
+  // write is not itself streamed/aborted early — that would need piping `git bundle create -`
+  // through a size-limiting transform, a larger change than this fix covers.
+  const { size: sizeBytes } = await stat(bundlePath);
+  if (sizeBytes > maxBytes) {
+    await rm(bundlePath, { force: true });
+    throw new GitBundleSizeExceededError(sizeBytes, maxBytes);
   }
+  const data = await readFile(bundlePath);
   return {
     sizeBytes: data.length,
     sha256: createHash('sha256').update(data).digest('hex'),

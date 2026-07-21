@@ -33,7 +33,7 @@ const REQUIRED_THREAT_KEYS = [
   'cross_client_idempotency',
 ] as const;
 
-describe('Phase 8 threat regression index (§34.5)', () => {
+describe('Threat regression index (§34.5)', () => {
   it('maps every §34.5 case to test refs or an environment gate', async () => {
     const coverage = JSON.parse(await readFile(THREAT_PATH, 'utf8')) as {
       cases: Record<string, { test_refs?: string[]; environment_gated?: string }>;

@@ -63,7 +63,7 @@ function makeRequest(overrides: Partial<JobRequest> = {}): JobRequest {
   };
 }
 
-describe('Scheduler Engine (§19.2, Phase 4)', () => {
+describe('Scheduler Engine (§19.2)', () => {
   it('selects candidate matching OS, Arch, and capabilities', () => {
     const a1 = makeAgent('agt_win', { os: { family: 'windows', version: '10', arch: 'x64' } });
     const a2 = makeAgent('agt_mac', { os: { family: 'macos', version: '13', arch: 'arm64' } });

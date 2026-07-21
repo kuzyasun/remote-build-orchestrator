@@ -44,7 +44,7 @@ function insertAgent(db: ReturnType<typeof openDatabase>, agentId: string): void
   ).run(agentId, agentId, 'localhost', nowIso());
 }
 
-describe('reconnect reconcile (Phase 6 recovery)', () => {
+describe('reconnect reconcile (recovery)', () => {
   let dataDir: string;
 
   beforeEach(() => {

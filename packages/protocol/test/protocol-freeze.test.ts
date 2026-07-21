@@ -17,7 +17,7 @@ const PHASE8_FROZEN_TOOL_NAMES = [
   'agent_probe',
 ] as const;
 
-describe('Phase 8 protocol freeze', () => {
+describe('Protocol freeze', () => {
   it('freezes MCP tool names to the Phase 8 set', () => {
     expect(MCP_TOOL_DEFS.map((d) => d.name).sort()).toEqual([...PHASE8_FROZEN_TOOL_NAMES].sort());
   });

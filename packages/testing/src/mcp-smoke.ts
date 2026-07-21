@@ -195,7 +195,7 @@ export function renderSmokeEvidence(transport: string, result: Phase8SmokeResult
     `- job_id: ${result.jobId}`,
     `- attempt_id: ${result.attemptId ?? 'n/a'}`,
     `- artifact_ids: ${result.artifactIds.join(', ') || 'none'}`,
-    '- known limitation: not a Fusion/Codex/Claude/Cursor/Antigravity UI client',
+    '- known limitation: not a Codex/Claude/Cursor/Antigravity UI client',
     '',
     '## Raw call transcript (this run, redacted)',
     '',

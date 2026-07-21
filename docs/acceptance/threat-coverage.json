@@ -23,7 +23,7 @@
     "tar_bomb": {
       "test_refs": [
         "packages/executor/test/artifacts.test.ts",
-        "apps/controller/test/phase8-threat-regression.test.ts"
+        "apps/controller/test/threat-regression.test.ts"
       ]
     },
     "duplicate_normalized_path": {
@@ -72,7 +72,7 @@
       "test_refs": ["apps/controller/test/agent-connection.test.ts"]
     },
     "artifact_destination_symlink_swap": {
-      "test_refs": ["apps/controller/test/phase8-threat-regression.test.ts"]
+      "test_refs": ["apps/controller/test/threat-regression.test.ts"]
     },
     "git_allowlist": {
       "test_refs": [

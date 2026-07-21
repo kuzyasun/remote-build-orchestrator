@@ -57,7 +57,7 @@ function agentConnection(stateDir: string, fingerprint?: string): AgentConnectio
   });
 }
 
-describe('Agent pairing over TLS WebSocket (Phase 2)', () => {
+describe('Agent pairing over TLS WebSocket', () => {
   it('rejects a controller with the wrong pinned fingerprint before pairing', async () => {
     const dir = newAgentDir();
     const conn = agentConnection(dir, `sha256:${'0'.repeat(64)}`);
@@ -129,7 +129,7 @@ describe('Agent pairing over TLS WebSocket (Phase 2)', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('agent keeps a stable ID across reconnects (service restart §35 Phase 2)', async () => {
+  it('agent keeps a stable ID across reconnects (service restart §35)', async () => {
     const dir = newAgentDir();
     const conn = agentConnection(dir);
     await conn.connectOnce();

@@ -124,8 +124,8 @@ a frequent manual step — it isn't built yet, so don't claim otherwise in relea
 - **Wire protocol is a single version today** (`min = max = 1`). Upgrade/downgrade tests are
   correspondingly a two-case check (accept the one supported version, reject anything else), not a
   multi-version matrix — that's inherent to there being only one version defined, not a test gap.
-- **AI client compatibility is `not_verified` for every real product client** (Fusion, Codex,
-  Claude, Cursor, Antigravity) until someone actually runs the smoke workflow against that client
+- **AI client compatibility is `not_verified` for every real product client** (Codex, Claude,
+  Cursor, Antigravity) until someone actually runs the smoke workflow against that client
   and records the evidence in `docs/compatibility/evidence/`. See
   [`docs/compatibility/report.md`](../compatibility/report.md).
 

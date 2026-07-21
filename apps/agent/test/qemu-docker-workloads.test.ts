@@ -1,12 +1,12 @@
 /**
- * Phase 7 workload coverage hub.
+ * QEMU / Docker workload coverage hub.
  *
  * Fake-QEMU (always-on) cancel / cleanup / artifact paths are exercised here and
  * more broadly in packages/executor/test/completion-qemu-fake.test.ts.
  *
  * Docker unit mocks + primary gated e2e: apps/agent/test/docker-cleanup.test.ts
  * Warm/cold build-cache: apps/agent/test/build-cache-warm.test.ts
- * Benchmark report: apps/agent/test/phase7-benchmark.test.ts
+ * Benchmark report: apps/agent/test/build-cache-benchmark.test.ts
  */
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -67,7 +67,7 @@ afterEach(async () => {
   }
 });
 
-describe('Phase 7 fake-QEMU workload (always)', () => {
+describe('Fake-QEMU workload (always)', () => {
   it('run_until_log_match success runs cleanup and collects artifacts', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'rbo-p7-fake-qemu-'));
     fakeWorkspaces.push(workspace);
@@ -179,7 +179,7 @@ async function canRunDocker(): Promise<boolean> {
 
 const dockerOk = await canRunDocker();
 
-describe('Phase 7 Docker gated workloads', () => {
+describe('Docker gated workloads', () => {
   // PLATFORM-GAP: Docker daemon not available on this host
   const runId = Date.now().toString(36);
   const created: Array<{ kind: 'container' | 'network' | 'volume'; id: string }> = [];

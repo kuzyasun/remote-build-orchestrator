@@ -1,7 +1,7 @@
 # Getting started with RBO
 
 Audience: an operator setting up RBO for the first time — a Controller, one or more Agents, and
-one or more AI coding clients (Fusion, Codex, Claude, Cursor, Antigravity) talking to it over MCP.
+one or more AI coding clients (Codex, Claude, Cursor, Antigravity) talking to it over MCP.
 For building RBO itself from source, see [`docs/dev/release-builds.md`](../dev/release-builds.md).
 For day-2 operations (drain/revoke/repair/update/backup), see [`runbook.md`](./runbook.md).
 
@@ -133,7 +133,6 @@ your client rather than retyping it:
 
 | Client | File |
 |---|---|
-| Fusion | [`snippets/fusion.md`](../compatibility/snippets/fusion.md) (HTTP preferred) |
 | Codex | [`snippets/codex.md`](../compatibility/snippets/codex.md) (stdio preferred) |
 | Claude | [`snippets/claude.md`](../compatibility/snippets/claude.md) |
 | Cursor | [`snippets/cursor.md`](../compatibility/snippets/cursor.md) |

@@ -40,7 +40,7 @@ function mockSocket(): WebSocket & { sent: Array<Record<string, unknown>> } {
   } as unknown as WebSocket & { sent: Array<Record<string, unknown>> };
 }
 
-describe('Phase 4 toolchain_changed rejection (§1.7)', () => {
+describe('toolchain_changed rejection (§1.7)', () => {
   let stateDir: string;
 
   afterEach(async () => {

@@ -9,7 +9,7 @@ import {
   WireMessageEnvelopeSchema,
 } from '../src/messages.js';
 
-describe('Phase 4 Protocol Schemas', () => {
+describe('Protocol schemas — remote execution (lease, source, log, exit, artifacts)', () => {
   it('validates LeaseOffer payload', () => {
     const valid = LeaseOfferPayloadSchema.safeParse({
       attempt_id: 'att_123',

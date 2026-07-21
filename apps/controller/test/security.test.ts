@@ -35,7 +35,7 @@ function newDb() {
   return db;
 }
 
-describe('Controller identity bootstrap (§8.1, Phase 2)', () => {
+describe('Controller identity bootstrap (§8.1)', () => {
   it('creates a TLS certificate, signing keys and a stable fingerprint', async () => {
     const dir = tempDir();
     const identity = await ensureControllerIdentity(dir);
@@ -49,7 +49,7 @@ describe('Controller identity bootstrap (§8.1, Phase 2)', () => {
   });
 });
 
-describe('Pairing lifecycle (§8.1, Phase 2)', () => {
+describe('Pairing lifecycle (§8.1)', () => {
   it('creates a pending pairing request with a one-time code', () => {
     const db = newDb();
     const device = generateDeviceKeyPair();
@@ -99,7 +99,7 @@ describe('Pairing lifecycle (§8.1, Phase 2)', () => {
   });
 });
 
-describe('Agent credentials (§8.1, Phase 2)', () => {
+describe('Agent credentials (§8.1)', () => {
   async function pairedAgent(db: ReturnType<typeof newDb>, dir: string) {
     const identity = await ensureControllerIdentity(dir);
     const device = generateDeviceKeyPair();

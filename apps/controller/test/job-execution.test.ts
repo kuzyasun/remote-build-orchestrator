@@ -118,7 +118,7 @@ async function connectClient(clientId: string): Promise<Client> {
   return client;
 }
 
-describe('Phase 3 local job execution', () => {
+describe('Local job execution', () => {
   it('submits a safe job, waits for completion, and collects artifacts', async () => {
     const client = await connectClient('client-a');
     const request = baseJobRequest(fixtureDir);

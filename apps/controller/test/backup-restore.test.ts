@@ -18,7 +18,7 @@ afterEach(async () => {
   }
 });
 
-describe('Phase 8 backup/restore', () => {
+describe('Backup and restore', () => {
   it('plans backup of db, attempts, and identity', () => {
     const plan = planBackup('/data');
     expect(plan.map((p) => p.kind).sort()).toEqual(['attempts', 'database', 'identity'].sort());

@@ -1,7 +1,7 @@
 /**
- * Phase 6 Task 5 — Fault-injection integration suite.
+ * Fault-injection integration suite — Controller/Agent reliability and reconciliation.
  *
- * Scenarios already proven elsewhere are cited in phase6-reliability coverage notes
+ * Scenarios already proven elsewhere are cited in reliability-reconciliation coverage notes
  * and only lightly re-asserted here when a gap remains. Focus of this file:
  * cursor restore on Controller restart, Agent stale cleanup, two-attempt isolation
  * (acks/artifacts), spool pressure / log_spool_limit, and bounded large-output streaming.
@@ -72,7 +72,7 @@ const identity = {
   signingPrivateKeyPem: '',
 };
 
-describe('Phase 6 fault-injection reliability', () => {
+describe('Fault-injection reliability and reconciliation', () => {
   let dataDir: string;
 
   beforeEach(() => {

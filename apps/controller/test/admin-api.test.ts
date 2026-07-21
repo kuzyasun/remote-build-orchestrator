@@ -44,7 +44,7 @@ async function post(path: string, body: unknown): Promise<{ status: number; body
   return { status: res.status, body: (await res.json()) as AdminApiBody };
 }
 
-describe('Admin API for CLI (§33, Phase 2)', () => {
+describe('Admin API for CLI (§33)', () => {
   it('lists pending pairing requests', async () => {
     const device = generateDeviceKeyPair();
     createPairingRequest(db, {

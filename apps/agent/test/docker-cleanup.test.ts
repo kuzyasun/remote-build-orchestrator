@@ -305,7 +305,7 @@ describe('cleanupDockerResourcesForAttempt (real Docker)', () => {
   );
 
   // Extended gated paths (success covered above; failure/cancel/recovery below).
-  // Full scenario matrix also in apps/agent/test/phase7-workloads.test.ts.
+  // Full scenario matrix also in apps/agent/test/qemu-docker-workloads.test.ts.
 
   it.skipIf(!dockerOk)(
     'failure/cancel/recovery contexts: same label filter; other attempt untouched',

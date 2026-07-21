@@ -343,6 +343,22 @@ export class AgentConnection {
               }
               break;
             }
+            case 'refresh_capabilities': {
+              // agent_probe / admin agents/probe (§33) send this bare message expecting the Agent
+              // to report fresh capabilities immediately, rather than waiting for the next
+              // heartbeat tick — previously nothing handled this case, so the request went nowhere.
+              const agentId = this.options.capabilities.agent_id;
+              if (agentId && socket.readyState === WebSocket.OPEN) {
+                this.send(socket, 'capabilities', {
+                  ...this.options.capabilities,
+                  agent_id: agentId,
+                });
+                void this.refreshBuildCacheCapabilities(socket).catch((error) => {
+                  logger.warn('build-cache capability refresh failed', { error: String(error) });
+                });
+              }
+              break;
+            }
             case 'reconcile_decision': {
               const parsed = ReconcileDecisionPayloadSchema.safeParse(message.payload);
               if (parsed.success) {

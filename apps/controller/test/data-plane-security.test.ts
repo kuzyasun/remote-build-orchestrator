@@ -123,7 +123,7 @@ function seedAttempt(
   );
 }
 
-describe('Phase 4 data-plane token negatives (§1.7)', () => {
+describe('Data-plane token negatives (§1.7)', () => {
   let tempDir: string;
   let db: ReturnType<typeof openDatabase>;
   let identity: Awaited<ReturnType<typeof ensureControllerIdentity>>;
@@ -236,7 +236,7 @@ describe('Phase 4 data-plane token negatives (§1.7)', () => {
   });
 });
 
-describe('Phase 4 /data/v1 isolation from MCP/admin auth (§1.7)', () => {
+describe('/data/v1 isolation from MCP/admin auth (§1.7)', () => {
   let tempDir: string;
   let db: ReturnType<typeof openDatabase>;
   let identity: Awaited<ReturnType<typeof ensureControllerIdentity>>;

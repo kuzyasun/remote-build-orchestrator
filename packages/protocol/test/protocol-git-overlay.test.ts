@@ -6,7 +6,7 @@ import {
   SourceNeedReasonSchema,
 } from '../src/messages.js';
 
-describe('Phase 5 Protocol Schemas', () => {
+describe('Protocol schemas — git overlay source transfer', () => {
   it('enumerates exact source_need reasons', () => {
     expect(SourceNeedReasonSchema.options).toEqual([
       'base_present',

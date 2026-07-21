@@ -1,5 +1,5 @@
 /**
- * Phase 7 benchmark report producer.
+ * Build-cache benchmark report producer.
  *
  * Measures focused cold/warm cache timings plus synthetic queue_wait and
  * snapshot_transfer_time using real wall-clock instrumentation (not hardcoded
@@ -65,7 +65,7 @@ const baseConfig = (): BuildCacheConfig => ({
   allowWriteRiskLevels: ['safe', 'normal'],
 });
 
-describe('Phase 7 benchmark report', () => {
+describe('Build cache benchmark report', () => {
   let root: string;
   const events: BuildCacheMetricsEvent[] = [];
 

@@ -11,7 +11,7 @@ import { renderServiceActionPlan } from '../../cli/src/commands/service.js';
 
 const ROOT = process.cwd();
 
-describe('Phase 8 packaging manifests', () => {
+describe('Packaging manifests', () => {
   for (const os of ['windows', 'macos', 'linux'] as const) {
     it(`validates ${os} MANIFEST.json structure and exclusions`, async () => {
       const raw = JSON.parse(

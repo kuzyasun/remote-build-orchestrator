@@ -10,7 +10,6 @@ host remain `not_verified`.
 |---|---|---|---|
 | test-mcp-client | stdio | verified | `evidence/test-mcp-client-stdio.md` |
 | test-mcp-client | streamable_http | verified | `evidence/test-mcp-client-http.md` |
-| Fusion | stdio / streamable_http | not_verified | client_not_launched_on_host |
 | Codex | stdio / streamable_http | not_verified | client_not_launched_on_host |
 | Claude | stdio / streamable_http | not_verified | client_not_launched_on_host |
 | Cursor | stdio / streamable_http | not_verified | client_not_launched_on_host |

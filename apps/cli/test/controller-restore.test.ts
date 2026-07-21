@@ -17,7 +17,7 @@ afterEach(async () => {
   }
 });
 
-describe('rbo controller restore (§26, Phase 8 runbook)', () => {
+describe('rbo controller restore (§26, runbook)', () => {
   it('restores a valid backup onto a fresh data dir with no prior identity', async () => {
     const staging = await tempDir('rbo-cli-restore-ok-');
     const dataDir = await tempDir('rbo-cli-restore-target-');

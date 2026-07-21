@@ -31,7 +31,7 @@ function insertAgent(db: ReturnType<typeof openDatabase>, agentId: string): void
   ).run(agentId, agentId, 'localhost', nowIso());
 }
 
-describe('Phase 4 remote cancel + lease_reject rematch', () => {
+describe('remote cancel + lease_reject rematch', () => {
   it('requestRemoteJobCancel sends typed cancel_job with attempt/lease/epoch', () => {
     const db = openDatabase(':memory:');
     migrateToLatest(db);

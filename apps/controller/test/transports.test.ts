@@ -52,7 +52,7 @@ async function connectStdioStyleClient(): Promise<Client> {
   return client;
 }
 
-describe('MCP transports (Phase 1)', () => {
+describe('MCP transports', () => {
   it('exposes the same MCP tools over Streamable HTTP', async () => {
     const client = await connectHttpClient();
     const tools = await client.listTools();

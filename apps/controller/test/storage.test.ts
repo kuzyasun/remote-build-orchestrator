@@ -28,7 +28,7 @@ function listTables(db: ReturnType<typeof openDatabase>): string[] {
     .map((row) => (row as { name: string }).name);
 }
 
-describe('Controller persistence (Section 25, Phase 1)', () => {
+describe('Controller persistence (Section 25)', () => {
   it('keeps @rbo/shared RBO_CONTROLLER_SCHEMA_VERSION in sync with MIGRATIONS.length', () => {
     // apps/cli validates a restore against RBO_CONTROLLER_SCHEMA_VERSION without importing
     // MIGRATIONS directly (cross-app source imports aren't supported by this repo's tsconfig

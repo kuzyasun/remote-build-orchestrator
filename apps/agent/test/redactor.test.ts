@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { StreamRedactor } from '../src/executor/redactor.js';
 
-describe('StreamRedactor (§29.5 - §29.6, Phase 4)', () => {
+describe('StreamRedactor (§29.5 - §29.6)', () => {
   it('redacts simple secret values in a single chunk', () => {
     const redactor = new StreamRedactor(['MY_SECRET_KEY']);
     const output = redactor.redact('log header MY_SECRET_KEY log footer') + redactor.flush();

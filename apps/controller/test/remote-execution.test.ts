@@ -75,7 +75,7 @@ function agentCapabilities(displayName: string) {
   };
 }
 
-describe('Phase 4 Remote Execution End-to-End', () => {
+describe('Remote Execution End-to-End', () => {
   let tempDir: string;
   let db: ReturnType<typeof openDatabase>;
   let identity: ReturnType<typeof ensureControllerIdentity>;

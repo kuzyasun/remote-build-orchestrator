@@ -1,5 +1,5 @@
 /**
- * Phase 4 §1.7 — one active job slot: second lease/prepare/run rejected while slot held.
+ * §1.7 — one active job slot: second lease/prepare/run rejected while slot held.
  */
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -42,7 +42,7 @@ function baseOffer(attemptId: string, leaseId: string) {
   };
 }
 
-describe('Phase 4 one-slot race (§1.7)', () => {
+describe('Single job-slot lease capacity race (§1.7)', () => {
   let stateDir: string;
 
   afterEach(async () => {
@@ -52,6 +52,18 @@ describe('Phase 4 one-slot race (§1.7)', () => {
   });
 
   it('rejects a second lease_offer while the single job slot is held', async () => {
+    // Why calling handleLeaseOffer twice back-to-back (rather than via Promise.all or two
+    // interleaved async tasks) genuinely proves the one-slot invariant, not just a sequential
+    // happy path: handleLeaseOffer (apps/agent/src/executor/index.ts) is fully synchronous from
+    // its isBusy() admission check through setting `this.activeAttemptId` — there is no `await`
+    // anywhere in between. Node's single-threaded event loop guarantees the first call's admission
+    // check-and-commit runs to completion before a second call's code executes at all, for any
+    // caller (including two real lease_offer WS frames arriving back-to-back on the same socket,
+    // which Node still dispatches as two separate, non-overlapping 'message' event handler calls).
+    // There is no interleaving window here to "race" — unlike, say, the Controller's scheduler
+    // admission (a real SQL COUNT-based check against concurrent async dispatches), which is where
+    // an actual race would need to be tested. Wrapping these two calls in Promise.all would test
+    // nothing different, since neither call ever yields the event loop.
     stateDir = await mkdtemp(join(tmpdir(), 'rbo-one-slot-'));
     const socket = mockSocket();
     const executor = new AgentJobExecutor(socket, {
@@ -73,6 +85,36 @@ describe('Phase 4 one-slot race (§1.7)', () => {
       reason: 'Agent capacity limit reached (1 active job max)',
     });
     expect(socket.sent.filter((f) => f.type === 'lease_accept')).toHaveLength(1);
+    // The held slot still belongs to the first attempt, not silently swapped to the rejected one.
+    expect(executor.isBusy()).toBe(true);
+  });
+
+  it('rejects a burst of many concurrent-looking offers, keeping exactly the first slot holder', async () => {
+    // Same synchronous-admission guarantee as above, exercised with more than two contenders and
+    // fired from a single loop (the closest a same-process test gets to "many arrive at once")
+    // to rule out an off-by-one in the busy-check surviving only a single extra offer.
+    stateDir = await mkdtemp(join(tmpdir(), 'rbo-one-slot-burst-'));
+    const socket = mockSocket();
+    const executor = new AgentJobExecutor(socket, {
+      stateDir,
+      controllerFingerprint: 'sha256:deadbeef',
+      gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
+      repoCache: DEFAULT_REPO_CACHE_CONFIG,
+    });
+
+    const contenders = Array.from({ length: 8 }, (_, i) => `att_burst_${i}`);
+    for (const attemptId of contenders) {
+      executor.handleLeaseOffer(baseOffer(attemptId, `lease_${attemptId}`));
+    }
+
+    const accepted = socket.sent.filter((f) => f.type === 'lease_accept');
+    const rejected = socket.sent.filter((f) => f.type === 'lease_reject');
+    expect(accepted).toHaveLength(1);
+    expect(rejected).toHaveLength(contenders.length - 1);
+    expect((accepted[0]?.payload as { attempt_id: string }).attempt_id).toBe(contenders[0]);
+    expect(
+      rejected.every((f) => (f.payload as { attempt_id: string }).attempt_id !== contenders[0]),
+    ).toBe(true);
   });
 
   it('ignores prepare_source and run_job for a different attempt while slot is held', async () => {

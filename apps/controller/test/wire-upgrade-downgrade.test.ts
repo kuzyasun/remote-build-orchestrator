@@ -19,7 +19,7 @@ function assertPeerEligibleForLease(negotiated: number | null): asserts negotiat
   }
 }
 
-describe('Phase 8 upgrade/downgrade compatibility', () => {
+describe('Wire protocol upgrade/downgrade compatibility', () => {
   it('negotiates within frozen wire range', () => {
     expect(RBO_WIRE_PROTOCOL_MIN_VERSION).toBe(1);
     expect(RBO_WIRE_PROTOCOL_MAX_VERSION).toBe(1);

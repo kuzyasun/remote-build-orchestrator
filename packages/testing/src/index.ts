@@ -25,7 +25,7 @@ export {
   type Phase8SmokeOptions,
   type Phase8SmokeResult,
   type Phase8SmokeTranscriptEntry,
-} from './phase8-smoke.js';
+} from './mcp-smoke.js';
 
 export function createMockAgentCapability(
   overrides?: Partial<AgentCapabilityReport>,

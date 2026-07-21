@@ -4,8 +4,9 @@ import { describe, expect, it } from 'vitest';
 
 const ROOT = process.cwd();
 
-// Bare filenames in the checklist (e.g. `phase8-smoke.test.ts` without a directory) are resolved
-// against these known test roots, so the doc can stay terse without the citation being unverifiable.
+// Bare filenames in the checklist (e.g. `mcp-smoke-workflow.test.ts` without a directory) are
+// resolved against these known test roots, so the doc can stay terse without the citation being
+// unverifiable.
 const TEST_ROOTS = [
   'apps/controller/test',
   'apps/agent/test',
@@ -56,10 +57,10 @@ async function citedFileExists(p: string): Promise<boolean> {
   return pathExists(join(ROOT, p));
 }
 
-describe('Phase 8 §37 acceptance checklist', () => {
+describe('§37 acceptance checklist', () => {
   it('lists all 23 criteria with status and link', async () => {
     const doc = await readFile(
-      join(process.cwd(), 'docs', 'acceptance', 'phase8-section37.md'),
+      join(process.cwd(), 'docs', 'acceptance', 'release-checklist.md'),
       'utf8',
     );
     const rows = [...doc.matchAll(/^\| (\d+) \|/gm)].map((m) => Number(m[1]));
@@ -67,12 +68,12 @@ describe('Phase 8 §37 acceptance checklist', () => {
     expect(doc).toMatch(/\bpass\b/);
     expect(doc).toMatch(/environment_gated|not_verified/);
     // Every pass/not_verified/environment_gated row should cite a path-like link
-    expect(doc).toMatch(/phase8-smoke\.test\.ts|matrix\.json|threat/);
+    expect(doc).toMatch(/mcp-smoke-workflow\.test\.ts|matrix\.json|threat/);
   });
 
   it('every concrete file/test citation in the checklist actually exists on disk', async () => {
     const doc = await readFile(
-      join(process.cwd(), 'docs', 'acceptance', 'phase8-section37.md'),
+      join(process.cwd(), 'docs', 'acceptance', 'release-checklist.md'),
       'utf8',
     );
     const rows = doc.split('\n').filter((line) => /^\|\s*\d+\s*\|/.test(line));

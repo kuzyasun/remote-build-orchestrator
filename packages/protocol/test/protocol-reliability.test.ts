@@ -10,7 +10,7 @@ import {
   WireMessageEnvelopeSchema,
 } from '../src/messages.js';
 
-describe('Phase 6 Protocol Schemas', () => {
+describe('Protocol schemas — reliability (log ack, recovery report, reconcile decision)', () => {
   it('includes log_spool_limit error category', () => {
     expect(ErrorCategorySchema.options).toContain('log_spool_limit');
   });

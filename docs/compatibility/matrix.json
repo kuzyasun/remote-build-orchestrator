@@ -22,32 +22,10 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "vitest-mcp-sdk",
-      "config_ref": "docs/compatibility/snippets/fusion.md",
+      "config_ref": "docs/compatibility/snippets/codex.md",
       "workflow": "submit→wait→logs→artifacts→materialize; cancel",
       "evidence_path": "docs/compatibility/evidence/test-mcp-client-http.md",
       "limitation": "Harness only — not a product AI client UI"
-    },
-    {
-      "client": "fusion",
-      "transport": "streamable_http",
-      "status": "not_verified",
-      "revision": "9c12c13",
-      "os": "win32",
-      "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/fusion.md",
-      "workflow": "submit→wait→logs→artifacts",
-      "limitation": "client_not_launched_on_host"
-    },
-    {
-      "client": "fusion",
-      "transport": "stdio",
-      "status": "not_verified",
-      "revision": "9c12c13",
-      "os": "win32",
-      "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/fusion.md",
-      "workflow": "submit→wait→logs→artifacts",
-      "limitation": "client_not_launched_on_host"
     },
     {
       "client": "codex",

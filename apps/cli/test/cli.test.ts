@@ -15,7 +15,7 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-describe('rbo controller init / fingerprint (§33, Phase 2)', () => {
+describe('rbo controller init / fingerprint (§33)', () => {
   it('init generates identity and fingerprint reads it back out-of-band', async () => {
     const dataDir = tempDir();
     const initResult = await runControllerInit({ dataDir });
@@ -33,7 +33,7 @@ describe('rbo controller init / fingerprint (§33, Phase 2)', () => {
   });
 });
 
-describe('rbo agent install plan (§33, Phase 2)', () => {
+describe('rbo agent install plan (§33)', () => {
   it('renders a Windows Service install plan on win32', () => {
     const plan = renderServiceInstallPlan('win32');
     expect(plan.kind).toBe('windows_service');

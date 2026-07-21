@@ -4,7 +4,7 @@ import { PrepareSourceGitOverlayPayloadSchema } from '@rbo/protocol';
  */
 import { describe, expect, it } from 'vitest';
 
-describe('Phase 5 agent prepare fetch_refs', () => {
+describe('Agent prepare fetch_refs', () => {
   it('accepts non-empty fetch_refs derived from branch', () => {
     const parsed = PrepareSourceGitOverlayPayloadSchema.parse({
       source_mode: 'git_overlay',

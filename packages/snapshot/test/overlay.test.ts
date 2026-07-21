@@ -19,7 +19,7 @@ afterEach(async () => {
   }
 });
 
-describe('Phase 5 overlay plan + apply', () => {
+describe('Overlay plan + apply', () => {
   it('plans staged, unstaged, deletion, untracked, and rename overlay entries', async () => {
     const repo = await createGitFixtureRepo({
       committed: [
