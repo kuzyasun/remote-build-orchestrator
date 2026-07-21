@@ -1,6 +1,8 @@
 import type { AgentCapabilityReport, JobRequest } from '@rbo/protocol';
 import { describe, expect, it } from 'vitest';
 import {
+  SCHEDULER_SCORE_BUILD_CACHE_HIT,
+  SCHEDULER_SCORE_REPOSITORY_CACHE_HIT,
   type SchedulerAgent,
   agentHasBuildCacheHit,
   selectAgentForJob,
@@ -145,8 +147,7 @@ describe('Scheduler build_cache_hit preference (+250)', () => {
   });
 
   it('documents build_cache_hit (+250) next to repository_cache_hit (+500)', () => {
-    // Scoring constants used by selectAgentForJob — keep in sync with scheduler comments.
-    expect(250).toBe(250);
-    expect(500).toBe(500);
+    expect(SCHEDULER_SCORE_BUILD_CACHE_HIT).toBe(250);
+    expect(SCHEDULER_SCORE_REPOSITORY_CACHE_HIT).toBe(500);
   });
 });

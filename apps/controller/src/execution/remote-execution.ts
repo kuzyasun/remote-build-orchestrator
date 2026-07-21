@@ -27,16 +27,19 @@ import { RboError, createLogger, generateId } from '@rbo/shared';
 import { captureFullSnapshot } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
+import { DEFAULT_MAX_GIT_BUNDLE_BYTES } from '../config.js';
 import {
   clearArtifactExpectations,
   filterMissingArtifacts,
   registerArtifactExpectations,
 } from '../http/data-plane.js';
 import {
+  bumpLeaseEpoch,
   createJobEvent,
   getJob,
   getJobRequest,
   getLatestAttempt,
+  nextLeaseEpochForJob,
   recordEvent,
   transitionAttemptState,
   transitionJobState,
@@ -50,6 +53,8 @@ import type { ConnectedAgent } from '../websocket/server.js';
 import { attemptLogDir, attemptTransferDir } from './runner.js';
 
 const execFileAsync = promisify(execFile);
+
+export { DEFAULT_MAX_GIT_BUNDLE_BYTES };
 
 type ToolchainProfile = z.infer<typeof ToolchainProfileSchema>;
 
@@ -70,6 +75,8 @@ export interface RemoteExecutionOptions {
   /** Full base URL override (e.g. https://192.168.1.10:7411). Wins over host+port. */
   dataPlaneBaseUrl?: string;
   allowedProjectRoots?: string[];
+  /** Max git bundle bytes; defaults to DEFAULT_MAX_GIT_BUNDLE_BYTES. */
+  maxGitBundleBytes?: number;
 }
 
 function snapshotManifestMode(manifest: unknown): 'full' | 'git_overlay' {
@@ -234,10 +241,21 @@ function failAttemptPrepare(
   });
 }
 
-async function createGitBundle(
+export class GitBundleSizeExceededError extends Error {
+  constructor(
+    readonly sizeBytes: number,
+    readonly maxBytes: number,
+  ) {
+    super(`Git bundle size ${sizeBytes} bytes exceeds maximum ${maxBytes} bytes`);
+    this.name = 'GitBundleSizeExceededError';
+  }
+}
+
+export async function createGitBundle(
   projectRoot: string,
   baseCommit: string,
   bundlePath: string,
+  maxBytes: number = DEFAULT_MAX_GIT_BUNDLE_BYTES,
 ): Promise<{ sizeBytes: number; sha256: string }> {
   await mkdir(dirname(bundlePath), { recursive: true });
   const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
@@ -264,6 +282,9 @@ async function createGitBundle(
     });
   }
   const data = await readFile(bundlePath);
+  if (data.length > maxBytes) {
+    throw new GitBundleSizeExceededError(data.length, maxBytes);
+  }
   return {
     sizeBytes: data.length,
     sha256: createHash('sha256').update(data).digest('hex'),
@@ -494,7 +515,7 @@ export async function initiateRemoteAttempt(
   }
 
   const leaseId = generateId('lease');
-  const leaseEpoch = 1;
+  const leaseEpoch = nextLeaseEpochForJob(opts.db, jobId);
   const leaseDeadline = new Date(Date.now() + DEFAULT_LEASE_TTL_SECONDS * 1000).toISOString();
   const attemptId = generateId('att');
   const maxOrdinal = opts.db
@@ -679,10 +700,12 @@ export async function handleRemoteSourceNeed(
     const transferDir = attemptTransferDir(opts.dataDir, attempt.id);
     const bundlePath = join(transferDir, 'bundle.gitbundle');
     try {
+      const maxBundleBytes = opts.maxGitBundleBytes ?? DEFAULT_MAX_GIT_BUNDLE_BYTES;
       const { sizeBytes, sha256 } = await createGitBundle(
         request.source.project_root,
         baseCommit,
         bundlePath,
+        maxBundleBytes,
       );
       const bundleToken = issueDataToken(opts.identity, {
         agent_id: agentId,
@@ -816,6 +839,7 @@ export function handleRemoteLeaseReject(
 
   // Abandon only this offer/attempt. Capacity-race rejects must not hard-fail
   // wait (or other rematch-eligible) jobs — re-queue for later dispatch.
+  bumpLeaseEpoch(opts.db, attempt.id);
   transitionAttemptState(opts.db, attempt.id, 'completed', {
     outcome: 'failed',
     finished_at: nowIso(),
@@ -988,9 +1012,10 @@ export function handleRemoteJobStarted(
   }
 
   if (payload.pid && payload.pid > 0) {
-    updateAttempt(opts.db, attempt.id, {
-      process_identity: processIdentityFromPid(payload.pid),
-    });
+    const process_identity = processIdentityFromPid(payload.pid);
+    if (process_identity) {
+      updateAttempt(opts.db, attempt.id, { process_identity });
+    }
   }
 
   const event = createJobEvent(opts.db, {

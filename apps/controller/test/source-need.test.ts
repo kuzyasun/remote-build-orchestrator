@@ -144,6 +144,104 @@ describe('Controller source_need → bundle_download', () => {
     expect(bundleFrame?.payload.expected_sha256).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  it('fails prepare when git bundle exceeds maxGitBundleBytes', async () => {
+    const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const socket = {
+      readyState: 1,
+      OPEN: 1,
+      send: (raw: string) => {
+        const frame = JSON.parse(raw) as { type: string; payload: Record<string, unknown> };
+        sent.push(frame);
+      },
+    };
+
+    const job = createJob(db, {
+      jobId: 'job_bundle_limit',
+      clientId: 'client',
+      clientRequestId: 'req_bundle_limit',
+      request: {
+        client_request_id: 'req_bundle_limit',
+        source: { project_root: fixture.root, cwd: '.' },
+        execution: { shell: 'bash', script: 'true' },
+      },
+      initialState: 'preparing_source',
+    });
+    transitionJobState(db, job.id, 'preparing_source');
+
+    const capture = await captureAndPersistSnapshot(
+      {
+        db,
+        dataDir: tempDir,
+        allowedProjectRoots: [fixture.root],
+        allowedArtifactDestinations: [fixture.root],
+        remoteCapable: true,
+        gitAllowlist: {
+          schemes: ['https'],
+          hosts: ['github.com'],
+          repository_prefixes: ['testuser/'],
+        },
+      },
+      job.id,
+      {
+        client_request_id: 'req_bundle_limit',
+        source: { project_root: fixture.root, cwd: '.' },
+        execution: { shell: 'bash', script: 'true' },
+      },
+    );
+
+    db.prepare(
+      `INSERT INTO agents (id, display_name, hostname, state, capabilities_json, paired_at)
+       VALUES ('ag_limit', 'ag-limit', 'localhost', 'idle', '{}', datetime('now'))`,
+    ).run();
+
+    db.prepare(
+      `INSERT INTO job_attempts (id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline, state)
+       VALUES ('att_limit', ?, 1, 'ag_limit', 'lease_limit', 1, ?, 'preparing_source')`,
+    ).run(job.id, new Date(Date.now() + 3_600_000).toISOString());
+
+    db.prepare('UPDATE jobs SET snapshot_id = ? WHERE id = ?').run(capture.snapshotId, job.id);
+
+    await handleRemoteSourceNeed(
+      {
+        db,
+        identity,
+        dataDir: tempDir,
+        connectedAgents: new Map([
+          [
+            'ag_limit',
+            {
+              agentId: 'ag_limit',
+              socket: socket as never,
+              protocolVersion: 1,
+              lastHeartbeatAt: Date.now(),
+            },
+          ],
+        ]),
+        serverPort: 7411,
+        allowedProjectRoots: [fixture.root],
+        maxGitBundleBytes: 1,
+      },
+      'ag_limit',
+      {
+        attempt_id: 'att_limit',
+        lease_id: 'lease_limit',
+        lease_epoch: 1,
+        reason: 'base_commit_missing',
+      },
+    );
+
+    expect(sent.some((frame) => frame.type === 'bundle_download')).toBe(false);
+    const attempt = db
+      .prepare('SELECT state, outcome FROM job_attempts WHERE id = ?')
+      .get('att_limit') as { state: string; outcome: string | null };
+    expect(attempt.state).toBe('completed');
+    expect(attempt.outcome).toBe('failed');
+    const jobRow = db.prepare('SELECT failure_message FROM jobs WHERE id = ?').get(job.id) as {
+      failure_message: string | null;
+    };
+    expect(jobRow.failure_message).toMatch(/exceeds maximum 1 bytes/);
+  });
+
   it('rejects overlay capture when repository URL is not allowlisted', async () => {
     const job = createJob(db, {
       jobId: 'job_disallowed',

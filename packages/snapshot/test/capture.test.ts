@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { RboError } from '@rbo/shared';
 import { assertGitStateUnchanged, captureGitState } from '@rbo/testing';
 import { describe, expect, it, vi } from 'vitest';
 import { decompressTarZstd, parseTarArchive } from '../src/archive.js';
@@ -85,6 +86,42 @@ describe('captureFullSnapshot (§11, Appendix C)', () => {
           contentStorageDir: storage,
         }),
       ).rejects.toMatchObject({ category: 'secret_blocked' });
+    } finally {
+      await cleanup();
+      await rm(storage, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('reports all secret denylist violations in block mode', async () => {
+    const { dir, cleanup } = await createFixtureRepo();
+    const storage = await mkdtemp(join(tmpdir(), 'rbo-capture-'));
+    try {
+      await writeFile(join(dir, '.env'), 'SECRET=1');
+      await writeFile(join(dir, 'credentials.json'), '{"token":"x"}');
+      await runGit(dir, ['add', '.env', 'credentials.json']);
+      await runGit(dir, ['commit', '-m', 'add secrets']);
+
+      let error: unknown;
+      try {
+        await captureFullSnapshot({
+          projectRoot: dir,
+          allowedProjectRoots: [dir],
+          sourcePolicy: {
+            include_untracked: true,
+            include_ignored: [],
+            secret_policy: 'block',
+          },
+          contentStorageDir: storage,
+        });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeInstanceOf(RboError);
+      const rboError = error as RboError;
+      expect(rboError.category).toBe('secret_blocked');
+      const violations = rboError.details?.violations as Array<{ path: string; pattern: string }>;
+      expect(violations.map((v) => v.path).sort()).toEqual(['.env', 'credentials.json']);
     } finally {
       await cleanup();
       await rm(storage, { recursive: true, force: true });

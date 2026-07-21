@@ -32,6 +32,28 @@ export const LOCK_STALE_MAX_AGE_MS = 10 * 60 * 1000;
 /** How often a held lock refreshes mtime (must be well below LOCK_STALE_MAX_AGE_MS). */
 const LOCK_TOUCH_INTERVAL_MS = Math.floor(LOCK_STALE_MAX_AGE_MS / 3);
 
+/** Windows can briefly EPERM on rename while a handle settles — retry a few times. */
+async function renameWithRetry(from: string, to: string, attempts = 8): Promise<void> {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (error) {
+      lastError = error;
+      const code =
+        error && typeof error === 'object' && 'code' in error
+          ? String((error as { code: unknown }).code)
+          : '';
+      if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') {
+        throw error;
+      }
+      await new Promise((r) => setTimeout(r, 15 + i * 10));
+    }
+  }
+  throw lastError;
+}
+
 export interface BuildCacheMeta {
   kind: BuildCacheKind;
   cache_key: string;
@@ -166,7 +188,9 @@ async function directorySizeBytes(dir: string): Promise<number> {
  * Per-key locked named build-cache store.
  *
  * Layout:
- * - `{root}/{cacheKey}/` — published entry (`.published`, `meta.json`, kind subdir, `.lock`)
+ * - `{root}/{cacheKey}/` — published entry (`.published`, `meta.json`, kind subdir)
+ * - `{root}/{cacheKey}.lock` — exclusive lock **outside** keyDir (so publish rename
+ *   never moves a path that Windows may still have open via utimes refresh)
  * - `{root}/{cacheKey}.tmp-{attemptId}/` — exclusive miss population dir
  *
  * Eviction order note (disk-pressure): build-cache eviction runs **after** inactive
@@ -211,8 +235,9 @@ export class BuildCacheStore {
     return join(keyDir, PUBLISHED_MARKER);
   }
 
-  private lockPath(keyDir: string): string {
-    return join(keyDir, LOCK_NAME);
+  /** Sibling lock path — never nested under keyDir (avoids Windows EPERM on publish rename). */
+  private lockPath(cacheKey: string): string {
+    return join(this.rootDir, `${cacheKey}${LOCK_NAME}`);
   }
 
   private async readMeta(keyDir: string): Promise<BuildCacheMeta | null> {
@@ -232,9 +257,11 @@ export class BuildCacheStore {
     return pathExists(this.publishedPath(keyDir));
   }
 
-  private async acquireExclusiveLock(keyDir: string): Promise<() => Promise<void>> {
-    await mkdir(keyDir, { recursive: true });
-    const lockFile = this.lockPath(keyDir);
+  private async acquireExclusiveLock(cacheKey: string): Promise<() => Promise<void>> {
+    await mkdir(this.rootDir, { recursive: true });
+    // Ensure keyDir exists as the published/miss slot (lock itself is a sibling file).
+    await mkdir(this.keyDir(cacheKey), { recursive: true });
+    const lockFile = this.lockPath(cacheKey);
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
     while (Date.now() < deadline) {
       try {
@@ -284,7 +311,7 @@ export class BuildCacheStore {
     let releaseLock: (() => Promise<void>) | null = null;
 
     try {
-      releaseLock = await this.acquireExclusiveLock(keyDir);
+      releaseLock = await this.acquireExclusiveLock(cacheKey);
     } catch {
       this.emit({
         event: 'build_cache_refuse',
@@ -328,7 +355,7 @@ export class BuildCacheStore {
               return;
             }
             released = true;
-            const unlock = await this.acquireExclusiveLock(keyDir);
+            const unlock = await this.acquireExclusiveLock(cacheKey);
             try {
               const current = await this.readMeta(keyDir);
               if (current) {
@@ -438,7 +465,7 @@ export class BuildCacheStore {
     }
 
     // Promote: write meta + marker into temp root, then replace published key dir.
-    // Lock is held by the miss acquire; we still write under keyDir carefully.
+    // Exclusive lock lives at `{cacheKey}.lock` (sibling) so rename never touches it.
     const now = new Date().toISOString();
     const bytes = await directorySizeBytes(tempRoot);
     const meta: BuildCacheMeta = {
@@ -453,34 +480,21 @@ export class BuildCacheStore {
     await writeFile(join(tempRoot, META_NAME), `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
     await writeFile(join(tempRoot, PUBLISHED_MARKER), `${now}\n`, 'utf8');
 
-    // Swap: move current keyDir aside (keeps .lock alive via reopen after),
-    // rename temp → keyDir, then restore lock file for the held acquire.
+    // Swap: move current keyDir aside, rename temp → keyDir. Lock stays at sibling path.
     const backup = join(this.rootDir, `${cacheKey}.bak-${attemptId}`);
     await rm(backup, { recursive: true, force: true }).catch(() => undefined);
 
-    const lockHeld = await pathExists(this.lockPath(keyDir));
     if (await pathExists(keyDir)) {
-      await rename(keyDir, backup);
+      await renameWithRetry(keyDir, backup);
     }
     try {
-      await rename(tempRoot, keyDir);
+      await renameWithRetry(tempRoot, keyDir);
     } catch (error) {
       // Roll back if possible
       if (await pathExists(backup)) {
-        await rename(backup, keyDir).catch(() => undefined);
+        await renameWithRetry(backup, keyDir).catch(() => undefined);
       }
       throw error;
-    }
-
-    // Restore exclusive lock marker so release() can still unlock.
-    if (lockHeld) {
-      try {
-        const handle = await open(this.lockPath(keyDir), 'wx');
-        await handle.writeFile(`${process.pid}\n`, 'utf8');
-        await handle.close();
-      } catch {
-        // If lock already present (unlikely), leave as-is.
-      }
     }
 
     await rm(backup, { recursive: true, force: true }).catch(() => undefined);
@@ -512,16 +526,18 @@ export class BuildCacheStore {
     let totalBytes = 0;
 
     for (const name of entries) {
-      if (name.includes('.tmp-') || name.includes('.bak-')) {
+      if (name.includes('.tmp-') || name.includes('.bak-') || name.endsWith(LOCK_NAME)) {
         // Orphan temps older than retention: remove opportunistically
-        const full = join(this.rootDir, name);
-        try {
-          const st = await stat(full);
-          if (nowMs - st.mtimeMs >= retentionMs) {
-            await rm(full, { recursive: true, force: true });
+        if (name.includes('.tmp-') || name.includes('.bak-')) {
+          const full = join(this.rootDir, name);
+          try {
+            const st = await stat(full);
+            if (nowMs - st.mtimeMs >= retentionMs) {
+              await rm(full, { recursive: true, force: true });
+            }
+          } catch {
+            // skip
           }
-        } catch {
-          // skip
         }
         continue;
       }
@@ -530,7 +546,7 @@ export class BuildCacheStore {
       if (!(await this.isPublished(keyDir))) {
         continue;
       }
-      const lockFile = this.lockPath(keyDir);
+      const lockFile = this.lockPath(name);
       if (await pathExists(lockFile)) {
         const reclaimed = await reclaimStaleLockIfNeeded(lockFile, nowMs);
         if (!reclaimed) {
@@ -572,7 +588,7 @@ export class BuildCacheStore {
 
       // Re-check lock / active_users immediately before delete
       const keyDir = this.keyDir(candidate.cacheKey);
-      const lockFile = this.lockPath(keyDir);
+      const lockFile = this.lockPath(candidate.cacheKey);
       if (await pathExists(lockFile)) {
         const reclaimed = await reclaimStaleLockIfNeeded(lockFile, nowMs);
         if (!reclaimed) {
@@ -586,6 +602,7 @@ export class BuildCacheStore {
 
       const kind = meta?.kind ?? 'npm';
       await rm(keyDir, { recursive: true, force: true });
+      await rm(lockFile, { force: true }).catch(() => undefined);
       evictedKeys.push(candidate.cacheKey);
       freedBytes += candidate.bytes;
       this.emit({
@@ -610,7 +627,7 @@ export class BuildCacheStore {
     }
     const byKind = new Map<BuildCacheKind, string[]>();
     for (const name of entries) {
-      if (name.includes('.tmp-') || name.includes('.bak-')) {
+      if (name.includes('.tmp-') || name.includes('.bak-') || name.endsWith(LOCK_NAME)) {
         continue;
       }
       const keyDir = join(this.rootDir, name);

@@ -448,6 +448,14 @@ describe('JobEventSchema (§18.1)', () => {
         message: 'cleanup failed',
       }).type,
     ).toBe('cleanup_error');
+    expect(
+      JobEventSchema.parse({
+        type: 'env_override_ignored',
+        ...base,
+        name: 'RBO_JOB_ID',
+        reason: 'Reserved RBO_ env key ignored; injected system value wins',
+      }).name,
+    ).toBe('RBO_JOB_ID');
   });
 });
 

@@ -147,15 +147,35 @@ export function transitionJobState(
   return row;
 }
 
+/** Next monotonic lease epoch for a job (§2.2 fencing). */
+export function nextLeaseEpochForJob(db: ControllerDatabase, jobId: string): number {
+  const row = db
+    .prepare('SELECT COALESCE(MAX(lease_epoch), 0) AS max_epoch FROM job_attempts WHERE job_id = ?')
+    .get(jobId) as { max_epoch: number };
+  return row.max_epoch + 1;
+}
+
+/** Bump lease epoch on an active attempt (disconnect/reassign re-fencing). */
+export function bumpLeaseEpoch(db: ControllerDatabase, attemptId: string): number {
+  const attempt = getAttempt(db, attemptId);
+  if (!attempt) {
+    throw new Error(`Attempt not found: ${attemptId}`);
+  }
+  const nextEpoch = attempt.lease_epoch + 1;
+  db.prepare('UPDATE job_attempts SET lease_epoch = ? WHERE id = ?').run(nextEpoch, attemptId);
+  return nextEpoch;
+}
+
 export function createAttempt(db: ControllerDatabase, jobId: string, ordinal: number): AttemptRow {
   const attemptId = generateId('att');
   const leaseId = generateId('lease');
+  const leaseEpoch = nextLeaseEpochForJob(db, jobId);
   const timestamp = nowIso();
   db.prepare(
     `INSERT INTO job_attempts (
       id, job_id, ordinal, lease_id, lease_epoch, state, started_at
-    ) VALUES (?, ?, ?, ?, 1, 'starting', ?)`,
-  ).run(attemptId, jobId, ordinal, leaseId, timestamp);
+    ) VALUES (?, ?, ?, ?, ?, 'starting', ?)`,
+  ).run(attemptId, jobId, ordinal, leaseId, leaseEpoch, timestamp);
   const row = getAttempt(db, attemptId);
   if (!row) {
     throw new Error('Failed to create attempt');

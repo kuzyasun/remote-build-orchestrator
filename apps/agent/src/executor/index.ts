@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
@@ -7,7 +7,9 @@ import { join } from 'node:path';
 import {
   type AttemptSpool,
   appendChunk,
+  appendEvent,
   collectArtifactFiles,
+  nextEventSequence,
   openAttemptSpool,
   readAck,
   runCleanupScript,
@@ -34,7 +36,11 @@ import type {
 } from '@rbo/protocol';
 import { certificateFingerprint, createLogger, generateId, resolveContainedCwd } from '@rbo/shared';
 import type { GitUrlAllowlist } from '@rbo/shared';
-import { applyGitOverlay, materializeFullSnapshot } from '@rbo/snapshot';
+import {
+  applyGitOverlay,
+  detectGitSourceRequirements,
+  materializeFullSnapshot,
+} from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
 import {
   type AcquireResult,
@@ -46,7 +52,11 @@ import {
   resolveBuildCachesDir,
   stripUserBuildCacheEnv,
 } from '../build-cache/index.js';
-import { DEFAULT_LOG_SEND_QUEUE_MAX, DEFAULT_LOG_SPOOL_MAX_BYTES } from '../config.js';
+import {
+  DEFAULT_LOG_SEND_QUEUE_MAX,
+  DEFAULT_LOG_SPOOL_MAX_BYTES,
+  resolveReposDir,
+} from '../config.js';
 import { cleanupDockerResourcesForAttempt } from '../docker/cleanup.js';
 import { SpoolSender } from '../logs/spool-sender.js';
 import {
@@ -58,8 +68,10 @@ import {
 } from '../recovery/attempt-metadata.js';
 import type { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
 import { isAcceptingJobsUnderDiskPressure } from '../recovery/disk-pressure.js';
+import { applyControlledGitSource } from '../repos/controlled-git.js';
 import { type RepoCacheConfig, RepoMirrorManager } from '../repos/mirror.js';
 import { StreamRedactor } from './redactor.js';
+import { streamDownloadWithLimits } from './stream-download-with-limits.js';
 
 const logger = createLogger('agent.executor');
 const ARTIFACT_TOKEN_TIMEOUT_MS = 60_000;
@@ -75,6 +87,8 @@ export function isDestructiveOrHardwareRisk(risk: RiskLevel | undefined | null):
 
 export interface AgentExecutorConfig {
   stateDir: string;
+  /** Mirror cache root override (§2.8). */
+  repoCacheDir?: string;
   /** Controller TLS certificate fingerprint (sha256:...), same pin as the WS session. */
   controllerFingerprint: string;
   /** Maps store ref name → environment variable that holds the secret value. */
@@ -183,7 +197,7 @@ export class AgentJobExecutor {
     private config: AgentExecutorConfig,
   ) {
     this.mirrorManager = new RepoMirrorManager({
-      reposDir: join(config.stateDir, 'repos'),
+      reposDir: resolveReposDir(config),
       allowlist: config.gitAllowlist,
       repoCache: config.repoCache,
     });
@@ -930,6 +944,24 @@ export class AgentJobExecutor {
       this.overlayRepoUrl = prepare.repo.url;
       this.materializedProjectPath = projectPath;
 
+      const gitSourceRequirements = await detectGitSourceRequirements(projectPath);
+      let gitLfsAvailable = false;
+      try {
+        const { execFile } = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        await promisify(execFile)('git-lfs', ['version'], { windowsHide: true });
+        gitLfsAvailable = true;
+      } catch {
+        gitLfsAvailable = false;
+      }
+      await applyControlledGitSource({
+        repoRoot: projectPath,
+        allowlist: this.config.gitAllowlist,
+        submodules: gitSourceRequirements.submodules,
+        lfs: gitSourceRequirements.lfs,
+        gitLfsAvailable,
+      });
+
       if (this.cancelSignal.cancelled) {
         throw new Error('cancelled');
       }
@@ -1271,6 +1303,18 @@ export class AgentJobExecutor {
         attachLogs: false,
       });
 
+      for (const key of child.ignoredRboEnvKeys ?? []) {
+        await appendEvent(logs, {
+          type: 'env_override_ignored',
+          sequence: await nextEventSequence(logs),
+          created_at: new Date().toISOString(),
+          job_id: offer.job_id,
+          attempt_id: run.attempt_id,
+          name: key,
+          reason: 'Reserved RBO_ env key ignored; injected system value wins',
+        });
+      }
+
       this.sendFrame('job_started', run.attempt_id, run.lease_id, run.lease_epoch, {
         attempt_id: run.attempt_id,
         lease_id: run.lease_id,
@@ -1278,34 +1322,47 @@ export class AgentJobExecutor {
         ...(child.pid && child.pid > 0 ? { pid: child.pid } : {}),
       });
 
-      if (child.pid && child.pid > 0) {
-        const identity = processIdentityFromPid(child.pid);
-        const risk = request.risk_level ?? 'normal';
-        writeAttemptMetadata(this.config.stateDir, {
-          attempt_id: run.attempt_id,
-          job_id: offer.job_id,
-          lease_id: run.lease_id,
-          lease_epoch: run.lease_epoch,
-          process_identity: identity,
-          status: 'running',
-          workspace_path: workspaceRoot,
-          spool_dir: logsDir,
-          risk_level: risk,
-          updated_at: new Date().toISOString(),
-        });
-      }
-
+      // Register kill before any sync OS lookup so lease-expiry self-term cannot
+      // race past spawn with activeProcessKill still null.
       this.activeProcessKill = (grace) => child.kill(grace ?? 10);
       // Keep the same cancelSignal object through waitForCompletion so a cancel
       // that fired during spawn is not wiped.
 
-      // If lease already expired before spawn finished, terminate now.
+      if (child.pid && child.pid > 0) {
+        const identity = processIdentityFromPid(child.pid);
+        if (identity) {
+          const risk = request.risk_level ?? 'normal';
+          writeAttemptMetadata(this.config.stateDir, {
+            attempt_id: run.attempt_id,
+            job_id: offer.job_id,
+            lease_id: run.lease_id,
+            lease_epoch: run.lease_epoch,
+            process_identity: identity,
+            status: 'running',
+            workspace_path: workspaceRoot,
+            spool_dir: logsDir,
+            risk_level: risk,
+            updated_at: new Date().toISOString(),
+          });
+        }
+      }
+
+      // If lease already expired before kill was registered, terminate now.
       if (
+        isDestructiveOrHardwareRisk(this.leaseRisk) &&
         this.leaseDeadlineMs !== null &&
-        Date.now() >= this.leaseDeadlineMs &&
-        isDestructiveOrHardwareRisk(this.leaseRisk)
+        Date.now() >= this.leaseDeadlineMs
       ) {
-        void this.onLeaseExpired();
+        if (this.leaseExpired) {
+          // Timer already ran with null activeProcessKill — kill now.
+          try {
+            await this.activeProcessKill(10);
+          } catch (error) {
+            logger.warn('failed to kill process on late lease-expiry', { error: String(error) });
+          }
+        } else {
+          void this.onLeaseExpired();
+        }
       }
 
       const appendAndEnqueue = (stream: 'stdout' | 'stderr', text: string): Promise<void> => {
@@ -1769,36 +1826,10 @@ export class AgentJobExecutor {
             return;
           }
 
-          const hasher = createHash('sha256');
-          const writeStream = createWriteStream(destPath);
-          let sizeCounter = 0;
-
-          res.on('data', (chunk: Buffer) => {
-            sizeCounter += chunk.length;
-            hasher.update(chunk);
-          });
-
-          writeStream.on('finish', () => {
-            const sha256 = hasher.digest('hex');
-            if (sizeCounter !== expectedSize) {
-              void rm(destPath, { force: true });
-              rejectPromise(
-                new Error(`Downloaded size ${sizeCounter} mismatch with expected ${expectedSize}`),
-              );
-              return;
-            }
-            if (sha256 !== expectedSha256) {
-              void rm(destPath, { force: true });
-              rejectPromise(
-                new Error(`Downloaded sha256 ${sha256} mismatch with expected ${expectedSha256}`),
-              );
-              return;
-            }
-            resolvePromise();
-          });
-
-          writeStream.on('error', rejectPromise);
-          res.pipe(writeStream);
+          void streamDownloadWithLimits(res, destPath, expectedSize, expectedSha256).then(
+            resolvePromise,
+            rejectPromise,
+          );
         },
       );
 

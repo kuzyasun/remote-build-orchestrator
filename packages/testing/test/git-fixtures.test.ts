@@ -29,7 +29,8 @@ describe('git fixture harness (§0.2)', () => {
     });
     try {
       const before = await captureGitState(repo.root);
-      const after = { ...before, head: `${before.head.slice(0, -1)}0` };
+      const flipped = before.head.endsWith('0') ? '1' : '0';
+      const after = { ...before, head: `${before.head.slice(0, -1)}${flipped}` };
       expect(() => assertGitStateUnchanged(before, after)).toThrow(/HEAD:/);
     } finally {
       await repo.cleanup();

@@ -45,6 +45,20 @@ function pathsInManifest(result: Awaited<ReturnType<typeof captureFullSnapshot>>
   return result.manifest.source.files.map((f) => f.path).sort();
 }
 
+/** Probe once: hosts without symlink privilege must skip symlink scenarios explicitly. */
+const canCreateSymlinks: boolean = await (async () => {
+  const probeDir = await mkdtemp(join(tmpdir(), 'rbo-symlink-probe-'));
+  try {
+    await writeFile(join(probeDir, 'target.txt'), 't');
+    await symlink('target.txt', join(probeDir, 'link.txt'));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await rm(probeDir, { recursive: true, force: true });
+  }
+})();
+
 describe('captureFullSnapshot scenarios (§34.1 full mode)', () => {
   it('captures staged-only changes', async () => {
     const { dir, cleanup } = await createFixtureRepo();
@@ -233,54 +247,55 @@ describe('captureFullSnapshot scenarios (§34.1 full mode)', () => {
     }
   }, 30_000);
 
-  it('captures relative symlinks inside the workspace', async () => {
-    const { dir, cleanup } = await createFixtureRepo();
-    const storage = await mkdtemp(join(tmpdir(), 'rbo-cap-'));
-    try {
-      await writeFile(join(dir, 'target.txt'), 'target');
-      await runGit(dir, ['add', 'target.txt']);
-      await runGit(dir, ['commit', '-m', 'init']);
+  // PLATFORM-GAP: OS denied symlink creation on this host — verify on Unix/macOS runner
+  it.skipIf(!canCreateSymlinks)(
+    'captures relative symlinks inside the workspace',
+    async () => {
+      const { dir, cleanup } = await createFixtureRepo();
+      const storage = await mkdtemp(join(tmpdir(), 'rbo-cap-'));
       try {
+        await writeFile(join(dir, 'target.txt'), 'target');
+        await runGit(dir, ['add', 'target.txt']);
+        await runGit(dir, ['commit', '-m', 'init']);
         await symlink('target.txt', join(dir, 'link.txt'));
-      } catch {
-        // PLATFORM-GAP: OS denied symlink creation on this host — verify on Unix/macOS runner
-        return;
+        await runGit(dir, ['add', 'link.txt']);
+
+        const result = await capture(dir, storage);
+        const entry = result.manifest.source.files.find((f) => f.path === 'link.txt');
+        expect(entry?.type).toBe('symlink');
+        expect(entry?.target).toBe('target.txt');
+      } finally {
+        await cleanup();
+        await rm(storage, { recursive: true, force: true });
       }
-      await runGit(dir, ['add', 'link.txt']);
+    },
+    30_000,
+  );
 
-      const result = await capture(dir, storage);
-      const entry = result.manifest.source.files.find((f) => f.path === 'link.txt');
-      expect(entry?.type).toBe('symlink');
-      expect(entry?.target).toBe('target.txt');
-    } finally {
-      await cleanup();
-      await rm(storage, { recursive: true, force: true });
-    }
-  }, 30_000);
-
-  it('rejects absolute symlink targets', async () => {
-    const { dir, cleanup } = await createFixtureRepo();
-    const storage = await mkdtemp(join(tmpdir(), 'rbo-cap-'));
-    try {
-      await writeFile(join(dir, 'base.txt'), 'base');
-      await runGit(dir, ['add', 'base.txt']);
-      await runGit(dir, ['commit', '-m', 'init']);
+  // PLATFORM-GAP: OS denied symlink creation on this host — verify on Unix/macOS runner
+  it.skipIf(!canCreateSymlinks)(
+    'rejects absolute symlink targets',
+    async () => {
+      const { dir, cleanup } = await createFixtureRepo();
+      const storage = await mkdtemp(join(tmpdir(), 'rbo-cap-'));
       try {
+        await writeFile(join(dir, 'base.txt'), 'base');
+        await runGit(dir, ['add', 'base.txt']);
+        await runGit(dir, ['commit', '-m', 'init']);
         const absTarget = process.platform === 'win32' ? 'C:\\Windows\\System32' : '/etc/hosts';
         await symlink(absTarget, join(dir, 'bad-link.txt'));
-      } catch {
-        return;
-      }
-      await runGit(dir, ['add', 'bad-link.txt']);
+        await runGit(dir, ['add', 'bad-link.txt']);
 
-      await expect(capture(dir, storage)).rejects.toThrow(
-        /Absolute symlink|escapes allowed root|Symlink escapes/,
-      );
-    } finally {
-      await cleanup();
-      await rm(storage, { recursive: true, force: true });
-    }
-  }, 30_000);
+        await expect(capture(dir, storage)).rejects.toThrow(
+          /Absolute symlink|escapes allowed root|Symlink escapes/,
+        );
+      } finally {
+        await cleanup();
+        await rm(storage, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 
   it('captures files from an additional root', async () => {
     const { dir, cleanup } = await createFixtureRepo();
@@ -420,47 +435,53 @@ describe('captureFullSnapshot scenarios (§34.1 full mode)', () => {
     }
   }, 30_000);
 
-  it('rejects project roots that escape allowed roots via symlink', async () => {
-    const allowed = await mkdtemp(join(tmpdir(), 'rbo-allowed-'));
-    const outside = await mkdtemp(join(tmpdir(), 'rbo-outside-'));
-    const storage = await mkdtemp(join(tmpdir(), 'rbo-cap-'));
-    try {
-      await writeFile(join(outside, 'tracked.txt'), 'tracked');
-      await runGit(outside, ['init']);
-      await runGit(outside, ['config', 'user.email', 'test@example.com']);
-      await runGit(outside, ['config', 'user.name', 'Test User']);
-      await runGit(outside, ['add', 'tracked.txt']);
-      await runGit(outside, ['commit', '-m', 'init']);
-
-      const linkPath = join(allowed, 'escape-link');
+  // PLATFORM-GAP: directory symlink/junction escape needs OS symlink privilege — verify on Unix/macOS runner
+  it.skipIf(!canCreateSymlinks)(
+    'rejects project roots that escape allowed roots via symlink',
+    async (ctx) => {
+      const allowed = await mkdtemp(join(tmpdir(), 'rbo-allowed-'));
+      const outside = await mkdtemp(join(tmpdir(), 'rbo-outside-'));
+      const storage = await mkdtemp(join(tmpdir(), 'rbo-cap-'));
       try {
-        await symlink(outside, linkPath, 'junction');
-      } catch {
-        try {
-          await symlink(outside, linkPath, 'dir');
-        } catch {
-          return;
-        }
-      }
+        await writeFile(join(outside, 'tracked.txt'), 'tracked');
+        await runGit(outside, ['init']);
+        await runGit(outside, ['config', 'user.email', 'test@example.com']);
+        await runGit(outside, ['config', 'user.name', 'Test User']);
+        await runGit(outside, ['add', 'tracked.txt']);
+        await runGit(outside, ['commit', '-m', 'init']);
 
-      await expect(
-        captureFullSnapshot({
-          projectRoot: linkPath,
-          allowedProjectRoots: [allowed],
-          sourcePolicy: {
-            include_untracked: true,
-            include_ignored: [],
-            secret_policy: 'block',
-          },
-          contentStorageDir: storage,
-        }),
-      ).rejects.toMatchObject({ category: 'materialization' });
-    } finally {
-      await rm(allowed, { recursive: true, force: true });
-      await rm(outside, { recursive: true, force: true });
-      await rm(storage, { recursive: true, force: true });
-    }
-  }, 30_000);
+        const linkPath = join(allowed, 'escape-link');
+        try {
+          await symlink(outside, linkPath, 'junction');
+        } catch {
+          try {
+            await symlink(outside, linkPath, 'dir');
+          } catch {
+            // PLATFORM-GAP: directory symlink/junction unavailable on this host
+            ctx.skip();
+          }
+        }
+
+        await expect(
+          captureFullSnapshot({
+            projectRoot: linkPath,
+            allowedProjectRoots: [allowed],
+            sourcePolicy: {
+              include_untracked: true,
+              include_ignored: [],
+              secret_policy: 'block',
+            },
+            contentStorageDir: storage,
+          }),
+        ).rejects.toMatchObject({ category: 'materialization' });
+      } finally {
+        await rm(allowed, { recursive: true, force: true });
+        await rm(outside, { recursive: true, force: true });
+        await rm(storage, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 
   it.skipIf(process.platform === 'win32')(
     'captures newline in filename when the OS allows it',

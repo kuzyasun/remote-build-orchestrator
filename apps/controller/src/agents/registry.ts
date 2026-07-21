@@ -22,6 +22,27 @@ export function updateAgentCapabilities(
   ).run(JSON.stringify(report), report.hostname, nowIso(), agentId);
 }
 
+/** Merge heartbeat cpu_load into stored capabilities for §19.2 scoring. */
+export function patchAgentCpuLoad(db: ControllerDatabase, agentId: string, cpuLoad: number): void {
+  const row = db.prepare('SELECT capabilities_json FROM agents WHERE id = ?').get(agentId) as
+    | { capabilities_json: string }
+    | undefined;
+  if (!row) {
+    return;
+  }
+  try {
+    const caps = JSON.parse(row.capabilities_json) as AgentCapabilityReport;
+    caps.resources.cpu_load = Math.min(1, Math.max(0, cpuLoad));
+    db.prepare('UPDATE agents SET capabilities_json = ?, last_seen_at = ? WHERE id = ?').run(
+      JSON.stringify(caps),
+      nowIso(),
+      agentId,
+    );
+  } catch {
+    // skip invalid stored capabilities
+  }
+}
+
 export function setAgentState(db: ControllerDatabase, agentId: string, state: string): void {
   db.prepare('UPDATE agents SET state = ?, last_seen_at = ? WHERE id = ?').run(
     state,

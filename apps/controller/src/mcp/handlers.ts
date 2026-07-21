@@ -5,6 +5,7 @@ import { getMcpToolDef } from '@rbo/protocol';
 import type { ControllerIdentity, GitUrlAllowlist, StructuredErrorDetails } from '@rbo/shared';
 import { RboError } from '@rbo/shared';
 import { z } from 'zod';
+import { requestAgentProbe } from '../agents/probe.js';
 import { listAgents } from '../agents/service.js';
 import { materializeArtifactToDestination } from '../execution/artifacts.js';
 import { attemptLogDir } from '../execution/runner.js';
@@ -39,6 +40,7 @@ export interface ToolContext {
   controllerPublicHost?: string;
   dataPlaneBaseUrl?: string;
   gitAllowlist?: GitUrlAllowlist;
+  allowLocalFallback?: boolean;
 }
 
 export interface ToolErrorResult {
@@ -68,21 +70,13 @@ function submitContext(ctx: ToolContext) {
     agentPlanePort: ctx.agentPlanePort,
     controllerPublicHost: ctx.controllerPublicHost,
     dataPlaneBaseUrl: ctx.dataPlaneBaseUrl,
+    allowLocalFallback: ctx.allowLocalFallback,
   };
 }
 
 // Tools whose backend arrives in a later phase return a schema-valid
 // not_implemented response instead of failing the transport (§35 Phase 1).
-function notImplemented(tool: McpToolName, plannedPhase: number): ToolErrorResult {
-  return {
-    error: {
-      category: 'internal',
-      message: `not_implemented: '${tool}' becomes available in Phase ${plannedPhase}`,
-      retryable: false,
-      details: { not_implemented: true, planned_phase: plannedPhase },
-    },
-  };
-}
+// (agent_probe wired in §2.7 remediation.)
 
 export function validateToolInput(name: string, args: unknown): Record<string, unknown> {
   const def = getMcpToolDef(name);
@@ -225,7 +219,12 @@ export async function handleToolCall(
         };
       }
 
-    case 'agent_probe':
-      return { ...notImplemented(name, 2) };
+    case 'agent_probe': {
+      const result = requestAgentProbe(ctx.connectedAgents, args.agent_id as string);
+      if ('error' in result) {
+        return { error: result.error };
+      }
+      return result;
+    }
   }
 }

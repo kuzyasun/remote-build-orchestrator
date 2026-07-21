@@ -1,5 +1,6 @@
 import { RboError } from '@rbo/shared';
 import type { ControllerIdentity } from '@rbo/shared';
+import { requestAgentProbe } from '../agents/probe.js';
 import { revokeAgent } from '../agents/registry.js';
 import { listAgents } from '../agents/service.js';
 import type { PairingRequestRow } from '../security/pairing.js';
@@ -64,32 +65,11 @@ export async function handleAdminRequest(
 
     case 'agents/probe': {
       const agentId = String(args.agent_id ?? '');
-      const connected = ctx.connectedAgents?.get(agentId);
-      if (!connected) {
-        return {
-          status: 409,
-          body: {
-            error: {
-              category: 'agent_lost',
-              message: `Agent '${agentId}' is not currently connected`,
-              retryable: true,
-            },
-          },
-        };
+      const result = requestAgentProbe(ctx.connectedAgents, agentId);
+      if ('error' in result) {
+        return { status: 409, body: { error: result.error } };
       }
-      connected.socket.send(
-        JSON.stringify({
-          protocol: 1,
-          type: 'refresh_capabilities',
-          message_id: `msg_${Date.now()}`,
-          sent_at: new Date().toISOString(),
-          attempt_id: null,
-          lease_id: null,
-          lease_epoch: null,
-          payload: {},
-        }),
-      );
-      return { status: 200, body: { requested: true } };
+      return { status: 200, body: result };
     }
 
     default:

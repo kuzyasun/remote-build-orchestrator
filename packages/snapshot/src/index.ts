@@ -126,6 +126,7 @@ export const SnapshotInstanceSchema = z.object({
 export type SnapshotInstance = z.infer<typeof SnapshotInstanceSchema>;
 
 export * from './git-status.js';
+export * from './git-source-policy.js';
 export * from './secret-policy.js';
 export * from './archive.js';
 export * from './canonical.js';

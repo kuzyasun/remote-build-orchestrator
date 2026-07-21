@@ -10,9 +10,12 @@ import { runControllerFingerprint, runControllerInit } from './commands/controll
 import { runDoctor } from './commands/doctor.js';
 import { cancelJobRemote, getJobLogsRemote, submitJobRemote } from './commands/jobs.js';
 import {
+  type ServiceAction,
   detectPlatform,
-  renderServiceInstallPlan,
-  renderServiceUninstallPlan,
+  executeServicePlan,
+  formatDryRunPlan,
+  hasExecuteFlag,
+  renderServiceActionPlan,
 } from './commands/service.js';
 
 function defaultDataDir(): string {
@@ -26,12 +29,11 @@ function defaultControllerUrl(): string {
   return process.env.RBO_CONTROLLER_URL_HTTP ?? 'http://127.0.0.1:7410';
 }
 
-function printPlan(action: string, plan: { commands: string[] }): void {
-  console.log(`# ${action} (dry run — pass --execute to run these commands)`);
-  for (const command of plan.commands) {
-    console.log(command);
-  }
+function printPlan(action: string, plan: Parameters<typeof formatDryRunPlan>[1]): void {
+  console.log(formatDryRunPlan(action, plan));
 }
+
+const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'status', 'start', 'stop']);
 
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
@@ -89,19 +91,22 @@ async function main(): Promise<void> {
         console.log(JSON.stringify(result));
         return;
       }
-      if (sub === 'install' || sub === 'uninstall') {
+      if (SERVICE_ACTIONS.has(sub as ServiceAction)) {
         const platform = detectPlatform(process.platform);
-        const plan =
-          sub === 'install'
-            ? renderServiceInstallPlan(platform)
-            : renderServiceUninstallPlan(platform);
-        printPlan(`agent ${sub}`, plan);
-        return;
-      }
-      if (sub === 'status' || sub === 'start' || sub === 'stop') {
-        console.log(
-          `'rbo agent ${sub}' delegates to the OS service manager (${detectPlatform(process.platform)}); not yet wired to a live service in this build.`,
-        );
+        const action = sub as ServiceAction;
+        const extraArgs = rest.slice(1);
+        const execute = hasExecuteFlag(extraArgs);
+        const plan = renderServiceActionPlan(platform, action);
+        const label = `agent ${action}`;
+        if (!execute) {
+          printPlan(label, plan);
+          return;
+        }
+        const results = await executeServicePlan(plan);
+        console.log(JSON.stringify(results, null, 2));
+        if (results.some((result) => result.code !== 0)) {
+          process.exitCode = 1;
+        }
         return;
       }
       throw new Error(

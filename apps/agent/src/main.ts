@@ -33,8 +33,10 @@ async function main(): Promise<void> {
     displayName: config.displayName,
     maxJobs: config.maxJobs,
     stateDir: config.stateDir,
+    repoCacheDir: config.repoCacheDir,
     diskMinFreeBytes: config.diskMinFreeBytes,
     enabledBuildCacheKinds: config.buildCache.enabledKinds,
+    configuredPriority: config.configuredPriority,
   });
 
   logger.info('agent starting', {
@@ -56,6 +58,7 @@ async function main(): Promise<void> {
     controllerUrl: config.controllerUrl,
     expectedFingerprint: config.controllerFingerprint,
     stateDir: config.stateDir,
+    repoCacheDir: config.repoCacheDir,
     displayName: config.displayName,
     capabilities,
     secretMap: config.secretMap,

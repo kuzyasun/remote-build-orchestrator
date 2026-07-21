@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureAttemptLogs, readLogsFromCursor } from '@rbo/executor';
+import { formatProcessIdentity } from '@rbo/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WebSocket } from 'ws';
 import {
@@ -21,6 +22,8 @@ import {
 import { RecoveryCoordinator } from '../src/recovery/coordinator.js';
 import { migrateToLatest, nowIso, openDatabase } from '../src/storage/database.js';
 import type { ConnectedAgent } from '../src/websocket/server.js';
+
+const TEST_IDENTITY = formatProcessIdentity(4242, 1_700_000_000_000);
 
 function mockSocket(): WebSocket & { sent: Array<Record<string, unknown>> } {
   const sent: Array<Record<string, unknown>> = [];
@@ -93,7 +96,7 @@ describe('reconnect reconcile (Phase 6 recovery)', () => {
     const leaseId = 'lease_rec_1';
     const futureDeadline = new Date(Date.now() + 600_000).toISOString();
     const state = opts?.attemptState ?? 'running';
-    const processIdentity = opts?.withProcess === false ? null : 'pid:4242';
+    const processIdentity = opts?.withProcess === false ? null : TEST_IDENTITY;
 
     db.prepare(
       `INSERT INTO job_attempts (
@@ -185,7 +188,7 @@ describe('reconnect reconcile (Phase 6 recovery)', () => {
       lease_id: leaseId,
       lease_epoch: 1,
       status: 'running',
-      process_identity: processIdentity ?? 'pid:4242',
+      process_identity: processIdentity ?? TEST_IDENTITY,
       last_sent_sequence: 2,
       last_acked_sequence: 1,
       artifact_upload_pending: false,
@@ -258,7 +261,7 @@ describe('reconnect reconcile (Phase 6 recovery)', () => {
       lease_id: leaseId,
       lease_epoch: 1, // stale epoch
       status: 'running',
-      process_identity: processIdentity ?? 'pid:4242',
+      process_identity: processIdentity ?? TEST_IDENTITY,
       last_sent_sequence: 5,
       last_acked_sequence: 0,
       artifact_upload_pending: false,
@@ -326,7 +329,7 @@ describe('reconnect reconcile (Phase 6 recovery)', () => {
       lease_id: leaseId,
       lease_epoch: 1,
       status: 'running',
-      process_identity: processIdentity ?? 'pid:4242',
+      process_identity: processIdentity ?? TEST_IDENTITY,
       last_sent_sequence: 0,
       last_acked_sequence: 0,
       artifact_upload_pending: false,
@@ -367,7 +370,7 @@ describe('reconnect reconcile (Phase 6 recovery)', () => {
       lease_id: leaseId,
       lease_epoch: 1,
       status: 'running',
-      process_identity: 'pid:9999',
+      process_identity: formatProcessIdentity(9999, 1_700_000_000_001),
       last_sent_sequence: 0,
       last_acked_sequence: 0,
       artifact_upload_pending: false,
@@ -443,7 +446,7 @@ describe('reconnect reconcile (Phase 6 recovery)', () => {
       lease_id: leaseId,
       lease_epoch: 1,
       status: 'completed_awaiting_upload',
-      process_identity: processIdentity ?? 'pid:4242',
+      process_identity: processIdentity ?? TEST_IDENTITY,
       last_sent_sequence: 3,
       last_acked_sequence: 1,
       artifact_upload_pending: true,

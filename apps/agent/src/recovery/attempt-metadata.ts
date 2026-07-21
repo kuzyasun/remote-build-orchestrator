@@ -103,9 +103,7 @@ export async function removeAttemptMetadata(stateDir: string, attemptId: string)
   );
 }
 
-export function processIdentityFromPid(pid: number): string {
-  return `pid:${pid}`;
-}
+export { processIdentityFromPid } from '@rbo/shared';
 
 /** Ensure parent dir exists (used when only creating spool path references). */
 export function ensureParentDir(filePath: string): void {

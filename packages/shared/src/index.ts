@@ -8,3 +8,4 @@ export * from './logging.js';
 export * from './crypto.js';
 export * from './controller-identity.js';
 export * from './build-cache-key.js';
+export * from './process-identity.js';

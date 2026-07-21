@@ -16,6 +16,15 @@ import type { z } from 'zod';
 import { type TarEntryInput, createZstdTarArchive } from './archive.js';
 import { attachContentId } from './canonical.js';
 import {
+  type GitSourceRequirements,
+  type SubmoduleStatusEntry,
+  assertLfsContentMaterialized,
+  assertSubmodulesReadyForCapture,
+  detectGitSourceRequirements,
+  enumerateSubmoduleContentPaths,
+  expandFullSnapshotPaths,
+} from './git-source-policy.js';
+import {
   type FileIdentity,
   type GitStatusSnapshot,
   describeRepository,
@@ -32,7 +41,7 @@ import type { FullSnapshotManifest, SnapshotFileEntry, SnapshotInstance } from '
 import { FullSnapshotManifestSchema, GitOverlaySnapshotManifestSchema } from './index.js';
 import type { GitOverlaySnapshotManifest } from './index.js';
 import { computeOverlayPlan } from './overlay.js';
-import { findSecretPolicyViolations } from './secret-policy.js';
+import { type SecretPolicyViolation, findSecretPolicyViolations } from './secret-policy.js';
 
 type JobAdditionalRoot = z.infer<typeof JobAdditionalRootSchema>;
 
@@ -58,6 +67,17 @@ export interface CapturedFile {
   content?: Buffer;
   tarEntry: TarEntryInput;
   secretWarnings?: Array<{ path: string; pattern: string }>;
+  secretViolations?: SecretPolicyViolation[];
+}
+
+function throwIfSecretViolations(violations: SecretPolicyViolation[]): void {
+  if (violations.length === 0) {
+    return;
+  }
+  const paths = [...new Set(violations.map((v) => v.path))].sort();
+  throw new RboError('secret_blocked', `Secret files blocked: ${paths.join(', ')}`, false, {
+    violations,
+  });
 }
 
 export interface CaptureFullSnapshotResult {
@@ -67,6 +87,8 @@ export interface CaptureFullSnapshotResult {
   contentStorageDir: string;
   /** Secret-policy matches when mode=warn (block throws; allow is empty). */
   secretWarnings: Array<{ path: string; pattern: string }>;
+  /** Agent capability hints derived during capture (§11.14–11.15). */
+  gitSourceRequirements: GitSourceRequirements;
 }
 
 /** Detect paths that collide under case-insensitive comparison (pure). */
@@ -129,6 +151,7 @@ interface CaptureGuardState {
     paths: string[];
     identities: Map<string, FileIdentity>;
   }>;
+  cleanSubmodules: SubmoduleStatusEntry[];
 }
 
 async function assertAllowedProjectRoot(
@@ -210,6 +233,7 @@ async function buildCaptureGuard(
   wirePaths: string[],
   status: GitStatusSnapshot,
   additionalRoots: JobAdditionalRoot[],
+  cleanSubmodules: SubmoduleStatusEntry[],
 ): Promise<CaptureGuardState> {
   const identities = new Map<string, FileIdentity>();
   for (const wirePath of wirePaths) {
@@ -229,7 +253,13 @@ async function buildCaptureGuard(
       identities: rootIdentities,
     });
   }
-  return { head: status.head, wirePaths: [...wirePaths], identities, additionalRoots: additional };
+  return {
+    head: status.head,
+    wirePaths: [...wirePaths],
+    identities,
+    additionalRoots: additional,
+    cleanSubmodules,
+  };
 }
 
 async function validateCaptureGuard(
@@ -245,7 +275,11 @@ async function validateCaptureGuard(
     });
   }
 
-  const currentPaths = await enumerateFullSourcePaths(repoRoot, sourcePolicy);
+  const currentPaths = await enumerateFullCapturePaths(
+    repoRoot,
+    sourcePolicy,
+    guard.cleanSubmodules,
+  );
   if (
     currentPaths.length !== guard.wirePaths.length ||
     currentPaths.some((path, index) => path !== guard.wirePaths[index])
@@ -320,6 +354,17 @@ async function enumerateFullSourcePaths(
   const ignoredExplicit = await gitLsFilesOthersIgnored(repoRoot, sourcePolicy.include_ignored);
   const paths = new Set<string>([...tracked, ...untracked, ...ignoredExplicit]);
   return [...paths].map(normalizeWirePath).sort();
+}
+
+async function enumerateFullCapturePaths(
+  repoRoot: string,
+  sourcePolicy: SourcePolicyInput,
+  cleanSubmodules: SubmoduleStatusEntry[],
+): Promise<string[]> {
+  const basePaths = await enumerateFullSourcePaths(repoRoot, sourcePolicy);
+  const submoduleGitlinks = new Set(cleanSubmodules.map((entry) => entry.path));
+  const submoduleContentPaths = await enumerateSubmoduleContentPaths(repoRoot, cleanSubmodules);
+  return expandFullSnapshotPaths(basePaths, submoduleGitlinks, submoduleContentPaths);
 }
 
 function globMatch(pathStr: string, pattern: string): boolean {
@@ -433,11 +478,6 @@ async function captureFileEntry(
     }
     await assertSymlinkAllowed(repoRoot, wirePath, target);
     const violations = findSecretPolicyViolations(wirePath, sourcePolicy.secret_policy);
-    if (violations.length > 0 && sourcePolicy.secret_policy === 'block') {
-      throw new RboError('secret_blocked', `Secret file blocked: ${wirePath}`, false, {
-        violations,
-      });
-    }
     const entry: SnapshotFileEntry = {
       path: wirePath,
       type: 'symlink',
@@ -449,6 +489,8 @@ async function captureFileEntry(
       entry,
       secretWarnings:
         sourcePolicy.secret_policy === 'warn' && violations.length > 0 ? violations : undefined,
+      secretViolations:
+        sourcePolicy.secret_policy === 'block' && violations.length > 0 ? violations : undefined,
       tarEntry: {
         path: wirePath,
         mode: 0o120000,
@@ -465,9 +507,6 @@ async function captureFileEntry(
   const content = await readFile(absolute);
   const hash = sha256(content);
   const violations = findSecretPolicyViolations(wirePath, sourcePolicy.secret_policy);
-  if (violations.length > 0 && sourcePolicy.secret_policy === 'block') {
-    throw new RboError('secret_blocked', `Secret file blocked: ${wirePath}`, false, { violations });
-  }
 
   const gitMode = stageModes.get(wirePath);
   const mode: '100644' | '100755' =
@@ -485,6 +524,8 @@ async function captureFileEntry(
     content,
     secretWarnings:
       sourcePolicy.secret_policy === 'warn' && violations.length > 0 ? violations : undefined,
+    secretViolations:
+      sourcePolicy.secret_policy === 'block' && violations.length > 0 ? violations : undefined,
     tarEntry: {
       path: wirePath,
       mode: mode === '100755' ? 0o755 : 0o644,
@@ -533,12 +574,16 @@ export async function captureFullSnapshot(
 
   const initialStatus = await gitStatusPorcelainV2(repoRoot);
   const repoInfo = await describeRepository(repoRoot);
-  const wirePaths = await enumerateFullSourcePaths(repoRoot, input.sourcePolicy);
+  const cleanSubmodules = await assertSubmodulesReadyForCapture(repoRoot);
+  const gitSourceRequirements = await detectGitSourceRequirements(repoRoot);
+  const wirePaths = await enumerateFullCapturePaths(repoRoot, input.sourcePolicy, cleanSubmodules);
+  await assertLfsContentMaterialized(repoRoot, wirePaths);
   const guard = await buildCaptureGuard(
     repoRoot,
     wirePaths,
     initialStatus,
     input.additionalRoots ?? [],
+    cleanSubmodules,
   );
   const stageModes = await gitLsFilesStageModes(repoRoot);
 
@@ -565,6 +610,7 @@ export async function captureFullSnapshot(
     );
 
     const secretWarnings: Array<{ path: string; pattern: string }> = [];
+    const secretBlockedViolations: SecretPolicyViolation[] = [];
     for (const wirePath of wirePaths) {
       const absolute = resolveInside(repoRoot, wirePath);
       try {
@@ -579,6 +625,9 @@ export async function captureFullSnapshot(
       capturedFiles.push(captured);
       if (captured.secretWarnings) {
         secretWarnings.push(...captured.secretWarnings);
+      }
+      if (captured.secretViolations) {
+        secretBlockedViolations.push(...captured.secretViolations);
       }
       if (captured.content) {
         const dest = join(contentStorageDir, wirePath);
@@ -644,6 +693,14 @@ export async function captureFullSnapshot(
             })),
           );
         }
+        if (captured.secretViolations) {
+          secretBlockedViolations.push(
+            ...captured.secretViolations.map((violation) => ({
+              ...violation,
+              path: mountPath,
+            })),
+          );
+        }
         if (captured.content) {
           const dest = join(additionalBase, root.mount_path, relPath);
           if (!isPathContained(additionalBase, dest)) {
@@ -679,6 +736,8 @@ export async function captureFullSnapshot(
       // source.files (and not twice into the tar via capturedFiles).
       additionalTarEntries.push(...rootCaptured.map((f) => f.tarEntry));
     }
+
+    throwIfSecretViolations(secretBlockedViolations);
 
     await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, input.additionalRoots ?? []);
 
@@ -739,7 +798,14 @@ export async function captureFullSnapshot(
       captured_at: new Date().toISOString(),
     };
 
-    return { instance, manifest, archivePath, contentStorageDir, secretWarnings };
+    return {
+      instance,
+      manifest,
+      archivePath,
+      contentStorageDir,
+      secretWarnings,
+      gitSourceRequirements,
+    };
   } catch (error) {
     await cleanupContentStorage(contentStorageDir);
     throw error;
@@ -766,6 +832,7 @@ export interface CaptureGitOverlaySnapshotResult {
   secretWarnings: Array<{ path: string; pattern: string }>;
   /** Bytes transferred for the overlay archive (not the full repository). */
   overlayBytes: number;
+  gitSourceRequirements: GitSourceRequirements;
 }
 
 /**
@@ -796,6 +863,8 @@ export async function captureGitOverlaySnapshot(
     throw new RboError('validation', 'git_overlay capture requires a base commit (HEAD)', false);
   }
 
+  await assertSubmodulesReadyForCapture(repoRoot);
+  const gitSourceRequirements = await detectGitSourceRequirements(repoRoot);
   const plan = computeOverlayPlan(initialStatus, input.sourcePolicy);
   const mainMount = input.mainMount ?? 'project';
   assertMountPathsDisjoint(
@@ -808,11 +877,13 @@ export async function captureGitOverlaySnapshot(
     plan.files,
     initialStatus,
     input.additionalRoots ?? [],
+    [],
   );
   const stageModes = await gitLsFilesStageModes(repoRoot);
 
   const capturedFiles: CapturedFile[] = [];
   const secretWarnings: Array<{ path: string; pattern: string }> = [];
+  const secretBlockedViolations: SecretPolicyViolation[] = [];
   try {
     const caseCollisions = findCaseCollisions([...plan.files, ...plan.deletions]);
     if (caseCollisions.length > 0) {
@@ -829,6 +900,9 @@ export async function captureGitOverlaySnapshot(
       capturedFiles.push(captured);
       if (captured.secretWarnings) {
         secretWarnings.push(...captured.secretWarnings);
+      }
+      if (captured.secretViolations) {
+        secretBlockedViolations.push(...captured.secretViolations);
       }
     }
 
@@ -858,6 +932,11 @@ export async function captureGitOverlaySnapshot(
         });
         if (captured.secretWarnings) {
           secretWarnings.push(...captured.secretWarnings.map((w) => ({ ...w, path: archivePath })));
+        }
+        if (captured.secretViolations) {
+          secretBlockedViolations.push(
+            ...captured.secretViolations.map((v) => ({ ...v, path: archivePath })),
+          );
         }
       }
       for (const f of rootCaptured) {
@@ -889,6 +968,8 @@ export async function captureGitOverlaySnapshot(
       });
       additionalTarEntries.push(...rootCaptured.map((f) => f.tarEntry));
     }
+
+    throwIfSecretViolations(secretBlockedViolations);
 
     // Overlay guard: only the dirty path set is tracked (not the full tree).
     const statusAfter = await gitStatusPorcelainV2(repoRoot);
@@ -1022,6 +1103,7 @@ export async function captureGitOverlaySnapshot(
       contentStorageDir,
       secretWarnings,
       overlayBytes: archive.size,
+      gitSourceRequirements,
     };
   } catch (error) {
     await cleanupContentStorage(contentStorageDir);

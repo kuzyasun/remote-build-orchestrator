@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { BuildCacheKind, RiskLevel } from '@rbo/protocol';
 import { BuildCacheKindSchema } from '@rbo/protocol';
 import type { GitUrlAllowlist } from '@rbo/shared';
@@ -15,6 +15,11 @@ export interface AgentConfig {
   displayName: string;
   maxJobs: number;
   stateDir: string;
+  /**
+   * Disposable mirror cache root (§2.8). Defaults to a sibling of stateDir
+   * (`{parent}/repo-cache`) or RBO_REPO_CACHE_DIR — not inside identity tree.
+   */
+  repoCacheDir?: string;
   /** Maps store ref name → environment variable that holds the secret value. */
   secretMap?: Record<string, string>;
   /** Git remote allowlist enforced before clone/fetch/bundle import (§10.4). */
@@ -38,6 +43,11 @@ export interface AgentConfig {
    * Defaults from RBO_DISK_MIN_FREE_BYTES or repo-cache min_free_disk_gb.
    */
   diskMinFreeBytes: number;
+  /**
+   * Optional §19.2 configured_priority override. When unset, the Agent advertises
+   * no value and the Controller applies OS-family defaults.
+   */
+  configuredPriority?: number;
 }
 
 /** Default disk admission floor: 1 GiB when RBO_DISK_MIN_FREE_BYTES unset. */
@@ -223,6 +233,9 @@ export function loadAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
     displayName: overrides.displayName ?? process.env.RBO_AGENT_NAME ?? 'rbo-agent',
     maxJobs: overrides.maxJobs ?? Number(process.env.RBO_MAX_JOBS ?? 1),
     stateDir: overrides.stateDir ?? process.env.RBO_AGENT_STATE_DIR ?? resolveDefaultStateDir(),
+    repoCacheDir:
+      overrides.repoCacheDir ??
+      (process.env.RBO_REPO_CACHE_DIR?.trim() ? process.env.RBO_REPO_CACHE_DIR.trim() : undefined),
     secretMap: overrides.secretMap ?? parseSecretMap(process.env.RBO_SECRET_MAP),
     gitAllowlist: parseGitAllowlist(overrides.gitAllowlist),
     repoCache: parseRepoCache(overrides.repoCache),
@@ -253,12 +266,31 @@ export function loadAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
         Math.floor(repoCache.min_free_disk_gb * 1024 ** 3),
       );
     })(),
+    configuredPriority: (() => {
+      if (overrides.configuredPriority !== undefined) {
+        return overrides.configuredPriority;
+      }
+      if (process.env.RBO_CONFIGURED_PRIORITY) {
+        return Number(process.env.RBO_CONFIGURED_PRIORITY);
+      }
+      return undefined;
+    })(),
   };
 }
 
+/** Disposable mirror cache root outside the identity state dir (§2.8). */
+export function resolveRepoCacheRoot(
+  config: Pick<AgentConfig, 'stateDir' | 'repoCacheDir'>,
+): string {
+  if (config.repoCacheDir) {
+    return config.repoCacheDir;
+  }
+  return join(dirname(config.stateDir), 'repo-cache');
+}
+
 /** Resolved path for bare repository mirrors (§10.1). */
-export function resolveReposDir(config: AgentConfig): string {
-  return join(config.stateDir, 'repos');
+export function resolveReposDir(config: Pick<AgentConfig, 'stateDir' | 'repoCacheDir'>): string {
+  return join(resolveRepoCacheRoot(config), 'repos');
 }
 
 /** Resolved path for named build caches (Phase 7). */

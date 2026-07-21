@@ -1,7 +1,7 @@
 /**
  * Phase 6 Task 5 — Fault-injection integration suite.
  *
- * Scenarios already proven elsewhere are cited in `.superpowers/sdd/task-5-report.md`
+ * Scenarios already proven elsewhere are cited in phase6-reliability coverage notes
  * and only lightly re-asserted here when a gap remains. Focus of this file:
  * cursor restore on Controller restart, Agent stale cleanup, two-attempt isolation
  * (acks/artifacts), spool pressure / log_spool_limit, and bounded large-output streaming.
@@ -16,6 +16,7 @@ import {
   readLogsFromCursor,
   totalBytes,
 } from '@rbo/executor';
+import { formatProcessIdentity } from '@rbo/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WebSocket } from 'ws';
 import { SpoolSender } from '../../agent/src/logs/spool-sender.js';
@@ -40,6 +41,8 @@ import {
 import { RecoveryCoordinator } from '../src/recovery/coordinator.js';
 import { migrateToLatest, nowIso, openDatabase } from '../src/storage/database.js';
 import type { ConnectedAgent } from '../src/websocket/server.js';
+
+const TEST_IDENTITY = formatProcessIdentity(4242, 1_700_000_000_000);
 
 function mockSocket(): WebSocket & { sent: Array<Record<string, unknown>> } {
   const sent: Array<Record<string, unknown>> = [];
@@ -118,7 +121,7 @@ describe('Phase 6 fault-injection reliability', () => {
     const leaseEpoch = opts?.leaseEpoch ?? 1;
     const futureDeadline = new Date(Date.now() + 600_000).toISOString();
     const state = opts?.attemptState ?? 'running';
-    const processIdentity = opts?.withProcess === false ? null : 'pid:4242';
+    const processIdentity = opts?.withProcess === false ? null : TEST_IDENTITY;
     const logAcked = opts?.logAcked ?? 0;
     const ordinal = opts?.ordinal ?? 1;
 
@@ -238,7 +241,7 @@ describe('Phase 6 fault-injection reliability', () => {
       lease_id: leaseId,
       lease_epoch: 1,
       status: 'running',
-      process_identity: processIdentity ?? 'pid:4242',
+      process_identity: processIdentity ?? TEST_IDENTITY,
       last_sent_sequence: 2,
       last_acked_sequence: 1,
       artifact_upload_pending: false,
@@ -299,7 +302,7 @@ describe('Phase 6 fault-injection reliability', () => {
       lease_id: leaseId,
       lease_epoch: 1,
       status: 'completed_awaiting_upload',
-      process_identity: processIdentity ?? 'pid:4242',
+      process_identity: processIdentity ?? TEST_IDENTITY,
       last_sent_sequence: 0,
       last_acked_sequence: 0,
       artifact_upload_pending: true,
@@ -380,7 +383,7 @@ describe('Phase 6 fault-injection reliability', () => {
       lease_id: leaseId,
       lease_epoch: 1,
       status: 'running',
-      process_identity: processIdentity ?? 'pid:4242',
+      process_identity: processIdentity ?? TEST_IDENTITY,
       last_sent_sequence: 10,
       last_acked_sequence: 7,
       artifact_upload_pending: false,
@@ -417,6 +420,7 @@ describe('Phase 6 fault-injection reliability', () => {
   });
 
   // --- Scenario 6: Agent restart → stale workspaces → idempotent cleanup ---
+  // Agent process kill+respawn reattach: apps/agent/test/agent-restart-reattach.test.ts
   it('6. Agent restart finds stale workspaces; cleanup after grace is idempotent', async () => {
     vi.useRealTimers();
     const stateDir = await mkdtemp(join(tmpdir(), 'rbo-p6-agent-'));
@@ -435,7 +439,7 @@ describe('Phase 6 fault-injection reliability', () => {
       job_id: 'job_stale',
       lease_id: 'lease_stale',
       lease_epoch: 1,
-      process_identity: 'pid:1',
+      process_identity: formatProcessIdentity(1, 1_700_000_000_001),
       status: 'terminal',
       workspace_path: wsPath,
       spool_dir: spoolPath,
@@ -472,7 +476,7 @@ describe('Phase 6 fault-injection reliability', () => {
       job_id: 'job_live',
       lease_id: 'lease_live',
       lease_epoch: 1,
-      process_identity: 'pid:99',
+      process_identity: formatProcessIdentity(99, 1_700_000_000_002),
       status: 'orphaned',
       workspace_path: join(stateDir, 'workspaces', liveId),
       spool_dir: join(stateDir, 'logs', liveId),
@@ -514,9 +518,15 @@ describe('Phase 6 fault-injection reliability', () => {
         `INSERT INTO job_attempts (
            id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline, state,
            process_identity, log_acked_sequence
-         ) VALUES (?, ?, 2, 'agt_1', ?, 1, ?, 'collecting_artifacts', 'pid:9999', 0)`,
+         ) VALUES (?, ?, 2, 'agt_1', ?, 1, ?, 'collecting_artifacts', ?, 0)`,
       )
-      .run('att_mix_2', a1.jobId, 'lease_mix_2', futureDeadline);
+      .run(
+        'att_mix_2',
+        a1.jobId,
+        'lease_mix_2',
+        futureDeadline,
+        formatProcessIdentity(9999, 1_700_000_000_003),
+      );
 
     // Logs for attempt 1
     await handleRemoteLogChunk(a1.remoteOpts, 'agt_1', {

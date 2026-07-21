@@ -28,7 +28,14 @@ export interface ControllerConfig {
   orphanTimeoutSeconds: number;
   /** Controller restart wait for Agent recovery_report (Phase 6). Default 120. */
   reconcileDeadlineSeconds: number;
+  /** Allow local executor fallback when no remote agent matches (§19.5). Default true. */
+  allowLocalFallback: boolean;
+  /** Max git bundle bytes for local-only base commits (Phase 5). Default 512 MiB. */
+  maxGitBundleBytes: number;
 }
+
+/** Default max git bundle size when RBO_MAX_GIT_BUNDLE_BYTES is unset (512 MiB). */
+export const DEFAULT_MAX_GIT_BUNDLE_BYTES = 512 * 1024 * 1024;
 
 /** Default Git schemes when RBO_GIT_ALLOWLIST_SCHEMES is unset. */
 export const DEFAULT_GIT_ALLOWLIST_SCHEMES = ['https', 'ssh'] as const;
@@ -108,6 +115,11 @@ export function loadControllerConfig(overrides: Partial<ControllerConfig> = {}):
     reconcileDeadlineSeconds:
       overrides.reconcileDeadlineSeconds ??
       Number(process.env.RBO_RECONCILE_DEADLINE_SECONDS ?? 120),
+    allowLocalFallback:
+      overrides.allowLocalFallback ?? process.env.RBO_ALLOW_LOCAL_FALLBACK !== 'false',
+    maxGitBundleBytes:
+      overrides.maxGitBundleBytes ??
+      Number(process.env.RBO_MAX_GIT_BUNDLE_BYTES ?? DEFAULT_MAX_GIT_BUNDLE_BYTES),
   };
 }
 

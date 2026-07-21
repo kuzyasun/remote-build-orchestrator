@@ -89,13 +89,14 @@ describe('MCP transports (Phase 1)', () => {
     await stdioClient.close();
   });
 
-  it('returns a structured not_implemented error for tools whose backend arrives later', async () => {
+  it('agent_probe returns the real probe payload shape', async () => {
     const client = await connectHttpClient();
     const result = JSON.parse(
       textOf(await client.callTool({ name: 'agent_probe', arguments: { agent_id: 'agt_x' } })),
     );
-    expect(result.error.details.not_implemented).toBe(true);
-    expect(result.error.retryable).toBe(false);
+    expect(result.error?.category).toBe('agent_lost');
+    expect(result.error?.retryable).toBe(true);
+    expect(result.error?.details?.not_implemented).toBeUndefined();
     await client.close();
   });
 

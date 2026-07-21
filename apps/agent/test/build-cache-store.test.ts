@@ -339,10 +339,9 @@ describe('BuildCacheStore', () => {
   it('reclaims crash-stale .lock with dead PID so acquire succeeds', async () => {
     const store = await makeStore();
     const cacheKey = 'npm_deadpid000000000000000000000000';
-    const keyDir = join(root, cacheKey);
-    await mkdir(keyDir, { recursive: true });
+    await mkdir(join(root, cacheKey), { recursive: true });
     // PID unlikely to exist on any host; kill(pid, 0) → ESRCH.
-    await writeFile(join(keyDir, '.lock'), '2147483646\n', 'utf8');
+    await writeFile(join(root, `${cacheKey}.lock`), '2147483646\n', 'utf8');
 
     const acquired = await store.acquireForJob({
       cacheKey,
@@ -357,9 +356,8 @@ describe('BuildCacheStore', () => {
   it('reclaims over-age .lock so acquire succeeds', async () => {
     const store = await makeStore();
     const cacheKey = 'npm_oldlock0000000000000000000000000';
-    const keyDir = join(root, cacheKey);
-    const lockPath = join(keyDir, '.lock');
-    await mkdir(keyDir, { recursive: true });
+    await mkdir(join(root, cacheKey), { recursive: true });
+    const lockPath = join(root, `${cacheKey}.lock`);
     // Live PID alone would block; aged mtime past LOCK_STALE_MAX_AGE_MS allows reclaim.
     await writeFile(lockPath, `${process.pid}\n`, 'utf8');
     const staleAt = new Date(Date.now() - LOCK_STALE_MAX_AGE_MS - 60_000);
@@ -400,7 +398,7 @@ describe('BuildCacheStore', () => {
     });
     await a.release();
 
-    const lockPath = join(root, cacheKey, '.lock');
+    const lockPath = join(root, `${cacheKey}.lock`);
     await writeFile(lockPath, '2147483646\n', 'utf8');
 
     const result = await store.evictInactive({

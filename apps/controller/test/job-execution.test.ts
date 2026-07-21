@@ -401,6 +401,78 @@ describe('Phase 3 local job execution', () => {
     }
   }, 120_000);
 
+  it('injects canonical RBO_* env and emits env_override_ignored for user overrides', async () => {
+    const client = await connectClient('client-env-override');
+    const probeScript =
+      process.platform === 'win32'
+        ? 'Write-Output "RBO_JOB_ID=$env:RBO_JOB_ID"; Write-Output "RBO_ATTEMPT_ID=$env:RBO_ATTEMPT_ID"; Write-Output "RBO_ARTIFACT_DIR=$env:RBO_ARTIFACT_DIR"'
+        : 'echo "RBO_JOB_ID=$RBO_JOB_ID"; echo "RBO_ATTEMPT_ID=$RBO_ATTEMPT_ID"; echo "RBO_ARTIFACT_DIR=$RBO_ARTIFACT_DIR"';
+    const request = {
+      ...baseJobRequest(fixtureDir),
+      client_request_id: `env-override-${Date.now()}`,
+      execution: {
+        ...baseJobRequest(fixtureDir).execution,
+        script: probeScript,
+        env: {
+          RBO_JOB_ID: 'user-job',
+          RBO_ATTEMPT_ID: 'user-attempt',
+          RBO_ARTIFACT_DIR: '/user/artifacts',
+          RBO_ARTIFACTS_DIR: '/user/wrong-plural',
+        },
+      },
+    };
+    const submit = JSON.parse(
+      textOf(await client.callTool({ name: 'job_submit', arguments: request })),
+    );
+    expect(submit.job_id).toBeTruthy();
+
+    await client.callTool({
+      name: 'job_wait',
+      arguments: { job_id: submit.job_id, wait_seconds: 60 },
+    });
+
+    const attempt = getLatestAttempt(db, submit.job_id);
+    expect(attempt).toBeTruthy();
+    if (!attempt) {
+      throw new Error('expected attempt');
+    }
+    const stdout = await readFile(join(attemptLogDir(dataDir, attempt.id), 'stdout.log'), 'utf8');
+    expect(stdout).toContain(`RBO_JOB_ID=${submit.job_id}`);
+    expect(stdout).toContain(`RBO_ATTEMPT_ID=${attempt.id}`);
+    expect(stdout).toContain(`RBO_ARTIFACT_DIR=${attemptArtifactsDir(dataDir, attempt.id)}`);
+    expect(stdout).not.toContain('user-job');
+    expect(stdout).not.toContain('user-attempt');
+    expect(stdout).not.toContain('/user/artifacts');
+
+    const logs = JSON.parse(
+      textOf(
+        await client.callTool({
+          name: 'job_logs',
+          arguments: {
+            job_id: submit.job_id,
+            streams: ['events'],
+            max_bytes: 65_536,
+            cursor: 0,
+          },
+        }),
+      ),
+    );
+    const ignored = (logs.events as Array<{ type: string; name?: string }>).filter(
+      (event) => event.type === 'env_override_ignored',
+    );
+    expect(ignored.map((e) => e.name).sort()).toEqual(
+      ['RBO_ARTIFACTS_DIR', 'RBO_ARTIFACT_DIR', 'RBO_ATTEMPT_ID', 'RBO_JOB_ID'].sort(),
+    );
+    const secretWarnings = (logs.events as Array<{ type: string; name?: string }>).filter(
+      (event) =>
+        event.type === 'secret_warning' &&
+        typeof event.name === 'string' &&
+        event.name.startsWith('RBO_'),
+    );
+    expect(secretWarnings).toHaveLength(0);
+    await client.close();
+  }, 120_000);
+
   it('rejects source.cwd that escapes the isolated workspace', async () => {
     const client = await connectClient('client-cwd-escape');
     const request = {

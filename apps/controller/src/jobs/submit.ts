@@ -13,12 +13,15 @@ import {
   type LocalRunnerContext,
   attemptLogDir,
   captureAndPersistSnapshot,
+  mergeGitSourceToolRequirements,
+  readGitSourceRequirements,
   requestJobCancel,
   runLocalJob,
 } from '../execution/runner.js';
 import {
   type SchedulerAgent,
   getActiveJobsForAgents,
+  getRecentFailurePenaltiesForAgents,
   selectAgentForJob,
 } from '../scheduler/index.js';
 import type { ControllerDatabase } from '../storage/database.js';
@@ -46,6 +49,7 @@ export interface SubmitJobContext extends LocalRunnerContext {
   agentPlanePort?: number;
   controllerPublicHost?: string;
   dataPlaneBaseUrl?: string;
+  allowLocalFallback?: boolean;
 }
 
 function requestHash(request: JobRequest): string {
@@ -234,6 +238,7 @@ export async function dispatchJobExecution(
     .all() as Array<{ id: string; capabilities_json: string; state: string }>;
 
   const activeCounts = getActiveJobsForAgents(ctx.db);
+  const recentFailurePenalties = getRecentFailurePenaltiesForAgents(ctx.db);
   const candidates: SchedulerAgent[] = [];
 
   for (const agentRow of dbAgents) {
@@ -254,10 +259,15 @@ export async function dispatchJobExecution(
 
   const snapshotMeta = ctx.db
     .prepare(
-      'SELECT repo_id, base_commit, content_id FROM snapshots WHERE id = (SELECT snapshot_id FROM jobs WHERE id = ?)',
+      'SELECT repo_id, base_commit, content_id, size_bytes FROM snapshots WHERE id = (SELECT snapshot_id FROM jobs WHERE id = ?)',
     )
     .get(jobId) as
-    | { repo_id: string | null; base_commit: string | null; content_id: string }
+    | {
+        repo_id: string | null;
+        base_commit: string | null;
+        content_id: string;
+        size_bytes: number | null;
+      }
     | undefined;
 
   const buildCacheProjectIdentity =
@@ -267,12 +277,17 @@ export async function dispatchJobExecution(
         ? `local:${snapshotMeta.content_id}`
         : null;
 
-  const decision = selectAgentForJob(candidates, request, {
-    allowLocalFallback: true,
+  const gitSourceRequirements = await readGitSourceRequirements(ctx.dataDir, jobId);
+  const schedulingRequest = mergeGitSourceToolRequirements(request, gitSourceRequirements);
+
+  const decision = selectAgentForJob(candidates, schedulingRequest, {
+    allowLocalFallback: ctx.allowLocalFallback,
     repoCanonicalId:
       snapshotMeta?.repo_id && snapshotMeta.repo_id !== 'local' ? snapshotMeta.repo_id : null,
     baseCommit: snapshotMeta?.base_commit ?? null,
     buildCacheProjectIdentity,
+    estimatedTransferBytes: snapshotMeta?.size_bytes ?? null,
+    recentFailurePenalties,
   });
 
   if (decision.action === 'remote' && decision.selectedAgent && ctx.agentPlanePort) {

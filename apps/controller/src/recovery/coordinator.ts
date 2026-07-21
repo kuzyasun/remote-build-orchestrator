@@ -1,5 +1,5 @@
 import type { ReconcileDecisionPayload, RecoveryReportPayload } from '@rbo/protocol';
-import { createLogger, generateId } from '@rbo/shared';
+import { createLogger, generateId, processIdentityFromPid } from '@rbo/shared';
 import type { WebSocket } from 'ws';
 import {
   ATTEMPT_OUTCOME_LOST,
@@ -173,8 +173,28 @@ export class RecoveryCoordinator {
     this.clearTimer(this.orphanTimers, payload.attempt_id);
 
     const attempt = getAttempt(this.db, payload.attempt_id);
+
+    // Fail closed: never adopt until job_started has persisted process_identity.
+    if (attempt && attempt.state !== 'completed' && !attempt.process_identity) {
+      updateAttempt(this.db, attempt.id, { last_reconcile_at: nowIso() });
+      this.rearmOrphanWatchdog(attempt.id);
+      logger.info('recovery_report deferred pending process_identity', {
+        attemptId: attempt.id,
+        agentId,
+      });
+      return {
+        attempt_id: payload.attempt_id,
+        lease_id: payload.lease_id,
+        lease_epoch: payload.lease_epoch,
+        action: 'terminate_stale',
+        reason: 'process_identity_pending',
+      };
+    }
+
     const decision = this.decide(agentId, attempt, payload);
-    this.sendReconcileDecision(agentId, decision);
+    if (decision.reason !== 'process_identity_pending') {
+      this.sendReconcileDecision(agentId, decision);
+    }
 
     if (decision.action === 'adopt' && attempt) {
       const nextState =
@@ -238,7 +258,7 @@ export class RecoveryCoordinator {
     if (
       attempt.lease_id !== payload.lease_id ||
       attempt.lease_epoch !== payload.lease_epoch ||
-      (attempt.process_identity != null && attempt.process_identity !== payload.process_identity)
+      attempt.process_identity !== payload.process_identity
     ) {
       return {
         attempt_id: payload.attempt_id,
@@ -251,17 +271,6 @@ export class RecoveryCoordinator {
             : attempt.lease_id !== payload.lease_id
               ? 'lease_mismatch'
               : 'process_identity_mismatch',
-      };
-    }
-
-    // Controller missing process_identity (job_started race) but Agent reports one — adopt and fill.
-    if (!attempt.process_identity && !payload.process_identity) {
-      return {
-        attempt_id: payload.attempt_id,
-        lease_id: payload.lease_id,
-        lease_epoch: payload.lease_epoch,
-        action: 'terminate_stale',
-        reason: 'process_identity_mismatch',
       };
     }
 
@@ -432,16 +441,13 @@ function sendWsFrame(
   );
 }
 
+export { processIdentityFromPid } from '@rbo/shared';
+
 /** True when job risk_level is destructive or hardware (Agent self-terminates at lease expiry). */
 export function isDestructiveOrHardwareRisk(db: ControllerDatabase, jobId: string): boolean {
   const request = getJobRequest(db, jobId);
   const risk = request?.risk_level ?? 'normal';
   return risk === 'destructive' || risk === 'hardware';
-}
-
-/** Canonical process identity from a job_started pid. */
-export function processIdentityFromPid(pid: number): string {
-  return `pid:${pid}`;
 }
 
 const PRE_START_ATTEMPT_STATES = new Set([

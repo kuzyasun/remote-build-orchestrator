@@ -38,6 +38,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
       child.pid = 4242;
       child.waitForExit = async () => ({ exitCode: null, signal: 'SIGTERM' });
       child.kill = async () => undefined;
+      Object.assign(child, { ignoredRboEnvKeys: [] as string[] });
       return child;
     }),
     waitForCompletion: vi.fn(async ({ signal }: { signal: { cancelled: boolean } }) => {

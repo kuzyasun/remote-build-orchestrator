@@ -210,6 +210,12 @@ export const JobEventSchema = z.discriminatedUnion('type', [
     reason: z.string().min(1),
   }),
   z.object({
+    type: z.literal('env_override_ignored'),
+    ...jobEventBase,
+    name: z.string().min(1),
+    reason: z.string().min(1),
+  }),
+  z.object({
     type: z.literal('cancel_requested'),
     ...jobEventBase,
     reason: z.string().optional(),
@@ -274,6 +280,11 @@ export const AgentCapabilityReportSchema = z.object({
     memory_total_mb: z.number(),
     memory_free_mb: z.number(),
     disk_free_mb: z.number(),
+    /**
+     * Agent-reported CPU busy fraction in [0, 1] for §19.2 scheduler scoring.
+     * Missing at schedule time is treated as 1 (pessimistic) by the Controller.
+     */
+    cpu_load: z.number().min(0).max(1).optional(),
     /** Additive Phase 6 capacity fields (bytes). */
     disk_free_bytes: z.number().nonnegative().optional(),
     disk_min_free_bytes: z.number().nonnegative().optional(),
@@ -316,6 +327,11 @@ export const AgentCapabilityReportSchema = z.object({
     .optional(),
   /** Phase 6: false under disk/spool pressure — Agent also lease_rejects. */
   accepting_jobs: z.boolean().optional(),
+  /**
+   * Operator-configured scheduling priority (§19.2 / §19.3). When unset, the
+   * Controller applies OS-family defaults at schedule time.
+   */
+  configured_priority: z.number().optional(),
 });
 
 export type AgentCapabilityReport = z.infer<typeof AgentCapabilityReportSchema>;

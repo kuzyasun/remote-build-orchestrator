@@ -20,7 +20,7 @@ import type { ControllerIdentity } from '@rbo/shared';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
-import { updateAgentCapabilities } from '../agents/registry.js';
+import { patchAgentCpuLoad, updateAgentCapabilities } from '../agents/registry.js';
 import {
   expireStaleLeases,
   handleRemoteArtifactManifest,
@@ -53,6 +53,7 @@ export interface AgentPlaneDispatchContext {
   allowedArtifactDestinations?: string[];
   maxConcurrentJobs?: number;
   gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
+  allowLocalFallback?: boolean;
 }
 
 export interface AgentPlaneOptions {
@@ -67,6 +68,7 @@ export interface AgentPlaneOptions {
   disconnectGraceSeconds?: number;
   orphanTimeoutSeconds?: number;
   reconcileDeadlineSeconds?: number;
+  maxGitBundleBytes?: number;
 }
 
 export interface ConnectedAgent {
@@ -152,6 +154,7 @@ export async function startAgentPlaneServer(
     controllerPublicHost: options.controllerPublicHost,
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
     allowedProjectRoots: options.dispatchContext?.allowedProjectRoots,
+    maxGitBundleBytes: options.maxGitBundleBytes,
   });
 
   const buildSubmitContext = () => {
@@ -174,6 +177,7 @@ export async function startAgentPlaneServer(
       agentPlanePort: boundPort,
       controllerPublicHost: options.controllerPublicHost,
       dataPlaneBaseUrl: options.dataPlaneBaseUrl,
+      allowLocalFallback: options.dispatchContext.allowLocalFallback,
     };
   };
 
@@ -339,6 +343,10 @@ export async function startAgentPlaneServer(
             authenticated.lastHeartbeatAt = Date.now();
             const state = String(message.payload?.state ?? 'idle');
             markAgentSeen(db, authenticated.agentId, state);
+            const cpuLoad = message.payload?.cpu_load;
+            if (typeof cpuLoad === 'number' && Number.isFinite(cpuLoad)) {
+              patchAgentCpuLoad(db, authenticated.agentId, cpuLoad);
+            }
             renewActiveLease(db, authenticated.agentId);
             return;
           }

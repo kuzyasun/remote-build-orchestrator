@@ -25,12 +25,14 @@ async function main(): Promise<void> {
     disconnectGraceSeconds: config.disconnectGraceSeconds,
     orphanTimeoutSeconds: config.orphanTimeoutSeconds,
     reconcileDeadlineSeconds: config.reconcileDeadlineSeconds,
+    maxGitBundleBytes: config.maxGitBundleBytes,
     dispatchContext: {
       dataDir: config.dataDir,
       allowedProjectRoots: config.allowedProjectRoots,
       allowedArtifactDestinations: config.allowedArtifactDestinations,
       maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
       gitAllowlist: config.gitAllowlist,
+      allowLocalFallback: config.allowLocalFallback,
     },
   });
 
@@ -48,6 +50,7 @@ async function main(): Promise<void> {
     allowedArtifactDestinations: config.allowedArtifactDestinations,
     maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
     gitAllowlist: config.gitAllowlist,
+    allowLocalFallback: config.allowLocalFallback,
   });
 
   logger.info('controller started', {

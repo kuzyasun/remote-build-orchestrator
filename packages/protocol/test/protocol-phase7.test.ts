@@ -66,7 +66,15 @@ describe('Phase 7 Protocol Schemas — build caches', () => {
     expect(
       AgentCapabilityReportSchema.safeParse({
         ...base,
-        build_caches: [{ kind: 'npm', keys: [''] }],
+        configured_priority: 25,
+        resources: { ...base.resources, cpu_load: 0.42 },
+      }).success,
+    ).toBe(true);
+
+    expect(
+      AgentCapabilityReportSchema.safeParse({
+        ...base,
+        resources: { ...base.resources, cpu_load: 1.5 },
       }).success,
     ).toBe(false);
   });

@@ -10,10 +10,29 @@ import type { ControllerDatabase } from '../storage/database.js';
 
 type ToolchainProfile = z.infer<typeof ToolchainProfileSchema>;
 
-/** Soft preference scores (§19.2) — applied only after hard filters. */
+/** §19.2 score formula constants — keep in sync with remote-build-orchestrator-design.md §19.2. */
+export const SCHEDULER_SCORE_CONFIGURED_PRIORITY_MULTIPLIER = 1000;
+export const SCHEDULER_SCORE_PREFERRED_AGENT_UNIT = 100;
 export const SCHEDULER_SCORE_REPOSITORY_CACHE_HIT = 500;
-/** build_cache_hit preference — weaker than repository_cache_hit (* 500). */
+export const SCHEDULER_SCORE_EXACT_TOOLCHAIN_MATCH = 200;
+export const SCHEDULER_SCORE_PREFERRED_OS_UNIT = 10;
+export const SCHEDULER_SCORE_RUNNING_JOBS_PENALTY = 300;
+export const SCHEDULER_SCORE_CPU_LOAD_PENALTY = 100;
+/** Phase 7 build_cache_hit preference — weaker than repository_cache_hit (* 500). */
 export const SCHEDULER_SCORE_BUILD_CACHE_HIT = 250;
+
+/** §19.3 OS-family defaults when configured_priority is unset on the capability report. */
+export const SCHEDULER_DEFAULT_PRIORITY_MACOS = 20;
+export const SCHEDULER_DEFAULT_PRIORITY_WINDOWS = 10;
+export const SCHEDULER_DEFAULT_PRIORITY_LINUX = 15;
+export const SCHEDULER_DEFAULT_PRIORITY_LOCAL = -100;
+
+/** Controller-computed recent_failure_penalty: min(500, failures * 50) over a fixed window. */
+export const SCHEDULER_FAILURE_PENALTY_PER_FAILURE = 50;
+export const SCHEDULER_FAILURE_PENALTY_MAX = 500;
+export const SCHEDULER_RECENT_FAILURE_WINDOW = 10;
+
+const MIB_BYTES = 1024 * 1024;
 
 const TOOL_NAME_TO_BUILD_CACHE_KIND: Record<string, BuildCacheKind> = {
   ccache: 'ccache',
@@ -28,7 +47,10 @@ const TOOLCHAIN_REQUIRED_KINDS = new Set<BuildCacheKind>(['ccache', 'sccache']);
 export interface SchedulerAgent {
   agentId: string;
   capabilities: AgentCapabilityReport;
+  /** Controller-known non-terminal attempt count for this agent (§19.2 running_jobs). */
   activeJobsCount: number;
+  /** Controller-computed recent_failure_penalty; defaults to 0 when omitted. */
+  recentFailurePenalty?: number;
 }
 
 export interface SchedulingDecision {
@@ -64,6 +86,13 @@ export interface SchedulerOptions {
    * `buildCacheKeys` is not provided (`repo_key` or `local:<content_id>`).
    */
   buildCacheProjectIdentity?: string | null;
+  /**
+   * Known snapshot/overlay/bundle transfer size in bytes at schedule time.
+   * Converted to `ceil(bytes / 1MiB)` for §19.2 estimated_transfer_mb.
+   */
+  estimatedTransferBytes?: number | null;
+  /** Controller-computed recent_failure_penalty per agent id (§19.2). */
+  recentFailurePenalties?: ReadonlyMap<string, number>;
 }
 
 function matchesOs(requestOs?: string[], agentOs?: string): boolean {
@@ -110,6 +139,133 @@ function matchesSecretRefs(requestRefs: string[], agentRefs: string[]): boolean 
   }
   const agentSet = new Set(agentRefs);
   return requestRefs.every((ref) => agentSet.has(ref));
+}
+
+/** §19.3 default configured_priority by OS family (remote agents). */
+export function defaultConfiguredPriorityForOs(
+  osFamily: AgentCapabilityReport['os']['family'],
+): number {
+  switch (osFamily) {
+    case 'macos':
+      return SCHEDULER_DEFAULT_PRIORITY_MACOS;
+    case 'linux':
+      return SCHEDULER_DEFAULT_PRIORITY_LINUX;
+    default:
+      return SCHEDULER_DEFAULT_PRIORITY_WINDOWS;
+  }
+}
+
+export function resolveConfiguredPriority(caps: AgentCapabilityReport): number {
+  if (caps.configured_priority !== undefined) {
+    return caps.configured_priority;
+  }
+  return defaultConfiguredPriorityForOs(caps.os.family);
+}
+
+/** Missing cpu_load is treated as 1 (pessimistic) for scoring only. */
+export function resolveCpuLoadForScoring(caps: AgentCapabilityReport): number {
+  const load = caps.resources.cpu_load;
+  if (load === undefined || !Number.isFinite(load)) {
+    return 1;
+  }
+  return Math.min(1, Math.max(0, load));
+}
+
+export function computeEstimatedTransferMb(knownTransferBytes: number | null | undefined): number {
+  if (!knownTransferBytes || knownTransferBytes <= 0) {
+    return 0;
+  }
+  return Math.ceil(knownTransferBytes / MIB_BYTES);
+}
+
+export function computeRecentFailurePenalty(failureCount: number): number {
+  if (failureCount <= 0) {
+    return 0;
+  }
+  return Math.min(
+    SCHEDULER_FAILURE_PENALTY_MAX,
+    failureCount * SCHEDULER_FAILURE_PENALTY_PER_FAILURE,
+  );
+}
+
+export interface SchedulerScoreContext {
+  agentId: string;
+  caps: AgentCapabilityReport;
+  runningJobs: number;
+  recentFailurePenalty: number;
+  request: JobRequest;
+  options: SchedulerOptions;
+  selectedToolchains: ToolchainProfile[];
+  toolsRequested: boolean;
+  toolsMatched: boolean;
+}
+
+/**
+ * Exact §19.2 score for one eligible agent, plus Phase 7 build_cache_hit (+250)
+ * applied after all §19.2 terms.
+ */
+export function computeAgentSchedulerScore(ctx: SchedulerScoreContext): number {
+  const prefs = ctx.request.preferences ?? {
+    prefer_repo_cache: true,
+    prefer_build_cache: true,
+    allow_local_fallback: true,
+  };
+  const reqs = ctx.request.requirements ?? {};
+
+  let score = 0;
+
+  score += resolveConfiguredPriority(ctx.caps) * SCHEDULER_SCORE_CONFIGURED_PRIORITY_MULTIPLIER;
+
+  if (prefs.agent_ids && prefs.agent_ids.length > 0) {
+    const idx = prefs.agent_ids.indexOf(ctx.agentId);
+    if (idx >= 0) {
+      score += (prefs.agent_ids.length - idx) * SCHEDULER_SCORE_PREFERRED_AGENT_UNIT;
+    }
+  }
+
+  if (prefs.os_order && prefs.os_order.length > 0) {
+    const idx = prefs.os_order.indexOf(ctx.caps.os.family);
+    if (idx >= 0) {
+      score += (prefs.os_order.length - idx) * SCHEDULER_SCORE_PREFERRED_OS_UNIT;
+    }
+  }
+
+  if (prefs.prefer_repo_cache !== false && ctx.options.repoCanonicalId) {
+    if (
+      agentHasRepoCacheHit(ctx.caps, ctx.options.repoCanonicalId, ctx.options.baseCommit ?? null)
+    ) {
+      score += SCHEDULER_SCORE_REPOSITORY_CACHE_HIT;
+    }
+  }
+
+  if (ctx.toolsRequested && ctx.toolsMatched) {
+    score += SCHEDULER_SCORE_EXACT_TOOLCHAIN_MATCH;
+  }
+
+  score -= ctx.runningJobs * SCHEDULER_SCORE_RUNNING_JOBS_PENALTY;
+  score -= resolveCpuLoadForScoring(ctx.caps) * SCHEDULER_SCORE_CPU_LOAD_PENALTY;
+  score -= computeEstimatedTransferMb(ctx.options.estimatedTransferBytes);
+  score -= ctx.recentFailurePenalty;
+
+  // Phase 7 additive extension — after all §19.2 terms.
+  if (prefs.prefer_build_cache !== false) {
+    const expected =
+      ctx.options.buildCacheKeys && ctx.options.buildCacheKeys.length > 0
+        ? ctx.options.buildCacheKeys
+        : ctx.options.buildCacheProjectIdentity
+          ? computeExpectedBuildCacheKeysForAgent({
+              caps: ctx.caps,
+              selectedToolchains: ctx.selectedToolchains,
+              projectIdentity: ctx.options.buildCacheProjectIdentity,
+              requiredTools: reqs.tools,
+            })
+          : [];
+    if (expected.length > 0 && agentHasBuildCacheHit(ctx.caps, expected)) {
+      score += SCHEDULER_SCORE_BUILD_CACHE_HIT;
+    }
+  }
+
+  return score;
 }
 
 /** §19.2 repository_cache_hit: same canonical repo and base commit (or allowed fetch path). */
@@ -294,6 +450,66 @@ function matchToolchainProfiles(
   return { matches: true, selectedProfiles };
 }
 
+const PROBE_TOOL_NAMES = new Set(['git', 'git-lfs']);
+
+function splitRequestedTools(requestedTools: Record<string, string> | undefined): {
+  probeTools: Record<string, string>;
+  toolchainTools: Record<string, string>;
+} {
+  const probeTools: Record<string, string> = {};
+  const toolchainTools: Record<string, string> = {};
+  if (!requestedTools) {
+    return { probeTools, toolchainTools };
+  }
+  for (const [name, spec] of Object.entries(requestedTools)) {
+    if (PROBE_TOOL_NAMES.has(name.toLowerCase())) {
+      probeTools[name] = spec;
+    } else {
+      toolchainTools[name] = spec;
+    }
+  }
+  return { probeTools, toolchainTools };
+}
+
+function matchProbeTools(
+  requestedTools: Record<string, string>,
+  agentTools: AgentCapabilityReport['tools'],
+): boolean {
+  for (const [toolName, versionSpec] of Object.entries(requestedTools)) {
+    const key =
+      Object.keys(agentTools).find(
+        (candidate) => candidate.toLowerCase() === toolName.toLowerCase(),
+      ) ?? toolName;
+    const versions = agentTools[key];
+    if (!versions || versions.length === 0) {
+      return false;
+    }
+    if (!versions.some((version) => matchesVersionSpec(version, versionSpec))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Match toolchain profiles plus Agent-probed tools (git, git-lfs). */
+export function matchJobToolRequirements(
+  requestedTools: Record<string, string> | undefined,
+  caps: AgentCapabilityReport,
+): { matches: boolean; selectedProfiles: ToolchainProfile[] } {
+  const { probeTools, toolchainTools } = splitRequestedTools(requestedTools);
+  const toolchainMatch = matchToolchainProfiles(
+    Object.keys(toolchainTools).length > 0 ? toolchainTools : undefined,
+    caps.toolchain_profiles ?? [],
+  );
+  if (!toolchainMatch.matches) {
+    return { matches: false, selectedProfiles: [] };
+  }
+  if (!matchProbeTools(probeTools, caps.tools ?? {})) {
+    return { matches: false, selectedProfiles: [] };
+  }
+  return toolchainMatch;
+}
+
 export function selectAgentForJob(
   agents: SchedulerAgent[],
   request: JobRequest,
@@ -366,59 +582,27 @@ export function selectAgentForJob(
     }
 
     // 9. Toolchain filter & profile resolution (one profile per requested tool)
-    const toolMatch = matchToolchainProfiles(reqs.tools, caps.toolchain_profiles ?? []);
+    const toolMatch = matchJobToolRequirements(reqs.tools, caps);
     if (!toolMatch.matches) {
       continue;
     }
 
-    // Scoring (§19.2)
-    let score = 0;
+    // Scoring (§19.2 + Phase 7 build_cache_hit)
+    const toolsRequested = Boolean(reqs.tools && Object.keys(reqs.tools).length > 0);
+    const recentFailurePenalty =
+      candidate.recentFailurePenalty ?? options.recentFailurePenalties?.get(candidate.agentId) ?? 0;
 
-    // Preference: agent_ids ranking
-    if (prefs.agent_ids && prefs.agent_ids.length > 0) {
-      const idx = prefs.agent_ids.indexOf(candidate.agentId);
-      if (idx >= 0) {
-        score += (prefs.agent_ids.length - idx) * 100;
-      }
-    }
-
-    // Preference: os_order ranking
-    if (prefs.os_order && prefs.os_order.length > 0) {
-      const idx = prefs.os_order.indexOf(caps.os.family);
-      if (idx >= 0) {
-        score += (prefs.os_order.length - idx) * 10;
-      }
-    }
-
-    // Memory headroom score
-    score += Math.floor(caps.resources.memory_free_mb / 1024);
-
-    // Repository cache affinity (§19.2) — preference only, after hard filters.
-    // repository_cache_hit * 500
-    if (prefs.prefer_repo_cache !== false && options.repoCanonicalId) {
-      if (agentHasRepoCacheHit(caps, options.repoCanonicalId, options.baseCommit ?? null)) {
-        score += SCHEDULER_SCORE_REPOSITORY_CACHE_HIT;
-      }
-    }
-
-    // Build cache affinity (Phase 7) — preference only, after hard filters.
-    // build_cache_hit +250 (weaker than repository_cache_hit * 500)
-    if (prefs.prefer_build_cache !== false) {
-      const expected =
-        options.buildCacheKeys && options.buildCacheKeys.length > 0
-          ? options.buildCacheKeys
-          : options.buildCacheProjectIdentity
-            ? computeExpectedBuildCacheKeysForAgent({
-                caps,
-                selectedToolchains: toolMatch.selectedProfiles,
-                projectIdentity: options.buildCacheProjectIdentity,
-                requiredTools: reqs.tools,
-              })
-            : [];
-      if (expected.length > 0 && agentHasBuildCacheHit(caps, expected)) {
-        score += SCHEDULER_SCORE_BUILD_CACHE_HIT;
-      }
-    }
+    const score = computeAgentSchedulerScore({
+      agentId: candidate.agentId,
+      caps,
+      runningJobs: candidate.activeJobsCount,
+      recentFailurePenalty,
+      request,
+      options,
+      selectedToolchains: toolMatch.selectedProfiles,
+      toolsRequested,
+      toolsMatched: toolMatch.matches,
+    });
 
     eligibleCandidates.push({
       agent: candidate,
@@ -485,4 +669,30 @@ export function getActiveJobsForAgents(db: ControllerDatabase): Map<string, numb
     counts.set(row.agent_id, Number(row.count));
   }
   return counts;
+}
+
+export function getRecentFailurePenaltiesForAgents(
+  db: ControllerDatabase,
+  windowSize = SCHEDULER_RECENT_FAILURE_WINDOW,
+): Map<string, number> {
+  const penalties = new Map<string, number>();
+  const rows = db
+    .prepare(
+      `WITH ranked AS (
+         SELECT agent_id, outcome,
+           ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY finished_at DESC) AS rn
+         FROM job_attempts
+         WHERE agent_id IS NOT NULL AND finished_at IS NOT NULL
+       )
+       SELECT agent_id, SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END) AS failures
+       FROM ranked
+       WHERE rn <= ?
+       GROUP BY agent_id`,
+    )
+    .all(windowSize) as Array<{ agent_id: string; failures: number }>;
+
+  for (const row of rows) {
+    penalties.set(row.agent_id, computeRecentFailurePenalty(Number(row.failures)));
+  }
+  return penalties;
 }

@@ -34,6 +34,8 @@ export function isAcceptingJobsUnderDiskPressure(input: DiskPressureAdmissionInp
 
 export interface DiskPressureCleanupOptions {
   stateDir: string;
+  /** Bare mirror cache directory (defaults to stateDir/repos when omitted). */
+  reposDir?: string;
   minFreeBytes: number;
   /** Injectable free-disk reading for tests. */
   freeBytes: number;
@@ -198,10 +200,10 @@ export async function applyDiskPressureCleanup(
   if (options.evictInactiveRepos) {
     const evicted = await options.evictInactiveRepos();
     for (const key of evicted) {
-      record('repos', join(options.stateDir, 'repos', key));
+      record('repos', join(options.reposDir ?? join(options.stateDir, 'repos'), key));
     }
   } else {
-    const reposDir = join(options.stateDir, 'repos');
+    const reposDir = options.reposDir ?? join(options.stateDir, 'repos');
     try {
       const entries = await readdir(reposDir);
       for (const name of entries) {

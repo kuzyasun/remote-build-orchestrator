@@ -29,8 +29,10 @@ import {
 } from '../build-cache/index.js';
 import {
   applyRefreshedBuildCacheAds,
+  probeCpuLoad,
   refreshBuildCacheCapabilityAds,
 } from '../capabilities/probe.js';
+import { resolveReposDir } from '../config.js';
 import { cleanupDockerResourcesForAttempt } from '../docker/cleanup.js';
 import { AgentJobExecutor } from '../executor/index.js';
 import { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
@@ -45,6 +47,8 @@ export interface AgentConnectionOptions {
   controllerUrl: string;
   expectedFingerprint: string;
   stateDir: string;
+  /** Mirror cache root override (§2.8). */
+  repoCacheDir?: string;
   displayName: string;
   capabilities: AgentCapabilityReport;
   /** Maps store ref → env var name holding the secret (optional). */
@@ -241,6 +245,7 @@ export class AgentConnection {
             } else {
               this.executor = new AgentJobExecutor(socket, {
                 stateDir: this.options.stateDir,
+                repoCacheDir: this.options.repoCacheDir,
                 controllerFingerprint: this.options.expectedFingerprint,
                 secretMap: this.options.secretMap,
                 toolchainProfiles: this.options.capabilities.toolchain_profiles,
@@ -413,6 +418,7 @@ export class AgentConnection {
       );
       void applyDiskPressureCleanup({
         stateDir: this.options.stateDir,
+        reposDir: resolveReposDir(this.options),
         minFreeBytes: minFree > 0 ? minFree : 1,
         freeBytes,
         spoolPressure,
@@ -436,6 +442,7 @@ export class AgentConnection {
     this.send(socket, 'heartbeat', {
       state: busy ? 'busy' : 'idle',
       active_jobs: [],
+      cpu_load: probeCpuLoad(),
       accepting_jobs: accepting,
       disk_free_bytes: freeBytes,
       disk_min_free_bytes: minFree,

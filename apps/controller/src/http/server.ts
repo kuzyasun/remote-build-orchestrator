@@ -40,6 +40,7 @@ export interface ControllerServerOptions {
   allowedArtifactDestinations?: string[];
   maxConcurrentJobs?: number;
   gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
+  allowLocalFallback?: boolean;
 }
 
 export interface RunningControllerServer {
@@ -97,6 +98,7 @@ function buildToolContext(
     controllerPublicHost: options.controllerPublicHost,
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
     gitAllowlist: options.gitAllowlist,
+    allowLocalFallback: options.allowLocalFallback,
   };
 }
 

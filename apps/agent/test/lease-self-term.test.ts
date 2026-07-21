@@ -38,6 +38,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
         waitResolve?.({ exitCode: null, signal: 'SIGTERM' });
         waitResolve = null;
       };
+      Object.assign(child, { ignoredRboEnvKeys: [] as string[] });
       spawnDone?.();
       return child;
     }),
@@ -168,8 +169,8 @@ describe('Lease-expiry self-termination (destructive/hardware)', () => {
         size_bytes: 1,
         sha256: 'ab',
       },
-      // Short TTL — real timer; spawn must win the race before expiry.
-      lease_ttl_seconds: 0.25,
+      // TTL must outlast pre-spawn work (toolchain/secrets/build-cache); renew after spawn.
+      lease_ttl_seconds: 5,
     });
 
     const exe = executor as unknown as {
@@ -244,7 +245,7 @@ describe('Lease-expiry self-termination (destructive/hardware)', () => {
         size_bytes: 1,
         sha256: 'ab',
       },
-      lease_ttl_seconds: 0.15,
+      lease_ttl_seconds: 5,
     });
 
     const exe = executor as unknown as {
@@ -278,6 +279,10 @@ describe('Lease-expiry self-termination (destructive/hardware)', () => {
     expect(meta?.status).not.toBe('terminal');
     expect(meta?.last_exit?.failure_category).not.toBe('lease_expired');
 
+    // Expire the lease while still running — safe jobs must not self-kill.
+    executor.renewLeaseDeadline(0.05);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(killCalls).toBe(0);
     waitResolve?.({ exitCode: 0, signal: null });
     await runPromise;
   });

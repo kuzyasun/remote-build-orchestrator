@@ -1,9 +1,11 @@
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, readFile, rm } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
-import { ensureControllerIdentity } from '@rbo/shared';
+import { promisify } from 'node:util';
+import { computeRepoKey, ensureControllerIdentity } from '@rbo/shared';
 import { createGitFixtureRepo } from '@rbo/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AgentConnection } from '../../../apps/agent/src/connection/client.js';
@@ -15,6 +17,64 @@ import { approvePairingRequest } from '../src/security/pairing.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 import { startAgentPlaneServer } from '../src/websocket/server.ts';
+
+const execFileAsync = promisify(execFile);
+
+const overlayGitAllowlist = {
+  schemes: ['https'],
+  hosts: ['github.com'],
+  repository_prefixes: ['testuser/'],
+} as const;
+
+const overlayRemoteUrl = 'https://github.com/testuser/overlay-remote.git';
+
+async function seedAgentMirror(
+  agentStateDir: string,
+  repoUrl: string,
+  fixtureRoot: string,
+): Promise<void> {
+  const repoKey = computeRepoKey(repoUrl);
+  const repoDir = join(dirname(agentStateDir), 'repo-cache', 'repos', repoKey);
+  await mkdir(repoDir, { recursive: true });
+  await execFileAsync('git', ['clone', '--mirror', fixtureRoot, 'mirror.git'], {
+    cwd: repoDir,
+    windowsHide: true,
+  });
+}
+
+function agentCapabilities(displayName: string) {
+  return {
+    agent_id: '',
+    display_name: displayName,
+    hostname: 'localhost',
+    os: {
+      family: (process.platform === 'win32'
+        ? 'windows'
+        : process.platform === 'darwin'
+          ? 'macos'
+          : 'linux') as 'windows' | 'macos' | 'linux',
+      version: '10.0',
+      arch: process.arch,
+    },
+    resources: {
+      cpu_logical: 4,
+      memory_total_mb: 8192,
+      memory_free_mb: 4096,
+      disk_free_mb: 10000,
+    },
+    execution: {
+      max_jobs: 1,
+      shells: ['powershell', 'bash'],
+      supports_tty: false,
+      supports_process_tree_kill: true,
+    },
+    tools: {},
+    toolchain_profiles: [],
+    labels: {},
+    secret_refs: [],
+  };
+}
+
 describe('Phase 4 Remote Execution End-to-End', () => {
   let tempDir: string;
   let db: ReturnType<typeof openDatabase>;
@@ -38,6 +98,11 @@ describe('Phase 4 Remote Execution End-to-End', () => {
       db,
       identity,
       dataDir: tempDir,
+      dispatchContext: {
+        dataDir: tempDir,
+        allowedProjectRoots: [tempDir],
+        gitAllowlist: overlayGitAllowlist,
+      },
     });
 
     controllerServer = await startControllerServer({
@@ -50,6 +115,7 @@ describe('Phase 4 Remote Execution End-to-End', () => {
       dataDir: tempDir,
       allowedProjectRoots: [tempDir],
       maxConcurrentJobs: 1,
+      gitAllowlist: overlayGitAllowlist,
     });
   });
 
@@ -73,37 +139,8 @@ describe('Phase 4 Remote Execution End-to-End', () => {
       expectedFingerprint: identity.fingerprint,
       stateDir: agentStateDir,
       displayName: 'test-remote-agent',
-      gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
-      capabilities: {
-        agent_id: '',
-        display_name: 'test-remote-agent',
-        hostname: 'localhost',
-        os: {
-          family: (process.platform === 'win32'
-            ? 'windows'
-            : process.platform === 'darwin'
-              ? 'macos'
-              : 'linux') as 'windows' | 'macos' | 'linux',
-          version: '10.0',
-          arch: process.arch,
-        },
-        resources: {
-          cpu_logical: 4,
-          memory_total_mb: 8192,
-          memory_free_mb: 4096,
-          disk_free_mb: 10000,
-        },
-        execution: {
-          max_jobs: 1,
-          shells: ['powershell', 'bash'],
-          supports_tty: false,
-          supports_process_tree_kill: true,
-        },
-        tools: {},
-        toolchain_profiles: [],
-        labels: {},
-        secret_refs: [],
-      },
+      gitAllowlist: overlayGitAllowlist,
+      capabilities: agentCapabilities('test-remote-agent'),
     });
 
     const p1 = await conn1.connectOnce();
@@ -122,37 +159,8 @@ describe('Phase 4 Remote Execution End-to-End', () => {
       expectedFingerprint: identity.fingerprint,
       stateDir: agentStateDir,
       displayName: 'test-remote-agent',
-      gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
-      capabilities: {
-        agent_id: '',
-        display_name: 'test-remote-agent',
-        hostname: 'localhost',
-        os: {
-          family: (process.platform === 'win32'
-            ? 'windows'
-            : process.platform === 'darwin'
-              ? 'macos'
-              : 'linux') as 'windows' | 'macos' | 'linux',
-          version: '10.0',
-          arch: process.arch,
-        },
-        resources: {
-          cpu_logical: 4,
-          memory_total_mb: 8192,
-          memory_free_mb: 4096,
-          disk_free_mb: 10000,
-        },
-        execution: {
-          max_jobs: 1,
-          shells: ['powershell', 'bash'],
-          supports_tty: false,
-          supports_process_tree_kill: true,
-        },
-        tools: {},
-        toolchain_profiles: [],
-        labels: {},
-        secret_refs: [],
-      },
+      gitAllowlist: overlayGitAllowlist,
+      capabilities: agentCapabilities('test-remote-agent'),
     });
 
     const p2 = await conn2.connectOnce();
@@ -194,6 +202,96 @@ describe('Phase 4 Remote Execution End-to-End', () => {
 
     conn2.close();
   });
+
+  it('executes a git_overlay remote prepare path on an authenticated agent', async () => {
+    const fixture = await createGitFixtureRepo({
+      committed: [{ path: 'marker.txt', content: 'clean-base' }],
+      unstaged: [{ path: 'marker.txt', content: 'overlay-applied' }],
+    });
+    await execFileAsync('git', ['remote', 'add', 'origin', overlayRemoteUrl], {
+      cwd: fixture.root,
+      windowsHide: true,
+    });
+
+    const verifyScript =
+      process.platform === 'win32'
+        ? "if ((Get-Content marker.txt -Raw) -notmatch 'overlay-applied') { exit 1 }"
+        : 'grep -q overlay-applied marker.txt';
+
+    const agentStateDir = join(tempDir, 'agent-state-overlay');
+    const conn1 = new AgentConnection({
+      controllerUrl: `wss://127.0.0.1:${agentPlane.port}/agent`,
+      expectedFingerprint: identity.fingerprint,
+      stateDir: agentStateDir,
+      displayName: 'test-overlay-agent',
+      gitAllowlist: overlayGitAllowlist,
+      capabilities: agentCapabilities('test-overlay-agent'),
+    });
+    const p1 = await conn1.connectOnce();
+    expect(p1.status).toBe('pairing_pending');
+    conn1.close();
+
+    const pendingReq = db
+      .prepare(
+        "SELECT id FROM pairing_requests WHERE state = 'pending' ORDER BY created_at DESC LIMIT 1",
+      )
+      .get() as { id: string };
+    approvePairingRequest(db, identity, pendingReq.id);
+
+    const conn2 = new AgentConnection({
+      controllerUrl: `wss://127.0.0.1:${agentPlane.port}/agent`,
+      expectedFingerprint: identity.fingerprint,
+      stateDir: agentStateDir,
+      displayName: 'test-overlay-agent',
+      gitAllowlist: overlayGitAllowlist,
+      capabilities: agentCapabilities('test-overlay-agent'),
+    });
+    const p2 = await conn2.connectOnce();
+    expect(p2.status).toBe('authenticated');
+
+    await seedAgentMirror(agentStateDir, overlayRemoteUrl, fixture.root);
+
+    const ctx = {
+      db,
+      identity: { client_id: 'test_client', transport: 'internal' as const, session_id: null },
+      dataDir: tempDir,
+      controllerIdentity: identity,
+      allowedProjectRoots: [fixture.root],
+      connectedAgents: agentPlane.connectedAgents,
+      agentPlanePort: agentPlane.port,
+      gitAllowlist: overlayGitAllowlist,
+    };
+
+    const submitRes = await handleToolCall(ctx, 'job_submit', {
+      client_request_id: 'req_overlay_remote_1',
+      source: { project_root: fixture.root, cwd: '.' },
+      execution: {
+        shell: process.platform === 'win32' ? 'powershell' : 'bash',
+        script: verifyScript,
+      },
+      queue_policy: 'wait',
+    });
+
+    expect(submitRes.job_id).toBeDefined();
+    const jobId = String(submitRes.job_id);
+
+    const manifest = JSON.parse(
+      await readFile(join(tempDir, 'snapshots', jobId, 'manifest.json'), 'utf8'),
+    );
+    expect(manifest.payload.mode).toBe('git_overlay');
+
+    const waitRes = await handleToolCall(ctx, 'job_wait', {
+      job_id: jobId,
+      timeout_ms: 60_000,
+    });
+
+    const jobData = waitRes.job as Record<string, unknown>;
+    expect(jobData.state).toBe('completed');
+    expect(jobData.outcome).toBe('succeeded');
+
+    conn2.close();
+    await fixture.cleanup();
+  }, 120_000);
 
   it('supports nested artifact relative paths in handleDataPlaneRequest URL regex', async () => {
     const token = issueDataToken(identity, {

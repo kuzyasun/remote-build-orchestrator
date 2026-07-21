@@ -49,6 +49,17 @@ export async function appendEvent(logs: AttemptLogPaths, event: JobEvent): Promi
   await appendFile(logs.eventsPath, `${JSON.stringify(event)}\n`);
 }
 
+export async function nextEventSequence(logs: AttemptLogPaths): Promise<number> {
+  const { events } = await readEventsFromCursor(logs, 0, Number.MAX_SAFE_INTEGER);
+  let maxSeq = 0;
+  for (const event of events) {
+    if (event.sequence > maxSeq) {
+      maxSeq = event.sequence;
+    }
+  }
+  return maxSeq + 1;
+}
+
 export async function readLogTail(
   path: string,
   maxLines: number,

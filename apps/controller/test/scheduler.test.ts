@@ -1,8 +1,20 @@
 import type { AgentCapabilityReport, JobRequest } from '@rbo/protocol';
 import { describe, expect, it } from 'vitest';
 import {
+  SCHEDULER_SCORE_BUILD_CACHE_HIT,
+  SCHEDULER_SCORE_CONFIGURED_PRIORITY_MULTIPLIER,
+  SCHEDULER_SCORE_CPU_LOAD_PENALTY,
+  SCHEDULER_SCORE_EXACT_TOOLCHAIN_MATCH,
+  SCHEDULER_SCORE_PREFERRED_AGENT_UNIT,
+  SCHEDULER_SCORE_PREFERRED_OS_UNIT,
+  SCHEDULER_SCORE_REPOSITORY_CACHE_HIT,
+  SCHEDULER_SCORE_RUNNING_JOBS_PENALTY,
   type SchedulerAgent,
+  computeAgentSchedulerScore,
+  computeEstimatedTransferMb,
+  computeRecentFailurePenalty,
   matchesVersionSpec,
+  resolveCpuLoadForScoring,
   selectAgentForJob,
 } from '../src/scheduler/index.js';
 
@@ -201,6 +213,9 @@ describe('Scheduler Engine (§19.2, Phase 4)', () => {
     expect(selectAgentForJob([], reqFallback, { allowLocalFallback: true }).action).toBe(
       'local_fallback',
     );
+    expect(selectAgentForJob([], reqFallback, { allowLocalFallback: false }).action).toBe(
+      'fail_fast',
+    );
   });
 
   it('supports mocked macOS capability selection as scheduler unit coverage', () => {
@@ -301,5 +316,148 @@ describe('Scheduler Engine (§19.2, Phase 4)', () => {
     });
 
     expect(decision.selectedAgent?.agentId).toBe('agt_cold_win');
+  });
+});
+
+describe('Scheduler §19.2 score terms', () => {
+  const baseRequest = makeRequest();
+
+  function scoreFor(
+    agent: SchedulerAgent,
+    request: JobRequest = baseRequest,
+    options: Parameters<typeof selectAgentForJob>[2] = {},
+    toolchains: Parameters<typeof computeAgentSchedulerScore>[0]['selectedToolchains'] = [],
+    toolsRequested = false,
+  ): number {
+    return computeAgentSchedulerScore({
+      agentId: agent.agentId,
+      caps: agent.capabilities,
+      runningJobs: agent.activeJobsCount,
+      recentFailurePenalty: agent.recentFailurePenalty ?? 0,
+      request,
+      options,
+      selectedToolchains: toolchains,
+      toolsRequested,
+      toolsMatched: true,
+    });
+  }
+
+  it('prefers higher configured_priority', () => {
+    const low = makeAgent('agt_low', { configured_priority: 10 });
+    const high = makeAgent('agt_high', { configured_priority: 30 });
+    const decision = selectAgentForJob([low, high], baseRequest);
+    expect(decision.selectedAgent?.agentId).toBe('agt_high');
+    expect(scoreFor(high) - scoreFor(low)).toBe(
+      20 * SCHEDULER_SCORE_CONFIGURED_PRIORITY_MULTIPLIER,
+    );
+  });
+
+  it('applies preferred_agent_bonus from agent_ids order', () => {
+    const first = makeAgent('agt_first');
+    const second = makeAgent('agt_second');
+    const req = makeRequest({ preferences: { agent_ids: ['agt_first', 'agt_second'] } });
+    const decision = selectAgentForJob([second, first], req);
+    expect(decision.selectedAgent?.agentId).toBe('agt_first');
+    expect(scoreFor(first, req) - scoreFor(second, req)).toBe(SCHEDULER_SCORE_PREFERRED_AGENT_UNIT);
+  });
+
+  it('applies preferred_os_bonus from os_order', () => {
+    const win = makeAgent('agt_win', {
+      configured_priority: 10,
+      os: { family: 'windows', version: '10', arch: 'x64' },
+    });
+    const mac = makeAgent('agt_mac', {
+      configured_priority: 10,
+      os: { family: 'macos', version: '14', arch: 'arm64' },
+    });
+    const req = makeRequest({ preferences: { os_order: ['macos', 'windows'] } });
+    const decision = selectAgentForJob([win, mac], req);
+    expect(decision.selectedAgent?.agentId).toBe('agt_mac');
+    expect(scoreFor(mac, req) - scoreFor(win, req)).toBe(SCHEDULER_SCORE_PREFERRED_OS_UNIT);
+  });
+
+  it('adds exact_toolchain_match when tools are requested and matched', () => {
+    const agent = makeAgent('agt_tools');
+    const withoutTools = scoreFor(agent, baseRequest, {}, [], false);
+    const withTools = scoreFor(agent, baseRequest, {}, [], true);
+    expect(withTools - withoutTools).toBe(SCHEDULER_SCORE_EXACT_TOOLCHAIN_MATCH);
+  });
+
+  it('penalizes running_jobs', () => {
+    const idle = makeAgent('agt_idle', {}, 0);
+    const busy = makeAgent('agt_busy', {}, 1);
+    const decision = selectAgentForJob([busy, idle], baseRequest);
+    expect(decision.selectedAgent?.agentId).toBe('agt_idle');
+    expect(scoreFor(idle) - scoreFor(busy)).toBe(SCHEDULER_SCORE_RUNNING_JOBS_PENALTY);
+  });
+
+  it('penalizes higher cpu_load', () => {
+    const idleCpu = makeAgent('agt_idle_cpu', {
+      resources: {
+        cpu_logical: 8,
+        memory_total_mb: 8192,
+        memory_free_mb: 8192,
+        disk_free_mb: 50000,
+        cpu_load: 0,
+      },
+    });
+    const busyCpu = makeAgent('agt_busy_cpu', {
+      resources: {
+        cpu_logical: 8,
+        memory_total_mb: 8192,
+        memory_free_mb: 8192,
+        disk_free_mb: 50000,
+        cpu_load: 1,
+      },
+    });
+    const decision = selectAgentForJob([busyCpu, idleCpu], baseRequest);
+    expect(decision.selectedAgent?.agentId).toBe('agt_idle_cpu');
+    expect(scoreFor(idleCpu) - scoreFor(busyCpu)).toBe(SCHEDULER_SCORE_CPU_LOAD_PENALTY);
+  });
+
+  it('treats missing cpu_load as 1 for scoring', () => {
+    const caps = makeAgent('agt_x').capabilities;
+    expect(resolveCpuLoadForScoring(caps)).toBe(1);
+  });
+
+  it('subtracts estimated_transfer_mb from score', () => {
+    const agent = makeAgent('agt_xfer');
+    const noXfer = scoreFor(agent, baseRequest, { estimatedTransferBytes: 0 });
+    const withXfer = scoreFor(agent, baseRequest, { estimatedTransferBytes: 3 * 1024 * 1024 });
+    expect(noXfer - withXfer).toBe(computeEstimatedTransferMb(3 * 1024 * 1024));
+  });
+
+  it('penalizes recent_failure_penalty per agent', () => {
+    const clean = makeAgent('agt_clean', {}, 0);
+    const flaky = makeAgent('agt_flaky', {}, 0);
+    flaky.recentFailurePenalty = computeRecentFailurePenalty(2);
+    const penalties = new Map([[flaky.agentId, flaky.recentFailurePenalty]]);
+    const decision = selectAgentForJob([flaky, clean], baseRequest, {
+      recentFailurePenalties: penalties,
+    });
+    expect(decision.selectedAgent?.agentId).toBe('agt_clean');
+    expect(
+      scoreFor(clean, baseRequest, { recentFailurePenalties: penalties }) -
+        scoreFor(flaky, baseRequest, { recentFailurePenalties: penalties }),
+    ).toBe(100);
+  });
+
+  it('caps recent_failure_penalty at 500', () => {
+    expect(computeRecentFailurePenalty(20)).toBe(500);
+  });
+
+  it('applies repository_cache_hit bonus of 500', () => {
+    const cold = makeAgent('agt_cold_repo', { repository_cache: [] });
+    const warm = makeAgent('agt_warm_repo', {
+      repository_cache: [{ canonical_id: 'github.com/org/repo', commits: ['abc'] }],
+    });
+    const req = makeRequest({ preferences: { prefer_repo_cache: true } });
+    const options = {
+      repoCanonicalId: 'github.com/org/repo',
+      baseCommit: 'abc',
+    };
+    expect(scoreFor(warm, req, options) - scoreFor(cold, req, options)).toBe(
+      SCHEDULER_SCORE_REPOSITORY_CACHE_HIT,
+    );
   });
 });

@@ -1,10 +1,11 @@
 import { execFile } from 'node:child_process';
 import { readFile, readdir, statfs } from 'node:fs/promises';
-import { arch, cpus, freemem, hostname, platform, release, totalmem } from 'node:os';
+import { arch, cpus, freemem, hostname, loadavg, platform, release, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { AgentCapabilityReport, BuildCacheKind } from '@rbo/protocol';
 import { listPresentBuildCacheKeys } from '../build-cache/index.js';
+import { resolveReposDir } from '../config.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -64,16 +65,38 @@ async function detectGitVersion(): Promise<string[]> {
   }
 }
 
+async function detectGitLfsVersion(): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync('git-lfs', ['version']);
+    const match = stdout.match(/git-lfs\/(\d+\.\d+\.\d+)/);
+    return match ? [match[1] as string] : [];
+  } catch {
+    return [];
+  }
+}
+
 export interface ProbeInput {
   agentId: string;
   displayName: string;
   maxJobs: number;
   /** When set, advertise repository_cache from mirror metadata (§19.2). */
   stateDir?: string;
+  /** Mirror cache root override (§2.8). */
+  repoCacheDir?: string;
   /** Phase 6 disk admission floor. */
   diskMinFreeBytes?: number;
   /** Build-cache kinds enabled on this agent (filters capability ads). */
   enabledBuildCacheKinds?: readonly BuildCacheKind[];
+  /** Optional §19.2 configured_priority override from agent config. */
+  configuredPriority?: number;
+}
+
+/** CPU busy fraction in [0, 1] from 1-minute load average vs logical CPUs. */
+export function probeCpuLoad(): number {
+  const [load1] = loadavg();
+  const logical = cpus().length || 1;
+  const fraction = load1 / logical;
+  return Math.min(1, Math.max(0, fraction));
 }
 
 export type BuildCacheCapabilityAds = NonNullable<AgentCapabilityReport['build_caches']>;
@@ -100,8 +123,9 @@ export function applyRefreshedBuildCacheAds(
 
 async function loadRepositoryCache(
   stateDir: string,
+  repoCacheDir?: string,
 ): Promise<NonNullable<AgentCapabilityReport['repository_cache']>> {
-  const reposDir = join(stateDir, 'repos');
+  const reposDir = resolveReposDir({ stateDir, repoCacheDir });
   try {
     const entries = await readdir(reposDir, { withFileTypes: true });
     const cache: NonNullable<AgentCapabilityReport['repository_cache']> = [];
@@ -128,7 +152,10 @@ async function loadRepositoryCache(
 export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabilityReport> {
   const shells = await detectShells();
   const gitVersions = await detectGitVersion();
-  const repository_cache = input.stateDir ? await loadRepositoryCache(input.stateDir) : [];
+  const gitLfsVersions = await detectGitLfsVersion();
+  const repository_cache = input.stateDir
+    ? await loadRepositoryCache(input.stateDir, input.repoCacheDir)
+    : [];
   const enabledKinds = input.enabledBuildCacheKinds;
   const build_caches = input.stateDir
     ? await listPresentBuildCacheKeys(input.stateDir, enabledKinds)
@@ -151,6 +178,7 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
       memory_total_mb: Math.round(totalmem() / (1024 * 1024)),
       memory_free_mb: Math.round(freemem() / (1024 * 1024)),
       disk_free_mb: Math.round(diskFreeBytes / (1024 * 1024)),
+      cpu_load: probeCpuLoad(),
       disk_free_bytes: diskFreeBytes,
       ...(diskMinFreeBytes > 0 ? { disk_min_free_bytes: diskMinFreeBytes } : {}),
       disk_pressure: diskPressure,
@@ -161,12 +189,18 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
       supports_tty: process.platform !== 'win32',
       supports_process_tree_kill: process.platform === 'win32', // via native helper, wired in Phase 3
     },
-    tools: gitVersions.length > 0 ? { git: gitVersions } : {},
+    tools: {
+      ...(gitVersions.length > 0 ? { git: gitVersions } : {}),
+      ...(gitLfsVersions.length > 0 ? { 'git-lfs': gitLfsVersions } : {}),
+    },
     toolchain_profiles: [],
     labels: {},
     secret_refs: [],
     accepting_jobs: !diskPressure,
     ...(repository_cache.length > 0 ? { repository_cache } : {}),
     ...(build_caches.length > 0 ? { build_caches } : {}),
+    ...(input.configuredPriority !== undefined
+      ? { configured_priority: input.configuredPriority }
+      : {}),
   };
 }

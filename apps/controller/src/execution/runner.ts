@@ -18,6 +18,7 @@ import {
   resolveContainedCwd,
 } from '@rbo/shared';
 import {
+  type GitSourceRequirements,
   captureFullSnapshot,
   captureGitOverlaySnapshot,
   describeRepository,
@@ -313,12 +314,12 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       env: injectedEnv,
       logs,
     });
-    for (const key of child.ignoredRboEnvKeys) {
+    for (const key of child.ignoredRboEnvKeys ?? []) {
       await emitJobEvent(ctx, logs, {
-        type: 'secret_warning',
+        type: 'env_override_ignored',
         job_id: jobId,
         attempt_id: attempt.id,
-        path: key,
+        name: key,
         reason: 'Reserved RBO_ env key ignored; injected system value wins',
       });
     }
@@ -544,6 +545,7 @@ export async function captureAndPersistSnapshot(
   snapshotId: string;
   contentId: string;
   secretWarnings: Array<{ path: string; pattern: string }>;
+  gitSourceRequirements: GitSourceRequirements;
 }> {
   const storageDir = join(ctx.dataDir, 'snapshots', jobId);
   const sourcePolicy = {
@@ -581,6 +583,10 @@ export async function captureAndPersistSnapshot(
     join(storageDir, 'secret-warnings.json'),
     JSON.stringify(captured.secretWarnings),
   );
+  await writeFile(
+    join(storageDir, 'git-source-requirements.json'),
+    JSON.stringify(captured.gitSourceRequirements),
+  );
 
   persistSnapshot(ctx.db, {
     snapshotId: captured.instance.snapshot_id,
@@ -605,7 +611,50 @@ export async function captureAndPersistSnapshot(
     snapshotId: captured.instance.snapshot_id,
     contentId: captured.manifest.content_id,
     secretWarnings: captured.secretWarnings,
+    gitSourceRequirements: captured.gitSourceRequirements,
   };
+}
+
+export function mergeGitSourceToolRequirements(
+  request: JobRequest,
+  gitSourceRequirements: GitSourceRequirements,
+): JobRequest {
+  const tools = { ...(request.requirements?.tools ?? {}) };
+  if (gitSourceRequirements.submodules) {
+    tools.git = tools.git ?? '>=0';
+  }
+  if (gitSourceRequirements.lfs) {
+    tools['git-lfs'] = tools['git-lfs'] ?? '>=0';
+  }
+  if (Object.keys(tools).length === 0) {
+    return request;
+  }
+  return {
+    ...request,
+    requirements: {
+      ...request.requirements,
+      tools,
+    },
+  };
+}
+
+export async function readGitSourceRequirements(
+  dataDir: string,
+  jobId: string,
+): Promise<GitSourceRequirements> {
+  try {
+    const raw = await readFile(
+      join(dataDir, 'snapshots', jobId, 'git-source-requirements.json'),
+      'utf8',
+    );
+    const parsed = JSON.parse(raw) as Partial<GitSourceRequirements>;
+    return {
+      submodules: parsed.submodules === true,
+      lfs: parsed.lfs === true,
+    };
+  } catch {
+    return { submodules: false, lfs: false };
+  }
 }
 
 async function canCaptureGitOverlay(

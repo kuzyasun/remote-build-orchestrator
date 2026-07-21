@@ -147,6 +147,14 @@ describe('Agent pairing over TLS WebSocket (Phase 2)', () => {
     expect(a.status).toBe('authenticated');
     expect(b.status).toBe('authenticated');
     expect(b.agentId).toBe(a.agentId);
+
+    const persisted = JSON.parse(readFileSync(join(dir, 'agent-state.json'), 'utf8')) as {
+      agentId?: string;
+      devicePrivateKeyPem: string;
+    };
+    expect(persisted.agentId).toBe(a.agentId);
+    expect(persisted.devicePrivateKeyPem).toMatch(/BEGIN PRIVATE KEY/);
+
     rmSync(dir, { recursive: true, force: true });
   });
 

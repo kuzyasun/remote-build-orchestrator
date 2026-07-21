@@ -6,3 +6,5 @@ node_modules/
 native/windows-executor/target/
 .fusion
 tmp/
+.superpowers
+docs/superpowers
