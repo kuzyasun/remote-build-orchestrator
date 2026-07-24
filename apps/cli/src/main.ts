@@ -4,7 +4,7 @@ import {
   resolveAgentStateDir,
   resolveControllerDataDir,
 } from '@rbo/shared';
-import { runAgentInit, runAgentStart } from './commands/agent.js';
+import { runAgentInit, runAgentStart, runAgentStopProcess } from './commands/agent.js';
 import {
   approveAgentRemote,
   listAgentsRemote,
@@ -16,10 +16,17 @@ import {
   runControllerInit,
   runControllerRestore,
   runControllerStart,
+  runControllerStop,
 } from './commands/controller.js';
 import { stripDaemonFlag } from './commands/daemon.js';
 import { formatDoctorCheckLine, runDoctor } from './commands/doctor.js';
-import { parseDataDirFlag, parseForceFlag, parseStateDirFlag } from './commands/flags.js';
+import {
+  parseDataDirFlag,
+  parseForceFlag,
+  parseReplaceFlag,
+  parseStateDirFlag,
+} from './commands/flags.js';
+import { formatCliHelp } from './commands/help.js';
 import { cancelJobRemote, getJobLogsRemote, submitJobRemote } from './commands/jobs.js';
 import {
   type ServiceAction,
@@ -51,6 +58,12 @@ async function main(): Promise<void> {
       console.log(`rbo CLI v${RBO_CONTROLLER_VERSION}`);
       return;
 
+    case 'help':
+    case '--help':
+    case '-h':
+      console.log(formatCliHelp());
+      return;
+
     case 'controller': {
       const { dataDir: flagDataDir, rest: controllerArgs } = parseDataDirFlag(rest);
       const dataDir = flagDataDir ?? resolveControllerDataDir();
@@ -79,19 +92,29 @@ async function main(): Promise<void> {
         return;
       }
       if (sub === 'start') {
-        const { daemon } = stripDaemonFlag(controllerArgs.slice(1));
+        const { daemon, args: afterDaemon } = stripDaemonFlag(controllerArgs.slice(1));
+        const { replace } = parseReplaceFlag(afterDaemon);
         const result = await runControllerStart({
           dataDir,
           daemon,
+          replace,
           cliScriptPath: process.argv[1],
         });
+        if (result === null) {
+          return;
+        }
         if (typeof result === 'number') {
           console.log(result);
         }
         return;
       }
+      if (sub === 'stop') {
+        const result = await runControllerStop({ dataDir });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
       throw new Error(
-        `Unknown 'controller' subcommand '${sub}'. Use init|fingerprint|restore|start.`,
+        `Unknown 'controller' subcommand '${sub}'. Use init|fingerprint|restore|start|stop.`,
       );
     }
 
@@ -133,15 +156,25 @@ async function main(): Promise<void> {
         return;
       }
       if (sub === 'start') {
-        const { daemon } = stripDaemonFlag(agentArgs.slice(1));
+        const { daemon, args: afterDaemon } = stripDaemonFlag(agentArgs.slice(1));
+        const { replace } = parseReplaceFlag(afterDaemon);
         const result = await runAgentStart({
           stateDir,
           daemon,
+          replace,
           cliScriptPath: process.argv[1],
         });
+        if (result === null) {
+          return;
+        }
         if (typeof result === 'number') {
           console.log(result);
         }
+        return;
+      }
+      if (sub === 'stop-process') {
+        const result = await runAgentStopProcess({ stateDir });
+        console.log(JSON.stringify(result, null, 2));
         return;
       }
       if (SERVICE_ACTIONS.has(sub as ServiceAction)) {
@@ -163,7 +196,7 @@ async function main(): Promise<void> {
         return;
       }
       throw new Error(
-        `Unknown 'agent' subcommand '${sub}'. Use approve|revoke|probe|init|start|install|status|stop|uninstall.`,
+        `Unknown 'agent' subcommand '${sub}'. Use approve|revoke|probe|init|start|stop-process|install|status|stop|uninstall.`,
       );
     }
 
@@ -210,7 +243,7 @@ async function main(): Promise<void> {
     }
 
     default:
-      throw new Error(`Unknown command '${command}'.`);
+      throw new Error(`Unknown command '${command}'. Run \`rbo --help\` for usage.`);
   }
 }
 

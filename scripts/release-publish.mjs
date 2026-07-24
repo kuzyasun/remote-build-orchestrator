@@ -3,7 +3,7 @@
  * Publish both packages to npm (optional package first, then @gemslibe/rbo).
  *
  * Safety gate: requires RELEASE_CONFIRM=1 or --yes / -y.
- * Does not bump versions or pack; run verify → bump-version → release:pack first.
+ * Does not bump versions or pack; run verify → build → bump-version → release:pack first.
  *
  * Prerequisites:
  *   npm login (account with publish rights under the gemslibe org)
@@ -77,7 +77,7 @@ function main() {
   }
   for (const bundle of CLI_BUNDLES) {
     if (!existsSync(bundle)) {
-      fail(`missing ${bundle}. Run \`pnpm verify\` then \`pnpm release:pack\` before publish.`);
+      fail(`missing ${bundle}. Run \`pnpm build\` then \`pnpm release:pack\` before publish.`);
     }
   }
 

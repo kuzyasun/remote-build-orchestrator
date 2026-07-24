@@ -16,7 +16,8 @@ import {
   spawnDetachedDaemon,
   stripDaemonFlag,
 } from '../src/commands/daemon.js';
-import { parseDataDirFlag, parseStateDirFlag } from '../src/commands/flags.js';
+import { parseDataDirFlag, parseReplaceFlag, parseStateDirFlag } from '../src/commands/flags.js';
+import { ensureNotRunningOrReplace, stopRoleForCli } from '../src/commands/process-lifecycle.js';
 
 const dirs: string[] = [];
 async function tempDir(prefix: string): Promise<string> {
@@ -110,6 +111,53 @@ describe('start without init guards', () => {
   it('runAgentStart refuses when agent is not initialized', async () => {
     const stateDir = await tempDir('rbo-cli-agent-start-guard-');
     await expect(runAgentStart({ stateDir, daemon: false })).rejects.toThrow(/rbo agent init/i);
+  });
+});
+
+describe('start replace / stop lifecycle', () => {
+  it('parseReplaceFlag is available alongside other path flags', () => {
+    expect(parseReplaceFlag(['--replace', '--daemon'])).toEqual({
+      replace: true,
+      rest: ['--daemon'],
+    });
+  });
+
+  it('runControllerStart with --replace stops a live pid then declines when confirm aborts', async () => {
+    const dataDir = await tempDir('rbo-cli-ctrl-replace-');
+    await ensureControllerIdentity(dataDir);
+
+    const stopRole = vi.fn(async () => ({ stopped: [42], alreadyStopped: false }));
+    await expect(
+      ensureNotRunningOrReplace('controller', {
+        dataDir,
+        replace: true,
+        findPids: async () => [42],
+        stopRole,
+        log: () => {},
+      }),
+    ).resolves.toBe(true);
+    expect(stopRole).toHaveBeenCalledOnce();
+
+    await expect(
+      ensureNotRunningOrReplace('controller', {
+        dataDir,
+        findPids: async () => [42],
+        stopRole,
+        confirm: async () => 'abort',
+        log: () => {},
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it('runControllerStop is a successful no-op when idle', async () => {
+    const dataDir = await tempDir('rbo-cli-ctrl-stop-idle-');
+    const result = await stopRoleForCli('controller', {
+      dataDir,
+      findPids: async () => [],
+      log: () => {},
+    });
+    expect(result.alreadyStopped).toBe(true);
+    expect(result.stopped).toEqual([]);
   });
 });
 

@@ -11,6 +11,7 @@ import {
   validateRestore,
 } from '@rbo/shared';
 import { controllerLogPath, controllerPidPath, spawnDetachedDaemon } from './daemon.js';
+import { ensureNotRunningOrReplace, stopRoleForCli } from './process-lifecycle.js';
 
 export interface ControllerInitOptions {
   dataDir: string;
@@ -86,15 +87,26 @@ export async function isControllerInitialized(dataDir: string): Promise<boolean>
 export interface ControllerStartOptions {
   dataDir: string;
   daemon?: boolean;
+  /** Restart a live Controller after TTY confirm or when true. */
+  replace?: boolean;
   /** CLI script path (`process.argv[1]`) for daemon re-exec. */
   cliScriptPath?: string;
 }
 
+/** @returns `undefined` when started in foreground, pid when daemon, or `null` when operator declined restart. */
 export async function runControllerStart(
   options: ControllerStartOptions,
-): Promise<number | undefined> {
+): Promise<number | undefined | null> {
   if (!(await isControllerInitialized(options.dataDir))) {
     throw new Error('Controller is not initialized. Run `rbo controller init` first.');
+  }
+
+  const shouldStart = await ensureNotRunningOrReplace('controller', {
+    dataDir: options.dataDir,
+    replace: options.replace,
+  });
+  if (!shouldStart) {
+    return null;
   }
 
   if (options.daemon) {
@@ -113,6 +125,13 @@ export async function runControllerStart(
   }
 
   await runController({ dataDir: options.dataDir });
+}
+
+export async function runControllerStop(options: ControllerInitOptions): Promise<{
+  stopped: number[];
+  alreadyStopped: boolean;
+}> {
+  return stopRoleForCli('controller', { dataDir: options.dataDir });
 }
 
 // `rbo controller restore <staging-dir>` (§26, Phase 8 runbook step "Run restore validation"):

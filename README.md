@@ -75,7 +75,8 @@ yet for your platform):
 ```bash
 git clone <this repo> && cd rm-builder
 pnpm install
-pnpm verify                 # build + full test gate — should exit 0
+pnpm build                  # produce apps/cli/dist
+pnpm verify                 # optional: lint + tests + Rust fmt/test
 node apps/cli/dist/rbo.js controller start   # or: rbo controller start after global install
 # from-source monorepo alternative: node apps/controller/dist/main.js
 ```

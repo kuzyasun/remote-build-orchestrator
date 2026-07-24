@@ -19,7 +19,7 @@ Product packaging decisions live in
 publish runbook only.
 
 There is **no** mega-script that bumps, packs, and publishes in one shot. Bump is interactive;
-publish is gated. Run the four commands below in order.
+publish is gated. Run the commands below in order.
 
 ---
 
@@ -29,15 +29,18 @@ From the repo root on a **Windows x64** machine (required for the optional packa
 
 ```powershell
 pnpm format          # optional but recommended before verify
-pnpm verify
+pnpm verify          # lint + Vitest + Rust fmt/test (does not build)
+pnpm build           # tsc + esbuild → apps/cli/dist
+pnpm package:archives
+pnpm package:verify
 pnpm bump-version    # or: pnpm bump-version 1.2.3
-pnpm release:pack
+pnpm release:pack    # cargo release build (win32-x64) + pack .tgz
 $env:RELEASE_CONFIRM=1; pnpm release:publish
 # equivalent: pnpm release:publish --yes
 ```
 
-`pnpm verify` already runs lint (Biome check). Format is separate; run `pnpm format` when you want
-autofix before the gate.
+`pnpm verify` runs checks and tests only. `pnpm build` produces distributable JS bundles.
+Format is separate; run `pnpm format` when you want autofix before the gate.
 
 After publish, smoke on a clean Windows x64 host:
 
@@ -83,7 +86,7 @@ pnpm install
 
 ## Detailed steps
 
-### 1. Verify
+### 1. Verify (checks + tests)
 
 ```powershell
 pnpm format   # optional autofix
@@ -93,18 +96,27 @@ pnpm verify
 `pnpm verify` must exit `0`. It runs, in order (root `package.json` → `scripts.verify`):
 
 1. `lint` — Biome check
-2. `build` — tsc + `@gemslibe/rbo` esbuild (`apps/cli` → `dist/rbo.js`, `dist/rbo-mcp-stdio.js`)
-3. `test` — all Vitest suites
-4. `rust:verify` — `cargo fmt --check`, `cargo test`, then `cargo build --release` for
-   `native/windows-executor`
-5. `package:archives` — refresh `packaging/{windows,macos,linux}/MANIFEST.json` hashes/sizes
-6. `package:verify` — re-check manifests (forbidden paths, required files, checksums on disk)
+2. `test` — all Vitest suites (resolve to TypeScript sources; no prior `pnpm build` required)
+3. `rust:verify` — `cargo fmt --check` + `cargo test` for `native/windows-executor`
+
+It does **not** compile TypeScript/esbuild bundles, refresh packaging manifests, or run
+`cargo build --release` (those belong to `pnpm build` / `pnpm package:archives` / `pnpm release:pack`).
+
+### 1b. Build + packaging manifests
+
+```powershell
+pnpm build
+pnpm package:archives   # refresh packaging/{windows,macos,linux}/MANIFEST.json hashes/sizes
+pnpm package:verify     # re-check manifests (forbidden paths, required files, checksums)
+```
+
+`pnpm build` runs tsc across workspace packages and esbuild for `@gemslibe/rbo`
+(`apps/cli` → `dist/rbo.js`, `dist/rbo-mcp-stdio.js`).
 
 If `package:verify` fails with `sha256 mismatch ... manifest is stale`, re-run
-`pnpm package:archives` after source changes — `pnpm verify` already does this, so you should only
-see that when running `package:verify` alone after hand-editing manifests.
+`pnpm package:archives` after source/build changes.
 
-Confirm CLI bundles after a successful verify:
+Confirm CLI bundles after a successful build:
 
 ```powershell
 Test-Path .\apps\cli\dist\rbo.js
@@ -197,7 +209,7 @@ Test-Path .\packages\rbo-windows-executor-win32-x64\bin\rbo-windows-executor.exe
 pnpm pack:windows-executor
 # equivalent: pnpm --dir packages/rbo-windows-executor-win32-x64 pack
 
-# 4. Ensure CLI bundles (skip if verify just succeeded)
+# 4. Ensure CLI bundles (skip if `pnpm build` just succeeded)
 pnpm --filter @gemslibe/rbo build
 
 # 5. Pack main package
@@ -226,7 +238,7 @@ Package scripts for the Windows executor:
 | `prepare-binary:require` | Hard require — exits 1 unless Cargo output **or** staged `bin/…exe` exists |
 | `prepack` | Same as `--require` — runs automatically on `pnpm pack` / `npm pack` / `npm publish` |
 
-`apps/cli` has **no** `prepack` hook — build (via `verify` or `pnpm --filter @gemslibe/rbo build`)
+`apps/cli` has **no** `prepack` hook — run `pnpm build` (or `pnpm --filter @gemslibe/rbo build`)
 before packing. Published `"files"`: `dist/rbo.js`, `dist/rbo-mcp-stdio.js`,
 `config/controller.json`, `config/agent.json`, `scripts/stop-running-rbo.mjs`, `LICENSE`,
 `README.md`. The stop script is the `preinstall` / `preuninstall` hook that terminates running
@@ -329,7 +341,8 @@ Forbidden paths (identity keys, `.env`, credentials, caches, logs, `node_modules
 once in `packages/shared/src/packaging.ts` (`PACKAGING_FORBIDDEN_PATH_PATTERNS`) and enforced by
 `scripts/package-archives.mjs`.
 
-Assemble a distributable after `pnpm verify` (PowerShell, Windows example):
+Assemble a distributable after `pnpm build` (and preferably `pnpm package:archives`) — PowerShell,
+Windows example:
 
 ```powershell
 $dest = Join-Path $env:TEMP "rbo-windows-0.1.0"
@@ -365,9 +378,9 @@ Archives are the air-gap fallback; **npm remains the primary** distribution chan
 | `engines` / install warnings | Node &lt; 22.14 | Upgrade Node; `rbo doctor` also surfaces mismatches |
 | Optional package skipped | Non-Windows or non-x64 host (`os`/`cpu` in package.json) | Expected; `rbo doctor` WARNs. Only win32-x64 gets the helper automatically |
 | `windows_executor` WARN on win32-x64 after `npm install -g` | Optional package not published yet, wrong semver pin, or network/registry failure | Publish optional package first at matching semver; reinstall; check `npm ls -g @gemslibe/rbo-windows-executor-win32-x64` |
-| Main pack missing `dist/*.js` | Forgot build / verify before pack | `pnpm --filter @gemslibe/rbo build` or full `pnpm verify` |
+| Main pack missing `dist/*.js` | Forgot `pnpm build` before pack | `pnpm build` or `pnpm --filter @gemslibe/rbo build` |
 | `pnpm --filter … pack` → `Unknown option: 'recursive'` | pnpm 10.x: `--filter` implies recursive; `pack` does not support it | Use `pnpm release:pack`, `pnpm pack:windows-executor` / `pnpm pack:rbo`, or `pnpm --dir <pkg-path> pack` |
-| `package:verify` sha256 mismatch | Stale manifest after edits | Run `pnpm package:archives` (or full `pnpm verify`) |
+| `package:verify` sha256 mismatch | Stale manifest after edits | Run `pnpm build` then `pnpm package:archives` |
 | Mismatched versions at runtime vs npm | Bumped only one of `versions.ts` / two package.json files / `optionalDependencies` | Re-run `pnpm bump-version` so all sites match |
 
 ---
@@ -391,6 +404,7 @@ Be honest when writing release notes:
 ## Pre-release checklist
 
 - [ ] `pnpm format` (optional) then `pnpm verify` exit 0
+- [ ] `pnpm build` then `pnpm package:archives` && `pnpm package:verify`
 - [ ] `pnpm bump-version` (or `pnpm bump-version x.y.z`) — lockstep sites updated
 - [ ] Semver matches in `versions.ts`, `apps/cli/package.json` (including `optionalDependencies`),
       `packages/rbo-windows-executor-win32-x64/package.json`, and root `package.json`

@@ -21,6 +21,11 @@ environment variables override the file when set. The package also ships matchin
 `config/controller.json` and `config/agent.json`. Use `--force` on init to rewrite a config back
 to defaults.
 
+`rbo controller start` / `rbo agent start` detect an already-running same-role process (pid file +
+`rbo.js … start` scan). In a TTY they prompt to restart; pass `--replace` to skip the prompt
+(required in non-TTY). Stop explicitly with `rbo controller stop` or `rbo agent stop-process`
+(`rbo agent stop` remains the OS-service plan).
+
 ## Binaries
 
 | Command | Purpose |

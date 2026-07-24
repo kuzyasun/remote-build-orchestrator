@@ -84,7 +84,7 @@ function main() {
   for (const bundle of CLI_BUNDLES) {
     if (!existsSync(bundle)) {
       fail(
-        `missing ${bundle}. Run \`pnpm verify\` (or \`pnpm --filter @gemslibe/rbo build\`) before pack.`,
+        `missing ${bundle}. Run \`pnpm build\` (or \`pnpm --filter @gemslibe/rbo build\`) before pack.`,
       );
     }
   }

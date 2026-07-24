@@ -4,6 +4,7 @@ import { AGENT_CONFIG_FILENAME, writeDefaultAgentConfigFile } from '@rbo/agent/c
 import { runAgent } from '@rbo/agent/run';
 import { resolveAgentStateDir } from '@rbo/shared';
 import { agentLogPath, agentPidPath, spawnDetachedDaemon } from './daemon.js';
+import { ensureNotRunningOrReplace, stopRoleForCli } from './process-lifecycle.js';
 
 export interface AgentInitOptions {
   stateDir?: string;
@@ -45,6 +46,8 @@ export async function runAgentInit(options: AgentInitOptions = {}): Promise<Agen
 export interface AgentStartOptions {
   stateDir?: string;
   daemon?: boolean;
+  /** Restart a live Agent after TTY confirm or when true. */
+  replace?: boolean;
   /** CLI script path (`process.argv[1]`) for daemon re-exec. */
   cliScriptPath?: string;
 }
@@ -55,9 +58,20 @@ function assertAgentInitialized(stateDir: string): void {
   }
 }
 
-export async function runAgentStart(options: AgentStartOptions = {}): Promise<number | undefined> {
+/** @returns `undefined` when started in foreground, pid when daemon, or `null` when operator declined restart. */
+export async function runAgentStart(
+  options: AgentStartOptions = {},
+): Promise<number | undefined | null> {
   const stateDir = options.stateDir ?? resolveAgentStateDir();
   assertAgentInitialized(stateDir);
+
+  const shouldStart = await ensureNotRunningOrReplace('agent', {
+    stateDir,
+    replace: options.replace,
+  });
+  if (!shouldStart) {
+    return null;
+  }
 
   if (options.daemon) {
     const cliScript = options.cliScriptPath;
@@ -75,4 +89,12 @@ export async function runAgentStart(options: AgentStartOptions = {}): Promise<nu
   }
 
   await runAgent({ stateDir });
+}
+
+export async function runAgentStopProcess(options: AgentInitOptions = {}): Promise<{
+  stopped: number[];
+  alreadyStopped: boolean;
+}> {
+  const stateDir = options.stateDir ?? resolveAgentStateDir();
+  return stopRoleForCli('agent', { stateDir });
 }

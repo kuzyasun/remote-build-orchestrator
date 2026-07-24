@@ -20,8 +20,8 @@
     "pack:rbo": "pnpm --dir apps/cli pack",
     "release:pack": "node scripts/release-pack.mjs",
     "release:publish": "node scripts/release-publish.mjs",
-    "rust:verify": "cargo fmt --manifest-path native/windows-executor/Cargo.toml -- --check && cargo test --manifest-path native/windows-executor/Cargo.toml && cargo build --release --manifest-path native/windows-executor/Cargo.toml",
-    "verify": "pnpm run lint && pnpm run build && pnpm run test && pnpm run rust:verify && pnpm run package:archives && pnpm run package:verify"
+    "rust:verify": "cargo fmt --manifest-path native/windows-executor/Cargo.toml -- --check && cargo test --manifest-path native/windows-executor/Cargo.toml",
+    "verify": "pnpm run lint && pnpm run test && pnpm run rust:verify"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

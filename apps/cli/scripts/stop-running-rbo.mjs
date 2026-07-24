@@ -12,7 +12,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -51,18 +51,70 @@ export function matchRboDaemonRole(commandLine) {
 }
 
 /**
- * @param {{ env?: NodeJS.ProcessEnv; home?: string }} [options]
+ * @param {{
+ *   env?: NodeJS.ProcessEnv;
+ *   home?: string;
+ *   dataDir?: string;
+ *   stateDir?: string;
+ * }} [options]
  * @returns {{ role: 'controller' | 'agent'; path: string }[]}
  */
 export function resolveDaemonPidFiles(options = {}) {
   const env = options.env ?? process.env;
   const home = options.home ?? homedir();
-  const dataDir = env.RBO_DATA_DIR?.trim() || join(home, '.rbo');
-  const agentStateDir = env.RBO_AGENT_STATE_DIR?.trim() || join(dataDir, 'agent');
+  const dataDir = options.dataDir?.trim() || env.RBO_DATA_DIR?.trim() || join(home, '.rbo');
+  const agentStateDir =
+    options.stateDir?.trim() || env.RBO_AGENT_STATE_DIR?.trim() || join(dataDir, 'agent');
   return [
     { role: 'controller', path: join(dataDir, 'run', 'controller.pid') },
     { role: 'agent', path: join(agentStateDir, 'run', 'agent.pid') },
   ];
+}
+
+/**
+ * @param {'controller' | 'agent'} role
+ * @param {{
+ *   env?: NodeJS.ProcessEnv;
+ *   home?: string;
+ *   dataDir?: string;
+ *   stateDir?: string;
+ * }} [options]
+ */
+export function resolveRolePidFile(role, options = {}) {
+  const files = resolveDaemonPidFiles(options);
+  const match = files.find((entry) => entry.role === role);
+  if (!match) {
+    throw new Error(`unknown role: ${role}`);
+  }
+  return match.path;
+}
+
+/**
+ * Remove a pid file when it is missing a live process (or unreadable).
+ * @param {string} pidFile
+ * @param {(pid: number) => boolean} isAlive
+ * @returns {boolean} true when the file was removed
+ */
+export function clearStalePidFile(pidFile, isAlive) {
+  if (!existsSync(pidFile)) {
+    return false;
+  }
+  let raw;
+  try {
+    raw = readFileSync(pidFile, 'utf8').trim();
+  } catch {
+    return false;
+  }
+  const pid = Number.parseInt(raw, 10);
+  if (Number.isInteger(pid) && pid > 0 && isAlive(pid)) {
+    return false;
+  }
+  try {
+    unlinkSync(pidFile);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -228,6 +280,112 @@ export async function stopPid(pid, options = {}) {
 }
 
 /**
+ * Discover live PIDs for one Controller/Agent role (pid file + process scan).
+ * Never includes `selfPid` (defaults to `process.pid`).
+ *
+ * @param {'controller' | 'agent'} role
+ * @param {{
+ *   env?: NodeJS.ProcessEnv;
+ *   home?: string;
+ *   dataDir?: string;
+ *   stateDir?: string;
+ *   listProcesses?: () => Promise<{ pid: number; commandLine: string }[]>;
+ *   isAlive?: (pid: number) => boolean;
+ *   selfPid?: number;
+ * }} [options]
+ * @returns {Promise<number[]>}
+ */
+export async function findLiveRolePids(role, options = {}) {
+  const env = options.env ?? process.env;
+  const home = options.home ?? homedir();
+  const listProcesses = options.listProcesses ?? listNodeProcesses;
+  const alive = options.isAlive ?? isProcessAlive;
+  const selfPid = options.selfPid ?? process.pid;
+  /** @type {Set<number>} */
+  const pids = new Set();
+
+  const pidFile = resolveRolePidFile(role, {
+    env,
+    home,
+    dataDir: options.dataDir,
+    stateDir: options.stateDir,
+  });
+  clearStalePidFile(pidFile, alive);
+  const fromFile = readLivePidFromFile(pidFile, alive);
+  if (fromFile !== null && fromFile !== selfPid) {
+    pids.add(fromFile);
+  }
+
+  for (const proc of await listProcesses()) {
+    if (proc.pid === selfPid) {
+      continue;
+    }
+    if (matchRboDaemonRole(proc.commandLine) === role) {
+      pids.add(proc.pid);
+    }
+  }
+
+  return [...pids].sort((a, b) => a - b);
+}
+
+/**
+ * Stop all live processes for one role. Clears the role pid file when no live pid remains.
+ *
+ * @param {'controller' | 'agent'} role
+ * @param {{
+ *   env?: NodeJS.ProcessEnv;
+ *   home?: string;
+ *   dataDir?: string;
+ *   stateDir?: string;
+ *   listProcesses?: () => Promise<{ pid: number; commandLine: string }[]>;
+ *   isAlive?: (pid: number) => boolean;
+ *   stopPid?: (pid: number) => Promise<void>;
+ *   log?: (msg: string) => void;
+ *   warn?: (msg: string) => void;
+ *   selfPid?: number;
+ *   strict?: boolean;
+ * }} [options]
+ * @returns {Promise<{ stopped: number[]; alreadyStopped: boolean }>}
+ */
+export async function stopRoleProcesses(role, options = {}) {
+  const alive = options.isAlive ?? isProcessAlive;
+  const doStop = options.stopPid ?? ((pid) => stopPid(pid, { isAlive: alive }));
+  const log = options.log ?? ((msg) => console.error(`[rbo] ${msg}`));
+  const warn = options.warn ?? ((msg) => console.error(`[rbo] ${msg}`));
+  const strict = options.strict === true;
+
+  const pids = await findLiveRolePids(role, options);
+  const stopped = [];
+
+  for (const pid of pids) {
+    try {
+      log(`stopping ${role} process pid=${pid}`);
+      await doStop(pid);
+    } catch (error) {
+      const message = `failed to stop pid=${pid} (${role}): ${error instanceof Error ? error.message : String(error)}`;
+      if (strict) {
+        throw new Error(message);
+      }
+      warn(`${message}; continuing`);
+      continue;
+    }
+    if (alive(pid)) {
+      const message = `failed to stop ${role} pid=${pid}: process still alive`;
+      if (strict) {
+        throw new Error(message);
+      }
+      warn(message);
+      continue;
+    }
+    stopped.push(pid);
+  }
+
+  clearStalePidFile(resolveRolePidFile(role, options), alive);
+
+  return { stopped, alreadyStopped: pids.length === 0 };
+}
+
+/**
  * @param {{
  *   env?: NodeJS.ProcessEnv;
  *   home?: string;
@@ -256,6 +414,7 @@ export async function stopRunningRbo(options = {}) {
   const targets = new Map();
 
   for (const { role, path } of resolveDaemonPidFiles({ env, home })) {
+    clearStalePidFile(path, alive);
     const pid = readLivePidFromFile(path, alive);
     if (pid !== null) {
       targets.set(pid, role);

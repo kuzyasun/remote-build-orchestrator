@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runControllerFingerprint, runControllerInit } from '../src/commands/controller.js';
+import { formatCliHelp } from '../src/commands/help.js';
 import { detectPlatform, renderServiceInstallPlan } from '../src/commands/service.js';
 
 const tempDirs: string[] = [];
@@ -13,6 +14,17 @@ function tempDir(): string {
 }
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe('rbo --help', () => {
+  it('lists top-level commands and version', () => {
+    const help = formatCliHelp();
+    expect(help).toMatch(/^rbo CLI v/);
+    expect(help).toContain('controller start');
+    expect(help).toContain('agent stop-process');
+    expect(help).toContain('doctor');
+    expect(help).toContain('--replace');
+  });
 });
 
 describe('rbo controller init / fingerprint (§33)', () => {

@@ -57,7 +57,11 @@ Always execute commands from the repo root or use `--filter` for targeted operat
   ```bash
   pnpm install
   ```
-- **Full verification** (lint + build + unit tests + Rust fmt/test):
+- **Build** (TypeScript/esbuild packages → `dist/`):
+  ```bash
+  pnpm build
+  ```
+- **Verification** (lint + unit tests + Rust fmt/test — does **not** build):
   ```bash
   pnpm verify
   ```
@@ -79,6 +83,11 @@ Always execute commands from the repo root or use `--filter` for targeted operat
 - **Rust verification**:
   ```bash
   pnpm rust:verify                     # cargo fmt --check + cargo test in native/windows-executor
+  ```
+- **Packaging manifests** (after `pnpm build`, before release pack):
+  ```bash
+  pnpm package:archives
+  pnpm package:verify
   ```
 
 ## Working Rules & Efficiency

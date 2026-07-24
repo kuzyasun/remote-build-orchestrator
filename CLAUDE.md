@@ -56,11 +56,13 @@ Consult in this order before modifying or designing code:
 Run commands from repo root or with `--filter`:
 
 - Monorepo setup: `pnpm install`
-- Full verification (lint + build + unit tests + Rust fmt/test): `pnpm verify`
+- Build (tsc + esbuild → `dist/`): `pnpm build`
+- Verification (lint + unit tests + Rust fmt/test — does **not** build): `pnpm verify`
 - TypeScript unit tests: `pnpm test` (or `pnpm --filter @rbo/protocol test`)
 - Lint & Format: `pnpm lint` / `pnpm format`
 - Typechecking: `pnpm typecheck`
-- Rust verification: `pnpm rust:verify`
+- Rust verification: `pnpm rust:verify` (`cargo fmt --check` + `cargo test`)
+- Packaging manifests (after build): `pnpm package:archives` / `pnpm package:verify`
 
 ## Working Rules & Efficiency
 

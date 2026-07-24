@@ -3,8 +3,9 @@
 Audience: an operator setting up RBO for the first time — a Controller, one or more Agents, and
 one or more AI coding clients (Codex, Claude, Cursor, Antigravity) talking to it over MCP.
 For building a release from this monorepo or publishing `@gemslibe/rbo` to npm, see
-[`docs/dev/release-builds.md`](../dev/release-builds.md) (maintainer guide — not required for
-operators installing from npm).
+[`docs/dev/release-builds.md`](../dev/release-builds.md) (maintainer guide). Operators who need
+a **local build** (not npm.js) can use [Install from a local build](#install-from-a-local-build)
+below.
 For day-2 operations (drain/revoke/repair/update/backup), see [`runbook.md`](./runbook.md).
 
 ## 1. What you're setting up
@@ -65,6 +66,53 @@ Archives ship the **same bundled bits** as `npm install -g @gemslibe/rbo` (inclu
 `node bin/rbo.js controller start` / `node bin/rbo.js agent start` (or `rbo ...` after a global
 install). There are no separate thin `rbo-controller` / `rbo-agent` archive entrypoints.
 
+### Install from a local build
+
+Use this when you have the monorepo checkout and want a global `rbo` / `rbo-mcp-stdio` **without**
+pulling from the npm registry (dev builds, unpublished fixes, air-gapped pack+copy).
+
+From the **repo root** (Node.js ≥ 22.14, pnpm 10.5.2):
+
+```powershell
+pnpm install
+pnpm build           # tsc + esbuild → apps/cli/dist (rbo.js, rbo-mcp-stdio.js)
+pnpm verify          # optional: lint + unit tests + Rust fmt/test (does not build)
+pnpm release:pack    # writes .tgz under apps/cli/ and (on win32-x64) packages/rbo-windows-executor-win32-x64/
+```
+
+Then install the packed tarballs globally (replace `0.4.0` with the version in `apps/cli/package.json`):
+
+```powershell
+# Windows x64 — install the Job Object helper first, then the main CLI
+npm install -g .\packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-0.4.0.tgz
+npm install -g .\apps\cli\gemslibe-rbo-0.4.0.tgz
+
+rbo --help
+rbo doctor
+```
+
+On macOS/Linux (no Windows executor tarball):
+
+```bash
+npm install -g ./apps/cli/gemslibe-rbo-0.4.0.tgz
+```
+
+> Global install from a `.tgz` still runs the same `preinstall` / `preuninstall` stop hook as a
+> registry install. Stop any live Controller/Agent first, or let the hook do it.
+
+**Without packing** (monorepo-only smoke; `rbo` is not on `PATH`):
+
+```powershell
+pnpm install
+pnpm --filter @gemslibe/rbo build
+node .\apps\cli\dist\rbo.js --help
+node .\apps\cli\dist\rbo.js controller start
+node .\apps\cli\dist\rbo-mcp-stdio.js   # MCP stdio proxy from the same build
+```
+
+Full pack/publish detail (bump, checksums, archives) stays in
+[`docs/dev/release-builds.md`](../dev/release-builds.md).
+
 ## 4. Set up the Controller
 
 The Controller loads **`~/.rbo/controller.json`** (or `$RBO_DATA_DIR/controller.json`) on start.
@@ -116,6 +164,8 @@ always target the same tree):
 ```bash
 rbo controller fingerprint  # print it — you'll need this on every Agent
 rbo controller start        # foreground; Ctrl-C to stop. Pass --daemon for detached PID+log.
+                            # If already running: TTY prompts to restart; or pass --replace.
+rbo controller stop         # stop a live Controller (pid file + process scan)
 # Archive alternative: node bin/rbo.js controller start
 ```
 
@@ -151,6 +201,8 @@ rbo agent init
 #   max_jobs               → default 1
 
 rbo agent start          # foreground; pass --daemon for detached PID+log
+                         # If already running: TTY prompts to restart; or pass --replace.
+rbo agent stop-process   # stop a live Agent process (OS service plans stay on `rbo agent stop`)
 # Archive alternative: node bin/rbo.js agent start
 ```
 
@@ -203,7 +255,7 @@ The snippets use `command: "rbo-mcp-stdio"` — that matches a global npm instal
 | Install | How to launch MCP stdio |
 |---|---|
 | `npm install -g @gemslibe/rbo` | `rbo-mcp-stdio` on `PATH` (what the snippets use) |
-| From-source monorepo (`pnpm install` + build / `pnpm verify`) | `node <REPO>/apps/cli/dist/rbo-mcp-stdio.js` |
+| From-source monorepo (`pnpm install` + `pnpm build`) | `node <REPO>/apps/cli/dist/rbo-mcp-stdio.js` |
 | OS archive extract | `node <RBO_ROOT>/bin/rbo-mcp-stdio.js` |
 
 For from-source or archive, replace the snippet's `command` with `node` and put the absolute path

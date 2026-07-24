@@ -3211,8 +3211,9 @@ Deliverables:
 - packages `protocol`, `snapshot`, `shared`, `testing`;
 - Rust crate `native/windows-executor`;
 - unit-test runner, lint, typecheck і formatting commands;
-- CI-equivalent local command `pnpm verify`, який запускає format check,
-  typecheck та unit tests;
+- CI-equivalent local command `pnpm verify`, який запускає lint,
+  unit tests та Rust fmt/test (без build);
+- окремий `pnpm build` для tsc/esbuild артефактів;
 - version constants для Controller, Agent, stdio adapter і wire protocol;
 - structured error base types із §30.
 

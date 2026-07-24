@@ -15,6 +15,23 @@ export function parseForceFlag(args: string[]): { force: boolean; rest: string[]
   return { force, rest };
 }
 
+/**
+ * Boolean `--replace` flag for start (restart an already-running Controller/Agent).
+ * Remaining tokens returned as `rest`.
+ */
+export function parseReplaceFlag(args: string[]): { replace: boolean; rest: string[] } {
+  const rest: string[] = [];
+  let replace = false;
+  for (const arg of args) {
+    if (arg === '--replace') {
+      replace = true;
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { replace, rest };
+}
+
 /** Parse `--data-dir <path>` from argv; remaining tokens returned as `rest`. */
 export function parseDataDirFlag(args: string[]): { dataDir?: string; rest: string[] } {
   const rest: string[] = [];
