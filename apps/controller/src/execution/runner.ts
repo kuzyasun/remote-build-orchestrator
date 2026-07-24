@@ -24,6 +24,7 @@ import {
   describeRepository,
   gitFindRoot,
   materializeFullSnapshot,
+  resolveSourceCwdForCapture,
 } from '@rbo/snapshot';
 import {
   createAttempt,
@@ -551,6 +552,8 @@ export async function captureAndPersistSnapshot(
   contentId: string;
   secretWarnings: Array<{ path: string; pattern: string }>;
   gitSourceRequirements: GitSourceRequirements;
+  /** Job request with nested `project_root` mapped onto an effective `source.cwd`. */
+  request: JobRequest;
 }> {
   const storageDir = join(ctx.dataDir, 'snapshots', jobId);
   const sourcePolicy = {
@@ -559,26 +562,41 @@ export async function captureAndPersistSnapshot(
     secret_policy: request.source_policy?.secret_policy ?? 'block',
   } as const;
 
+  const resolvedCwd = await resolveSourceCwdForCapture(
+    request.source.project_root,
+    request.source.cwd,
+  );
+  const normalizedRequest: JobRequest =
+    resolvedCwd === request.source.cwd
+      ? request
+      : {
+          ...request,
+          source: {
+            ...request.source,
+            cwd: resolvedCwd,
+          },
+        };
+
   const useOverlay =
     ctx.remoteCapable === true &&
     ctx.gitAllowlist &&
-    (await canCaptureGitOverlay(request.source.project_root, ctx.gitAllowlist));
+    (await canCaptureGitOverlay(normalizedRequest.source.project_root, ctx.gitAllowlist));
 
   const captured = useOverlay
     ? await captureGitOverlaySnapshot({
-        projectRoot: request.source.project_root,
+        projectRoot: normalizedRequest.source.project_root,
         allowedProjectRoots: ctx.allowedProjectRoots,
-        cwd: request.source.cwd,
+        cwd: normalizedRequest.source.cwd,
         sourcePolicy,
-        additionalRoots: request.source.additional_roots,
+        additionalRoots: normalizedRequest.source.additional_roots,
         contentStorageDir: storageDir,
       })
     : await captureFullSnapshot({
-        projectRoot: request.source.project_root,
+        projectRoot: normalizedRequest.source.project_root,
         allowedProjectRoots: ctx.allowedProjectRoots,
-        cwd: request.source.cwd,
+        cwd: normalizedRequest.source.cwd,
         sourcePolicy,
-        additionalRoots: request.source.additional_roots,
+        additionalRoots: normalizedRequest.source.additional_roots,
         contentStorageDir: storageDir,
       });
 
@@ -617,6 +635,7 @@ export async function captureAndPersistSnapshot(
     contentId: captured.manifest.content_id,
     secretWarnings: captured.secretWarnings,
     gitSourceRequirements: captured.gitSourceRequirements,
+    request: normalizedRequest,
   };
 }
 

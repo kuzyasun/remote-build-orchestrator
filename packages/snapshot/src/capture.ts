@@ -1,6 +1,6 @@
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { lstat } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import type { JobAdditionalRootSchema } from '@rbo/protocol';
 import {
   RboError,
@@ -169,6 +169,46 @@ async function assertAllowedProjectRoot(
     }
   }
   throw new RboError('materialization', `Project root is not under allowed roots: ${projectRoot}`);
+}
+
+/**
+ * When `project_root` points at a subdirectory of a git repo and the caller left
+ * `cwd` as the default `.`, derive the repo-relative package path (e.g. `radev`).
+ *
+ * Snapshot still materializes the full git tree under `main_mount`; this only
+ * sets the job working directory so scripts like `pnpm install` run in the
+ * package, not the monorepo root. Explicit non-default `cwd` is preserved.
+ */
+export async function resolveSourceCwdForCapture(
+  projectRoot: string,
+  cwd?: string,
+): Promise<string> {
+  const requested = cwd === undefined || cwd === '' ? '.' : normalizeWirePath(cwd);
+  if (requested !== '.') {
+    if (!isSafeRelativePath(requested, { allowDot: true })) {
+      throw new RboError('validation', `cwd must be a safe relative path: ${cwd}`, false);
+    }
+    return requested;
+  }
+
+  const repoRoot = await gitFindRoot(projectRoot);
+  const realRepo = await resolveRealPath(repoRoot);
+  const realProject = await resolveRealPath(projectRoot);
+  const rel = relative(realRepo, realProject).replace(/\\/g, '/');
+  if (!rel || rel === '.') {
+    return '.';
+  }
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    throw new RboError(
+      'validation',
+      `project_root is outside its git repository: ${projectRoot}`,
+      false,
+    );
+  }
+  if (!isSafeRelativePath(rel)) {
+    throw new RboError('validation', `derived cwd is unsafe: ${rel}`, false);
+  }
+  return rel;
 }
 
 async function statFileIdentity(repoRoot: string, wirePath: string): Promise<FileIdentity> {
@@ -608,6 +648,7 @@ export async function captureFullSnapshot(
       mainMount,
       (input.additionalRoots ?? []).map((root) => root.mount_path),
     );
+    const effectiveCwd = await resolveSourceCwdForCapture(input.projectRoot, input.cwd);
 
     const secretWarnings: Array<{ path: string; pattern: string }> = [];
     const secretBlockedViolations: SecretPolicyViolation[] = [];
@@ -773,7 +814,7 @@ export async function captureFullSnapshot(
         : undefined,
       workspace: {
         main_mount: mainMount,
-        cwd: normalizeWirePath(input.cwd ?? mainMount),
+        cwd: effectiveCwd,
       },
       source: {
         files: capturedFiles.map((f) => f.entry).sort((a, b) => a.path.localeCompare(b.path)),
@@ -871,6 +912,7 @@ export async function captureGitOverlaySnapshot(
     mainMount,
     (input.additionalRoots ?? []).map((r) => r.mount_path),
   );
+  const effectiveCwd = await resolveSourceCwdForCapture(input.projectRoot, input.cwd);
 
   const guard = await buildCaptureGuard(
     repoRoot,
@@ -1070,7 +1112,7 @@ export async function captureGitOverlaySnapshot(
       },
       workspace: {
         main_mount: mainMount,
-        cwd: normalizeWirePath(input.cwd ?? mainMount),
+        cwd: effectiveCwd,
       },
       overlay: {
         files: capturedFiles.map((f) => f.entry).sort((a, b) => a.path.localeCompare(b.path)),

@@ -299,6 +299,13 @@ rbo logs <job_id>
 rbo cancel <job_id> "changed my mind"   # only if it's still running
 ```
 
+**Monorepo packages:** `project_root` may point at a subdirectory (e.g. `…/radar-a121/radev` or
+`…/DTrack/flutter`). Snapshot still captures the git repository (ignored paths like `node_modules`
+stay out). When `cwd` is left as `"."`, the Controller derives the package-relative cwd
+(`radev`, `flutter`, …) so the job script runs in that package — install deps on the Agent
+(`pnpm install` / `flutter pub get`), do not expect ignored build trees to be shipped in the
+snapshot. An explicit non-default `cwd` is left unchanged.
+
 Via an AI client, prefer **`job_run`** (one call: submit + wait + summary). Keep `job_submit` /
 `job_wait` / `job_logs` for CI or advanced workflows. `risk_level: "destructive"` or `"hardware"`
 jobs come back `awaiting_confirmation` with a short-lived `confirmation_token`; the client must

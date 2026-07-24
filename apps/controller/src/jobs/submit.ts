@@ -156,29 +156,30 @@ export async function handleJobSubmit(
       remoteCapable: (ctx.connectedAgents?.size ?? 0) > 0,
       gitAllowlist: ctx.gitAllowlist,
     };
-    const { snapshotId, contentId, secretWarnings } = await captureAndPersistSnapshot(
-      captureCtx,
-      pendingJobId,
-      request,
-    );
-    const hash = requestHash(request);
+    const {
+      snapshotId,
+      contentId,
+      secretWarnings,
+      request: normalizedRequest,
+    } = await captureAndPersistSnapshot(captureCtx, pendingJobId, request);
+    const hash = requestHash(normalizedRequest);
 
     const job = createJob(ctx.db, {
       jobId: pendingJobId,
       clientId: ctx.clientId,
-      clientRequestId: request.client_request_id,
-      request,
+      clientRequestId: normalizedRequest.client_request_id,
+      request: normalizedRequest,
       initialState,
-      name: request.name,
+      name: normalizedRequest.name,
     });
     transitionJobState(ctx.db, job.id, job.state, { snapshot_id: snapshotId });
 
-    if (isDestructiveRisk(request.risk_level)) {
+    if (isDestructiveRisk(normalizedRequest.risk_level)) {
       const confirmation_token = issueConfirmationToken(ctx.controllerIdentity, {
         job_id: job.id,
         request_hash: hash,
         content_id: contentId,
-        risk_level: request.risk_level,
+        risk_level: normalizedRequest.risk_level,
       });
       transitionJobState(ctx.db, job.id, 'awaiting_confirmation', { queued_at: nowIso() });
       const response = {
@@ -194,7 +195,7 @@ export async function handleJobSubmit(
       completeSubmission(
         ctx.db,
         ctx.clientId,
-        request.client_request_id,
+        normalizedRequest.client_request_id,
         'captured',
         response,
         job.id,
@@ -215,12 +216,12 @@ export async function handleJobSubmit(
     completeSubmission(
       ctx.db,
       ctx.clientId,
-      request.client_request_id,
+      normalizedRequest.client_request_id,
       'captured',
       response,
       job.id,
     );
-    void dispatchJobExecution(ctx, job.id, request).catch((error) => {
+    void dispatchJobExecution(ctx, job.id, normalizedRequest).catch((error) => {
       console.error('job execution dispatch failed', job.id, error);
     });
     return response;
