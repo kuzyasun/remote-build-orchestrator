@@ -13,7 +13,7 @@ import {
   sha256,
 } from '@rbo/shared';
 import type { z } from 'zod';
-import { type TarEntryInput, createZstdTarArchive } from './archive.js';
+import { type TarEntryInput, writeZstdTarArchiveFile } from './archive.js';
 import { attachContentId } from './canonical.js';
 import {
   type GitSourceRequirements,
@@ -70,6 +70,33 @@ export interface CapturedFile {
   secretViolations?: SecretPolicyViolation[];
 }
 
+function releaseCapturedFileBuffers(files: CapturedFile[]): number {
+  let retained = 0;
+  for (const file of files) {
+    if (file.content) {
+      retained += file.content.length;
+      file.content = undefined;
+    }
+    if (file.tarEntry.content) {
+      file.tarEntry.content = undefined;
+    }
+  }
+  return retained;
+}
+
+function countRetainedContentBytes(files: CapturedFile[]): number {
+  let total = 0;
+  for (const file of files) {
+    if (file.content) {
+      total += file.content.length;
+    }
+    if (file.tarEntry.content) {
+      total += file.tarEntry.content.length;
+    }
+  }
+  return total;
+}
+
 function throwIfSecretViolations(violations: SecretPolicyViolation[]): void {
   if (violations.length === 0) {
     return;
@@ -89,6 +116,8 @@ export interface CaptureFullSnapshotResult {
   secretWarnings: Array<{ path: string; pattern: string }>;
   /** Agent capability hints derived during capture (§11.14–11.15). */
   gitSourceRequirements: GitSourceRequirements;
+  /** Bytes still held in-process from captured file contents after archive persist (should be 0). */
+  retainedContentBytes: number;
 }
 
 /** Detect paths that collide under case-insensitive comparison (pure). */
@@ -674,6 +703,12 @@ export async function captureFullSnapshot(
         const dest = join(contentStorageDir, wirePath);
         await mkdir(join(dest, '..'), { recursive: true });
         await writeFile(dest, captured.content);
+        captured.tarEntry = {
+          ...captured.tarEntry,
+          content: undefined,
+          contentPath: dest,
+        };
+        captured.content = undefined;
       }
     }
 
@@ -753,6 +788,16 @@ export async function captureFullSnapshot(
           }
           await mkdir(join(dest, '..'), { recursive: true });
           await writeFile(dest, captured.content);
+          const last = rootCaptured[rootCaptured.length - 1];
+          if (last) {
+            last.tarEntry = {
+              ...last.tarEntry,
+              content: undefined,
+              contentPath: dest,
+            };
+            last.content = undefined;
+          }
+          captured.content = undefined;
         }
       }
       const fileEntries = rootCaptured
@@ -792,15 +837,15 @@ export async function captureFullSnapshot(
       ...additionalTarEntries,
     ];
 
-    let archive: ReturnType<typeof createZstdTarArchive>;
+    const archivePath = join(contentStorageDir, 'full-source.tar.zst');
+    let archive: Awaited<ReturnType<typeof writeZstdTarArchiveFile>>;
     try {
-      archive = createZstdTarArchive(tarEntries);
+      archive = await writeZstdTarArchiveFile(archivePath, tarEntries);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new RboError('materialization', message, false);
     }
-    const archivePath = join(contentStorageDir, 'full-source.tar.zst');
-    await writeFile(archivePath, archive.data);
+    releaseCapturedFileBuffers(capturedFiles);
 
     const manifestBody = {
       schema_version: 1 as const,
@@ -846,6 +891,7 @@ export async function captureFullSnapshot(
       contentStorageDir,
       secretWarnings,
       gitSourceRequirements,
+      retainedContentBytes: countRetainedContentBytes(capturedFiles),
     };
   } catch (error) {
     await cleanupContentStorage(contentStorageDir);
@@ -861,7 +907,7 @@ export interface CaptureGitOverlaySnapshotInput {
   additionalRoots?: JobAdditionalRoot[];
   contentStorageDir: string;
   mainMount?: string;
-  /** Optional override when origin remote is missing (tests). */
+  /** Allowlisted remote URL for the overlay manifest (any matching remote, not only origin). */
   repoUrl?: string;
 }
 
@@ -874,6 +920,8 @@ export interface CaptureGitOverlaySnapshotResult {
   /** Bytes transferred for the overlay archive (not the full repository). */
   overlayBytes: number;
   gitSourceRequirements: GitSourceRequirements;
+  /** Bytes still held in-process from captured file contents after archive persist (should be 0). */
+  retainedContentBytes: number;
 }
 
 /**
@@ -946,6 +994,17 @@ export async function captureGitOverlaySnapshot(
       if (captured.secretViolations) {
         secretBlockedViolations.push(...captured.secretViolations);
       }
+      if (captured.content) {
+        const dest = join(contentStorageDir, 'overlay-staging', wirePath);
+        await mkdir(join(dest, '..'), { recursive: true });
+        await writeFile(dest, captured.content);
+        captured.tarEntry = {
+          ...captured.tarEntry,
+          content: undefined,
+          contentPath: dest,
+        };
+        captured.content = undefined;
+      }
     }
 
     const emptyDirectories = (await findEmptyUntrackedDirectories(repoRoot)).filter((dir) =>
@@ -987,6 +1046,12 @@ export async function captureGitOverlaySnapshot(
           await mkdir(join(dest, '..'), { recursive: true });
           if (f.content) {
             await writeFile(dest, f.content);
+            f.tarEntry = {
+              ...f.tarEntry,
+              content: undefined,
+              contentPath: dest,
+            };
+            f.content = undefined;
           }
         }
       }
@@ -1090,15 +1155,15 @@ export async function captureGitOverlaySnapshot(
       ...additionalTarEntries,
     ];
 
-    let archive: ReturnType<typeof createZstdTarArchive>;
+    const archivePath = join(contentStorageDir, 'overlay.tar.zst');
+    let archive: Awaited<ReturnType<typeof writeZstdTarArchiveFile>>;
     try {
-      archive = createZstdTarArchive(tarEntries);
+      archive = await writeZstdTarArchiveFile(archivePath, tarEntries);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new RboError('materialization', message, false);
     }
-    const archivePath = join(contentStorageDir, 'overlay.tar.zst');
-    await writeFile(archivePath, archive.data);
+    releaseCapturedFileBuffers(capturedFiles);
 
     const manifestBody = {
       schema_version: 1 as const,
@@ -1146,6 +1211,7 @@ export async function captureGitOverlaySnapshot(
       secretWarnings,
       overlayBytes: archive.size,
       gitSourceRequirements,
+      retainedContentBytes: countRetainedContentBytes(capturedFiles),
     };
   } catch (error) {
     await cleanupContentStorage(contentStorageDir);

@@ -11,19 +11,15 @@ import {
   writeJobScript,
 } from '@rbo/executor';
 import type { JobEvent, JobRequest } from '@rbo/protocol';
-import {
-  type GitUrlAllowlist,
-  RboError,
-  isAllowedRepositoryUrl,
-  resolveContainedCwd,
-} from '@rbo/shared';
+import { type GitUrlAllowlist, RboError, resolveContainedCwd } from '@rbo/shared';
 import {
   type GitSourceRequirements,
   captureFullSnapshot,
   captureGitOverlaySnapshot,
-  describeRepository,
   gitFindRoot,
+  gitRevParseHead,
   materializeFullSnapshot,
+  resolveAllowlistedRemoteUrl,
   resolveSourceCwdForCapture,
 } from '@rbo/snapshot';
 import {
@@ -582,6 +578,14 @@ export async function captureAndPersistSnapshot(
     ctx.gitAllowlist &&
     (await canCaptureGitOverlay(normalizedRequest.source.project_root, ctx.gitAllowlist));
 
+  const overlayRemoteUrl =
+    useOverlay && ctx.gitAllowlist
+      ? await resolveAllowlistedRemoteUrl(
+          await gitFindRoot(normalizedRequest.source.project_root),
+          ctx.gitAllowlist,
+        )
+      : null;
+
   const captured = useOverlay
     ? await captureGitOverlaySnapshot({
         projectRoot: normalizedRequest.source.project_root,
@@ -590,6 +594,7 @@ export async function captureAndPersistSnapshot(
         sourcePolicy,
         additionalRoots: normalizedRequest.source.additional_roots,
         contentStorageDir: storageDir,
+        ...(overlayRemoteUrl ? { repoUrl: overlayRemoteUrl } : {}),
       })
     : await captureFullSnapshot({
         projectRoot: normalizedRequest.source.project_root,
@@ -687,11 +692,11 @@ async function canCaptureGitOverlay(
 ): Promise<boolean> {
   try {
     const repoRoot = await gitFindRoot(projectRoot);
-    const repoInfo = await describeRepository(repoRoot);
-    if (!repoInfo.remoteUrl || !repoInfo.head) {
-      return false;
-    }
-    return isAllowedRepositoryUrl(repoInfo.remoteUrl, allowlist);
+    const [remoteUrl, head] = await Promise.all([
+      resolveAllowlistedRemoteUrl(repoRoot, allowlist),
+      gitRevParseHead(repoRoot),
+    ]);
+    return Boolean(remoteUrl && head);
   } catch {
     return false;
   }

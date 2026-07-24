@@ -3,8 +3,6 @@
  * Archives must never include identity keys, credentials, caches, logs, or snapshots.
  */
 
-import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import {
   RBO_AGENT_VERSION,
   RBO_CONTROLLER_VERSION,
@@ -105,9 +103,4 @@ export function buildBaseManifest(os: PackagingManifest['os']): PackagingManifes
     files: [],
     forbidden_path_patterns: PACKAGING_FORBIDDEN_PATH_PATTERNS.map(String),
   };
-}
-
-export async function sha256File(absPath: string): Promise<string> {
-  const buf = await readFile(absPath);
-  return createHash('sha256').update(buf).digest('hex');
 }

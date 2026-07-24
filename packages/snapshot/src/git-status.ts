@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { type GitUrlAllowlist, isAllowedRepositoryUrl } from '@rbo/shared';
 
 const execFileAsync = promisify(execFile);
 
@@ -148,11 +149,70 @@ export async function gitRemoteOriginUrl(repoRoot: string): Promise<string | nul
   }
 }
 
+export interface GitRemoteFetchUrl {
+  name: string;
+  url: string;
+}
+
+/** Unique `(name, fetch-url)` pairs from `git remote -v`. */
+export async function gitListRemoteFetchUrls(repoRoot: string): Promise<GitRemoteFetchUrl[]> {
+  const { stdout } = await runGit(repoRoot, ['remote', '-v']);
+  const remotes: GitRemoteFetchUrl[] = [];
+  const seen = new Set<string>();
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const match = /^(\S+)\s+(\S+)\s+\(fetch\)\s*$/.exec(line.trim());
+    if (!match) {
+      continue;
+    }
+    const name = match[1] ?? '';
+    const url = match[2] ?? '';
+    const key = `${name}\0${url}`;
+    if (!name || !url || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    remotes.push({ name, url });
+  }
+  return remotes;
+}
+
+function orderRemotesPreferOrigin(remotes: GitRemoteFetchUrl[]): GitRemoteFetchUrl[] {
+  return [
+    ...remotes.filter((remote) => remote.name === 'origin'),
+    ...remotes.filter((remote) => remote.name !== 'origin'),
+  ];
+}
+
+/**
+ * Prefer `origin` when present; otherwise the first configured fetch remote.
+ * Used for manifests when no allowlist is in play.
+ */
+export async function resolveRepositoryRemoteUrl(repoRoot: string): Promise<string | null> {
+  const remotes = orderRemotesPreferOrigin(await gitListRemoteFetchUrls(repoRoot));
+  return remotes[0]?.url ?? null;
+}
+
+/**
+ * Prefer allowlisted `origin`, else any other allowlisted fetch remote.
+ * Controllers must use this for overlay eligibility instead of origin-only lookup.
+ */
+export async function resolveAllowlistedRemoteUrl(
+  repoRoot: string,
+  allowlist: GitUrlAllowlist,
+): Promise<string | null> {
+  for (const remote of orderRemotesPreferOrigin(await gitListRemoteFetchUrls(repoRoot))) {
+    if (isAllowedRepositoryUrl(remote.url, allowlist)) {
+      return remote.url;
+    }
+  }
+  return null;
+}
+
 export async function describeRepository(repoRoot: string): Promise<GitRepositoryInfo> {
   const [head, branch, remoteUrl] = await Promise.all([
     gitRevParseHead(repoRoot),
     gitSymbolicRefShort(repoRoot),
-    gitRemoteOriginUrl(repoRoot),
+    resolveRepositoryRemoteUrl(repoRoot),
   ]);
   return { root: repoRoot, head, branch, remoteUrl };
 }

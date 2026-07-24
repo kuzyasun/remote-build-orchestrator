@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { appendLogChunk, ensureAttemptLogs } from '@rbo/executor';
@@ -23,7 +23,7 @@ import type {
   ToolchainProfileSchema,
 } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
-import { RboError, createLogger, generateId } from '@rbo/shared';
+import { RboError, createLogger, generateId, sha256File } from '@rbo/shared';
 import { captureFullSnapshot } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
@@ -319,8 +319,7 @@ async function ensureFullFallbackArchive(
   const manifestPath = join(transferDir, 'snapshot.manifest.json');
   try {
     const existing = await stat(archivePath);
-    const data = await readFile(archivePath);
-    const sha256 = createHash('sha256').update(data).digest('hex');
+    const sha256 = await sha256File(archivePath);
     const manifestRaw = await readFile(manifestPath, 'utf8');
     const manifest = JSON.parse(manifestRaw) as {
       payload?: { sha256?: string; size?: number };
@@ -351,7 +350,7 @@ async function ensureFullFallbackArchive(
     additionalRoots: request.source.additional_roots,
     contentStorageDir: transferDir,
   });
-  await writeFile(archivePath, await readFile(captured.archivePath));
+  await copyFile(captured.archivePath, archivePath);
   await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
   return {
     archivePath,
