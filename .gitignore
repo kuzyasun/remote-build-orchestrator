@@ -10,3 +10,4 @@ tmp/
 .superpowers
 docs/superpowers
 packaging/*/dist/
+.pnpm-store/

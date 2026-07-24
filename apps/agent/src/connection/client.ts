@@ -290,7 +290,9 @@ export class AgentConnection {
             case 'prepare_source': {
               const parsed = PrepareSourcePayloadSchema.safeParse(message.payload);
               if (parsed.success) {
-                void this.executor.handlePrepareSource(parsed.data);
+                void this.executor.handlePrepareSource(parsed.data).catch((error) => {
+                  logger.warn('handlePrepareSource failed', { error: String(error) });
+                });
               } else {
                 logger.warn('invalid prepare_source payload', { issues: parsed.error.issues });
               }
@@ -299,7 +301,9 @@ export class AgentConnection {
             case 'run_job': {
               const parsed = RunJobPayloadSchema.safeParse(message.payload);
               if (parsed.success) {
-                void this.executor.handleRunJob(parsed.data);
+                void this.executor.handleRunJob(parsed.data).catch((error) => {
+                  logger.warn('handleRunJob failed', { error: String(error) });
+                });
               } else {
                 logger.warn('invalid run_job payload', { issues: parsed.error.issues });
               }
@@ -328,7 +332,9 @@ export class AgentConnection {
             case 'cancel_job': {
               const parsed = CancelJobPayloadSchema.safeParse(message.payload);
               if (parsed.success) {
-                void this.executor.handleCancelJob(parsed.data);
+                void this.executor.handleCancelJob(parsed.data).catch((error) => {
+                  logger.warn('handleCancelJob failed', { error: String(error) });
+                });
               } else {
                 logger.warn('invalid cancel_job payload', { issues: parsed.error.issues });
               }
@@ -337,7 +343,9 @@ export class AgentConnection {
             case 'log_ack': {
               const parsed = LogAckPayloadSchema.safeParse(message.payload);
               if (parsed.success) {
-                void this.executor.handleLogAck(parsed.data);
+                void this.executor.handleLogAck(parsed.data).catch((error) => {
+                  logger.warn('handleLogAck failed', { error: String(error) });
+                });
               } else {
                 logger.warn('invalid log_ack payload', { issues: parsed.error.issues });
               }

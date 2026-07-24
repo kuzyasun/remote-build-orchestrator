@@ -1676,7 +1676,18 @@ export class AgentJobExecutor {
     if (!spool || !sender) {
       return;
     }
-    await writeAck(spool, ack.sequence);
+    try {
+      await writeAck(spool, ack.sequence);
+    } catch (error) {
+      // Disk ack is best-effort durability for reconnect; never crash the Agent daemon.
+      logger.warn('failed to persist log ack', {
+        attemptId: ack.attempt_id,
+        sequence: ack.sequence,
+        ackPath: spool.ackPath,
+        error: String(error),
+      });
+    }
+    // Always advance in-memory cursor — Controller already accepted these chunks.
     sender.onAck(ack.sequence);
   }
 

@@ -1,5 +1,6 @@
-import { appendFile, readFile, rename, stat, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { type AttemptLogPaths, ensureAttemptLogs } from './logs.js';
 
 export interface ChunkIndexEntry {
@@ -130,10 +131,18 @@ export async function readAck(spool: AttemptSpool): Promise<number> {
 }
 
 export async function writeAck(spool: AttemptSpool, sequence: number): Promise<void> {
-  const tmpPath = `${spool.ackPath}.${process.pid}.${Date.now()}.tmp`;
+  // Unique tmp name: concurrent log_acks in the same ms must not share a path
+  // (otherwise one rename steals the other's tmp → ENOENT crash on the Agent).
+  const tmpPath = `${spool.ackPath}.${process.pid}.${Date.now()}.${randomBytes(6).toString('hex')}.tmp`;
   const payload = JSON.stringify({ acked_sequence: sequence });
-  await writeFile(tmpPath, payload);
-  await rename(tmpPath, spool.ackPath);
+  await mkdir(dirname(spool.ackPath), { recursive: true });
+  try {
+    await writeFile(tmpPath, payload);
+    await rename(tmpPath, spool.ackPath);
+  } catch (error) {
+    await rm(tmpPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function* iterUnacked(

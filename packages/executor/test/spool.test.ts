@@ -54,6 +54,38 @@ describe('AttemptSpool', () => {
     expect(JSON.parse(raw)).toEqual({ acked_sequence: 1 });
   });
 
+  it('writeAck tolerates concurrent same-ms writers without ENOENT', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-ack-race-'));
+    const spool = await openAttemptSpool(spoolDir);
+
+    await Promise.all(Array.from({ length: 40 }, (_, i) => writeAck(spool, i + 1)));
+
+    const acked = await readAck(spool);
+    expect(acked).toBeGreaterThanOrEqual(1);
+    expect(acked).toBeLessThanOrEqual(40);
+  });
+
+  it('writeAck recreates missing parent directory', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-ack-mkdir-'));
+    const nested = join(spoolDir, 'att_missing', 'logs');
+    const spool = {
+      dir: nested,
+      logs: {
+        logDir: nested,
+        stdoutPath: join(nested, 'stdout.log'),
+        stderrPath: join(nested, 'stderr.log'),
+        eventsPath: join(nested, 'events.jsonl'),
+      },
+      chunksPath: join(nested, 'chunks.jsonl'),
+      ackPath: join(nested, 'ack.json'),
+      nextSequence: 1,
+      streamOffsets: { stdout: 0, stderr: 0 },
+    };
+
+    await writeAck(spool, 7);
+    expect(await readAck(spool)).toBe(7);
+  });
+
   it('iterUnacked returns only sequences > afterSequence in order', async () => {
     spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-iter-'));
     const spool = await openAttemptSpool(spoolDir);

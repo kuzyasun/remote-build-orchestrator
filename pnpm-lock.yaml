@@ -100,6 +100,10 @@ importers:
       typescript:
         specifier: ^5.7.3
         version: 5.9.3
+    optionalDependencies:
+      '@gemslibe/rbo-windows-executor-win32-x64':
+        specifier: 0.4.0
+        version: 0.4.0
 
   apps/controller:
     dependencies:
@@ -624,6 +628,12 @@ packages:
   '@esbuild/win32-x64@0.28.1':
     resolution: {integrity: sha512-bm4Mowrv+GXMlpWX++EcXw/iLyd1o3+bJkC2DkWXYVvgZCqD/bSj9ctZeAMC3cIxgjRVR2Dufaiu4YPxr5gW1A==}
     engines: {node: '>=18'}
+    cpu: [x64]
+    os: [win32]
+
+  '@gemslibe/rbo-windows-executor-win32-x64@0.4.0':
+    resolution: {integrity: sha512-xXtrVWv8CXU2M5dtoqLRvQjmBW3mXv7g/Tw09da29YHjfV0RdK92gmmDRi+vifni8oV1rxTWh/ZXCx8UIQKpsw==}
+    engines: {node: '>=22.14'}
     cpu: [x64]
     os: [win32]
 
@@ -1679,6 +1689,9 @@ snapshots:
     optional: true
 
   '@esbuild/win32-x64@0.28.1':
+    optional: true
+
+  '@gemslibe/rbo-windows-executor-win32-x64@0.4.0':
     optional: true
 
   '@hono/node-server@1.19.14(hono@4.12.31)':

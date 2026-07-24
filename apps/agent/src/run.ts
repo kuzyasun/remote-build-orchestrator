@@ -57,6 +57,11 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
   process.on('SIGTERM', () => {
     stopped = true;
   });
+  // Daemon safety net: a single async handler failure must not kill the Agent.
+  // Call sites still catch and log; this covers any remaining fire-and-forget gaps.
+  process.on('unhandledRejection', (reason) => {
+    logger.error('unhandledRejection', { error: String(reason) });
+  });
 
   const connection = new AgentConnection({
     controllerUrl: config.controllerUrl,
