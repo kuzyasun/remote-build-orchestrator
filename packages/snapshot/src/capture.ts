@@ -24,6 +24,7 @@ import {
   detectGitSourceRequirements,
   enumerateSubmoduleContentPaths,
   expandFullSnapshotPaths,
+  gitSubmoduleStatus,
 } from './git-source-policy.js';
 import {
   type FileIdentity,
@@ -37,7 +38,6 @@ import {
   gitLsFilesZ,
   gitRevParseHead,
   gitStatusPorcelainV2,
-  gitSubmoduleStatus,
   normalizeWirePath,
   resolveInside,
 } from './git-status.js';

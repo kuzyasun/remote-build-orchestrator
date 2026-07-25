@@ -13,7 +13,9 @@ import {
   FullSnapshotManifestSchema,
   type GitOverlaySnapshotManifest,
   GitOverlaySnapshotManifestSchema,
+  type SnapshotFileEntry,
 } from './index.js';
+import type { OverlayGitlinkPin } from './overlay.js';
 
 export interface MaterializeFullSnapshotInput {
   /** Raw or already-parsed manifest — always re-validated before use. */
@@ -256,11 +258,6 @@ export interface ApplyGitOverlayInput {
   workspaceRoot: string;
   /** Detached worktree / project directory already checked out at base_commit. */
   projectPath: string;
-}
-
-export interface OverlayGitlinkPin {
-  path: string;
-  commit: string;
 }
 
 /** Extract gitlink pins from a parsed or unparsed git_overlay manifest (ordered as in manifest). */
