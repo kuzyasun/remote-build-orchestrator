@@ -22,6 +22,21 @@ import {
   resolveAllowlistedRemoteUrl,
   resolveSourceCwdForCapture,
 } from '@rbo/snapshot';
+
+function snapshotPayloadMode(manifest: unknown): 'full' | 'git_overlay' {
+  if (
+    manifest &&
+    typeof manifest === 'object' &&
+    'payload' in manifest &&
+    manifest.payload &&
+    typeof manifest.payload === 'object' &&
+    'mode' in manifest.payload &&
+    manifest.payload.mode === 'git_overlay'
+  ) {
+    return 'git_overlay';
+  }
+  return 'full';
+}
 import {
   createAttempt,
   createJobEvent,
@@ -241,6 +256,16 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       throw new RboError('internal', 'Job is missing snapshot payload');
     }
     const manifest = JSON.parse(await readFile(snapshotRow.manifest_path, 'utf8'));
+    // Local runner only unpacks full archives. git_overlay needs a base worktree
+    // (remote Agent prepare path). Fail closed with RboError — do not let ZodError
+    // escape to console.error (Node 24.11+ util.inspect crash).
+    if (snapshotPayloadMode(manifest) === 'git_overlay') {
+      throw new RboError(
+        'materialization',
+        'Local fallback cannot materialize git_overlay snapshots; a remote agent is required',
+        true,
+      );
+    }
     const materialized = await materializeFullSnapshot({
       manifest,
       archivePath: snapshotRow.payload_path,
@@ -518,7 +543,9 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       message,
     }).catch(() => undefined);
     if (!cancelled && category !== 'cancelled') {
-      throw error;
+      // Re-throw as RboError so outer dispatch catch never sees exotic ZodError
+      // objects that can crash Node 24.11+ console.error / util.inspect.
+      throw error instanceof RboError ? error : new RboError('internal', message, false);
     }
   } finally {
     activeCancels.delete(attempt.id);

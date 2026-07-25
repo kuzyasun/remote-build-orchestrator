@@ -149,7 +149,15 @@ async function assertSymlinkTargetContained(
 export async function materializeFullSnapshot(
   input: MaterializeFullSnapshotInput,
 ): Promise<MaterializedWorkspace> {
-  const manifest = FullSnapshotManifestSchema.parse(input.manifest);
+  const parsed = FullSnapshotManifestSchema.safeParse(input.manifest);
+  if (!parsed.success) {
+    throw new RboError(
+      'materialization',
+      `Invalid full snapshot manifest: ${parsed.error.message}`,
+      false,
+    );
+  }
+  const manifest = parsed.data;
 
   const archiveData = await readFile(input.archivePath);
   const archiveHash = sha256(archiveData);
@@ -255,7 +263,15 @@ export interface ApplyGitOverlayInput {
  * Order: deletions → extract overlay files/modes/symlinks → empty dirs → hash verify.
  */
 export async function applyGitOverlay(input: ApplyGitOverlayInput): Promise<MaterializedWorkspace> {
-  const manifest = GitOverlaySnapshotManifestSchema.parse(input.manifest);
+  const parsed = GitOverlaySnapshotManifestSchema.safeParse(input.manifest);
+  if (!parsed.success) {
+    throw new RboError(
+      'materialization',
+      `Invalid git_overlay snapshot manifest: ${parsed.error.message}`,
+      false,
+    );
+  }
+  const manifest = parsed.data;
 
   const archiveData = await readFile(input.archivePath);
   const archiveHash = sha256(archiveData);

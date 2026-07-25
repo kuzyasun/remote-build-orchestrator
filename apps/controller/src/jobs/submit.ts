@@ -10,6 +10,7 @@ import {
   RboError,
   computeCapacityScore,
   createLogger,
+  formatUnknownError,
   generateId,
   signEdDsaJwt,
   verifyEdDsaJwt,
@@ -222,7 +223,12 @@ export async function handleJobSubmit(
       job.id,
     );
     void dispatchJobExecution(ctx, job.id, normalizedRequest).catch((error) => {
-      console.error('job execution dispatch failed', job.id, error);
+      // Never pass raw Error objects to console.* — Node 24.11+ util.inspect can
+      // throw on ZodError and kill the Controller process.
+      logger.error('job execution dispatch failed', {
+        jobId: job.id,
+        error: formatUnknownError(error),
+      });
     });
     return response;
   } catch (error) {
@@ -452,7 +458,10 @@ export async function handleJobConfirm(
 
   transitionJobState(ctx.db, job.id, 'queued', { queued_at: nowIso() });
   void dispatchJobExecution(ctx, job.id, request).catch((error) => {
-    console.error('job execution dispatch failed', job.id, error);
+    logger.error('job execution dispatch failed', {
+      jobId: job.id,
+      error: formatUnknownError(error),
+    });
   });
   return { job_id: job.id, state: 'queued' };
 }

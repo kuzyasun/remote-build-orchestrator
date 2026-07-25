@@ -322,6 +322,17 @@ the live tree. Paste this into that project's `AGENTS.md` / `CLAUDE.md` (not thi
 Prefer RBO MCP over a local shell for build/test/long commands when an agent is reachable.
 Server name: `rbo` / `user-rbo`.
 
+### Shell vs agent OS
+
+- Before submit: `agents_list` once — pick a live agent that can run this build.
+- Match shell/command to **target agent OS**, not Cursor host:
+  - Windows → `powershell` (+ Windows-native cmds when that toolchain applies)
+  - macOS/Linux → `bash`/`zsh` (unix cmds; no PowerShell / Windows-only tools unless the agent has them)
+- `job_run` picks shell from **Controller** OS (no `shell` arg). Wrong OS/shell live? Tell the user
+  and ask to start the right agent — do **not** hope `local_fallback` will fix a PowerShell job on a
+  Mac-only fleet.
+- Explicit shell: `job_submit` → `execution.shell` = target agent (`powershell` | `bash`/`zsh`).
+
 Primary tool: `job_run` with:
 - `project_root`: this repo (absolute path)
 - `command`: the shell command to run
