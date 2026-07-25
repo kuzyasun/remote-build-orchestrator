@@ -673,8 +673,11 @@ export function selectAgentForJob(
     }
 
     // 7. Required shell (§19.1)
-    const requiredShell = request.execution.shell ?? 'bash';
-    if (!caps.execution.shells.map((s) => s.toLowerCase()).includes(requiredShell.toLowerCase())) {
+    const requiredShell = (request.execution.shell ?? 'bash').replace(/\.exe$/i, '').toLowerCase();
+    const hasShell = caps.execution.shells.some(
+      (s) => s.replace(/\.exe$/i, '').toLowerCase() === requiredShell,
+    );
+    if (!hasShell) {
       continue;
     }
 
