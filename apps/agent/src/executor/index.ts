@@ -38,6 +38,7 @@ import type { GitUrlAllowlist } from '@rbo/shared';
 import {
   applyGitOverlay,
   detectGitSourceRequirements,
+  listGitlinkPins,
   materializeFullSnapshot,
 } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
@@ -67,7 +68,7 @@ import {
 } from '../recovery/attempt-metadata.js';
 import type { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
 import { isAcceptingJobsUnderDiskPressure } from '../recovery/disk-pressure.js';
-import { applyControlledGitSource } from '../repos/controlled-git.js';
+import { applyControlledGitSource, checkoutOverlayGitlinkPins } from '../repos/controlled-git.js';
 import { type RepoCacheConfig, RepoMirrorManager } from '../repos/mirror.js';
 import { StreamRedactor } from './redactor.js';
 import { streamDownloadWithLimits } from './stream-download-with-limits.js';
@@ -1007,6 +1008,15 @@ export class AgentJobExecutor {
         lfs: gitSourceRequirements.lfs,
         gitLfsAvailable,
       });
+
+      const gitlinkPins = listGitlinkPins(prepare.manifest);
+      if (gitlinkPins.length > 0) {
+        await checkoutOverlayGitlinkPins({
+          projectPath,
+          pins: gitlinkPins,
+          allowlist: this.config.gitAllowlist,
+        });
+      }
 
       if (attempt.cancelSignal.cancelled) {
         throw new Error('cancelled');

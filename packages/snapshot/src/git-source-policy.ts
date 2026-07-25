@@ -195,6 +195,44 @@ export async function assertSubmodulesReadyForCapture(
   return statuses;
 }
 
+/** Fail closed when submodules are uninitialized or conflicted for git_overlay capture (§11.14 / Approach A). */
+export async function assertSubmodulesReadyForOverlayCapture(
+  repoRoot: string,
+): Promise<SubmoduleStatusEntry[]> {
+  const hasModules = await hasGitModulesFile(repoRoot);
+  if (!hasModules) {
+    return [];
+  }
+  const statuses = await gitSubmoduleStatus(repoRoot);
+  if (statuses.length === 0 && hasModules) {
+    throw new RboError(
+      'materialization',
+      'Repository declares submodules but none are initialized. Run git submodule update --init --recursive in the project root, then retry the job.',
+      false,
+      { reason: 'uninitialized_submodule' },
+    );
+  }
+  for (const entry of statuses) {
+    if (entry.state === 'uninitialized') {
+      throw new RboError(
+        'materialization',
+        `Submodule '${entry.path}' is not initialized. Run git submodule update --init --recursive in the project root, then retry the job.`,
+        false,
+        { reason: 'uninitialized_submodule', path: entry.path, state: entry.state },
+      );
+    }
+    if (entry.state === 'conflict') {
+      throw new RboError(
+        'materialization',
+        `Submodule '${entry.path}' has conflicts. Resolve conflicts before capture.`,
+        false,
+        { reason: 'submodule_conflict', path: entry.path, state: entry.state },
+      );
+    }
+  }
+  return statuses;
+}
+
 /** Fail when captured paths contain LFS pointer bytes instead of materialized content (§11.15). */
 // TODO(§11.15 follow-up): transfer local-only LFS objects as explicit blobs in overlay/full payloads.
 export async function assertLfsContentMaterialized(

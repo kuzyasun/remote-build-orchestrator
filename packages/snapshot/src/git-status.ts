@@ -12,6 +12,8 @@ export interface GitStatusEntry {
   /** X/Y status from porcelain v2 (e.g. " M", "MM", "??"). */
   xy: string;
   kind: 'tracked' | 'untracked' | 'ignored';
+  /** Porcelain v2 4-character submodule state (e.g. "S...", "N..."). */
+  submodule?: string;
 }
 
 export interface GitRepositoryInfo {
@@ -81,9 +83,10 @@ export function parsePorcelainV2(output: Buffer | string): GitStatusEntry[] {
     if (kind === '1' || kind === '2') {
       const fields = line.split(' ');
       const xy = fields[1] ?? '';
+      const sub = fields[2];
       if (kind === '1') {
         const path = fields[fields.length - 1] ?? '';
-        entries.push({ path, xy, kind: 'tracked' });
+        entries.push({ path, xy, kind: 'tracked', ...(sub ? { submodule: sub } : {}) });
       } else {
         // Rename/copy: `<line with path>` NUL `<origPath>` NUL
         const path = fields[fields.length - 1] ?? '';
@@ -92,7 +95,7 @@ export function parsePorcelainV2(output: Buffer | string): GitStatusEntry[] {
           .subarray(offset, origEnd === -1 ? buf.length : origEnd)
           .toString('utf8');
         offset = origEnd === -1 ? buf.length : origEnd + 1;
-        entries.push({ path, origPath, xy, kind: 'tracked' });
+        entries.push({ path, origPath, xy, kind: 'tracked', ...(sub ? { submodule: sub } : {}) });
       }
       continue;
     }

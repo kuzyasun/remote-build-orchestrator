@@ -1175,17 +1175,16 @@ Rules:
 
 ### 11.14. Submodules
 
-MVP policy:
+MVP policy (Approach A — Hybrid overlay entries):
 
 - `payload.mode=full`: initialized clean submodule content capture-иться як
   ordinary source files без його `.git` metadata; uninitialized/missing або dirty
   submodule завершує capture помилкою;
-- `payload.mode=git_overlay`: clean submodule —
-  `git submodule update --init --recursive` із controlled config та approved Git
-  host policy;
-- pointer change — підтримується;
-- dirty submodule — fail;
-- dirty submodule можна додати як explicit additional Git root.
+- `payload.mode=git_overlay`:
+  - base submodules initialised via `git submodule update --init --recursive` з controlled config та approved Git host policy;
+  - clean pointer changes: manifest `gitlink` entry (SHA pin); Agent checks out pin detached parent-before-child;
+  - dirty submodules: hybrid overlay (pin SHA + packed dirty/untracked files under submodule path prefix);
+  - uninitialized/missing submodule checkout on Controller host fails closed with actionable error (`git submodule update --init --recursive`).
 
 ### 11.15. Git LFS
 

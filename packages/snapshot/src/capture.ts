@@ -20,12 +20,14 @@ import {
   type SubmoduleStatusEntry,
   assertLfsContentMaterialized,
   assertSubmodulesReadyForCapture,
+  assertSubmodulesReadyForOverlayCapture,
   detectGitSourceRequirements,
   enumerateSubmoduleContentPaths,
   expandFullSnapshotPaths,
 } from './git-source-policy.js';
 import {
   type FileIdentity,
+  type GitStatusEntry,
   type GitStatusSnapshot,
   describeRepository,
   gitFindRoot,
@@ -33,7 +35,9 @@ import {
   gitLsFilesOthersIgnored,
   gitLsFilesStageModes,
   gitLsFilesZ,
+  gitRevParseHead,
   gitStatusPorcelainV2,
+  gitSubmoduleStatus,
   normalizeWirePath,
   resolveInside,
 } from './git-status.js';
@@ -924,6 +928,89 @@ export interface CaptureGitOverlaySnapshotResult {
   retainedContentBytes: number;
 }
 
+async function collectSubmodulePinsAndOverlay(
+  repoRoot: string,
+  sourcePolicy: SourcePolicyInput,
+  submodules: SubmoduleStatusEntry[],
+  parentPath = '',
+): Promise<{
+  gitlinkCommits: Map<string, string>;
+  submoduleHeads: Map<string, string>;
+  nestedStatusEntries: GitStatusEntry[];
+  nestedStageModes: Map<string, string>;
+}> {
+  const gitlinkCommits = new Map<string, string>();
+  const submoduleHeads = new Map<string, string>();
+  const nestedStatusEntries: GitStatusEntry[] = [];
+  const nestedStageModes = new Map<string, string>();
+
+  for (const sub of submodules) {
+    const wirePath = parentPath ? normalizeWirePath(`${parentPath}/${sub.path}`) : sub.path;
+    const subAbsRoot = resolveInside(repoRoot, wirePath);
+
+    let headCommit: string;
+    try {
+      headCommit = await gitRevParseHead(subAbsRoot);
+    } catch {
+      headCommit = sub.commit;
+    }
+    gitlinkCommits.set(wirePath, headCommit);
+    submoduleHeads.set(wirePath, headCommit);
+
+    let subStatus: GitStatusSnapshot;
+    try {
+      subStatus = await gitStatusPorcelainV2(subAbsRoot);
+    } catch {
+      subStatus = { head: headCommit, branch: null, entries: [] };
+    }
+
+    let subStageModes = new Map<string, string>();
+    try {
+      subStageModes = await gitLsFilesStageModes(subAbsRoot);
+    } catch {
+      subStageModes = new Map();
+    }
+    for (const [p, mode] of subStageModes) {
+      nestedStageModes.set(`${wirePath}/${p}`, mode);
+    }
+
+    for (const entry of subStatus.entries) {
+      nestedStatusEntries.push({
+        ...entry,
+        path: `${wirePath}/${entry.path}`,
+        origPath: entry.origPath ? `${wirePath}/${entry.origPath}` : undefined,
+      });
+    }
+
+    let childSubmodules: SubmoduleStatusEntry[] = [];
+    try {
+      childSubmodules = await gitSubmoduleStatus(subAbsRoot);
+    } catch {
+      childSubmodules = [];
+    }
+    if (childSubmodules.length > 0) {
+      const childRes = await collectSubmodulePinsAndOverlay(
+        repoRoot,
+        sourcePolicy,
+        childSubmodules,
+        wirePath,
+      );
+      for (const [p, c] of childRes.gitlinkCommits) {
+        gitlinkCommits.set(p, c);
+      }
+      for (const [p, h] of childRes.submoduleHeads) {
+        submoduleHeads.set(p, h);
+      }
+      nestedStatusEntries.push(...childRes.nestedStatusEntries);
+      for (const [p, m] of childRes.nestedStageModes) {
+        nestedStageModes.set(p, m);
+      }
+    }
+  }
+
+  return { gitlinkCommits, submoduleHeads, nestedStatusEntries, nestedStageModes };
+}
+
 /**
  * Capture an exact dirty-tree overlay against HEAD (§11 / Phase 5).
  * Archive contains only overlay files + additional roots — not the full tree.
@@ -952,9 +1039,27 @@ export async function captureGitOverlaySnapshot(
     throw new RboError('validation', 'git_overlay capture requires a base commit (HEAD)', false);
   }
 
-  await assertSubmodulesReadyForCapture(repoRoot);
+  const submodules = await assertSubmodulesReadyForOverlayCapture(repoRoot);
   const gitSourceRequirements = await detectGitSourceRequirements(repoRoot);
-  const plan = computeOverlayPlan(initialStatus, input.sourcePolicy);
+
+  const subRes = await collectSubmodulePinsAndOverlay(repoRoot, input.sourcePolicy, submodules);
+  const combinedEntries = [...initialStatus.entries, ...subRes.nestedStatusEntries];
+  const combinedStatus: GitStatusSnapshot = {
+    head: initialStatus.head,
+    branch: initialStatus.branch,
+    entries: combinedEntries,
+  };
+  const topStageModes = await gitLsFilesStageModes(repoRoot);
+  const combinedStageModes = new Map<string, string>([
+    ...topStageModes,
+    ...subRes.nestedStageModes,
+  ]);
+
+  const plan = computeOverlayPlan(combinedStatus, input.sourcePolicy, {
+    stageModes: combinedStageModes,
+    gitlinkCommits: subRes.gitlinkCommits,
+  });
+
   const mainMount = input.mainMount ?? 'project';
   assertMountPathsDisjoint(
     mainMount,
@@ -969,24 +1074,39 @@ export async function captureGitOverlaySnapshot(
     input.additionalRoots ?? [],
     [],
   );
-  const stageModes = await gitLsFilesStageModes(repoRoot);
 
   const capturedFiles: CapturedFile[] = [];
   const secretWarnings: Array<{ path: string; pattern: string }> = [];
   const secretBlockedViolations: SecretPolicyViolation[] = [];
   try {
-    const caseCollisions = findCaseCollisions([...plan.files, ...plan.deletions]);
+    const caseCollisions = findCaseCollisions([
+      ...plan.files,
+      ...plan.deletions,
+      ...plan.gitlinks.map((g) => g.path),
+    ]);
     if (caseCollisions.length > 0) {
       throw new RboError('materialization', 'Case-colliding paths in overlay capture', false, {
         collisions: caseCollisions,
       });
     }
 
+    const gitlinkEntries: SnapshotFileEntry[] = plan.gitlinks.map((link) => ({
+      path: link.path,
+      type: 'gitlink' as const,
+      mode: '160000' as const,
+      commit: link.commit,
+    }));
+
     for (const wirePath of plan.files) {
       if (!isSafeRelativePath(wirePath)) {
         throw new RboError('materialization', `Unsafe overlay path: ${wirePath}`);
       }
-      const captured = await captureFileEntry(repoRoot, wirePath, stageModes, input.sourcePolicy);
+      const captured = await captureFileEntry(
+        repoRoot,
+        wirePath,
+        combinedStageModes,
+        input.sourcePolicy,
+      );
       capturedFiles.push(captured);
       if (captured.secretWarnings) {
         secretWarnings.push(...captured.secretWarnings);
@@ -1019,7 +1139,6 @@ export async function captureGitOverlaySnapshot(
       const rootCaptured: CapturedFile[] = [];
       for (const relPath of rootPaths) {
         const captured = await captureFileEntry(realSource, relPath, new Map(), input.sourcePolicy);
-        // Rewrite paths under mount for the archive
         const mount = normalizeWirePath(root.mount_path);
         const archivePath = `${mount}/${relPath}`.replace(/\\/g, '/');
         rootCaptured.push({
@@ -1078,12 +1197,28 @@ export async function captureGitOverlaySnapshot(
 
     throwIfSecretViolations(secretBlockedViolations);
 
-    // Overlay guard: only the dirty path set is tracked (not the full tree).
+    // Overlay guard: only the dirty path set + submodule HEADs are tracked.
     const statusAfter = await gitStatusPorcelainV2(repoRoot);
     if (statusAfter.head !== guard.head) {
       throw new RboError('workspace_changed', 'HEAD changed during overlay capture', true, {
         reason: 'head_changed',
       });
+    }
+    for (const [subPath, expectedHead] of subRes.submoduleHeads) {
+      let currentHead = expectedHead;
+      try {
+        currentHead = await gitRevParseHead(resolveInside(repoRoot, subPath));
+      } catch {
+        // ignore if missing
+      }
+      if (currentHead !== expectedHead) {
+        throw new RboError(
+          'workspace_changed',
+          `Submodule ${subPath} HEAD changed during overlay capture`,
+          true,
+          { reason: 'head_changed', path: subPath },
+        );
+      }
     }
     for (const wirePath of guard.wirePaths) {
       const before = guard.identities.get(wirePath);
@@ -1125,26 +1260,6 @@ export async function captureGitOverlaySnapshot(
       }
     }
 
-    // Re-check overlay plan did not drift
-    const recheck = statusAfter;
-    if (recheck.head !== guard.head) {
-      throw new RboError('workspace_changed', 'HEAD changed during overlay capture', true, {
-        reason: 'head_changed',
-      });
-    }
-    const replan = computeOverlayPlan(recheck, input.sourcePolicy);
-    if (
-      replan.files.join('\0') !== plan.files.join('\0') ||
-      replan.deletions.join('\0') !== plan.deletions.join('\0')
-    ) {
-      throw new RboError(
-        'workspace_changed',
-        'Overlay path set changed during snapshot capture',
-        true,
-        { reason: 'overlay_path_set_changed' },
-      );
-    }
-
     const tarEntries: TarEntryInput[] = [
       ...capturedFiles.map((f) => f.tarEntry),
       ...emptyDirectories.map((dir) => ({
@@ -1180,7 +1295,9 @@ export async function captureGitOverlaySnapshot(
         cwd: effectiveCwd,
       },
       overlay: {
-        files: capturedFiles.map((f) => f.entry).sort((a, b) => a.path.localeCompare(b.path)),
+        files: [...capturedFiles.map((f) => f.entry), ...gitlinkEntries].sort((a, b) =>
+          a.path.localeCompare(b.path),
+        ),
         deletions: plan.deletions,
         empty_directories: emptyDirectories,
       },

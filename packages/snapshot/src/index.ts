@@ -14,19 +14,31 @@ const SafeRelativePathSchema = z
 // --- File entries (§11.6, §11.7) ---
 
 export const SnapshotFileEntrySchema = z.discriminatedUnion('type', [
-  z.object({
-    path: z.string().min(1),
-    type: z.literal('file'),
-    mode: z.enum(['100644', '100755']),
-    size: z.number().int().nonnegative(),
-    sha256: Sha256HexSchema,
-  }),
-  z.object({
-    path: z.string().min(1),
-    type: z.literal('symlink'),
-    mode: z.literal('120000'),
-    target: z.string().min(1),
-  }),
+  z
+    .object({
+      path: z.string().min(1),
+      type: z.literal('file'),
+      mode: z.enum(['100644', '100755']),
+      size: z.number().int().nonnegative(),
+      sha256: Sha256HexSchema,
+    })
+    .strict(),
+  z
+    .object({
+      path: z.string().min(1),
+      type: z.literal('symlink'),
+      mode: z.literal('120000'),
+      target: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      path: z.string().min(1),
+      type: z.literal('gitlink'),
+      mode: z.literal('160000'),
+      commit: z.string().regex(/^[0-9a-f]{40}$/),
+    })
+    .strict(),
 ]);
 
 export type SnapshotFileEntry = z.infer<typeof SnapshotFileEntrySchema>;

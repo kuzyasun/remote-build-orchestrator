@@ -104,3 +104,55 @@ export async function applyControlledGitSource(options: ControlledGitSourceOptio
     // Detached worktrees may not expose origin; submodule URLs were checked above.
   }
 }
+
+export interface CheckoutOverlayGitlinkPinsOptions {
+  projectPath: string;
+  pins: Array<{ path: string; commit: string }>;
+  allowlist: GitUrlAllowlist;
+}
+
+/**
+ * Check out submodule pins parent-before-child for git_overlay snapshot manifests (§11.14 / Approach A).
+ */
+export async function checkoutOverlayGitlinkPins(
+  options: CheckoutOverlayGitlinkPinsOptions,
+): Promise<void> {
+  const { projectPath, pins, allowlist } = options;
+  if (pins.length === 0) {
+    return;
+  }
+
+  const sortedPins = [...pins].sort((a, b) => {
+    const depthA = a.path.split('/').length;
+    const depthB = b.path.split('/').length;
+    if (depthA !== depthB) {
+      return depthA - depthB;
+    }
+    return a.path.localeCompare(b.path);
+  });
+
+  for (const pin of sortedPins) {
+    const subDir = join(projectPath, pin.path);
+
+    const nestedUrls = await readSubmoduleUrls(subDir);
+    assertSubmoduleUrlsAllowed(nestedUrls, allowlist);
+
+    let hasCommit = false;
+    try {
+      await runGit(subDir, ['cat-file', '-e', `${pin.commit}^{commit}`]);
+      hasCommit = true;
+    } catch {
+      hasCommit = false;
+    }
+
+    if (!hasCommit) {
+      try {
+        await runGit(subDir, ['fetch', '--depth', '1', 'origin', pin.commit]);
+      } catch {
+        await runGit(subDir, ['fetch', 'origin']);
+      }
+    }
+
+    await runGit(subDir, ['checkout', '--detach', pin.commit]);
+  }
+}

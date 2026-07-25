@@ -258,6 +258,22 @@ export interface ApplyGitOverlayInput {
   projectPath: string;
 }
 
+export interface OverlayGitlinkPin {
+  path: string;
+  commit: string;
+}
+
+/** Extract gitlink pins from a parsed or unparsed git_overlay manifest (ordered as in manifest). */
+export function listGitlinkPins(manifest: unknown): OverlayGitlinkPin[] {
+  const parsed = GitOverlaySnapshotManifestSchema.safeParse(manifest);
+  if (!parsed.success) {
+    return [];
+  }
+  return parsed.data.overlay.files
+    .filter((f): f is Extract<SnapshotFileEntry, { type: 'gitlink' }> => f.type === 'gitlink')
+    .map((f) => ({ path: f.path, commit: f.commit }));
+}
+
 /**
  * Apply a git_overlay archive onto an existing base worktree (§11 / Phase 5).
  * Order: deletions → extract overlay files/modes/symlinks → empty dirs → hash verify.
@@ -302,10 +318,20 @@ export async function applyGitOverlay(input: ApplyGitOverlayInput): Promise<Mate
   const tar = decompressTarZstd(archiveData);
   const entries = parseTarArchive(tar);
 
+  const gitlinkPaths = new Set(
+    manifest.overlay.files.filter((f) => f.type === 'gitlink').map((f) => f.path),
+  );
+
   for (const entry of entries) {
     const normalized = entry.path.replace(/\\/g, '/').replace(/^\.\//, '');
     if (!isSafeRelativePath(normalized)) {
       throw new RboError('materialization', `Overlay entry path is unsafe: ${entry.path}`);
+    }
+    if (gitlinkPaths.has(normalized)) {
+      throw new RboError(
+        'materialization',
+        `Archive contains member at gitlink path: ${entry.path}`,
+      );
     }
 
     // Additional-root mounts are workspace-relative; overlay files are project-relative.

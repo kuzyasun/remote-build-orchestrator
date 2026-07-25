@@ -25,7 +25,7 @@ fallback — see step 4).
 ## 2. Prerequisites
 
 - Node.js ≥ 22.14 on every machine (Controller and every Agent)
-- Git on `PATH` on every machine that will run a job (snapshot capture shells out to `git`)
+- Git on `PATH` on every machine that will run a job (snapshot capture shells out to `git`). For repositories with Git submodules, ensure submodules are initialized on the project checkout host (`git submodule update --init --recursive`) before submitting `git_overlay` jobs.
 - Windows Agents: nothing extra on **win32-x64** — with `npm install -g @gemslibe/rbo`, the Job
   Object helper arrives via optionalDependency `@gemslibe/rbo-windows-executor-win32-x64`
   (`rbo-windows-executor.exe`). Archives ship the same exe under `bin/`. Other Windows arches /
