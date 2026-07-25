@@ -75,6 +75,7 @@ describe('AttemptSpool', () => {
         stdoutPath: join(nested, 'stdout.log'),
         stderrPath: join(nested, 'stderr.log'),
         eventsPath: join(nested, 'events.jsonl'),
+        chunksPath: join(nested, 'chunks.jsonl'),
       },
       chunksPath: join(nested, 'chunks.jsonl'),
       ackPath: join(nested, 'ack.json'),

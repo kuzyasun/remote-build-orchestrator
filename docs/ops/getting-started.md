@@ -319,26 +319,29 @@ the live tree. Paste this into that project's `AGENTS.md` / `CLAUDE.md` (not thi
 ```markdown
 ## Remote builds via RBO
 
-For build/test/long commands, call MCP `job_run` (server `rbo`) with:
+Prefer RBO MCP over a local shell for build/test/long commands when an agent is reachable.
+Server name: `rbo` / `user-rbo`.
+
+Primary tool: `job_run` with:
 - `project_root`: this repo (absolute path)
 - `command`: the shell command to run
+- optional `artifacts`: only when you need outputs back — choose globs for *this* task.
+  Skip when `outcome` / `exit_code` / `log_tail` suffice.
 
-Optional `artifacts`: only when you need outputs back — choose globs for the files that matter
-for *this* task (binaries, logs, reports, configs, etc.). Skip artifacts when you only need
-`outcome` / `exit_code` / `log_tail`. Avoid scooping an entire huge build tree unless you
-really need it.
+Use `outcome` / `exit_code` / `log_tail` / `artifacts`. If `resume: true`, call `job_run` again
+with the same `job_id` until finished. Do not assume the job wrote into the live tree — use
+`artifact_materialize` when you need a file locally.
 
-Use `outcome` / `exit_code` / `log_tail` / `artifacts`. If the response has `resume: true`, call
-`job_run` again with the same `job_id` until `resume` is false (keeps each MCP call under ~60s).
+Destructive/hardware jobs return `awaiting_confirmation`; call `job_confirm`, then `job_wait` /
+`job_get` (or resume `job_run`).
 
-Do not run the same command in the live tree unless `job_run` fails and the user approves a local
-fallback.
+`job_logs` is pull-based (cursor). There is no MCP subscribe/streaming. Live follow is CLI-only:
+`rbo logs <job_id> --follow` (human; outside model context).
 
-Destructive or hardware-risk jobs return `awaiting_confirmation`; call `job_confirm` with the
-token, then `job_wait` / `job_get` as needed.
+If `job_run` fails or no agent is reachable, tell the user why and ask before running locally.
 ```
 
-If your `mcpServers` entry is not named `rbo`, change the server name in the first line.
+If your `mcpServers` entry is not named `rbo` / `user-rbo`, change the server name in the first line.
 
 ## 9. Troubleshooting
 

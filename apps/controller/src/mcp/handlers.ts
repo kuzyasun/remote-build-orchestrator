@@ -194,6 +194,7 @@ export async function handleToolCall(
         stdoutPath: join(logDir, 'stdout.log'),
         stderrPath: join(logDir, 'stderr.log'),
         eventsPath: join(logDir, 'events.jsonl'),
+        chunksPath: join(logDir, 'chunks.jsonl'),
       };
       const streams = args.streams as Array<'stdout' | 'stderr' | 'events'>;
       const response: Record<string, unknown> = { job_id: job.id, attempt_id: attemptId };

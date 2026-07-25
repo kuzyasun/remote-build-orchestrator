@@ -4,7 +4,6 @@ import { readFileSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
-import { appendLogChunk, ensureAttemptLogs } from '@rbo/executor';
 import type {
   ArtifactManifestPayload,
   ArtifactUploadGrantPayload,
@@ -45,12 +44,13 @@ import {
   transitionJobState,
   updateAttempt,
 } from '../jobs/lifecycle.js';
+import { persistAndPublishLogChunk } from '../logs/stream.js';
 import { processIdentityFromPid } from '../recovery/coordinator.js';
 import { issueDataToken } from '../security/data-tokens.js';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
 import type { ConnectedAgent } from '../websocket/server.js';
-import { attemptLogDir, attemptTransferDir } from './runner.js';
+import { attemptTransferDir } from './runner.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -996,9 +996,15 @@ export async function handleRemoteLogChunk(
     return;
   }
 
-  const logDir = attemptLogDir(opts.dataDir, attempt.id);
-  const logs = await ensureAttemptLogs(logDir);
-  await appendLogChunk(logs, payload.stream, payload.bytes);
+  // Durable write + index + live publish, then ack (observer path must not
+  // affect Agent spool reliability).
+  await persistAndPublishLogChunk({
+    dataDir: opts.dataDir,
+    attemptId: attempt.id,
+    stream: payload.stream,
+    chunk: payload.bytes,
+    sequence: payload.sequence,
+  });
   updateAttempt(opts.db, attempt.id, { log_acked_sequence: payload.sequence });
   sendAck();
 }

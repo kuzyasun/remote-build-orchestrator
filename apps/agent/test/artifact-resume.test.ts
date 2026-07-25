@@ -22,6 +22,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
         stdoutPath: '/dev/null',
         stderrPath: '/dev/null',
         eventsPath: '/dev/null',
+        chunksPath: '/dev/null',
       },
       chunksPath: '/dev/null',
       ackPath: '/dev/null',
@@ -179,6 +180,13 @@ describe('Artifact upload resume (completed_awaiting_upload)', () => {
       repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
     });
 
+    // Seed an active attempt slot so requestArtifactUploadTokens can attach pending state.
+    (
+      executor as unknown as {
+        attempts: Map<string, { pendingArtifactUpload: unknown | null }>;
+      }
+    ).attempts.set('att_2', { pendingArtifactUpload: null });
+
     const requestPromise = (
       executor as unknown as {
         requestArtifactUploadTokens: (
@@ -212,7 +220,11 @@ describe('Artifact upload resume (completed_awaiting_upload)', () => {
     executor.handleArtifactUploadGrant({ ...grantArgs, lease_id: 'lease_2', lease_epoch: 1 });
     executor.handleArtifactUploadGrant({ ...grantArgs, lease_id: 'lease_stale', lease_epoch: 2 });
     expect(
-      (executor as unknown as { pendingArtifactUpload: unknown }).pendingArtifactUpload,
+      (
+        executor as unknown as {
+          attempts: Map<string, { pendingArtifactUpload: unknown }>;
+        }
+      ).attempts.get('att_2')?.pendingArtifactUpload,
     ).not.toBeNull();
 
     // The correct grant, matching the outstanding request's own lease tuple, resolves it.

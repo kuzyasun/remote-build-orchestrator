@@ -5,6 +5,7 @@ import type { McpToolName } from '@rbo/protocol';
 import { getMcpToolDef } from '@rbo/protocol';
 import { RboError, createLogger } from '@rbo/shared';
 import type { ControllerIdentity } from '@rbo/shared';
+import { handleJobLogsStreamRequest } from '../logs/stream.js';
 import type { ClientIdentity, ToolContext } from '../mcp/handlers.js';
 import { handleToolCall } from '../mcp/handlers.js';
 import { buildMcpServer } from '../mcp/server.js';
@@ -262,6 +263,21 @@ export async function startControllerServer(
         sendJson(res, 200, { ok: true });
         return;
       }
+
+      const logStreamMatch = url.pathname.match(/^\/internal\/v1\/jobs\/([^/]+)\/logs\/stream$/);
+      if (logStreamMatch) {
+        const jobId = decodeURIComponent(logStreamMatch[1] ?? '');
+        await handleJobLogsStreamRequest({
+          req,
+          res,
+          db: options.db,
+          dataDir: options.dataDir ?? process.env.RBO_DATA_DIR ?? '',
+          jobId,
+          url,
+        });
+        return;
+      }
+
       sendJson(res, 404, {
         error: { category: 'validation', message: 'Not found', retryable: false },
       });
@@ -270,9 +286,13 @@ export async function startControllerServer(
     run().catch((error) => {
       logger.error('request failed', { path: url.pathname, error: String(error) });
       if (!res.headersSent) {
-        sendJson(res, 500, {
-          error: { category: 'internal', message: 'Internal error', retryable: false },
-        });
+        if (error instanceof RboError) {
+          sendJson(res, error.category === 'validation' ? 400 : 500, { error: error.toJSON() });
+        } else {
+          sendJson(res, 500, {
+            error: { category: 'internal', message: 'Internal error', retryable: false },
+          });
+        }
       } else {
         res.end();
       }

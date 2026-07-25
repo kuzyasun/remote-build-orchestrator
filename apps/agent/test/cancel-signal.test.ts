@@ -51,6 +51,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
       stdoutPath: '/dev/null',
       stderrPath: '/dev/null',
       eventsPath: '/dev/null',
+      chunksPath: '/dev/null',
     })),
     openAttemptSpool: vi.fn(async () => ({
       dir: '/dev/null',
@@ -59,6 +60,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
         stdoutPath: '/dev/null',
         stderrPath: '/dev/null',
         eventsPath: '/dev/null',
+        chunksPath: '/dev/null',
       },
       chunksPath: '/dev/null',
       ackPath: '/dev/null',
@@ -154,11 +156,15 @@ describe('Agent cancelSignal race across spawn', () => {
       lease_ttl_seconds: 300,
     });
 
-    const exe = executor as unknown as {
-      currentPrepare: unknown;
-      materializedProjectPath: string;
-    };
-    exe.currentPrepare = {
+    const attempt = (
+      executor as unknown as {
+        attempts: Map<string, { prepare: unknown; materializedProjectPath: string | null }>;
+      }
+    ).attempts.get('att_1');
+    if (!attempt) {
+      throw new Error('expected att_1 runtime');
+    }
+    attempt.prepare = {
       source_mode: 'full',
       attempt_id: 'att_1',
       lease_id: 'lease_1',
@@ -168,7 +174,7 @@ describe('Agent cancelSignal race across spawn', () => {
       expected_size_bytes: 1,
       expected_sha256: 'ab',
     };
-    exe.materializedProjectPath = projectPath;
+    attempt.materializedProjectPath = projectPath;
 
     await executor.handleRunJob({
       attempt_id: 'att_1',

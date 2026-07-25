@@ -99,6 +99,8 @@ export interface AgentExecutorConfig {
   repoCache: RepoCacheConfig;
   /** Named build-cache policy (Phase 7). */
   buildCache?: BuildCacheConfig;
+  /** Max concurrent job slots; default 1. */
+  maxJobs?: number;
   /** Max attempt spool bytes (stdout+stderr); default 512 MiB. */
   logSpoolMaxBytes?: number;
   /** Max in-memory log send queue; default 64. */
@@ -111,6 +113,78 @@ export interface AgentExecutorConfig {
   getFreeDiskBytes?: () => number | Promise<number>;
   /** Injectable spool-pressure flag. */
   getSpoolPressure?: () => boolean;
+}
+
+/** Per-attempt execution state (one slot in the multi-job map). */
+interface AttemptRuntime {
+  attemptId: string;
+  jobId: string;
+  offer: LeaseOfferPayload | null;
+  prepare: PrepareSourcePayload | null;
+  /** True after source_ready until attempt clear — cancel must emit terminal itself. */
+  prepareReady: boolean;
+  /** True while handleRunJob owns the attempt (including pre-spawn). */
+  runInProgress: boolean;
+  materializedProjectPath: string | null;
+  overlayRepoUrl: string | null;
+  activeProcessKill?: (graceSeconds?: number) => Promise<void>;
+  cancelSignal: { cancelled: boolean };
+  pendingArtifactUpload: {
+    attemptId: string;
+    leaseId: string;
+    leaseEpoch: number;
+    resolve: (grant: ArtifactUploadGrantPayload) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null;
+  pendingBundleDownload: {
+    attemptId: string;
+    resolve: (grant: BundleDownloadPayload) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null;
+  activeSpool: AttemptSpool | null;
+  activeSpoolSender: SpoolSender | null;
+  activeSpoolLease: {
+    attemptId: string;
+    leaseId: string;
+    leaseEpoch: number;
+  } | null;
+  /** Serializes disk spool writes across concurrent stdout/stderr handlers. */
+  spoolWriteChain: Promise<void>;
+  spoolLimitBreached: boolean;
+  /** Local lease deadline (ms since epoch) from offer / heartbeat renewals. */
+  leaseDeadlineMs: number | null;
+  leaseTtlSeconds: number;
+  leaseRisk: RiskLevel;
+  leaseTimer: ReturnType<typeof setTimeout> | null;
+  leaseExpired: boolean;
+}
+
+function createAttemptRuntime(attemptId: string, jobId: string): AttemptRuntime {
+  return {
+    attemptId,
+    jobId,
+    offer: null,
+    prepare: null,
+    prepareReady: false,
+    runInProgress: false,
+    materializedProjectPath: null,
+    overlayRepoUrl: null,
+    cancelSignal: { cancelled: false },
+    pendingArtifactUpload: null,
+    pendingBundleDownload: null,
+    activeSpool: null,
+    activeSpoolSender: null,
+    activeSpoolLease: null,
+    spoolWriteChain: Promise.resolve(),
+    spoolLimitBreached: false,
+    leaseDeadlineMs: null,
+    leaseTtlSeconds: 300,
+    leaseRisk: 'normal',
+    leaseTimer: null,
+    leaseExpired: false,
+  };
 }
 
 function agentOsFamily(): string {
@@ -132,52 +206,14 @@ function resolveProjectIdentity(
 
 export class AgentJobExecutor {
   private readonly mirrorManager: RepoMirrorManager;
-  private activeAttemptId: string | null = null;
-  private currentOffer: LeaseOfferPayload | null = null;
-  private currentPrepare: PrepareSourcePayload | null = null;
-  /** True after source_ready until attempt clear — cancel must emit terminal itself. */
-  private prepareReady = false;
-  /** True while handleRunJob owns the attempt (including pre-spawn). */
-  private runInProgress = false;
-  private materializedProjectPath: string | null = null;
-  private overlayRepoUrl: string | null = null;
-  private activeProcessKill?: (graceSeconds?: number) => Promise<void>;
-  private cancelSignal = { cancelled: false };
-  private pendingArtifactUpload: {
-    attemptId: string;
-    leaseId: string;
-    leaseEpoch: number;
-    resolve: (grant: ArtifactUploadGrantPayload) => void;
-    reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  } | null = null;
-  private pendingBundleDownload: {
-    attemptId: string;
-    resolve: (grant: BundleDownloadPayload) => void;
-    reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  } | null = null;
-  private activeSpool: AttemptSpool | null = null;
-  private activeSpoolSender: SpoolSender | null = null;
-  private activeSpoolLease: {
-    attemptId: string;
-    leaseId: string;
-    leaseEpoch: number;
-  } | null = null;
-  /** Serializes disk spool writes across concurrent stdout/stderr handlers. */
-  private spoolWriteChain: Promise<void> = Promise.resolve();
-  private spoolLimitBreached = false;
-  /** Local lease deadline (ms since epoch) from offer / heartbeat renewals. */
-  private leaseDeadlineMs: number | null = null;
-  private leaseTtlSeconds = 300;
-  private leaseRisk: RiskLevel = 'normal';
-  private leaseTimer: ReturnType<typeof setTimeout> | null = null;
-  private leaseExpired = false;
+  private readonly attempts = new Map<string, AttemptRuntime>();
+  private readonly maxJobs: number;
 
   constructor(
     private socket: WebSocket,
     private config: AgentExecutorConfig,
   ) {
+    this.maxJobs = config.maxJobs ?? 1;
     this.mirrorManager = new RepoMirrorManager({
       reposDir: resolveReposDir(config),
       allowlist: config.gitAllowlist,
@@ -186,12 +222,24 @@ export class AgentJobExecutor {
   }
 
   public isBusy(): boolean {
-    return this.activeAttemptId !== null;
+    return this.attempts.size > 0;
   }
 
-  /** True when the active log send queue is saturated (disk carries backlog). */
+  public getActiveJobs(): Array<{ attempt_id: string; job_id: string }> {
+    return [...this.attempts.values()].map((attempt) => ({
+      attempt_id: attempt.attemptId,
+      job_id: attempt.jobId,
+    }));
+  }
+
+  /** True when any attempt's log send queue is saturated (disk carries backlog). */
   public isUnderSpoolPressure(): boolean {
-    return this.activeSpoolSender?.isUnderPressure() ?? false;
+    for (const attempt of this.attempts.values()) {
+      if (attempt.activeSpoolSender?.isUnderPressure()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private sendFrame(
@@ -218,131 +266,127 @@ export class AgentJobExecutor {
     );
   }
 
-  private matchesReservedLease(attemptId: string, leaseId: string, leaseEpoch: number): boolean {
-    return (
-      this.activeAttemptId === attemptId &&
-      this.currentOffer?.attempt_id === attemptId &&
-      this.currentOffer.lease_id === leaseId &&
-      this.currentOffer.lease_epoch === leaseEpoch
-    );
+  private matchesReservedLease(
+    attemptId: string,
+    leaseId: string,
+    leaseEpoch: number,
+  ): AttemptRuntime | null {
+    const attempt = this.attempts.get(attemptId);
+    if (
+      attempt &&
+      attempt.offer?.attempt_id === attemptId &&
+      attempt.offer.lease_id === leaseId &&
+      attempt.offer.lease_epoch === leaseEpoch
+    ) {
+      return attempt;
+    }
+    return null;
   }
 
-  private clearAttempt(): void {
-    if (this.activeAttemptId && this.config.recovery) {
-      this.config.recovery.clearLiveSender(this.activeAttemptId);
-    }
-    this.clearLeaseTimer();
-    this.leaseDeadlineMs = null;
-    this.leaseExpired = false;
-    this.leaseRisk = 'normal';
-    this.activeAttemptId = null;
-    this.currentOffer = null;
-    this.currentPrepare = null;
-    this.prepareReady = false;
-    this.runInProgress = false;
-    this.materializedProjectPath = null;
-    this.overlayRepoUrl = null;
-    this.activeProcessKill = undefined;
-    this.cancelSignal = { cancelled: false };
-    this.activeSpool = null;
-    this.activeSpoolSender = null;
-    this.activeSpoolLease = null;
-    this.spoolWriteChain = Promise.resolve();
-    this.spoolLimitBreached = false;
-    if (this.pendingArtifactUpload) {
-      clearTimeout(this.pendingArtifactUpload.timer);
-      const pending = this.pendingArtifactUpload;
-      this.pendingArtifactUpload = null;
-      pending.reject(new Error('attempt cleared'));
-    }
-    if (this.pendingBundleDownload) {
-      clearTimeout(this.pendingBundleDownload.timer);
-      const pending = this.pendingBundleDownload;
-      this.pendingBundleDownload = null;
-      pending.reject(new Error('attempt cleared'));
-    }
-  }
-
-  private clearLeaseTimer(): void {
-    if (this.leaseTimer) {
-      clearTimeout(this.leaseTimer);
-      this.leaseTimer = null;
-    }
-  }
-
-  private scheduleLeaseTimer(): void {
-    this.clearLeaseTimer();
-    if (this.leaseDeadlineMs === null) {
+  private clearAttempt(attemptId: string): void {
+    const attempt = this.attempts.get(attemptId);
+    if (!attempt) {
       return;
     }
-    const delay = Math.max(0, this.leaseDeadlineMs - Date.now());
-    this.leaseTimer = setTimeout(() => {
-      void this.onLeaseExpired();
+    if (this.config.recovery) {
+      this.config.recovery.clearLiveSender(attemptId);
+    }
+    this.clearLeaseTimer(attempt);
+    if (attempt.pendingArtifactUpload) {
+      clearTimeout(attempt.pendingArtifactUpload.timer);
+      const pending = attempt.pendingArtifactUpload;
+      attempt.pendingArtifactUpload = null;
+      pending.reject(new Error('attempt cleared'));
+    }
+    if (attempt.pendingBundleDownload) {
+      clearTimeout(attempt.pendingBundleDownload.timer);
+      const pending = attempt.pendingBundleDownload;
+      attempt.pendingBundleDownload = null;
+      pending.reject(new Error('attempt cleared'));
+    }
+    this.attempts.delete(attemptId);
+  }
+
+  private clearLeaseTimer(attempt: AttemptRuntime): void {
+    if (attempt.leaseTimer) {
+      clearTimeout(attempt.leaseTimer);
+      attempt.leaseTimer = null;
+    }
+  }
+
+  private scheduleLeaseTimer(attempt: AttemptRuntime): void {
+    this.clearLeaseTimer(attempt);
+    if (attempt.leaseDeadlineMs === null) {
+      return;
+    }
+    const delay = Math.max(0, attempt.leaseDeadlineMs - Date.now());
+    const attemptId = attempt.attemptId;
+    attempt.leaseTimer = setTimeout(() => {
+      void this.onLeaseExpired(attemptId);
     }, delay);
-    this.leaseTimer.unref?.();
+    attempt.leaseTimer.unref?.();
   }
 
   /**
    * Arm / re-arm local lease deadline from offer TTL.
    * Heartbeat renewals call {@link renewLeaseDeadline} while connected.
    */
-  private armLeaseDeadline(offer: LeaseOfferPayload): void {
-    this.leaseTtlSeconds = offer.lease_ttl_seconds;
-    this.leaseRisk = offer.job_request.risk_level ?? 'normal';
-    this.leaseDeadlineMs = Date.now() + offer.lease_ttl_seconds * 1000;
-    this.leaseExpired = false;
-    this.scheduleLeaseTimer();
+  private armLeaseDeadline(attempt: AttemptRuntime, offer: LeaseOfferPayload): void {
+    attempt.leaseTtlSeconds = offer.lease_ttl_seconds;
+    attempt.leaseRisk = offer.job_request.risk_level ?? 'normal';
+    attempt.leaseDeadlineMs = Date.now() + offer.lease_ttl_seconds * 1000;
+    attempt.leaseExpired = false;
+    this.scheduleLeaseTimer(attempt);
   }
 
-  /** Mirror Controller renewActiveLease while heartbeats succeed. */
+  /** Mirror Controller renewActiveLease while heartbeats succeed. Renews ALL active attempts. */
   public renewLeaseDeadline(ttlSeconds?: number): void {
-    if (this.leaseDeadlineMs === null || this.leaseExpired) {
-      return;
-    }
-    const ttl = ttlSeconds ?? this.leaseTtlSeconds;
-    this.leaseDeadlineMs = Date.now() + ttl * 1000;
-    this.scheduleLeaseTimer();
-    const attemptId = this.activeAttemptId;
-    if (attemptId) {
-      const existing = readAttemptMetadata(this.config.stateDir, attemptId);
+    for (const attempt of this.attempts.values()) {
+      if (attempt.leaseDeadlineMs === null || attempt.leaseExpired) {
+        continue;
+      }
+      const ttl = ttlSeconds ?? attempt.leaseTtlSeconds;
+      attempt.leaseDeadlineMs = Date.now() + ttl * 1000;
+      this.scheduleLeaseTimer(attempt);
+      const existing = readAttemptMetadata(this.config.stateDir, attempt.attemptId);
       if (existing) {
         writeAttemptMetadata(this.config.stateDir, {
           ...existing,
-          lease_deadline: new Date(this.leaseDeadlineMs).toISOString(),
+          lease_deadline: new Date(attempt.leaseDeadlineMs).toISOString(),
           updated_at: new Date().toISOString(),
         });
       }
     }
   }
 
-  private async onLeaseExpired(): Promise<void> {
-    if (this.leaseExpired || this.leaseDeadlineMs === null) {
+  private async onLeaseExpired(attemptId: string): Promise<void> {
+    const attempt = this.attempts.get(attemptId);
+    if (!attempt || attempt.leaseExpired || attempt.leaseDeadlineMs === null) {
       return;
     }
-    if (Date.now() < this.leaseDeadlineMs) {
-      this.scheduleLeaseTimer();
+    if (Date.now() < attempt.leaseDeadlineMs) {
+      this.scheduleLeaseTimer(attempt);
       return;
     }
-    if (!isDestructiveOrHardwareRisk(this.leaseRisk)) {
+    if (!isDestructiveOrHardwareRisk(attempt.leaseRisk)) {
       // safe/normal: Controller owns lease expiry / orphan / lost.
       return;
     }
-    this.leaseExpired = true;
-    const offer = this.currentOffer;
-    const attemptId = this.activeAttemptId;
+    attempt.leaseExpired = true;
+    const offer = attempt.offer;
     logger.warn('lease expired — self-terminating destructive/hardware attempt', {
       attemptId,
-      risk: this.leaseRisk,
+      risk: attempt.leaseRisk,
     });
-    this.cancelSignal.cancelled = true;
-    if (this.activeProcessKill) {
+    attempt.cancelSignal.cancelled = true;
+    if (attempt.activeProcessKill) {
       try {
-        await this.activeProcessKill(10);
+        await attempt.activeProcessKill(10);
       } catch (error) {
         logger.warn('failed to kill process on lease expiry', { error: String(error) });
       }
     }
-    if (attemptId && offer) {
+    if (offer) {
       const existing = readAttemptMetadata(this.config.stateDir, attemptId);
       writeAttemptMetadata(this.config.stateDir, {
         attempt_id: attemptId,
@@ -354,9 +398,9 @@ export class AgentJobExecutor {
         workspace_path:
           existing?.workspace_path ?? join(this.config.stateDir, 'workspaces', attemptId),
         spool_dir: existing?.spool_dir ?? join(this.config.stateDir, 'logs', attemptId),
-        risk_level: this.leaseRisk,
+        risk_level: attempt.leaseRisk,
         updated_at: new Date().toISOString(),
-        lease_deadline: new Date(this.leaseDeadlineMs).toISOString(),
+        lease_deadline: new Date(attempt.leaseDeadlineMs).toISOString(),
         last_exit: {
           exit_code: null,
           outcome: 'failed',
@@ -369,13 +413,13 @@ export class AgentJobExecutor {
     // Terminal frames are emitted from handleRunJob after waitForCompletion observes the kill.
   }
 
-  private async cleanupOverlayWorktree(): Promise<void> {
-    if (this.overlayRepoUrl && this.materializedProjectPath) {
+  private async cleanupOverlayWorktree(attempt: AttemptRuntime): Promise<void> {
+    if (attempt.overlayRepoUrl && attempt.materializedProjectPath) {
       await this.mirrorManager
-        .removeWorktree(this.overlayRepoUrl, this.materializedProjectPath)
+        .removeWorktree(attempt.overlayRepoUrl, attempt.materializedProjectPath)
         .catch(() => undefined);
     }
-    this.overlayRepoUrl = null;
+    attempt.overlayRepoUrl = null;
   }
 
   /**
@@ -385,8 +429,10 @@ export class AgentJobExecutor {
     this.socket = socket;
   }
 
+  /** First active attempt id (test helper); prefer {@link getActiveJobs}. */
   public getActiveAttemptId(): string | null {
-    return this.activeAttemptId;
+    const first = this.attempts.keys().next();
+    return first.done ? null : first.value;
   }
 
   /**
@@ -395,36 +441,42 @@ export class AgentJobExecutor {
    * Frames are not sent — Controller enters grace/orphan reconciliation.
    */
   public async abandonOnDisconnect(): Promise<void> {
-    const attemptId = this.activeAttemptId;
-    if (attemptId && this.config.recovery) {
-      this.config.recovery.onDisconnectPark(attemptId);
+    if (this.config.recovery) {
+      for (const attemptId of this.attempts.keys()) {
+        this.config.recovery.onDisconnectPark(attemptId);
+      }
       this.config.recovery.detachSocket();
     }
-    // Intentionally do NOT kill the process or clearAttempt — Phase 6 grace/adopt.
+    // Intentionally do NOT kill processes or clearAttempt — Phase 6 grace/adopt.
   }
 
-  /** Operator shutdown / terminate_stale: kill process and free the slot. */
+  /** Operator shutdown / terminate_stale: kill all processes and free slots. */
   public async forceAbandon(): Promise<void> {
-    this.cancelSignal.cancelled = true;
-    if (this.activeProcessKill) {
+    const ids = [...this.attempts.keys()];
+    for (const attemptId of ids) {
+      await this.forceAbandonAttempt(attemptId);
+    }
+  }
+
+  private async forceAbandonAttempt(attemptId: string): Promise<void> {
+    const attempt = this.attempts.get(attemptId);
+    if (!attempt) {
+      return;
+    }
+    attempt.cancelSignal.cancelled = true;
+    if (attempt.activeProcessKill) {
       try {
-        await this.activeProcessKill(10);
+        await attempt.activeProcessKill(10);
       } catch (error) {
         logger.warn('failed to kill process on force abandon', { error: String(error) });
       }
     }
-    if (this.activeAttemptId && this.config.recovery) {
-      this.config.recovery.clearLiveSender(this.activeAttemptId);
-    }
-    this.clearAttempt();
+    this.clearAttempt(attemptId);
   }
 
   /** Recovery terminate_stale hook. */
   public async terminateAttemptForRecovery(attemptId: string): Promise<void> {
-    if (this.activeAttemptId !== attemptId) {
-      return;
-    }
-    await this.forceAbandon();
+    await this.forceAbandonAttempt(attemptId);
   }
 
   /**
@@ -487,10 +539,16 @@ export class AgentJobExecutor {
       return;
     }
 
-    this.activeAttemptId = meta.attempt_id;
-    this.leaseRisk = meta.risk_level;
+    let attempt = this.attempts.get(meta.attempt_id);
+    if (!attempt) {
+      attempt = createAttemptRuntime(meta.attempt_id, meta.job_id);
+      this.attempts.set(meta.attempt_id, attempt);
+    } else {
+      attempt.jobId = meta.job_id;
+    }
+    attempt.leaseRisk = meta.risk_level;
     if (meta.lease_deadline) {
-      this.leaseDeadlineMs = Date.parse(meta.lease_deadline);
+      attempt.leaseDeadlineMs = Date.parse(meta.lease_deadline);
     }
 
     const uploadGrant = await this.requestArtifactUploadTokens(
@@ -525,6 +583,7 @@ export class AgentJobExecutor {
   }
 
   private persistCompletedAwaitingUpload(
+    attempt: AttemptRuntime,
     offer: LeaseOfferPayload,
     run: RunJobPayload,
     exit: {
@@ -548,8 +607,8 @@ export class AgentJobExecutor {
       spool_dir: existing?.spool_dir ?? join(this.config.stateDir, 'logs', run.attempt_id),
       risk_level: offer.job_request.risk_level ?? existing?.risk_level ?? 'normal',
       updated_at: new Date().toISOString(),
-      ...(this.leaseDeadlineMs
-        ? { lease_deadline: new Date(this.leaseDeadlineMs).toISOString() }
+      ...(attempt.leaseDeadlineMs
+        ? { lease_deadline: new Date(attempt.leaseDeadlineMs).toISOString() }
         : existing?.lease_deadline
           ? { lease_deadline: existing.lease_deadline }
           : {}),
@@ -652,12 +711,12 @@ export class AgentJobExecutor {
     if (this.config.recovery?.isRejected(offer.attempt_id)) {
       return;
     }
-    if (this.isBusy()) {
+    if (this.attempts.size >= this.maxJobs) {
       this.sendFrame('lease_reject', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
         attempt_id: offer.attempt_id,
         lease_id: offer.lease_id,
         lease_epoch: offer.lease_epoch,
-        reason: 'Agent capacity limit reached (1 active job max)',
+        reason: `Agent capacity limit reached (${this.maxJobs} active job max)`,
       });
       return;
     }
@@ -687,9 +746,10 @@ export class AgentJobExecutor {
       }
     }
 
-    this.activeAttemptId = offer.attempt_id;
-    this.currentOffer = offer;
-    this.armLeaseDeadline(offer);
+    const attempt = createAttemptRuntime(offer.attempt_id, offer.job_id);
+    attempt.offer = offer;
+    this.attempts.set(offer.attempt_id, attempt);
+    this.armLeaseDeadline(attempt, offer);
 
     const risk = offer.job_request.risk_level ?? 'normal';
     const spoolDir = join(this.config.stateDir, 'logs', offer.attempt_id);
@@ -704,7 +764,7 @@ export class AgentJobExecutor {
       spool_dir: spoolDir,
       risk_level: risk,
       updated_at: new Date().toISOString(),
-      lease_deadline: new Date(this.leaseDeadlineMs ?? Date.now()).toISOString(),
+      lease_deadline: new Date(attempt.leaseDeadlineMs ?? Date.now()).toISOString(),
     });
 
     this.sendFrame('lease_accept', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
@@ -715,18 +775,23 @@ export class AgentJobExecutor {
   }
 
   public async handlePrepareSource(prepare: PrepareSourcePayload): Promise<void> {
-    if (!this.matchesReservedLease(prepare.attempt_id, prepare.lease_id, prepare.lease_epoch)) {
+    const attempt = this.matchesReservedLease(
+      prepare.attempt_id,
+      prepare.lease_id,
+      prepare.lease_epoch,
+    );
+    if (!attempt) {
       return;
     }
-    this.currentPrepare = prepare;
-    this.prepareReady = false;
+    attempt.prepare = prepare;
+    attempt.prepareReady = false;
 
     if (prepare.source_mode === 'git_overlay') {
-      await this.handlePrepareGitOverlay(prepare);
+      await this.handlePrepareGitOverlay(attempt, prepare);
       return;
     }
 
-    await this.cleanupOverlayWorktree();
+    await this.cleanupOverlayWorktree(attempt);
 
     const attemptDir = join(this.config.stateDir, 'workspaces', prepare.attempt_id);
     const archivePartPath = join(attemptDir, 'snapshot.tar.zst.part');
@@ -739,7 +804,7 @@ export class AgentJobExecutor {
       if (prepare.expected_size_bytes <= 0 || !prepare.expected_sha256) {
         throw new Error('prepare_source missing expected size or sha256');
       }
-      if (this.cancelSignal.cancelled) {
+      if (attempt.cancelSignal.cancelled) {
         throw new Error('cancelled');
       }
 
@@ -751,7 +816,7 @@ export class AgentJobExecutor {
         prepare.expected_sha256,
       );
 
-      if (this.cancelSignal.cancelled) {
+      if (attempt.cancelSignal.cancelled) {
         throw new Error('cancelled');
       }
 
@@ -762,9 +827,9 @@ export class AgentJobExecutor {
         archivePath,
         workspaceRoot,
       });
-      this.materializedProjectPath = materialized.projectPath;
+      attempt.materializedProjectPath = materialized.projectPath;
 
-      if (this.cancelSignal.cancelled) {
+      if (attempt.cancelSignal.cancelled) {
         this.sendCancelledTerminal(
           prepare.attempt_id,
           prepare.lease_id,
@@ -772,11 +837,11 @@ export class AgentJobExecutor {
           'Job cancelled during prepare_source',
         );
         await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        this.clearAttempt();
+        this.clearAttempt(prepare.attempt_id);
         return;
       }
 
-      this.prepareReady = true;
+      attempt.prepareReady = true;
       this.sendFrame('source_ready', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
         attempt_id: prepare.attempt_id,
         lease_id: prepare.lease_id,
@@ -791,7 +856,7 @@ export class AgentJobExecutor {
         await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
         return;
       }
-      if (this.cancelSignal.cancelled || String(error).includes('cancelled')) {
+      if (attempt.cancelSignal.cancelled || String(error).includes('cancelled')) {
         this.sendCancelledTerminal(
           prepare.attempt_id,
           prepare.lease_id,
@@ -808,12 +873,15 @@ export class AgentJobExecutor {
         );
       }
       await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-      this.clearAttempt();
+      this.clearAttempt(prepare.attempt_id);
     }
   }
 
   /** Phase 5 git_overlay prepare — mirror + worktree + overlay materialization. */
-  private async handlePrepareGitOverlay(prepare: PrepareSourceGitOverlayPayload): Promise<void> {
+  private async handlePrepareGitOverlay(
+    attempt: AttemptRuntime,
+    prepare: PrepareSourceGitOverlayPayload,
+  ): Promise<void> {
     const attemptDir = join(this.config.stateDir, 'workspaces', prepare.attempt_id);
     const projectPath = join(attemptDir, 'project');
     let worktreeCreated = false;
@@ -821,7 +889,7 @@ export class AgentJobExecutor {
     await mkdir(attemptDir, { recursive: true });
 
     try {
-      if (this.cancelSignal.cancelled) {
+      if (attempt.cancelSignal.cancelled) {
         throw new Error('cancelled');
       }
 
@@ -860,13 +928,9 @@ export class AgentJobExecutor {
 
         let bundle: BundleDownloadPayload;
         try {
-          bundle = await this.waitForBundleDownload(
-            prepare.attempt_id,
-            prepare.lease_id,
-            prepare.lease_epoch,
-          );
+          bundle = await this.waitForBundleDownload(attempt);
         } catch (bundleError) {
-          if (this.cancelSignal.cancelled || String(bundleError).includes('cancelled')) {
+          if (attempt.cancelSignal.cancelled || String(bundleError).includes('cancelled')) {
             throw new Error('cancelled');
           }
           const escalate: SourceNeedReason = fetchFailed
@@ -881,7 +945,7 @@ export class AgentJobExecutor {
           });
           return;
         }
-        if (this.cancelSignal.cancelled) {
+        if (attempt.cancelSignal.cancelled) {
           throw new Error('cancelled');
         }
 
@@ -923,8 +987,8 @@ export class AgentJobExecutor {
         projectPath,
       );
       worktreeCreated = true;
-      this.overlayRepoUrl = prepare.repo.url;
-      this.materializedProjectPath = projectPath;
+      attempt.overlayRepoUrl = prepare.repo.url;
+      attempt.materializedProjectPath = projectPath;
 
       const gitSourceRequirements = await detectGitSourceRequirements(projectPath);
       let gitLfsAvailable = false;
@@ -944,7 +1008,7 @@ export class AgentJobExecutor {
         gitLfsAvailable,
       });
 
-      if (this.cancelSignal.cancelled) {
+      if (attempt.cancelSignal.cancelled) {
         throw new Error('cancelled');
       }
 
@@ -959,7 +1023,7 @@ export class AgentJobExecutor {
       );
       await rename(overlayPartPath, overlayPath);
 
-      if (this.cancelSignal.cancelled) {
+      if (attempt.cancelSignal.cancelled) {
         throw new Error('cancelled');
       }
 
@@ -970,7 +1034,7 @@ export class AgentJobExecutor {
         projectPath,
       });
 
-      if (this.cancelSignal.cancelled) {
+      if (attempt.cancelSignal.cancelled) {
         this.sendCancelledTerminal(
           prepare.attempt_id,
           prepare.lease_id,
@@ -978,16 +1042,17 @@ export class AgentJobExecutor {
           'Job cancelled during prepare_source',
         );
         await this.cleanupOverlayAttempt(
+          attempt,
           attemptDir,
           prepare.repo.url,
           projectPath,
           worktreeCreated,
         );
-        this.clearAttempt();
+        this.clearAttempt(prepare.attempt_id);
         return;
       }
 
-      this.prepareReady = true;
+      attempt.prepareReady = true;
       this.sendFrame('source_ready', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
         attempt_id: prepare.attempt_id,
         lease_id: prepare.lease_id,
@@ -1000,6 +1065,7 @@ export class AgentJobExecutor {
       });
       if (!this.matchesReservedLease(prepare.attempt_id, prepare.lease_id, prepare.lease_epoch)) {
         await this.cleanupOverlayAttempt(
+          attempt,
           attemptDir,
           prepare.repo.url,
           projectPath,
@@ -1007,7 +1073,7 @@ export class AgentJobExecutor {
         );
         return;
       }
-      if (this.cancelSignal.cancelled || String(error).includes('cancelled')) {
+      if (attempt.cancelSignal.cancelled || String(error).includes('cancelled')) {
         this.sendCancelledTerminal(
           prepare.attempt_id,
           prepare.lease_id,
@@ -1023,41 +1089,48 @@ export class AgentJobExecutor {
           String(error),
         );
       }
-      await this.cleanupOverlayAttempt(attemptDir, prepare.repo.url, projectPath, worktreeCreated);
-      this.clearAttempt();
+      await this.cleanupOverlayAttempt(
+        attempt,
+        attemptDir,
+        prepare.repo.url,
+        projectPath,
+        worktreeCreated,
+      );
+      this.clearAttempt(prepare.attempt_id);
     }
   }
 
   public handleBundleDownload(bundle: BundleDownloadPayload): void {
+    const attempt = this.matchesReservedLease(
+      bundle.attempt_id,
+      bundle.lease_id,
+      bundle.lease_epoch,
+    );
     if (
-      !this.matchesReservedLease(bundle.attempt_id, bundle.lease_id, bundle.lease_epoch) ||
-      !this.pendingBundleDownload ||
-      this.pendingBundleDownload.attemptId !== bundle.attempt_id
+      !attempt ||
+      !attempt.pendingBundleDownload ||
+      attempt.pendingBundleDownload.attemptId !== bundle.attempt_id
     ) {
       return;
     }
-    clearTimeout(this.pendingBundleDownload.timer);
-    const { resolve } = this.pendingBundleDownload;
-    this.pendingBundleDownload = null;
+    clearTimeout(attempt.pendingBundleDownload.timer);
+    const { resolve } = attempt.pendingBundleDownload;
+    attempt.pendingBundleDownload = null;
     resolve(bundle);
   }
 
-  private waitForBundleDownload(
-    attemptId: string,
-    leaseId: string,
-    leaseEpoch: number,
-  ): Promise<BundleDownloadPayload> {
+  private waitForBundleDownload(attempt: AttemptRuntime): Promise<BundleDownloadPayload> {
     return new Promise((resolvePromise, rejectPromise) => {
-      if (this.pendingBundleDownload) {
+      if (attempt.pendingBundleDownload) {
         rejectPromise(new Error('bundle download already pending'));
         return;
       }
       const timer = setTimeout(() => {
-        this.pendingBundleDownload = null;
+        attempt.pendingBundleDownload = null;
         rejectPromise(new Error('timed out waiting for bundle_download'));
       }, BUNDLE_TOKEN_TIMEOUT_MS);
-      this.pendingBundleDownload = {
-        attemptId,
+      attempt.pendingBundleDownload = {
+        attemptId: attempt.attemptId,
         resolve: resolvePromise,
         reject: rejectPromise,
         timer,
@@ -1066,6 +1139,7 @@ export class AgentJobExecutor {
   }
 
   private async cleanupOverlayAttempt(
+    attempt: AttemptRuntime,
     attemptDir: string,
     repoUrl: string,
     projectPath: string,
@@ -1074,25 +1148,22 @@ export class AgentJobExecutor {
     if (worktreeCreated) {
       await this.mirrorManager.removeWorktree(repoUrl, projectPath).catch(() => undefined);
     }
-    this.overlayRepoUrl = null;
+    attempt.overlayRepoUrl = null;
     await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
   }
 
   public async handleRunJob(run: RunJobPayload): Promise<void> {
-    if (
-      !this.matchesReservedLease(run.attempt_id, run.lease_id, run.lease_epoch) ||
-      !this.currentOffer ||
-      !this.currentPrepare
-    ) {
+    const attempt = this.matchesReservedLease(run.attempt_id, run.lease_id, run.lease_epoch);
+    if (!attempt || !attempt.offer || !attempt.prepare) {
       return;
     }
 
-    this.runInProgress = true;
+    attempt.runInProgress = true;
 
-    const offer = this.currentOffer;
+    const offer = attempt.offer;
     const request = offer.job_request;
     const attemptDir = join(this.config.stateDir, 'workspaces', run.attempt_id);
-    const isOverlay = this.currentPrepare?.source_mode === 'git_overlay';
+    const isOverlay = attempt.prepare.source_mode === 'git_overlay';
     const workspaceRoot = isOverlay ? attemptDir : join(attemptDir, 'workspace');
     const controlDir = join(attemptDir, 'control');
     const artifactsDir = join(attemptDir, 'artifacts');
@@ -1106,17 +1177,17 @@ export class AgentJobExecutor {
     const logs = spool.logs;
     const logSpoolMaxBytes = this.config.logSpoolMaxBytes ?? DEFAULT_LOG_SPOOL_MAX_BYTES;
     const logSendQueueMax = this.config.logSendQueueMax ?? DEFAULT_LOG_SEND_QUEUE_MAX;
-    this.activeSpool = spool;
-    this.activeSpoolLease = {
+    attempt.activeSpool = spool;
+    attempt.activeSpoolLease = {
       attemptId: run.attempt_id,
       leaseId: run.lease_id,
       leaseEpoch: run.lease_epoch,
     };
-    this.spoolLimitBreached = false;
-    this.spoolWriteChain = Promise.resolve();
+    attempt.spoolLimitBreached = false;
+    attempt.spoolWriteChain = Promise.resolve();
     const sender = new SpoolSender({
       maxQueue: logSendQueueMax,
-      getSpool: () => this.activeSpool ?? spool,
+      getSpool: () => attempt.activeSpool ?? spool,
       send: (chunk) => {
         if (this.socket.readyState !== this.socket.OPEN) {
           return false;
@@ -1133,7 +1204,7 @@ export class AgentJobExecutor {
       },
     });
     sender.setAcked(await readAck(spool));
-    this.activeSpoolSender = sender;
+    attempt.activeSpoolSender = sender;
     this.config.recovery?.registerLiveSender(run.attempt_id, sender);
 
     // Toolchain recheck before spawn: path + environment_fingerprint vs current caps
@@ -1149,7 +1220,7 @@ export class AgentJobExecutor {
           `Selected toolchain path missing: ${activationPath}`,
         );
         await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        this.clearAttempt();
+        this.clearAttempt(run.attempt_id);
         return;
       }
       const current = currentProfiles.find((p) => p.id === profile.id);
@@ -1167,12 +1238,12 @@ export class AgentJobExecutor {
           `Selected toolchain fingerprint mismatch for profile '${profile.id}'`,
         );
         await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        this.clearAttempt();
+        this.clearAttempt(run.attempt_id);
         return;
       }
     }
 
-    if (this.cancelSignal.cancelled) {
+    if (attempt.cancelSignal.cancelled) {
       this.sendCancelledTerminal(
         run.attempt_id,
         run.lease_id,
@@ -1180,7 +1251,7 @@ export class AgentJobExecutor {
         'Job cancelled before spawn',
       );
       await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-      this.clearAttempt();
+      this.clearAttempt(run.attempt_id);
       return;
     }
 
@@ -1201,7 +1272,7 @@ export class AgentJobExecutor {
           `Missing required secret ref '${storeRef}'`,
         );
         await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        this.clearAttempt();
+        this.clearAttempt(run.attempt_id);
         return;
       }
       secretEnv[envName] = val;
@@ -1225,7 +1296,7 @@ export class AgentJobExecutor {
     try {
       await writeJobScript(controlDir, request.execution);
 
-      const projectPath = this.materializedProjectPath ?? join(workspaceRoot, 'main_mount');
+      const projectPath = attempt.materializedProjectPath ?? join(workspaceRoot, 'main_mount');
       const projectCwd = await resolveContainedCwd(projectPath, request.source.cwd);
 
       const selectedToolchain = offer.selected_toolchain_profiles?.[0];
@@ -1237,7 +1308,7 @@ export class AgentJobExecutor {
         riskLevel,
         osFamily: agentOsFamily(),
         arch: process.arch,
-        projectIdentity: resolveProjectIdentity(offer, this.currentPrepare),
+        projectIdentity: resolveProjectIdentity(offer, attempt.prepare),
         selectedToolchain: selectedToolchain
           ? {
               id: selectedToolchain.id,
@@ -1306,7 +1377,7 @@ export class AgentJobExecutor {
 
       // Register kill before any sync OS lookup so lease-expiry self-term cannot
       // race past spawn with activeProcessKill still null.
-      this.activeProcessKill = (grace) => child.kill(grace ?? 10);
+      attempt.activeProcessKill = (grace) => child.kill(grace ?? 10);
       // Keep the same cancelSignal object through waitForCompletion so a cancel
       // that fired during spawn is not wiped.
 
@@ -1331,31 +1402,31 @@ export class AgentJobExecutor {
 
       // If lease already expired before kill was registered, terminate now.
       if (
-        isDestructiveOrHardwareRisk(this.leaseRisk) &&
-        this.leaseDeadlineMs !== null &&
-        Date.now() >= this.leaseDeadlineMs
+        isDestructiveOrHardwareRisk(attempt.leaseRisk) &&
+        attempt.leaseDeadlineMs !== null &&
+        Date.now() >= attempt.leaseDeadlineMs
       ) {
-        if (this.leaseExpired) {
+        if (attempt.leaseExpired) {
           // Timer already ran with null activeProcessKill — kill now.
           try {
-            await this.activeProcessKill(10);
+            await attempt.activeProcessKill(10);
           } catch (error) {
             logger.warn('failed to kill process on late lease-expiry', { error: String(error) });
           }
         } else {
-          void this.onLeaseExpired();
+          void this.onLeaseExpired(run.attempt_id);
         }
       }
 
       const appendAndEnqueue = (stream: 'stdout' | 'stderr', text: string): Promise<void> => {
         const runAppend = async (): Promise<void> => {
-          if (this.spoolLimitBreached) {
+          if (attempt.spoolLimitBreached) {
             return;
           }
           const { sequence: seq } = await appendChunk(spool, stream, text);
           sender.enqueue({ sequence: seq, stream, bytes: text });
           if ((await totalBytes(spool)) >= logSpoolMaxBytes) {
-            this.spoolLimitBreached = true;
+            attempt.spoolLimitBreached = true;
             logger.error('log spool limit breached', {
               attemptId: run.attempt_id,
               maxBytes: logSpoolMaxBytes,
@@ -1363,8 +1434,8 @@ export class AgentJobExecutor {
             void child.kill(request.execution.cancel_grace_seconds);
           }
         };
-        this.spoolWriteChain = this.spoolWriteChain.then(runAppend, runAppend);
-        return this.spoolWriteChain;
+        attempt.spoolWriteChain = attempt.spoolWriteChain.then(runAppend, runAppend);
+        return attempt.spoolWriteChain;
       };
 
       child.stdout.on('data', (rawChunk: Buffer) => {
@@ -1385,11 +1456,11 @@ export class AgentJobExecutor {
         child,
         execution: request.execution,
         logs,
-        signal: this.cancelSignal,
+        signal: attempt.cancelSignal,
       });
 
       // Drain in-flight spool writes before flush / exit.
-      await this.spoolWriteChain.catch(() => undefined);
+      await attempt.spoolWriteChain.catch(() => undefined);
 
       for (const [stream, redactor] of [
         ['stdout', stdoutRedactor],
@@ -1404,7 +1475,7 @@ export class AgentJobExecutor {
       let timedOut = false;
       let logFailure = false;
       let durationComplete = false;
-      const spoolLimit = this.spoolLimitBreached;
+      const spoolLimit = attempt.spoolLimitBreached;
 
       if (result.type === 'timeout') {
         timedOut = true;
@@ -1420,7 +1491,7 @@ export class AgentJobExecutor {
       }
 
       const exitCode = result.type === 'exit' ? result.exitCode : null;
-      const outcome = this.cancelSignal.cancelled
+      const outcome = attempt.cancelSignal.cancelled
         ? 'cancelled'
         : spoolLimit
           ? 'failed'
@@ -1439,7 +1510,7 @@ export class AgentJobExecutor {
             failure_category: 'log_spool_limit' as const,
             failure_message: `Log spool exceeded ${logSpoolMaxBytes} bytes`,
           }
-        : this.leaseExpired
+        : attempt.leaseExpired
           ? {
               failure_category: 'lease_expired' as const,
               failure_message: 'Lease expired — Agent self-terminated destructive/hardware job',
@@ -1458,13 +1529,13 @@ export class AgentJobExecutor {
                 }
               : {};
 
-      const effectiveOutcome = this.leaseExpired
+      const effectiveOutcome = attempt.leaseExpired
         ? ('failed' as const)
-        : this.cancelSignal.cancelled
+        : attempt.cancelSignal.cancelled
           ? ('cancelled' as const)
           : outcome;
 
-      if (this.leaseExpired) {
+      if (attempt.leaseExpired) {
         // Metadata already written in onLeaseExpired; emit terminals if still connected.
         const exitPayload: JobExitPayload = {
           attempt_id: run.attempt_id,
@@ -1494,7 +1565,7 @@ export class AgentJobExecutor {
       }
 
       // Persist before/alongside job_exit so reconnect can recover completion.
-      this.persistCompletedAwaitingUpload(offer, run, {
+      this.persistCompletedAwaitingUpload(attempt, offer, run, {
         exit_code: exitCode,
         outcome: effectiveOutcome,
         ...exitExtras,
@@ -1532,6 +1603,7 @@ export class AgentJobExecutor {
       }
 
       this.persistCompletedAwaitingUpload(
+        attempt,
         offer,
         run,
         {
@@ -1632,38 +1704,41 @@ export class AgentJobExecutor {
           error: String(error),
         });
       });
-      if (this.overlayRepoUrl && this.materializedProjectPath) {
+      if (attempt.overlayRepoUrl && attempt.materializedProjectPath) {
         await this.mirrorManager
-          .removeWorktree(this.overlayRepoUrl, this.materializedProjectPath)
+          .removeWorktree(attempt.overlayRepoUrl, attempt.materializedProjectPath)
           .catch(() => undefined);
       }
       await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-      this.clearAttempt();
+      this.clearAttempt(run.attempt_id);
     }
   }
 
   public handleArtifactUploadGrant(grant: ArtifactUploadGrantPayload): void {
     // Fence against the exact outstanding request's own lease tuple (captured when it was sent),
-    // not the offer-flow-only matchesReservedLease/currentOffer — a resumed upload after Agent
-    // restart (resumeArtifactUpload) never goes through handleLeaseOffer, so currentOffer is null
+    // not the offer-flow-only matchesReservedLease — a resumed upload after Agent
+    // restart (resumeArtifactUpload) never goes through handleLeaseOffer, so offer may be null
     // there even though the request is legitimate.
+    const attempt = this.attempts.get(grant.attempt_id);
     if (
-      this.pendingArtifactUpload &&
-      this.pendingArtifactUpload.attemptId === grant.attempt_id &&
-      this.pendingArtifactUpload.leaseId === grant.lease_id &&
-      this.pendingArtifactUpload.leaseEpoch === grant.lease_epoch
+      attempt?.pendingArtifactUpload &&
+      attempt.pendingArtifactUpload.attemptId === grant.attempt_id &&
+      attempt.pendingArtifactUpload.leaseId === grant.lease_id &&
+      attempt.pendingArtifactUpload.leaseEpoch === grant.lease_epoch
     ) {
-      clearTimeout(this.pendingArtifactUpload.timer);
-      const { resolve } = this.pendingArtifactUpload;
-      this.pendingArtifactUpload = null;
+      clearTimeout(attempt.pendingArtifactUpload.timer);
+      const { resolve } = attempt.pendingArtifactUpload;
+      attempt.pendingArtifactUpload = null;
       resolve(grant);
     }
   }
 
   /** Controller contiguous log_ack — persist ack.json and advance the sender cursor. */
   public async handleLogAck(ack: LogAckPayload): Promise<void> {
-    const lease = this.activeSpoolLease;
+    const attempt = this.attempts.get(ack.attempt_id);
+    const lease = attempt?.activeSpoolLease;
     if (
+      !attempt ||
       !lease ||
       lease.attemptId !== ack.attempt_id ||
       lease.leaseId !== ack.lease_id ||
@@ -1671,8 +1746,8 @@ export class AgentJobExecutor {
     ) {
       return;
     }
-    const spool = this.activeSpool;
-    const sender = this.activeSpoolSender;
+    const spool = attempt.activeSpool;
+    const sender = attempt.activeSpoolSender;
     if (!spool || !sender) {
       return;
     }
@@ -1692,39 +1767,44 @@ export class AgentJobExecutor {
   }
 
   public async handleCancelJob(cancel: CancelJobPayload): Promise<void> {
-    if (!this.matchesReservedLease(cancel.attempt_id, cancel.lease_id, cancel.lease_epoch)) {
+    const attempt = this.matchesReservedLease(
+      cancel.attempt_id,
+      cancel.lease_id,
+      cancel.lease_epoch,
+    );
+    if (!attempt) {
       return;
     }
-    this.cancelSignal.cancelled = true;
-    if (this.activeProcessKill) {
-      await this.activeProcessKill(cancel.grace_seconds);
+    attempt.cancelSignal.cancelled = true;
+    if (attempt.activeProcessKill) {
+      await attempt.activeProcessKill(cancel.grace_seconds);
       return;
     }
 
     // run_job owns the attempt (including pre-spawn): keep cancelSignal for waiters.
-    if (this.runInProgress) {
+    if (attempt.runInProgress) {
       return;
     }
 
     // Unblock prepare waiting on bundle_download.
-    if (this.pendingBundleDownload?.attemptId === cancel.attempt_id) {
-      clearTimeout(this.pendingBundleDownload.timer);
-      const pending = this.pendingBundleDownload;
-      this.pendingBundleDownload = null;
+    if (attempt.pendingBundleDownload?.attemptId === cancel.attempt_id) {
+      clearTimeout(attempt.pendingBundleDownload.timer);
+      const pending = attempt.pendingBundleDownload;
+      attempt.pendingBundleDownload = null;
       pending.reject(new Error('cancelled'));
     }
 
     const attemptDir = join(this.config.stateDir, 'workspaces', cancel.attempt_id);
     const projectPath = join(attemptDir, 'project');
-    if (this.overlayRepoUrl) {
+    if (attempt.overlayRepoUrl) {
       await this.mirrorManager
-        .removeWorktree(this.overlayRepoUrl, projectPath)
+        .removeWorktree(attempt.overlayRepoUrl, projectPath)
         .catch(() => undefined);
     }
     await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
 
     // In-flight prepare (before source_ready): prepare observes cancelSignal / bundle reject.
-    if (this.currentPrepare && !this.prepareReady) {
+    if (attempt.prepare && !attempt.prepareReady) {
       return;
     }
 
@@ -1735,7 +1815,7 @@ export class AgentJobExecutor {
       cancel.lease_epoch,
       cancel.reason ?? 'Job cancelled before process start',
     );
-    this.clearAttempt();
+    this.clearAttempt(cancel.attempt_id);
   }
 
   private requestArtifactUploadTokens(
@@ -1750,15 +1830,23 @@ export class AgentJobExecutor {
     }>,
   ): Promise<ArtifactUploadGrantPayload> {
     return new Promise((resolve, reject) => {
-      if (this.pendingArtifactUpload) {
+      const attempt = this.attempts.get(attemptId);
+      if (!attempt) {
+        reject(new Error('attempt not active for artifact upload'));
+        return;
+      }
+      if (attempt.pendingArtifactUpload) {
         reject(new Error('artifact upload already pending'));
         return;
       }
       const timer = setTimeout(() => {
-        this.pendingArtifactUpload = null;
+        const live = this.attempts.get(attemptId);
+        if (live) {
+          live.pendingArtifactUpload = null;
+        }
         reject(new Error('timed out waiting for artifact upload tokens'));
       }, ARTIFACT_TOKEN_TIMEOUT_MS);
-      this.pendingArtifactUpload = { attemptId, leaseId, leaseEpoch, resolve, reject, timer };
+      attempt.pendingArtifactUpload = { attemptId, leaseId, leaseEpoch, resolve, reject, timer };
       const manifest: ArtifactManifestPayload = {
         attempt_id: attemptId,
         lease_id: leaseId,

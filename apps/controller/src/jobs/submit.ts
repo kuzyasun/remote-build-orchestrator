@@ -577,6 +577,7 @@ function recordCancelEvent(
       stdoutPath: join(logDir, 'stdout.log'),
       stderrPath: join(logDir, 'stderr.log'),
       eventsPath: join(logDir, 'events.jsonl'),
+      chunksPath: join(logDir, 'chunks.jsonl'),
     },
     event,
   ).catch(() => undefined);

@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { JobEvent } from '@rbo/protocol';
 import { parseJobEventLine } from '@rbo/protocol';
@@ -8,6 +8,15 @@ export interface AttemptLogPaths {
   stdoutPath: string;
   stderrPath: string;
   eventsPath: string;
+  chunksPath: string;
+}
+
+/** Ordered stdout/stderr chunk index beside durable log files (Controller + Agent spool). */
+export interface ChunkIndexEntry {
+  sequence: number;
+  stream: 'stdout' | 'stderr';
+  byte_offset: number;
+  byte_length: number;
 }
 
 export async function ensureAttemptLogs(logDir: string): Promise<AttemptLogPaths> {
@@ -15,14 +24,15 @@ export async function ensureAttemptLogs(logDir: string): Promise<AttemptLogPaths
   const stdoutPath = join(logDir, 'stdout.log');
   const stderrPath = join(logDir, 'stderr.log');
   const eventsPath = join(logDir, 'events.jsonl');
-  for (const path of [stdoutPath, stderrPath, eventsPath]) {
+  const chunksPath = join(logDir, 'chunks.jsonl');
+  for (const path of [stdoutPath, stderrPath, eventsPath, chunksPath]) {
     try {
       await readFile(path);
     } catch {
       await writeFile(path, '');
     }
   }
-  return { logDir, stdoutPath, stderrPath, eventsPath };
+  return { logDir, stdoutPath, stderrPath, eventsPath, chunksPath };
 }
 
 export async function appendStdout(logs: AttemptLogPaths, chunk: string | Buffer): Promise<void> {
@@ -42,6 +52,77 @@ export async function appendLogChunk(
     await appendStderr(logs, chunk);
   } else {
     await appendStdout(logs, chunk);
+  }
+}
+
+async function streamByteOffset(
+  logs: AttemptLogPaths,
+  stream: 'stdout' | 'stderr',
+): Promise<number> {
+  const path = stream === 'stdout' ? logs.stdoutPath : logs.stderrPath;
+  try {
+    return (await stat(path)).size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Append a log chunk and a matching chunks.jsonl index entry with an explicit
+ * sequence (Agent-assigned for remote jobs; Controller-assigned for local).
+ * Durable write order: stream file first, then index line.
+ */
+export async function appendIndexedLogChunk(
+  logs: AttemptLogPaths,
+  stream: 'stdout' | 'stderr',
+  chunk: string | Buffer,
+  sequence: number,
+): Promise<{ entry: ChunkIndexEntry; text: string }> {
+  const buf = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+  const byte_offset = await streamByteOffset(logs, stream);
+  const byte_length = buf.byteLength;
+  await appendLogChunk(logs, stream, buf);
+  const entry: ChunkIndexEntry = { sequence, stream, byte_offset, byte_length };
+  await appendFile(logs.chunksPath, `${JSON.stringify(entry)}\n`);
+  return { entry, text: buf.toString('utf8') };
+}
+
+export async function readChunkIndexEntries(logs: AttemptLogPaths): Promise<ChunkIndexEntry[]> {
+  try {
+    const content = await readFile(logs.chunksPath, 'utf8');
+    if (!content.trim()) {
+      return [];
+    }
+    const entries: ChunkIndexEntry[] = [];
+    for (const line of content.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      entries.push(JSON.parse(line) as ChunkIndexEntry);
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+/** Replay ordered stdout/stderr chunks after `afterSequence` (inclusive exclusive). */
+export async function* iterIndexedChunksAfter(
+  logs: AttemptLogPaths,
+  afterSequence: number,
+): AsyncIterable<{ sequence: number; stream: 'stdout' | 'stderr'; text: string }> {
+  const entries = await readChunkIndexEntries(logs);
+  const stdoutContent = await readFile(logs.stdoutPath);
+  const stderrContent = await readFile(logs.stderrPath);
+  for (const entry of entries) {
+    if (entry.sequence <= afterSequence) {
+      continue;
+    }
+    const file = entry.stream === 'stdout' ? stdoutContent : stderrContent;
+    const slice = file.subarray(entry.byte_offset, entry.byte_offset + entry.byte_length);
+    yield {
+      sequence: entry.sequence,
+      stream: entry.stream,
+      text: slice.toString('utf8'),
+    };
   }
 }
 

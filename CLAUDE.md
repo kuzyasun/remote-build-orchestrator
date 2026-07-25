@@ -30,6 +30,18 @@ Instructions for Claude and other AI tools working in this repository.
 - `docs/ops/runbook.md`: Day-2 operator procedures (install/pair/drain/revoke/repair/update/backup/restore/uninstall).
 - `remote-build-orchestrator-design.md`: Canonical architectural design specification.
 
+## MCP client wiring (for consuming projects)
+
+This monorepo **is** RBO. Do **not** route this repo's own `pnpm build` / `pnpm verify` / package
+tests through MCP `job_run` as the default workflow — develop and verify here with Canonical
+Commands below.
+
+For **other** projects (firmware, clients, etc.) that should call this Controller over MCP, see
+[`docs/ops/getting-started.md`](docs/ops/getting-started.md) §§6–8 (client snippets, `job_run`
+preferred for AI clients, paste-ready AGENTS.md guidance). Server names in clients are typically
+`rbo` or `user-rbo`. AI agents use pull-based `job_logs`; live follow is CLI `rbo logs --follow`
+for human operators.
+
 ## Stack Summary
 
 - **Runtime & Package Management**: Node.js ≥ 22.14 (`.nvmrc`), pnpm 10.5.2 (`packageManager` in `package.json`, pnpm workspace).

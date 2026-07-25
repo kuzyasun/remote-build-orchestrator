@@ -119,7 +119,20 @@ export const POWERSHELL_JOB_PRELUDE = [
   '',
 ].join('\n');
 
-function attachLogPipes(child: ManagedChildProcess, logs: AttemptLogPaths): void {
+function attachLogPipes(
+  child: ManagedChildProcess,
+  logs: AttemptLogPaths,
+  onLogChunk?: (stream: 'stdout' | 'stderr', chunk: Buffer) => void | Promise<void>,
+): void {
+  if (onLogChunk) {
+    child.stdout.on('data', (chunk: Buffer | string) => {
+      void onLogChunk('stdout', Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      void onLogChunk('stderr', Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    return;
+  }
   child.stdout.on('data', (chunk: Buffer | string) => {
     void appendStdout(logs, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   });
@@ -135,6 +148,7 @@ function spawnNodeProcess(input: {
   env: NodeJS.ProcessEnv;
   logs: AttemptLogPaths;
   attachLogs?: boolean;
+  onLogChunk?: (stream: 'stdout' | 'stderr', chunk: Buffer) => void | Promise<void>;
   timeoutSeconds?: number;
   cancelGraceSeconds?: number;
   idleTimeoutSeconds?: number;
@@ -249,8 +263,8 @@ function spawnNodeProcess(input: {
     managed.stderr.end();
   });
 
-  if (input.attachLogs !== false) {
-    attachLogPipes(managed, input.logs);
+  if (input.onLogChunk || input.attachLogs !== false) {
+    attachLogPipes(managed, input.logs, input.onLogChunk);
   }
   return managed;
 }
@@ -263,6 +277,7 @@ function spawnWindowsHelperProcess(input: {
   env: NodeJS.ProcessEnv;
   logs: AttemptLogPaths;
   attachLogs?: boolean;
+  onLogChunk?: (stream: 'stdout' | 'stderr', chunk: Buffer) => void | Promise<void>;
   timeoutSeconds: number;
   cancelGraceSeconds: number;
   idleTimeoutSeconds?: number;
@@ -396,8 +411,8 @@ function spawnWindowsHelperProcess(input: {
     }
   });
 
-  if (input.attachLogs !== false) {
-    attachLogPipes(managed, input.logs);
+  if (input.onLogChunk || input.attachLogs !== false) {
+    attachLogPipes(managed, input.logs, input.onLogChunk);
   }
   return managed;
 }
@@ -435,6 +450,8 @@ export function spawnJobScript(input: {
   scriptFileName?: string;
   /** When false, caller owns redaction/persistence of stdout/stderr. Default true. */
   attachLogs?: boolean;
+  /** Optional chunk callback (used with attachLogs: false for Controller live logs). */
+  onLogChunk?: (stream: 'stdout' | 'stderr', chunk: Buffer) => void | Promise<void>;
 }): SpawnJobScriptResult {
   const defaultName =
     input.execution.shell === 'powershell'
@@ -491,6 +508,7 @@ export function spawnJobScript(input: {
       env: childEnv,
       logs: input.logs,
       attachLogs: input.attachLogs,
+      onLogChunk: input.onLogChunk,
       timeoutSeconds: input.execution.timeout_seconds,
       cancelGraceSeconds: input.execution.cancel_grace_seconds,
       idleTimeoutSeconds: input.execution.idle_timeout_seconds,
@@ -508,6 +526,7 @@ export function spawnJobScript(input: {
     env: childEnv,
     logs: input.logs,
     attachLogs: input.attachLogs,
+    onLogChunk: input.onLogChunk,
     timeoutSeconds: input.execution.timeout_seconds,
     cancelGraceSeconds: input.execution.cancel_grace_seconds,
     idleTimeoutSeconds: input.execution.idle_timeout_seconds,

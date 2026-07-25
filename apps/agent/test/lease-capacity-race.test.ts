@@ -1,5 +1,5 @@
 /**
- * §1.7 — one active job slot: second lease/prepare/run rejected while slot held.
+ * Multi-slot lease capacity: default maxJobs=1; configurable slots.
  */
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -55,7 +55,7 @@ describe('Single job-slot lease capacity race (§1.7)', () => {
     // Why calling handleLeaseOffer twice back-to-back (rather than via Promise.all or two
     // interleaved async tasks) genuinely proves the one-slot invariant, not just a sequential
     // happy path: handleLeaseOffer (apps/agent/src/executor/index.ts) is fully synchronous from
-    // its isBusy() admission check through setting `this.activeAttemptId` — there is no `await`
+    // its capacity admission check through inserting into `this.attempts` — there is no `await`
     // anywhere in between. Node's single-threaded event loop guarantees the first call's admission
     // check-and-commit runs to completion before a second call's code executes at all, for any
     // caller (including two real lease_offer WS frames arriving back-to-back on the same socket,
@@ -87,6 +87,7 @@ describe('Single job-slot lease capacity race (§1.7)', () => {
     expect(socket.sent.filter((f) => f.type === 'lease_accept')).toHaveLength(1);
     // The held slot still belongs to the first attempt, not silently swapped to the rejected one.
     expect(executor.isBusy()).toBe(true);
+    expect(executor.getActiveJobs()).toEqual([{ attempt_id: 'att_1', job_id: 'job_att_1' }]);
   });
 
   it('rejects a burst of many concurrent-looking offers, keeping exactly the first slot holder', async () => {
@@ -149,6 +150,48 @@ describe('Single job-slot lease capacity race (§1.7)', () => {
     expect(socket.sent.some((f) => f.type === 'source_ready')).toBe(false);
     expect(socket.sent.some((f) => f.type === 'job_started')).toBe(false);
     expect(socket.sent.some((f) => f.type === 'job_exit')).toBe(false);
+    expect(executor.isBusy()).toBe(true);
+  });
+});
+
+describe('Multi job-slot lease capacity (maxJobs=2)', () => {
+  let stateDir: string;
+
+  afterEach(async () => {
+    if (stateDir) {
+      await rm(stateDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it('accepts two leases and rejects a third with 2 active job max', async () => {
+    stateDir = await mkdtemp(join(tmpdir(), 'rbo-two-slot-'));
+    const socket = mockSocket();
+    const executor = new AgentJobExecutor(socket, {
+      stateDir,
+      controllerFingerprint: 'sha256:deadbeef',
+      gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
+      repoCache: DEFAULT_REPO_CACHE_CONFIG,
+      maxJobs: 2,
+    });
+
+    executor.handleLeaseOffer(baseOffer('att_1', 'lease_1'));
+    executor.handleLeaseOffer(baseOffer('att_2', 'lease_2'));
+    executor.handleLeaseOffer(baseOffer('att_3', 'lease_3'));
+
+    const accepted = socket.sent.filter((f) => f.type === 'lease_accept');
+    const rejected = socket.sent.filter((f) => f.type === 'lease_reject');
+    expect(accepted).toHaveLength(2);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.payload).toMatchObject({
+      attempt_id: 'att_3',
+    });
+    expect(String((rejected[0]?.payload as { reason: string }).reason)).toContain(
+      '2 active job max',
+    );
+    expect(executor.getActiveJobs()).toEqual([
+      { attempt_id: 'att_1', job_id: 'job_att_1' },
+      { attempt_id: 'att_2', job_id: 'job_att_2' },
+    ]);
     expect(executor.isBusy()).toBe(true);
   });
 });

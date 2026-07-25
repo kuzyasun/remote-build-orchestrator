@@ -104,12 +104,18 @@ describe('toolchain_changed rejection (§1.7)', () => {
       lease_ttl_seconds: 300,
     });
 
-    const exe = executor as unknown as {
-      currentPrepare: unknown;
-      materializedProjectPath: string;
-      prepareReady: boolean;
-    };
-    exe.currentPrepare = {
+    const attempt = (
+      executor as unknown as {
+        attempts: Map<
+          string,
+          { prepare: unknown; materializedProjectPath: string | null; prepareReady: boolean }
+        >;
+      }
+    ).attempts.get('att_tc');
+    if (!attempt) {
+      throw new Error('expected att_tc runtime');
+    }
+    attempt.prepare = {
       source_mode: 'full',
       attempt_id: 'att_tc',
       lease_id: 'lease_tc',
@@ -119,8 +125,8 @@ describe('toolchain_changed rejection (§1.7)', () => {
       expected_size_bytes: 1,
       expected_sha256: 'ab',
     };
-    exe.materializedProjectPath = projectPath;
-    exe.prepareReady = true;
+    attempt.materializedProjectPath = projectPath;
+    attempt.prepareReady = true;
 
     await executor.handleRunJob({
       attempt_id: 'att_tc',
@@ -192,11 +198,15 @@ describe('toolchain_changed rejection (§1.7)', () => {
       lease_ttl_seconds: 300,
     });
 
-    const exe = executor as unknown as {
-      currentPrepare: unknown;
-      materializedProjectPath: string;
-    };
-    exe.currentPrepare = {
+    const attempt = (
+      executor as unknown as {
+        attempts: Map<string, { prepare: unknown; materializedProjectPath: string | null }>;
+      }
+    ).attempts.get('att_fp');
+    if (!attempt) {
+      throw new Error('expected att_fp runtime');
+    }
+    attempt.prepare = {
       source_mode: 'full',
       attempt_id: 'att_fp',
       lease_id: 'lease_fp',
@@ -206,7 +216,7 @@ describe('toolchain_changed rejection (§1.7)', () => {
       expected_size_bytes: 1,
       expected_sha256: 'ab',
     };
-    exe.materializedProjectPath = projectPath;
+    attempt.materializedProjectPath = projectPath;
 
     await executor.handleRunJob({
       attempt_id: 'att_fp',

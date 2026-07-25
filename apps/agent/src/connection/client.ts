@@ -62,6 +62,8 @@ export interface AgentConnectionOptions {
   diskMinFreeBytes?: number;
   /** Cached free-disk probe used for heartbeat/capabilities/admission. */
   getFreeDiskBytes?: () => number;
+  /** Max concurrent job slots; default 1. */
+  maxJobs?: number;
 }
 
 export interface ConnectResult {
@@ -252,6 +254,7 @@ export class AgentConnection {
                 gitAllowlist: this.options.gitAllowlist,
                 repoCache: this.options.repoCache ?? DEFAULT_REPO_CACHE_CONFIG,
                 buildCache: this.options.buildCache ?? DEFAULT_BUILD_CACHE_CONFIG,
+                maxJobs: this.options.maxJobs,
                 logSpoolMaxBytes: this.options.logSpoolMaxBytes,
                 logSendQueueMax: this.options.logSendQueueMax,
                 recovery: this.recovery,
@@ -465,7 +468,7 @@ export class AgentConnection {
 
     this.send(socket, 'heartbeat', {
       state: busy ? 'busy' : 'idle',
-      active_jobs: [],
+      active_jobs: this.executor?.getActiveJobs() ?? [],
       cpu_load: probeCpuLoad(),
       accepting_jobs: accepting,
       disk_free_bytes: freeBytes,

@@ -27,7 +27,12 @@ import {
   parseStateDirFlag,
 } from './commands/flags.js';
 import { formatCliHelp } from './commands/help.js';
-import { cancelJobRemote, getJobLogsRemote, submitJobRemote } from './commands/jobs.js';
+import {
+  cancelJobRemote,
+  followJobLogsRemote,
+  getJobLogsRemote,
+  submitJobRemote,
+} from './commands/jobs.js';
 import {
   type ServiceAction,
   detectPlatform,
@@ -225,10 +230,31 @@ async function main(): Promise<void> {
     case 'logs': {
       const jobId = rest[0];
       if (!jobId) {
-        throw new Error('Usage: rbo logs <job-id>');
+        throw new Error('Usage: rbo logs <job-id> [--follow]');
       }
-      const result = await getJobLogsRemote(controllerUrl, jobId);
-      console.log(JSON.stringify(result, null, 2));
+      const follow = rest.includes('--follow');
+      if (follow) {
+        await followJobLogsRemote(controllerUrl, jobId);
+        return;
+      }
+      // Pull historical stdout/stderr as terminal text (not events JSON).
+      let cursor = 0;
+      for (;;) {
+        const result = await getJobLogsRemote(controllerUrl, jobId, {
+          streams: ['stdout', 'stderr'],
+          cursor,
+          max_bytes: 65_536,
+        });
+        const data = typeof result.data === 'string' ? result.data : '';
+        if (data.length > 0) {
+          process.stdout.write(data);
+        }
+        const next = typeof result.next_cursor === 'number' ? result.next_cursor : cursor;
+        if (next <= cursor || data.length === 0) {
+          break;
+        }
+        cursor = next;
+      }
       return;
     }
 

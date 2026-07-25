@@ -33,6 +33,7 @@ import {
   transitionAttemptState,
   transitionJobState,
 } from '../jobs/lifecycle.js';
+import { persistAndPublishLogChunk } from '../logs/stream.js';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
 import { persistCollectedArtifacts } from './artifacts.js';
@@ -307,6 +308,23 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       RBO_ATTEMPT_ID: attempt.id,
       RBO_ARTIFACT_DIR: artifactsDir,
     };
+    let nextLogSequence = 1;
+    let logWriteChain: Promise<void> = Promise.resolve();
+    const enqueueLocalLog = (stream: 'stdout' | 'stderr', chunk: Buffer): void => {
+      const sequence = nextLogSequence;
+      nextLogSequence += 1;
+      logWriteChain = logWriteChain
+        .catch(() => undefined)
+        .then(() =>
+          persistAndPublishLogChunk({
+            dataDir: ctx.dataDir,
+            attemptId: attempt.id,
+            stream,
+            chunk,
+            sequence,
+          }).then(() => undefined),
+        );
+    };
     const child = spawnJobScript({
       attemptId: attempt.id,
       controlDir,
@@ -315,6 +333,8 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       execution: request.execution,
       env: injectedEnv,
       logs,
+      attachLogs: false,
+      onLogChunk: enqueueLocalLog,
     });
     for (const key of child.ignoredRboEnvKeys ?? []) {
       await emitJobEvent(ctx, logs, {
@@ -354,6 +374,9 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       logs,
       signal: cancelSignal,
     });
+
+    // Drain durable log writes before artifact collection / terminal state.
+    await logWriteChain.catch(() => undefined);
 
     if (result.type === 'timeout') {
       timedOut = true;

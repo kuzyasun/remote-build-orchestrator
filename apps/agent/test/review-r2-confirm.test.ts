@@ -60,12 +60,18 @@ describe('REVIEW R2 agent fixes', () => {
     });
     expect(executor.isBusy()).toBe(true);
 
-    const exe = executor as unknown as {
-      currentPrepare: unknown;
-      materializedProjectPath: string | null;
-      prepareReady: boolean;
-    };
-    exe.currentPrepare = {
+    const attempt = (
+      executor as unknown as {
+        attempts: Map<
+          string,
+          { prepare: unknown; materializedProjectPath: string | null; prepareReady: boolean }
+        >;
+      }
+    ).attempts.get('att_1');
+    if (!attempt) {
+      throw new Error('expected att_1 runtime');
+    }
+    attempt.prepare = {
       source_mode: 'git_overlay',
       attempt_id: 'att_1',
       lease_id: 'lease_1',
@@ -84,8 +90,8 @@ describe('REVIEW R2 agent fixes', () => {
         expected_sha256: 'ab',
       },
     };
-    exe.materializedProjectPath = join(stateDir, 'workspaces', 'att_1', 'project');
-    exe.prepareReady = true;
+    attempt.materializedProjectPath = join(stateDir, 'workspaces', 'att_1', 'project');
+    attempt.prepareReady = true;
 
     await executor.handleCancelJob({
       attempt_id: 'att_1',

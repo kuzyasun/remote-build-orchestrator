@@ -27,7 +27,7 @@ Commands:
   agents
   doctor [--data-dir <dir>]
   submit <job-request.json>
-  logs <job-id>
+  logs <job-id> [--follow]
   cancel <job-id> [reason]
 
 Environment:

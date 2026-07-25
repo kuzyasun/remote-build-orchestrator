@@ -57,6 +57,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
       stdoutPath: '/dev/null',
       stderrPath: '/dev/null',
       eventsPath: '/dev/null',
+      chunksPath: '/dev/null',
     })),
     openAttemptSpool: vi.fn(async () => ({
       dir: '/dev/null',
@@ -65,6 +66,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
         stdoutPath: '/dev/null',
         stderrPath: '/dev/null',
         eventsPath: '/dev/null',
+        chunksPath: '/dev/null',
       },
       chunksPath: '/dev/null',
       ackPath: '/dev/null',
@@ -173,11 +175,15 @@ describe('Lease-expiry self-termination (destructive/hardware)', () => {
       lease_ttl_seconds: 5,
     });
 
-    const exe = executor as unknown as {
-      currentPrepare: unknown;
-      materializedProjectPath: string;
-    };
-    exe.currentPrepare = {
+    const attempt = (
+      executor as unknown as {
+        attempts: Map<string, { prepare: unknown; materializedProjectPath: string | null }>;
+      }
+    ).attempts.get('att_hw');
+    if (!attempt) {
+      throw new Error('expected att_hw runtime');
+    }
+    attempt.prepare = {
       source_mode: 'full',
       attempt_id: 'att_hw',
       lease_id: 'lease_hw',
@@ -187,7 +193,7 @@ describe('Lease-expiry self-termination (destructive/hardware)', () => {
       expected_size_bytes: 1,
       expected_sha256: 'ab',
     };
-    exe.materializedProjectPath = projectPath;
+    attempt.materializedProjectPath = projectPath;
 
     const spawnPromise = waitForSpawn();
     const runPromise = executor.handleRunJob({
@@ -248,11 +254,15 @@ describe('Lease-expiry self-termination (destructive/hardware)', () => {
       lease_ttl_seconds: 5,
     });
 
-    const exe = executor as unknown as {
-      currentPrepare: unknown;
-      materializedProjectPath: string;
-    };
-    exe.currentPrepare = {
+    const attempt = (
+      executor as unknown as {
+        attempts: Map<string, { prepare: unknown; materializedProjectPath: string | null }>;
+      }
+    ).attempts.get('att_safe');
+    if (!attempt) {
+      throw new Error('expected att_safe runtime');
+    }
+    attempt.prepare = {
       source_mode: 'full',
       attempt_id: 'att_safe',
       lease_id: 'lease_safe',
@@ -262,7 +272,7 @@ describe('Lease-expiry self-termination (destructive/hardware)', () => {
       expected_size_bytes: 1,
       expected_sha256: 'ab',
     };
-    exe.materializedProjectPath = projectPath;
+    attempt.materializedProjectPath = projectPath;
 
     const spawnPromise = waitForSpawn();
     const runPromise = executor.handleRunJob({

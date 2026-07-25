@@ -74,6 +74,7 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
     gitAllowlist: config.gitAllowlist,
     repoCache: config.repoCache,
     buildCache: config.buildCache,
+    maxJobs: config.maxJobs,
     logSpoolMaxBytes: config.logSpoolMaxBytes,
     logSendQueueMax: config.logSendQueueMax,
     diskMinFreeBytes: config.diskMinFreeBytes,

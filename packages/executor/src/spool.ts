@@ -1,14 +1,14 @@
 import { randomBytes } from 'node:crypto';
 import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { type AttemptLogPaths, ensureAttemptLogs } from './logs.js';
+import {
+  type AttemptLogPaths,
+  type ChunkIndexEntry,
+  ensureAttemptLogs,
+  readChunkIndexEntries,
+} from './logs.js';
 
-export interface ChunkIndexEntry {
-  sequence: number;
-  stream: 'stdout' | 'stderr';
-  byte_offset: number;
-  byte_length: number;
-}
+export type { ChunkIndexEntry };
 
 export interface SpoolChunk {
   sequence: number;
@@ -27,40 +27,18 @@ export interface AttemptSpool {
   streamOffsets: { stdout: number; stderr: number };
 }
 
-async function readChunksFile(path: string): Promise<ChunkIndexEntry[]> {
-  try {
-    const content = await readFile(path, 'utf8');
-    if (!content.trim()) {
-      return [];
-    }
-    const entries: ChunkIndexEntry[] = [];
-    for (const line of content.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      entries.push(JSON.parse(line) as ChunkIndexEntry);
-    }
-    return entries;
-  } catch {
-    return [];
-  }
-}
-
 export async function openAttemptSpool(spoolDir: string): Promise<AttemptSpool> {
   const logs = await ensureAttemptLogs(spoolDir);
-  const chunksPath = join(spoolDir, 'chunks.jsonl');
+  const chunksPath = logs.chunksPath;
   const ackPath = join(spoolDir, 'ack.json');
 
-  try {
-    await readFile(chunksPath);
-  } catch {
-    await writeFile(chunksPath, '');
-  }
   try {
     await readFile(ackPath);
   } catch {
     await writeFile(ackPath, JSON.stringify({ acked_sequence: 0 }));
   }
 
-  const entries = await readChunksFile(chunksPath);
+  const entries = await readChunkIndexEntries(logs);
   let nextSequence = 1;
   const streamOffsets = { stdout: 0, stderr: 0 };
   for (const entry of entries) {
@@ -133,23 +111,35 @@ export async function readAck(spool: AttemptSpool): Promise<number> {
 export async function writeAck(spool: AttemptSpool, sequence: number): Promise<void> {
   // Unique tmp name: concurrent log_acks in the same ms must not share a path
   // (otherwise one rename steals the other's tmp → ENOENT crash on the Agent).
-  const tmpPath = `${spool.ackPath}.${process.pid}.${Date.now()}.${randomBytes(6).toString('hex')}.tmp`;
   const payload = JSON.stringify({ acked_sequence: sequence });
   await mkdir(dirname(spool.ackPath), { recursive: true });
-  try {
-    await writeFile(tmpPath, payload);
-    await rename(tmpPath, spool.ackPath);
-  } catch (error) {
-    await rm(tmpPath, { force: true }).catch(() => undefined);
-    throw error;
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const tmpPath = `${spool.ackPath}.${process.pid}.${Date.now()}.${randomBytes(6).toString('hex')}.tmp`;
+    try {
+      await writeFile(tmpPath, payload);
+      // Windows cannot always rename over an existing file while another writer
+      // races; remove then rename, with retries for residual EPERM/EACCES.
+      if (process.platform === 'win32') {
+        await rm(spool.ackPath, { force: true }).catch(() => undefined);
+      }
+      await rename(tmpPath, spool.ackPath);
+      return;
+    } catch (error) {
+      lastError = error;
+      await rm(tmpPath, { force: true }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 5 + attempt * 5));
+    }
   }
+  throw lastError;
 }
 
 export async function* iterUnacked(
   spool: AttemptSpool,
   afterSequence: number,
 ): AsyncIterable<SpoolChunk> {
-  const entries = await readChunksFile(spool.chunksPath);
+  const entries = await readChunkIndexEntries(spool.logs);
   const stdoutContent = await readFile(spool.logs.stdoutPath);
   const stderrContent = await readFile(spool.logs.stderrPath);
 

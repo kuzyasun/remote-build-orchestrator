@@ -158,11 +158,15 @@ describe('Cross-chunk secret redaction e2e (§1.8)', () => {
       lease_ttl_seconds: 300,
     });
 
-    const exe = executor as unknown as {
-      currentPrepare: unknown;
-      materializedProjectPath: string;
-    };
-    exe.currentPrepare = {
+    const attempt = (
+      executor as unknown as {
+        attempts: Map<string, { prepare: unknown; materializedProjectPath: string | null }>;
+      }
+    ).attempts.get('att_redact');
+    if (!attempt) {
+      throw new Error('expected att_redact runtime');
+    }
+    attempt.prepare = {
       source_mode: 'full',
       attempt_id: 'att_redact',
       lease_id: 'lease_redact',
@@ -172,7 +176,7 @@ describe('Cross-chunk secret redaction e2e (§1.8)', () => {
       expected_size_bytes: 1,
       expected_sha256: 'ab',
     };
-    exe.materializedProjectPath = projectPath;
+    attempt.materializedProjectPath = projectPath;
 
     await executor.handleRunJob({
       attempt_id: 'att_redact',
