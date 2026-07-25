@@ -50,23 +50,30 @@ export class ManagedChildProcess extends EventEmitter {
 
 export type RunningProcess = ManagedChildProcess;
 
-/** Phase 3 implements bash/powershell/direct; remaining shells are a documented gap. */
-export const PHASE3_UNSUPPORTED_SHELLS = ['sh', 'zsh', 'cmd', 'pwsh'] as const;
-
 function resolveShellCommand(shell: ExecutionConfig['shell']): { command: string; args: string[] } {
   switch (shell) {
     case 'bash':
       return { command: 'bash', args: [] };
+    case 'sh':
+      return { command: 'sh', args: [] };
+    case 'zsh':
+      return { command: 'zsh', args: [] };
     case 'powershell':
-      return { command: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-File'] };
+      return {
+        command: process.platform === 'win32' ? 'powershell.exe' : 'powershell',
+        args: ['-NoProfile', '-NonInteractive', '-File'],
+      };
+    case 'pwsh':
+      return {
+        command: process.platform === 'win32' ? 'pwsh.exe' : 'pwsh',
+        args: ['-NoProfile', '-NonInteractive', '-File'],
+      };
+    case 'cmd':
+      return { command: 'cmd.exe', args: ['/c'] };
     case 'direct':
       return { command: '', args: [] };
     default:
-      throw new RboError(
-        'shell_missing',
-        `Shell '${shell}' is not supported in Phase 3 (supported: bash, powershell, direct; gap: ${PHASE3_UNSUPPORTED_SHELLS.join(', ')})`,
-        false,
-      );
+      throw new RboError('shell_missing', `Unsupported shell: '${shell as string}'`, false);
   }
 }
 
@@ -76,11 +83,16 @@ export async function writeJobScript(
   scriptName?: string,
 ): Promise<string> {
   await mkdir(controlDir, { recursive: true });
-  const isPowerShell = execution.shell === 'powershell';
+  const isPowerShell = execution.shell === 'powershell' || execution.shell === 'pwsh';
+  const isCmd = execution.shell === 'cmd';
   const isDirect = execution.shell === 'direct';
   const fileName =
     scriptName ??
-    (isPowerShell ? 'job.ps1' : isDirect && process.platform === 'win32' ? 'job.cmd' : 'job.sh');
+    (isPowerShell
+      ? 'job.ps1'
+      : isCmd || (isDirect && process.platform === 'win32')
+        ? 'job.cmd'
+        : 'job.sh');
   const scriptPath = join(controlDir, fileName);
   const isCleanup =
     scriptName === 'cleanup.ps1' || scriptName === 'cleanup.sh' || scriptName === 'cleanup.cmd';
@@ -454,9 +466,10 @@ export function spawnJobScript(input: {
   onLogChunk?: (stream: 'stdout' | 'stderr', chunk: Buffer) => void | Promise<void>;
 }): SpawnJobScriptResult {
   const defaultName =
-    input.execution.shell === 'powershell'
+    input.execution.shell === 'powershell' || input.execution.shell === 'pwsh'
       ? 'job.ps1'
-      : input.execution.shell === 'direct' && process.platform === 'win32'
+      : input.execution.shell === 'cmd' ||
+          (input.execution.shell === 'direct' && process.platform === 'win32')
         ? 'job.cmd'
         : 'job.sh';
   const scriptPath = join(input.controlDir, input.scriptFileName ?? defaultName);
@@ -491,7 +504,10 @@ export function spawnJobScript(input: {
       command = scriptPath;
       args = [];
     }
-  } else if (input.execution.shell === 'powershell') {
+  } else if (input.execution.shell === 'powershell' || input.execution.shell === 'pwsh') {
+    command = shell.command;
+    args = [...shell.args, scriptPath];
+  } else if (input.execution.shell === 'cmd') {
     command = shell.command;
     args = [...shell.args, scriptPath];
   } else {

@@ -37,11 +37,16 @@ async function detectShells(): Promise<string[]> {
       ? [
           ['powershell', ['-NoProfile', '-Command', 'exit']],
           ['cmd', ['/c', 'exit']],
-        ]
-      : [
+          ['pwsh', ['-NoProfile', '-Command', 'exit']],
           ['bash', ['-c', 'exit']],
           ['sh', ['-c', 'exit']],
           ['zsh', ['-c', 'exit']],
+        ]
+      : [
+          ['bash', ['-c', 'exit']],
+          ['zsh', ['-c', 'exit']],
+          ['sh', ['-c', 'exit']],
+          ['pwsh', ['-NoProfile', '-Command', 'exit']],
         ];
   const found: string[] = [];
   for (const [name, args] of candidates) {
