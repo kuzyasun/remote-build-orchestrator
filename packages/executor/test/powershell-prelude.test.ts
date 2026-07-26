@@ -51,7 +51,7 @@ describe('PowerShell job prelude', () => {
     expect(cleanupBody).toContain('Write-Output cleanup');
   });
 
-  it('does not prefix bash scripts', async () => {
+  it('does not prefix bash scripts with the PowerShell prelude', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'rbo-bash-prelude-'));
     dirs.push(dir);
     const p = await writeJobScript(dir, {
@@ -65,6 +65,7 @@ describe('PowerShell job prelude', () => {
       completion: { type: 'run_to_exit' },
     });
     const body = await readFile(p, 'utf8');
-    expect(body).toBe('echo hi');
+    expect(body.startsWith(POWERSHELL_JOB_PRELUDE)).toBe(false);
+    expect(body).toContain('echo hi');
   });
 });
