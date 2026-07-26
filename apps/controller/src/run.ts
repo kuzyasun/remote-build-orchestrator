@@ -69,6 +69,7 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
     gitAllowlist: config.gitAllowlist,
     allowLocalFallback: config.allowLocalFallback,
+    allowFullSnapshotFallback: config.allowFullSnapshotFallback,
     getHostCpuBusyFraction,
     maxHostCpuBusyFraction: config.maxHostCpuBusyFraction,
   });

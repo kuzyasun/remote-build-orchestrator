@@ -42,6 +42,8 @@ export interface ControllerServerOptions {
   maxConcurrentJobs?: number;
   gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
   allowLocalFallback?: boolean;
+  /** Opt in to full working-tree snapshot when overlay capture is impossible. Default false. */
+  allowFullSnapshotFallback?: boolean;
   /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
   getHostCpuBusyFraction?: () => number;
   maxHostCpuBusyFraction?: number;
@@ -103,6 +105,7 @@ function buildToolContext(
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
     gitAllowlist: options.gitAllowlist,
     allowLocalFallback: options.allowLocalFallback,
+    allowFullSnapshotFallback: options.allowFullSnapshotFallback,
     getHostCpuBusyFraction: options.getHostCpuBusyFraction,
     maxHostCpuBusyFraction: options.maxHostCpuBusyFraction,
   };

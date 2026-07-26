@@ -262,6 +262,9 @@ describe('/data/v1 isolation from MCP/admin auth (§1.7)', () => {
     });
 
     controllerServer = await startControllerServer({
+      // These fixtures use local repos with no allowlisted remote, so overlay
+      // capture is impossible; opt in to the full-snapshot path explicitly.
+      allowFullSnapshotFallback: true,
       host: '127.0.0.1',
       port: 0,
       db,

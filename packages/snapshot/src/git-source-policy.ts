@@ -96,7 +96,13 @@ export async function hasGitModulesFile(repoRoot: string): Promise<boolean> {
 }
 
 export function isLfsPointer(content: Buffer | string): boolean {
-  const text = (typeof content === 'string' ? content : content.toString('utf8')).slice(0, 200);
+  // Slice BEFORE decoding: an LFS pointer is a short ASCII header, so only the
+  // first bytes can ever match. Decoding the whole buffer first turned every
+  // captured file into a UTF-8 string just to read ~130 bytes of it — on a repo
+  // with a few hundred MB of tracked binaries (CAD/PCB assets) that is minutes
+  // of CPU in one non-yielding call, which also blocks the event loop.
+  const text =
+    typeof content === 'string' ? content.slice(0, 200) : content.subarray(0, 200).toString('utf8');
   return text.startsWith(LFS_POINTER_PREFIX);
 }
 

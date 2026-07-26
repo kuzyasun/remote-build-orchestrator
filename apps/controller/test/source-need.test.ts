@@ -242,38 +242,65 @@ describe('Controller source_need → bundle_download', () => {
     expect(jobRow.failure_message).toMatch(/exceeds maximum 1 bytes/);
   });
 
-  it('rejects overlay capture when repository URL is not allowlisted', async () => {
+  // A non-allowlisted remote makes overlay capture impossible. Falling back to a
+  // full snapshot silently would upload the whole working tree, so the fallback
+  // is opt-in: default refuses with an actionable reason, opt-in degrades to full.
+  function disallowedRemoteCtx(jobSuffix: string, allowFullSnapshotFallback?: boolean) {
+    return {
+      db,
+      dataDir: tempDir,
+      allowedProjectRoots: [fixture.root],
+      allowedArtifactDestinations: [fixture.root],
+      remoteCapable: true,
+      gitAllowlist: {
+        schemes: ['https'],
+        hosts: ['github.com'],
+        repository_prefixes: ['other-user/'],
+      },
+      ...(allowFullSnapshotFallback === undefined ? {} : { allowFullSnapshotFallback }),
+      jobSuffix,
+    };
+  }
+
+  function disallowedRequest(clientRequestId: string) {
+    return {
+      client_request_id: clientRequestId,
+      source: { project_root: fixture.root, cwd: '.' },
+      execution: { shell: 'bash', script: 'true' },
+    };
+  }
+
+  it('refuses capture when the repository URL is not allowlisted and fallback is default-off', async () => {
+    const job = createJob(db, {
+      jobId: 'job_disallowed_strict',
+      clientId: 'client',
+      clientRequestId: 'req_disallowed_strict',
+      request: disallowedRequest('req_disallowed_strict'),
+      initialState: 'created',
+    });
+
+    const { jobSuffix: _unused, ...ctx } = disallowedRemoteCtx('strict');
+    await expect(
+      captureAndPersistSnapshot(ctx, job.id, disallowedRequest('req_disallowed_strict')),
+    ).rejects.toThrow(
+      /no fetch remote is allowed by git_allowlist[\s\S]*disabled by default[\s\S]*allow_full_snapshot_fallback/,
+    );
+  });
+
+  it('falls back to a full snapshot when allow_full_snapshot_fallback is opted in', async () => {
     const job = createJob(db, {
       jobId: 'job_disallowed',
       clientId: 'client',
       clientRequestId: 'req_disallowed',
-      request: {
-        client_request_id: 'req_disallowed',
-        source: { project_root: fixture.root, cwd: '.' },
-        execution: { shell: 'bash', script: 'true' },
-      },
+      request: disallowedRequest('req_disallowed'),
       initialState: 'created',
     });
 
+    const { jobSuffix: _unused, ...ctx } = disallowedRemoteCtx('optin', true);
     const capture = await captureAndPersistSnapshot(
-      {
-        db,
-        dataDir: tempDir,
-        allowedProjectRoots: [fixture.root],
-        allowedArtifactDestinations: [fixture.root],
-        remoteCapable: true,
-        gitAllowlist: {
-          schemes: ['https'],
-          hosts: ['github.com'],
-          repository_prefixes: ['other-user/'],
-        },
-      },
+      ctx,
       job.id,
-      {
-        client_request_id: 'req_disallowed',
-        source: { project_root: fixture.root, cwd: '.' },
-        execution: { shell: 'bash', script: 'true' },
-      },
+      disallowedRequest('req_disallowed'),
     );
 
     const manifest = JSON.parse(

@@ -30,6 +30,13 @@ export interface ControllerConfig {
   reconcileDeadlineSeconds: number;
   /** Allow local executor fallback when no remote agent matches (§19.5). Default true. */
   allowLocalFallback: boolean;
+  /**
+   * Allow falling back to a FULL working-tree snapshot when git-overlay capture is
+   * not possible (§10.4). Default false: overlay only ships the dirty diff, so a
+   * silent fallback can turn a config mistake (e.g. an SSH host alias missing from
+   * `git_allowlist.hosts`) into a multi-hundred-MB upload that looks like a hang.
+   */
+  allowFullSnapshotFallback: boolean;
   /** Max git bundle bytes for local-only base commits (Phase 5). Default 512 MiB. */
   maxGitBundleBytes: number;
   /**
@@ -83,6 +90,7 @@ export const ControllerConfigFileSchema = z
     orphan_timeout_seconds: z.number().int().nonnegative().optional(),
     reconcile_deadline_seconds: z.number().int().nonnegative().optional(),
     allow_local_fallback: z.boolean().optional(),
+    allow_full_snapshot_fallback: z.boolean().optional(),
     max_git_bundle_bytes: z.number().int().positive().optional(),
     local_fallback_max_host_cpu_percent: z.number().min(0).max(100).optional(),
   })
@@ -227,6 +235,7 @@ export function defaultControllerConfigFile(): ControllerConfigFile {
     orphan_timeout_seconds: 300,
     reconcile_deadline_seconds: 120,
     allow_local_fallback: true,
+    allow_full_snapshot_fallback: false,
     max_git_bundle_bytes: DEFAULT_MAX_GIT_BUNDLE_BYTES,
     local_fallback_max_host_cpu_percent: 80,
   };
@@ -354,6 +363,14 @@ export function loadControllerConfig(
     file?.allow_local_fallback ??
     true;
 
+  const allowFullSnapshotFallback =
+    fieldOverrides.allowFullSnapshotFallback ??
+    (envSet('RBO_ALLOW_FULL_SNAPSHOT_FALLBACK')
+      ? process.env.RBO_ALLOW_FULL_SNAPSHOT_FALLBACK === 'true'
+      : undefined) ??
+    file?.allow_full_snapshot_fallback ??
+    false;
+
   const maxHostCpuBusyFraction =
     fieldOverrides.maxHostCpuBusyFraction ??
     (envSet('RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT')
@@ -413,6 +430,7 @@ export function loadControllerConfig(
       file?.reconcile_deadline_seconds ??
       120,
     allowLocalFallback,
+    allowFullSnapshotFallback,
     maxGitBundleBytes:
       fieldOverrides.maxGitBundleBytes ??
       (envSet('RBO_MAX_GIT_BUNDLE_BYTES')

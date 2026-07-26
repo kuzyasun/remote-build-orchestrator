@@ -106,6 +106,9 @@ describe('Remote Execution End-to-End', () => {
     });
 
     controllerServer = await startControllerServer({
+      // These fixtures use local repos with no allowlisted remote, so overlay
+      // capture is impossible; opt in to the full-snapshot path explicitly.
+      allowFullSnapshotFallback: true,
       host: '127.0.0.1',
       port: 0,
       db,
@@ -175,6 +178,9 @@ describe('Remote Execution End-to-End', () => {
       allowedProjectRoots: [fixture.root],
       connectedAgents: agentPlane.connectedAgents,
       agentPlanePort: agentPlane.port,
+      // This case deliberately exercises the FULL snapshot path on a fixture repo
+      // with no allowlisted remote, so the opt-in is required.
+      allowFullSnapshotFallback: true,
     };
 
     const submitRes = await handleToolCall(ctx, 'job_submit', {

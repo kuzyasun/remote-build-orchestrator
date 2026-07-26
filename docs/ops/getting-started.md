@@ -25,7 +25,6 @@ fallback — see step 4).
 ## 2. Prerequisites
 
 - Node.js ≥ 22.14 on every machine (Controller and every Agent)
-- Git on `PATH` on every machine that will run a job (snapshot capture shells out to `git`). For repositories with Git submodules, ensure submodules are initialized on the project checkout host (`git submodule update --init --recursive`) before submitting `git_overlay` jobs.
 - Windows Agents: nothing extra on **win32-x64** — with `npm install -g @gemslibe/rbo`, the Job
   Object helper arrives via optionalDependency `@gemslibe/rbo-windows-executor-win32-x64`
   (`rbo-windows-executor.exe`). Archives ship the same exe under `bin/`. Other Windows arches /
@@ -33,6 +32,39 @@ fallback — see step 4).
 - macOS/Linux Agents: scripts run without the equivalent process-tree containment layer today (see
   Known limitations in the release guide) — fine for trusted local dev use, be aware for anything
   more adversarial
+
+### What must be installed on each Agent
+
+The Agent **probes** its own machine on connect and reports what it finds; the Controller then
+only schedules a job onto an Agent that satisfies the job's `requirements`. So a missing tool does
+not produce a crash — it produces an Agent that never gets picked (see Troubleshooting).
+
+| On the Agent | Needed for | If missing |
+|---|---|---|
+| **Node.js ≥ 22.14** | the Agent process itself | Agent won't run |
+| **`git`** on `PATH` | any git-sourced job; overlay materialization | reported as absent; jobs requiring `git` never match this Agent |
+| **`git-lfs`** on `PATH` | repos that use Git LFS — see [Recommended: Git LFS](#recommended-git-lfs-for-large-binary-assets) | LFS repos never match this Agent |
+| **the shell your jobs use** | `execution.shell` | a job naming a shell this Agent lacks never matches |
+| network/credential access to your git remote | fetching the base commit into `repo_cache_dir` | overlay materialization fails |
+
+Shell detection is best-effort per platform: on Linux/macOS it probes `bash`, `zsh`, `sh`, `pwsh`;
+on Windows `powershell`, `cmd`, `pwsh`, `bash`, `sh`, `zsh`. Whatever it finds is what your jobs may
+name in `execution.shell`.
+
+Check what an Agent actually reported with `rbo agents` — the `tools` object is the probe result
+(e.g. `"tools": { "git": ["2.50.1"], "git-lfs": ["3.5.1"] }`), and `rbo agent probe <agent-id>`
+re-runs it on demand.
+
+### On the machine holding the project checkout (the Controller's `source.project_root`)
+
+Capture reads this working tree, so it must be in a state RBO can reason about:
+
+- **Submodules initialized and clean.** If the repo has a `.gitmodules`, capture fails with
+  `uninitialized_submodule` or `dirty_submodule`. Run
+  `git submodule update --init --recursive` first. A repo with submodules also makes the job
+  require `git` on the Agent.
+- **LFS content materialized.** If a tracked file is still an LFS *pointer* rather than real
+  content, capture fails with `Git LFS content missing for: <paths>`. Run `git lfs pull`.
 
 ## 3. Install the package
 
@@ -135,7 +167,9 @@ fill the allowlists — they default to empty and `job_submit` rejects every pro
 | `mcp_host` / `mcp_port` | `127.0.0.1` / `7410` | MCP endpoint your AI client / `rbo-mcp-stdio` connects to |
 | `agent_plane_port` | `7411` | TLS port Agents connect to |
 | `controller_public_host` | `127.0.0.1` | Host Agents use in data-plane HTTPS URLs (set to a reachable address for remote Agents) |
+| `git_allowlist` | `{schemes:[https,ssh], hosts:[github.com]}` | Remotes eligible for **git-overlay capture** — see [Overlay vs full snapshot](#overlay-vs-full-snapshot-and-why-a-job-may-refuse-to-start) |
 | `allow_local_fallback` | `true` | Allow the Controller to run a job locally when no eligible Agent matches |
+| `allow_full_snapshot_fallback` | `false` | Allow uploading the **entire working tree** when git-overlay capture is impossible. Off by default — see below |
 | `local_max_concurrent_jobs` | `1` | Cap on concurrent locally-executed jobs |
 | `local_fallback_max_host_cpu_percent` | `80` | Host-aware local fallback CPU busy% threshold |
 
@@ -157,6 +191,81 @@ Windows example:
 }
 ```
 
+### Overlay vs full snapshot, and why a job may refuse to start
+
+RBO has two ways to get your source onto an Agent, and the difference is large:
+
+- **git overlay** (preferred) — the Controller ships only your **dirty diff**; the Agent
+  materializes the rest by fetching the base commit from the remote into its
+  `repo_cache_dir`. On a clean working tree the payload is a few **bytes**.
+- **full snapshot** (fallback) — the Controller packs the **entire working tree**. On a repo with
+  large tracked binaries (CAD, PCB, media, vendored blobs) that is hundreds of **MB** per submit,
+  and capture is CPU-bound, so it can look like the Controller has hung.
+
+Overlay requires all of:
+
+1. at least one Agent connected (otherwise there is nothing to fetch remotely);
+2. a `git_allowlist` on the Controller;
+3. the project inside a git repo with a HEAD commit;
+4. **a fetch remote whose host is in `git_allowlist.hosts`.**
+
+> **The trap — SSH host aliases.** If you use a `~/.ssh/config` alias for multiple accounts,
+> your remote is `git@github-myorg:org/repo.git`, and its host is **`github-myorg`**, *not*
+> `github.com`. The default allowlist only contains `github.com`, so such a repo is **not**
+> overlay-eligible and every job would otherwise fall back to a full snapshot. Either list the
+> alias explicitly:
+>
+> ```json
+> { "git_allowlist": { "schemes": ["https", "ssh"], "hosts": ["github.com", "github-myorg"] } }
+> ```
+>
+> …or normalize the remote to `github.com` (e.g. `git config remote.origin.url
+> git@github.com:org/repo.git` plus a `Host github.com` entry with the right `IdentityFile`, or
+> `url.insteadOf`). Normalizing is usually better: the repo's canonical id — and therefore the
+> Agent's `repo_cache_dir` entry — is derived from the host, so `github-myorg/...` and
+> `github.com/...` are cached as two different repositories.
+
+Because a silent downgrade to full snapshot is expensive and easy to miss,
+**`allow_full_snapshot_fallback` defaults to `false`**: when overlay is impossible, `job_submit`
+fails with the specific reason instead. Fix the reason, or opt in explicitly:
+
+```json
+{ "allow_full_snapshot_fallback": true }
+```
+
+(or `RBO_ALLOW_FULL_SNAPSHOT_FALLBACK=true`). With the opt-in enabled the fallback still logs a
+`git overlay capture unavailable; falling back to full snapshot` warning naming the cause, so it
+is never silent. You need the opt-in for repos with **no** allowlisted remote at all — local-only
+repos, or a Controller running with no Agent connected.
+
+Also set `repo_cache_dir` in `agent.json` (step 5) so Agents reuse one clone per repo instead of
+re-fetching per job.
+
+### Recommended: Git LFS for large binary assets
+
+If your repo tracks large binaries directly in git — CAD/PCB exports, media, vendored archives,
+firmware blobs — move them to [Git LFS](https://git-lfs.com/). This is a recommendation, not a
+requirement, and it pays off in two places:
+
+- **Clone size.** Every Agent's `repo_cache_dir` clone carries the full history of those blobs.
+  With LFS the Agent fetches only the versions it actually checks out.
+- **Full-snapshot cost.** If a repo ever *does* take the full-snapshot path, capture packs the whole
+  working tree. Hundreds of MB of tracked binaries make that slow and CPU-bound.
+
+Once a repo uses LFS, RBO detects it automatically (`git lfs ls-files`, or `filter=lfs` in
+`.gitattributes`) and **adds `git-lfs` to the job's requirements**, so:
+
+1. **Install `git-lfs` on every Agent** that should be eligible for that repo. Without it the
+   Agent is simply never selected; if it is selected anyway the run fails with
+   `git-lfs is required but not available on this Agent`.
+2. **Give each Agent credentials/network access to the LFS store.** The Agent materializes content
+   itself with `git lfs install --local` + `git lfs pull` — LFS objects are **not** shipped inside
+   the job payload.
+3. **Push your LFS objects.** Objects that exist only on your machine cannot be fetched by the
+   Agent (see Limitations).
+4. On the checkout host, keep content materialized (`git lfs pull`) — capture refuses to package
+   pointer files with `Git LFS content missing for: <paths>`.
+
 Then start (defaults already use `~/.rbo`; override with `RBO_DATA_DIR` or `--data-dir <dir>` on
 **every** `rbo controller` subcommand — init, fingerprint, start, restore — so init and start
 always target the same tree):
@@ -174,7 +283,8 @@ and Controller reachability at `http://127.0.0.1:7410`).
 
 Optional env overrides (same names as before; they win over the file when set):
 `RBO_MCP_HOST`, `RBO_MCP_PORT`, `RBO_AGENT_PORT`, `RBO_ALLOWED_PROJECT_ROOTS` (comma-separated),
-`RBO_ALLOWED_ARTIFACT_DESTINATIONS`, `RBO_ALLOW_LOCAL_FALLBACK`, `RBO_LOCAL_MAX_CONCURRENT_JOBS`,
+`RBO_ALLOWED_ARTIFACT_DESTINATIONS`, `RBO_ALLOW_LOCAL_FALLBACK`,
+`RBO_ALLOW_FULL_SNAPSHOT_FALLBACK`, `RBO_LOCAL_MAX_CONCURRENT_JOBS`,
 `RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT`, `RBO_CONTROLLER_PUBLIC_HOST`, `RBO_DATA_DIR`.
 
 > **Naming trap**: the `rbo` CLI (`agents`/`agent`/`submit`/`logs`/`cancel`/`doctor` — anything
@@ -199,6 +309,11 @@ rbo agent init
 #   controller_fingerprint → value from `rbo controller fingerprint`
 #   display_name           → e.g. "my-laptop" (default: rbo-agent)
 #   max_jobs               → default 1
+#   repo_cache_dir         → recommended: one reusable clone per repo instead of
+#                            re-fetching every job (default null = no cache)
+#   git_allowlist          → the Agent enforces this too, on the remote it fetches
+#                            AND on every submodule URL. Keep it in sync with the
+#                            Controller's, including any SSH host aliases.
 
 rbo agent start          # foreground; pass --daemon for detached PID+log
                          # If already running: TTY prompts to restart; or pass --replace.
@@ -370,4 +485,58 @@ If your `mcpServers` entry is not named `rbo` / `user-rbo`, change the server na
   current output.
 - Agent connects but never gets work: check `rbo agents` for its reported capacity/capabilities,
   and confirm your job's `requirements` (OS, labels, toolchain) actually match it.
+- `job_submit` fails with `Cannot capture this job with git overlay: ...`: that is the
+  default-off full-snapshot fallback refusing to upload your whole working tree. The message names
+  the cause — most often a fetch remote whose host is not in `git_allowlist.hosts` (watch for SSH
+  host aliases like `github-myorg`, which are a different host than `github.com`). See
+  [Overlay vs full snapshot](#overlay-vs-full-snapshot-and-why-a-job-may-refuse-to-start).
+  Set `allow_full_snapshot_fallback: true` only if you really do want the full-tree upload.
+- `job_submit` takes minutes and pegs a CPU: you are on the full-snapshot path with a large
+  tracked tree. Confirm with the Controller log — a
+  `git overlay capture unavailable; falling back to full snapshot` warning names the cause. Making
+  the repo overlay-eligible turns that capture into a few bytes.
 - For anything else, see [`runbook.md`](./runbook.md)'s Repair section.
+
+## 10. Limitations to plan around
+
+Current behavior worth knowing before you wire RBO into a real workflow. Release-level caveats live
+in [`docs/dev/release-builds.md`](../dev/release-builds.md); this list is about day-to-day operation.
+
+**Source materialization**
+
+- **LFS objects are never transferred in the payload.** The Agent fetches them with `git lfs pull`,
+  so objects that exist only on your machine are unreachable — push them first. (Tracked as a
+  §11.15 follow-up in `git-source-policy.ts`.)
+- **Submodule URLs must also pass `git_allowlist`** — not just the top-level remote. A submodule
+  pointing at an SSH host alias, or a host you did not list, fails with
+  `Submodule URL rejected (unknown_host)`.
+- **Submodules are cloned shallow** (`--depth 1`). Job scripts that need submodule history have to
+  deepen it themselves.
+- **Submodules must be initialized and clean on the checkout host** before submit; capture will not
+  do it for you.
+- **Base commits that are not pushed** are shipped as a git bundle, capped by
+  `max_git_bundle_bytes` (default 512 MiB). Above that the job fails rather than falling back.
+- **Full-snapshot capture is CPU-bound and runs on the Controller's event loop.** On a repo with a
+  large tracked tree a single submit can occupy a core for minutes and make the Controller
+  unresponsive meanwhile. Prefer overlay; this is the main reason
+  `allow_full_snapshot_fallback` is off by default.
+
+**Process containment**
+
+- **macOS/Linux Agents have no process-tree containment layer** equivalent to the Windows Job
+  Object helper. Job scripts get their own process group and cancellation walks the descendant
+  tree, but a determined process can still escape; fine for trusted local use, weaker for
+  adversarial workloads.
+
+**Operational**
+
+- **`--replace` is not scoped to a state directory.** `rbo agent start --replace` /
+  `rbo controller start --replace` stop *every* matching agent/controller process on the machine,
+  including instances running under a different `--state-dir` / `--data-dir`. Running a test rig
+  next to a real paired Agent will take the real one down — stop and restart it deliberately
+  instead of relying on `--replace`.
+- **A stale pid file can report a process that is gone** ("Agent already running (pid N)" for a dead
+  pid). `rbo agent stop-process` clears it; then start normally.
+- **Global npm installs may skip the stop hook.** With npm's `allowScripts` policy the
+  `preinstall` hook that stops running daemons does not run, so a live Controller/Agent keeps
+  serving the *old* bundle after an upgrade. Restart both after installing.

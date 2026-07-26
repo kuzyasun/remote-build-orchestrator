@@ -13,7 +13,14 @@ let running: RunningControllerServer;
 beforeAll(async () => {
   const db = openDatabase(':memory:');
   migrateToLatest(db);
-  running = await startControllerServer({ host: '127.0.0.1', port: 0, db });
+  running = await startControllerServer({
+    // These fixtures use local repos with no allowlisted remote, so overlay
+    // capture is impossible; opt in to the full-snapshot path explicitly.
+    allowFullSnapshotFallback: true,
+    host: '127.0.0.1',
+    port: 0,
+    db,
+  });
 });
 
 afterAll(async () => {
@@ -141,8 +148,15 @@ describe('Loopback enforcement (§7.1)', () => {
   it('refuses to bind the MCP endpoint to a non-loopback interface', async () => {
     const db = openDatabase(':memory:');
     migrateToLatest(db);
-    await expect(startControllerServer({ host: '0.0.0.0', port: 0, db })).rejects.toThrow(
-      /loopback/i,
-    );
+    await expect(
+      startControllerServer({
+        // These fixtures use local repos with no allowlisted remote, so overlay
+        // capture is impossible; opt in to the full-snapshot path explicitly.
+        allowFullSnapshotFallback: true,
+        host: '0.0.0.0',
+        port: 0,
+        db,
+      }),
+    ).rejects.toThrow(/loopback/i);
   });
 });

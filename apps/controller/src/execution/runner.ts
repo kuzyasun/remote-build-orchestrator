@@ -11,12 +11,19 @@ import {
   writeJobScript,
 } from '@rbo/executor';
 import type { JobEvent, JobRequest } from '@rbo/protocol';
-import { type GitUrlAllowlist, RboError, resolveContainedCwd } from '@rbo/shared';
+import {
+  type GitUrlAllowlist,
+  RboError,
+  createLogger,
+  formatUnknownError,
+  resolveContainedCwd,
+} from '@rbo/shared';
 import {
   type GitSourceRequirements,
   captureFullSnapshot,
   captureGitOverlaySnapshot,
   gitFindRoot,
+  gitListRemoteFetchUrls,
   gitRevParseHead,
   materializeFullSnapshot,
   resolveAllowlistedRemoteUrl,
@@ -53,6 +60,8 @@ import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
 import { persistCollectedArtifacts } from './artifacts.js';
 
+const logger = createLogger('controller.execution.runner');
+
 export interface LocalRunnerContext {
   db: ControllerDatabase;
   dataDir: string;
@@ -62,6 +71,12 @@ export interface LocalRunnerContext {
   gitAllowlist?: GitUrlAllowlist;
   /** When true, prefer git_overlay capture for remote-eligible jobs. */
   remoteCapable?: boolean;
+  /**
+   * Opt in to uploading the whole working tree when git-overlay capture is not
+   * possible (§10.4). Default false so a misconfigured allowlist fails loudly
+   * instead of silently transferring the entire repository.
+   */
+  allowFullSnapshotFallback?: boolean;
 }
 
 const activeCancels = new Map<string, () => Promise<void>>();
@@ -623,10 +638,7 @@ export async function captureAndPersistSnapshot(
           },
         };
 
-  const useOverlay =
-    ctx.remoteCapable === true &&
-    ctx.gitAllowlist &&
-    (await canCaptureGitOverlay(normalizedRequest.source.project_root, ctx.gitAllowlist));
+  const useOverlay = await resolveUseGitOverlay(ctx, normalizedRequest.source.project_root);
 
   const overlayRemoteUrl =
     useOverlay && ctx.gitAllowlist
@@ -736,18 +748,100 @@ export async function readGitSourceRequirements(
   }
 }
 
-async function canCaptureGitOverlay(
+/**
+ * Why a job could not use git-overlay capture, in operator-actionable terms.
+ *
+ * Overlay sends only the dirty diff and lets the Agent materialize the rest from
+ * the remote, so losing it silently means uploading the entire working tree
+ * instead — on a repo with large tracked binaries that is the difference between
+ * a few KB and hundreds of MB. Every reason below therefore has to reach the
+ * operator (see resolveUseGitOverlay), never get swallowed.
+ */
+export type OverlayIneligibility =
+  | { reason: 'no_connected_agent' }
+  | { reason: 'no_git_allowlist' }
+  | { reason: 'not_a_git_repo'; detail: string }
+  | { reason: 'no_head_commit' }
+  | { reason: 'remote_not_allowlisted'; remotes: string[]; allowedHosts: readonly string[] };
+
+export function describeOverlayIneligibility(cause: OverlayIneligibility): string {
+  switch (cause.reason) {
+    case 'no_connected_agent':
+      return 'no Agent is connected, so there is nothing to materialize the repository remotely';
+    case 'no_git_allowlist':
+      return 'the Controller has no git_allowlist configured';
+    case 'not_a_git_repo':
+      return `the project root is not inside a git repository (${cause.detail})`;
+    case 'no_head_commit':
+      return 'the repository has no HEAD commit yet';
+    case 'remote_not_allowlisted':
+      return cause.remotes.length === 0
+        ? 'the repository has no fetch remote configured'
+        : `no fetch remote is allowed by git_allowlist. Remotes: ${cause.remotes.join(', ')}; allowed hosts: ${cause.allowedHosts.join(', ') || '(none)'}. Note an SSH host alias from ~/.ssh/config (e.g. "git@github-myorg:org/repo.git") is a DIFFERENT host than github.com and must be listed explicitly`;
+  }
+}
+
+/**
+ * Decide overlay vs full-snapshot capture, and never fall back silently.
+ *
+ * Full-snapshot fallback is opt-in (`allow_full_snapshot_fallback`, default
+ * false): a misconfigured allowlist used to degrade quietly into uploading the
+ * whole working tree, which looks like a hang rather than a config error.
+ */
+async function resolveUseGitOverlay(
+  ctx: LocalRunnerContext,
   projectRoot: string,
-  allowlist: GitUrlAllowlist,
 ): Promise<boolean> {
-  try {
-    const repoRoot = await gitFindRoot(projectRoot);
-    const [remoteUrl, head] = await Promise.all([
-      resolveAllowlistedRemoteUrl(repoRoot, allowlist),
-      gitRevParseHead(repoRoot),
-    ]);
-    return Boolean(remoteUrl && head);
-  } catch {
+  let cause: OverlayIneligibility | null;
+  if (ctx.remoteCapable !== true) {
+    cause = { reason: 'no_connected_agent' };
+  } else if (!ctx.gitAllowlist) {
+    cause = { reason: 'no_git_allowlist' };
+  } else {
+    cause = await assessGitOverlayEligibility(projectRoot, ctx.gitAllowlist);
+  }
+  if (!cause) {
+    return true;
+  }
+
+  const explanation = describeOverlayIneligibility(cause);
+  if (ctx.allowFullSnapshotFallback === true) {
+    logger.warn('git overlay capture unavailable; falling back to full snapshot', {
+      projectRoot,
+      reason: cause.reason,
+      explanation,
+      hint: 'A full snapshot uploads the entire working tree. Fix the cause above to use overlay capture instead.',
+    });
     return false;
   }
+  throw RboError.validation(
+    `Cannot capture this job with git overlay: ${explanation}. A full-snapshot fallback would upload the entire working tree, so it is disabled by default — fix the cause, or set "allow_full_snapshot_fallback": true in controller.json (or RBO_ALLOW_FULL_SNAPSHOT_FALLBACK=true) to opt in.`,
+    { reason: cause.reason, project_root: projectRoot },
+  );
+}
+
+async function assessGitOverlayEligibility(
+  projectRoot: string,
+  allowlist: GitUrlAllowlist,
+): Promise<OverlayIneligibility | null> {
+  let repoRoot: string;
+  try {
+    repoRoot = await gitFindRoot(projectRoot);
+  } catch (error) {
+    return { reason: 'not_a_git_repo', detail: formatUnknownError(error) };
+  }
+  const [remoteUrl, head] = await Promise.all([
+    resolveAllowlistedRemoteUrl(repoRoot, allowlist).catch(() => null),
+    gitRevParseHead(repoRoot).catch(() => null),
+  ]);
+  if (!head) {
+    return { reason: 'no_head_commit' };
+  }
+  if (!remoteUrl) {
+    const remotes = await gitListRemoteFetchUrls(repoRoot)
+      .then((list) => list.map((r) => r.url))
+      .catch(() => []);
+    return { reason: 'remote_not_allowlisted', remotes, allowedHosts: allowlist.hosts };
+  }
+  return null;
 }

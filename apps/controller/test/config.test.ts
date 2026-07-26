@@ -13,6 +13,7 @@ const ENV_KEYS = [
   'RBO_ALLOWED_ARTIFACT_DESTINATIONS',
   'RBO_MCP_PORT',
   'RBO_ALLOW_LOCAL_FALLBACK',
+  'RBO_ALLOW_FULL_SNAPSHOT_FALLBACK',
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
@@ -30,6 +31,24 @@ afterEach(() => {
     else process.env[key] = savedEnv[key];
   }
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe('allow_full_snapshot_fallback (§10.4)', () => {
+  it('defaults to false so a full working-tree upload is never silent', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    expect(loadControllerConfig({ configPath: null }).allowFullSnapshotFallback).toBe(false);
+  });
+
+  it('honours the config file, and env overrides it', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(path, JSON.stringify({ allow_full_snapshot_fallback: true }), 'utf8');
+    expect(loadControllerConfig({ dataDir }).allowFullSnapshotFallback).toBe(true);
+
+    process.env.RBO_ALLOW_FULL_SNAPSHOT_FALLBACK = 'false';
+    expect(loadControllerConfig({ dataDir }).allowFullSnapshotFallback).toBe(false);
+  });
 });
 
 describe('loadControllerConfig allowed roots/destinations (operator setup)', () => {
