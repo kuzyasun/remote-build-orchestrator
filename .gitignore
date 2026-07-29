@@ -1,0 +1,13 @@
+dist/
+node_modules/
+*.tsbuildinfo
+*.tgz
+
+# Rust build artifacts
+native/windows-executor/target/
+.fusion
+tmp/
+.superpowers
+docs/superpowers
+packaging/*/dist/
+.pnpm-store/

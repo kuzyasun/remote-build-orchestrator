@@ -1,0 +1,35 @@
+{
+  "name": "@rbo/agent",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/main.js",
+  "exports": {
+    ".": "./dist/main.js",
+    "./run": {
+      "types": "./dist/run.d.ts",
+      "import": "./dist/run.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@rbo/executor": "workspace:*",
+    "@rbo/protocol": "workspace:*",
+    "@rbo/shared": "workspace:*",
+    "@rbo/snapshot": "workspace:*",
+    "@rbo/testing": "workspace:^",
+    "ws": "^8.21.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.3"
+  }
+}

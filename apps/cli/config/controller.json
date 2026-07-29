@@ -1,0 +1,20 @@
+{
+  "mcp_host": "127.0.0.1",
+  "mcp_port": 7410,
+  "agent_plane_port": 7411,
+  "controller_public_host": "127.0.0.1",
+  "data_plane_base_url": null,
+  "allowed_project_roots": [],
+  "allowed_artifact_destinations": [],
+  "git_allowlist": {
+    "schemes": ["https", "ssh"],
+    "hosts": ["github.com"]
+  },
+  "local_max_concurrent_jobs": 1,
+  "disconnect_grace_seconds": 60,
+  "orphan_timeout_seconds": 300,
+  "reconcile_deadline_seconds": 120,
+  "allow_local_fallback": true,
+  "max_git_bundle_bytes": 536870912,
+  "local_fallback_max_host_cpu_percent": 80
+}

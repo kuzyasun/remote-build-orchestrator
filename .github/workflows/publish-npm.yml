@@ -1,0 +1,84 @@
+name: Publish npm packages
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ !github.event.release.prerelease }}
+    name: Verify, build, and publish
+    runs-on: windows-latest
+    environment: npm
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the release
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install release toolchain
+        shell: pwsh
+        run: |
+          npm install --global npm@11.7.0 pnpm@10.5.2
+          node --version
+          npm --version
+          pnpm --version
+
+      - name: Verify release version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $root = Get-Content package.json -Raw | ConvertFrom-Json
+          $cli = Get-Content apps/cli/package.json -Raw | ConvertFrom-Json
+          $executor = Get-Content packages/rbo-windows-executor-win32-x64/package.json -Raw | ConvertFrom-Json
+          $versions = @($root.version, $cli.version, $executor.version) | Sort-Object -Unique
+
+          if ($versions.Count -ne 1) {
+            throw "Package versions are not in lockstep: $($versions -join ', ')"
+          }
+          if ($cli.optionalDependencies.'@gemslibe/rbo-windows-executor-win32-x64' -ne "workspace:$($cli.version)") {
+            throw "The Windows executor dependency does not match @gemslibe/rbo@$($cli.version)"
+          }
+          if ($env:RELEASE_TAG -ne "v$($cli.version)") {
+            throw "Release tag '$env:RELEASE_TAG' must equal 'v$($cli.version)'"
+          }
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify source
+        run: pnpm verify
+
+      - name: Build release
+        run: pnpm build
+
+      - name: Verify packaging manifests
+        shell: pwsh
+        run: |
+          pnpm package:archives
+          git diff --exit-code -- packaging
+          pnpm package:verify
+
+      - name: Pack release
+        run: pnpm release:pack
+
+      - name: Publish with npm Trusted Publishing
+        run: pnpm release:publish --yes

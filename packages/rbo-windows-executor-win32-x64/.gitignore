@@ -1,0 +1,3 @@
+# Built by `prepare-binary` / cargo release — do not commit
+bin/rbo-windows-executor.exe
+*.tgz
