@@ -184,4 +184,14 @@ ALTER TABLE job_attempts ADD COLUMN last_reconcile_at TEXT;
 -- SQLite cannot DROP COLUMN portably in all versions used here; no-op downgrade.
 `,
   },
+  {
+    version: 4,
+    name: 'agent-boot-id',
+    up: `
+ALTER TABLE agents ADD COLUMN last_boot_id TEXT;
+`,
+    down: `
+-- SQLite cannot DROP COLUMN portably in all versions used here; no-op downgrade.
+`,
+  },
 ];

@@ -31,7 +31,8 @@ describe('Migration v3 — phase6 attempt recovery columns', () => {
     try {
       migrateToLatest(db);
 
-      expect(getSchemaVersion(db)).toBe(3);
+      // v3 columns are present regardless of how many later migrations ran after it.
+      expect(getSchemaVersion(db)).toBeGreaterThanOrEqual(3);
 
       const columns = listColumnNames(db, 'job_attempts');
       expect(columns).toContain('log_acked_sequence');

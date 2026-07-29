@@ -26,8 +26,8 @@ Instructions for Claude and other AI tools working in this repository.
 - `native/windows-executor/`: Rust Job Object process isolation helper for Windows (§15.2).
 - `packaging/`: Per-OS packaging manifests and config templates (see `docs/dev/release-builds.md`).
 - `docs/dev/release-builds.md`: How to build a release and publish `@gemslibe/rbo` to npm.
-- `docs/ops/getting-started.md`: Operator walkthrough — Controller/Agent setup, pairing, MCP client wiring.
-- `docs/ops/runbook.md`: Day-2 operator procedures (install/pair/drain/revoke/repair/update/backup/restore/uninstall).
+- `docs/user/getting-started.md`: Operator walkthrough — Controller/Agent setup, pairing, MCP client wiring.
+- `docs/user/runbook.md`: Day-2 operator procedures (install/pair/drain/revoke/repair/update/backup/restore/uninstall).
 - `remote-build-orchestrator-design.md`: Canonical architectural design specification.
 
 ## MCP client wiring (for consuming projects)
@@ -37,7 +37,7 @@ tests through MCP `job_run` as the default workflow — develop and verify here 
 Commands below.
 
 For **other** projects (firmware, clients, etc.) that should call this Controller over MCP, see
-[`docs/ops/getting-started.md`](docs/ops/getting-started.md) §§6–8 (client snippets, `job_run`
+[`docs/user/getting-started.md`](docs/user/getting-started.md) §§6–8 (client snippets, `job_run`
 preferred for AI clients, paste-ready AGENTS.md guidance including **Shell vs agent OS**). Server
 names in clients are typically `rbo` or `user-rbo`. AI agents use pull-based `job_logs`; live follow
 is CLI `rbo logs --follow` for human operators. Consumer note: match shell/command to the live

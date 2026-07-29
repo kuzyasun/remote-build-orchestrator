@@ -1,127 +1,107 @@
 # RBO — Remote Build Orchestrator
 
-**Stop letting AI-agent builds and tests peg your main machine. Offload them to whatever other
-computers you have sitting idle — while still being able to run them on your own host when that's
-the right call.**
+RBO moves builds, tests, QEMU runs, and Docker jobs from an AI coding assistant to one or more
+worker machines. Your current checkout stays responsive and untouched, while the assistant still
+gets logs and artifacts through MCP.
 
-AI coding agents (Codex, Claude, Cursor, Antigravity, …) build and test *a lot* while they work —
-often heavier and more often than a human would, and usually right when you're trying to keep
-using the same machine for everything else. RBO's first job is to spread that load: whenever you
-have another machine available, an agent's build/test/QEMU/Docker job runs there instead of on
-your host, so your host stays responsive and the agent isn't waiting behind your own CPU/disk
-contention. It's not an all-or-nothing switch — a job can still run locally when that's what makes
-sense (no other machine free, a policy that requires it); the point is to actually *distribute* the
-work across host + available machines, not to ban local execution. The net effect: agents get more
-throughput, and working on your own machine while they're busy stays comfortable.
+## What problem does it solve?
 
-RBO does this by running each job against an exact, isolated snapshot of your current dirty working
-tree (uncommitted changes included) — never against your live files. Whichever machine ends up
-running the job, it can't touch the tree you're actively editing. The same snapshot isolation also
-makes it safe to run genuinely destructive or hardware-risk jobs: they come back
-`awaiting_confirmation` with a short-lived token, and nothing runs until you confirm it.
+AI coding assistants run commands frequently. Running every command directly in your working tree
+creates three problems:
 
-## Why
+- builds compete with your editor and other work for CPU, memory, and disk;
+- a command can modify files you are editing;
+- adding another machine usually requires client-specific scripts and manual coordination.
 
-- **Keep your host free while agents work.** Route the build/test/QEMU/Docker load an AI agent
-  generates onto other available machines instead of competing with it for your own CPU/disk —
-  local execution stays available as a fallback, not disabled. When it does fall back to your own
-  machine, it checks your host's real CPU load first and prefers queuing (or another machine)
-  over piling onto an already-busy host — see
-  [`docs/dev/host-aware-local-fallback-plan.md`](docs/dev/host-aware-local-fallback-plan.md).
-- **Faster agents, more comfortable host.** Spreading work across host + Agents means an agent
-  doesn't have to wait its turn behind whatever else you're doing on the same machine, and you
-  don't have to wait behind the agent.
-- **Safe by construction, not by policy.** Every job runs against a snapshot instead of your live
-  tree, so a `rm -rf` in a "destructive" job can't touch your real files, and destructive/hardware-
-  risk jobs come back `awaiting_confirmation` with a short-lived token nothing can skip.
-- **Works with the repo you actually have.** Uncommitted changes, untracked files, staged and
-  unstaged edits — captured exactly, including on large repos via a cached Git overlay instead of
-  re-sending the whole tree every time.
-- **Recovers from real interruptions.** A dropped connection during a long build doesn't lose logs
-  or silently re-run a side-effecting script.
-- **One MCP integration, any client.** Codex, Claude, Cursor, and Antigravity all talk to the same
-  Controller through the same tools — `job_submit`, `job_wait`, `job_logs`, `job_artifacts`,
-  `job_cancel`.
+RBO gives supported AI clients one interface for this work. It captures the current state of the
+project, including uncommitted changes, and runs the job in an isolated workspace on an available
+Agent. The Controller can also run the job locally when your policy allows it.
 
-## What it looks like in practice
+This is useful when you:
 
-1. Your AI agent calls `job_submit` with a script and your project's dirty working tree.
-2. RBO snapshots that tree exactly as it is right now and queues the job.
-3. A paired Agent on another machine picks it up and runs it there — freeing your own machine
-   entirely for that job's duration; if no other machine is available (or policy calls for it),
-   it falls back to running locally instead.
-4. Your agent polls `job_wait`/`job_logs`, then pulls back any declared output via
-   `job_artifacts`/`artifact_materialize`.
-5. You keep working on your host the entire time, unaffected by whatever the job is doing —
-   whether it ran elsewhere or fell back to local, it only ever touched an isolated snapshot.
+- use Codex, Claude, Cursor, Antigravity, OpenCode, or ZCode for development;
+- have an idle desktop, laptop, build server, or lab machine;
+- run expensive builds, tests, emulators, or containers;
+- need outputs from a job without letting it write into the live checkout.
 
-## Install
+## How it works
 
-**Global npm package** (when published):
+```text
+AI client ──MCP──> Controller ──secure connection──> Agent
+                       │                                │
+                       │ creates an isolated snapshot   │ runs the job
+                       └──────── logs and artifacts <────┘
+```
+
+1. The AI client submits a command and project path.
+2. The Controller captures an immutable snapshot of the current working tree.
+3. The scheduler selects a compatible Agent, or uses local fallback when allowed.
+4. The job runs only inside the isolated snapshot.
+5. The client reads the result, logs, and requested artifacts.
+
+Destructive and hardware-risk jobs require explicit confirmation before they start.
+
+## Quick start
+
+RBO requires Node.js 22.14 or newer on the Controller and every Agent.
+
+Install the CLI on each machine that will run a Controller or Agent:
 
 ```bash
 npm install -g @gemslibe/rbo
-rbo controller init && rbo agent init   # see docs/ops/getting-started.md
 ```
 
-**Option A — download a release archive** (fastest, no build toolchain needed):
-extract the archive for your OS, then follow
-[`docs/ops/getting-started.md`](docs/ops/getting-started.md) to set up the Controller, pair an
-Agent, and connect your AI client's MCP config.
+Then:
 
-**Option B — build and run from this repo** (if you're modifying RBO, or no release archive exists
-yet for your platform):
+1. initialize and start the Controller;
+2. initialize an Agent and pair it with the Controller;
+3. connect your AI client's MCP configuration;
+4. run `rbo doctor`, then submit a first job.
+
+The [getting-started guide](docs/user/getting-started.md) provides the commands and the small set
+of configuration values required for each step. If the npm package is not available for your
+environment, the same guide also explains how to install a local build.
+
+Once configured, the AI client normally drives RBO for you. The CLI remains useful for diagnostics
+and manual jobs:
 
 ```bash
-git clone <this repo> && cd rm-builder
-pnpm install
-pnpm build                  # produce apps/cli/dist
-pnpm verify                 # optional: lint + tests + Rust fmt/test
-node apps/cli/dist/rbo.js controller start   # or: rbo controller start after global install
-# from-source monorepo alternative: node apps/controller/dist/main.js
+rbo agents                 # show workers and pending pairing requests
+rbo submit job.json        # submit a job manually
+rbo logs <job-id> --follow # follow its logs
+rbo cancel <job-id>        # cancel it
+rbo doctor                 # check the local setup
 ```
-
-Then continue from step 4 of [`docs/ops/getting-started.md`](docs/ops/getting-started.md) (pairing
-an Agent and wiring your AI client).
-
-## Usage
-
-Once set up, you mostly don't type commands — your AI client's MCP tools drive the whole
-`job_submit → job_wait → job_logs → job_artifacts` workflow. To try it by hand or script it
-outside an AI client, the `rbo` CLI exposes the same operations:
-
-```bash
-rbo submit job.json      # submit a job request (see getting-started.md for the JSON shape)
-rbo logs <job_id>        # fetch incremental logs
-rbo cancel <job_id>      # cancel a running job
-rbo doctor               # sanity-check git, data dir, shells, Controller reachability
-```
-
-Want your AI agent to *default* to routing builds through RBO instead of running them inline? See
-step 8 of [`docs/ops/getting-started.md`](docs/ops/getting-started.md#8-tell-your-ai-coding-assistant-to-actually-use-rbo)
-for an `AGENTS.md`/`CLAUDE.md` snippet to drop into your own project.
 
 ## Documentation
 
-| For... | Read |
-|---|---|
-| Setting up a Controller + Agent(s) and connecting an AI client | [`docs/ops/getting-started.md`](docs/ops/getting-started.md) |
-| Day-2 operations (pair/drain/revoke/repair/update/backup/restore) | [`docs/ops/runbook.md`](docs/ops/runbook.md) |
-| Modifying RBO itself — architecture, component interaction, tech stack | [`docs/dev/architecture.md`](docs/dev/architecture.md) |
-| Building a release and publishing to npm | [`docs/dev/release-builds.md`](docs/dev/release-builds.md) |
-| The full architectural design spec (§-numbered, canonical) | [`remote-build-orchestrator-design.md`](remote-build-orchestrator-design.md) |
+Start with the document that matches your goal:
 
-## Known limitations
+| Goal | Read |
+| --- | --- |
+| Understand, install, and try RBO | [Getting started](docs/user/getting-started.md) |
+| Connect a specific AI client | [AI client configuration](docs/user/client-integration/README.md) |
+| Diagnose a problem | [Troubleshooting](docs/user/troubleshooting.md) |
+| Operate, update, back up, or remove RBO | [Operator runbook](docs/user/runbook.md) |
+| Understand the codebase | [Architecture](docs/dev/architecture.md) |
+| Build or publish a release | [Release guide](docs/dev/release-builds.md) |
+| Work on this repository | [Contributor guidance](AGENTS.md) |
+| Read the complete design contract | [Design specification](remote-build-orchestrator-design.md) |
 
-- Real process-tree containment (Win32 Job Objects) exists for Windows Agents only; macOS/Linux
-  Agents run scripts without an equivalent isolation layer today.
-- OS service install for the Agent is dry-run by default (`--execute` runs it for real, but there's
-  no fully-automated unattended install path yet).
-- AI client compatibility is honestly `not_verified` for every real product client until someone
-  runs the smoke workflow against it and records evidence — see
-  [`docs/compatibility/report.md`](docs/compatibility/report.md).
+The design specification is intentionally detailed. Most users do not need it, and developers
+should use it only when changing a protocol, state machine, scheduler rule, or security boundary.
+
+## Current limitations
+
+- Strong process-tree containment through Windows Job Objects is currently available only on
+  Windows x64 Agents. macOS and Linux are suitable for trusted development workloads but do not
+  provide equivalent containment.
+- Agent service installation is best-effort and dry-run by default. Running
+  `rbo agent start --daemon` is the simpler option today.
+- RBO isolates a job from your live checkout; it is not a general-purpose sandbox for untrusted
+  code.
 
 ## Contributing
 
-See [`AGENTS.md`](AGENTS.md) (mirrored in `CLAUDE.md`) for repo conventions, canonical commands,
-and the required `pnpm format && pnpm verify` gate before any change is considered done.
+See [AGENTS.md](AGENTS.md) for repository conventions, canonical commands, and the required
+`pnpm format` followed by `pnpm verify` validation gate.

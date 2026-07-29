@@ -59,10 +59,7 @@ async function citedFileExists(p: string): Promise<boolean> {
 
 describe('§37 acceptance checklist', () => {
   it('lists all 23 criteria with status and link', async () => {
-    const doc = await readFile(
-      join(process.cwd(), 'docs', 'acceptance', 'release-checklist.md'),
-      'utf8',
-    );
+    const doc = await readFile(join(process.cwd(), 'docs', 'dev', 'release-checklist.md'), 'utf8');
     const rows = [...doc.matchAll(/^\| (\d+) \|/gm)].map((m) => Number(m[1]));
     expect(rows).toEqual([...Array.from({ length: 23 }, (_, i) => i + 1)]);
     expect(doc).toMatch(/\bpass\b/);
@@ -72,10 +69,7 @@ describe('§37 acceptance checklist', () => {
   });
 
   it('every concrete file/test citation in the checklist actually exists on disk', async () => {
-    const doc = await readFile(
-      join(process.cwd(), 'docs', 'acceptance', 'release-checklist.md'),
-      'utf8',
-    );
+    const doc = await readFile(join(process.cwd(), 'docs', 'dev', 'release-checklist.md'), 'utf8');
     const rows = doc.split('\n').filter((line) => /^\|\s*\d+\s*\|/.test(line));
     expect(rows.length).toBe(23);
 

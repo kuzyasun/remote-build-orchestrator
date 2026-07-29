@@ -8,7 +8,7 @@ Remote Build Orchestrator (RBO) — global CLI, Controller, Agent, and MCP stdio
 npm install -g @gemslibe/rbo
 ```
 
-Requires Node.js ≥ 22.14. See the monorepo [`docs/ops/getting-started.md`](../../docs/ops/getting-started.md) for Controller/Agent setup and MCP client wiring.
+Requires Node.js ≥ 22.14. See the monorepo [`docs/user/getting-started.md`](../../docs/user/getting-started.md) for Controller/Agent setup and MCP client wiring.
 
 Global reinstall/uninstall runs `scripts/stop-running-rbo.mjs` (`preinstall` /
 `preuninstall`) to stop live Controller/Agent processes so native deps can be replaced on

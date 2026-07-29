@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { type QueuePolicy, QueuePolicySchema } from '@rbo/protocol';
 import { type GitUrlAllowlist, resolveControllerDataDir } from '@rbo/shared';
 import { z } from 'zod';
 
@@ -45,6 +46,12 @@ export interface ControllerConfig {
    * the least-loaded option available — see `decideLocalFallback`). Default 0.8.
    */
   maxHostCpuBusyFraction: number;
+  /**
+   * Queue policy applied to a job whose `JobRequest.queue_policy` was not explicitly set by the
+   * client. `wait` (default) keeps such jobs in the `queued` backlog until an eligible Agent has
+   * capacity; `local_fallback` runs them on the Controller host; `fail_fast` fails immediately.
+   */
+  defaultQueuePolicy: QueuePolicy;
 }
 
 /** Default max git bundle size when RBO_MAX_GIT_BUNDLE_BYTES is unset (512 MiB). */
@@ -93,6 +100,7 @@ export const ControllerConfigFileSchema = z
     allow_full_snapshot_fallback: z.boolean().optional(),
     max_git_bundle_bytes: z.number().int().positive().optional(),
     local_fallback_max_host_cpu_percent: z.number().min(0).max(100).optional(),
+    default_queue_policy: QueuePolicySchema.optional(),
   })
   .strict();
 
@@ -238,6 +246,7 @@ export function defaultControllerConfigFile(): ControllerConfigFile {
     allow_full_snapshot_fallback: false,
     max_git_bundle_bytes: DEFAULT_MAX_GIT_BUNDLE_BYTES,
     local_fallback_max_host_cpu_percent: 80,
+    default_queue_policy: 'wait',
   };
 }
 
@@ -363,6 +372,14 @@ export function loadControllerConfig(
     file?.allow_local_fallback ??
     true;
 
+  const defaultQueuePolicy =
+    fieldOverrides.defaultQueuePolicy ??
+    (envSet('RBO_DEFAULT_QUEUE_POLICY')
+      ? (QueuePolicySchema.parse(process.env.RBO_DEFAULT_QUEUE_POLICY) as QueuePolicy)
+      : undefined) ??
+    file?.default_queue_policy ??
+    'wait';
+
   const allowFullSnapshotFallback =
     fieldOverrides.allowFullSnapshotFallback ??
     (envSet('RBO_ALLOW_FULL_SNAPSHOT_FALLBACK')
@@ -439,6 +456,7 @@ export function loadControllerConfig(
       file?.max_git_bundle_bytes ??
       DEFAULT_MAX_GIT_BUNDLE_BYTES,
     maxHostCpuBusyFraction,
+    defaultQueuePolicy,
   };
 }
 

@@ -1,4 +1,4 @@
-import { RBO_AGENT_VERSION, createLogger } from '@rbo/shared';
+import { RBO_AGENT_VERSION, createLogger, generateId } from '@rbo/shared';
 import { probeCapabilities } from './capabilities/probe.js';
 import { type AgentConfig, ensureStateDir, loadAgentConfig } from './config.js';
 import { AgentConnection } from './connection/client.js';
@@ -42,6 +42,11 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
     enabledBuildCacheKinds: config.buildCache.enabledKinds,
     configuredPriority: config.configuredPriority,
   });
+  // Process-identity marker: generated once per process start, reused across network reconnects.
+  // The Controller detects a restart by comparing to the last known boot_id and sweeps leaked
+  // in-flight attempts pinned to this Agent.
+  const bootId = generateId('boot');
+  capabilities.boot_id = bootId;
 
   logger.info('agent starting', {
     version: RBO_AGENT_VERSION,

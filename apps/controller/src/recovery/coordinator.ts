@@ -1,6 +1,7 @@
 import type { ReconcileDecisionPayload, RecoveryReportPayload } from '@rbo/protocol';
 import { createLogger, generateId, processIdentityFromPid } from '@rbo/shared';
 import type { WebSocket } from 'ws';
+import { getAgentLastBootId } from '../agents/registry.js';
 import {
   ATTEMPT_OUTCOME_LOST,
   ATTEMPT_STATE_ORPHANED,
@@ -131,6 +132,48 @@ export class RecoveryCoordinator {
         graceSeconds: this.graceSeconds,
       });
     }
+  }
+
+  /**
+   * Agent (re)connected and reported a `boot_id` (process marker). When it differs from the last
+   * known value the Agent process restarted, so every in-flight attempt pinned to it is leaked
+   * (the Agent no longer runs it). Fail them immediately as `lost` rather than waiting for the
+   * grace/orphan timers. A matching (or absent) boot_id means a network reconnect with a live
+   * executor or an older Agent — leave attempts untouched.
+   *
+   * `updateAgentCapabilities` (called by the WS layer right after this) persists the new boot_id.
+   */
+  onAgentConnect(agentId: string, bootId: string | undefined): void {
+    if (bootId === undefined) {
+      // Older Agent without boot_id: no restart detection (grace/orphan timers remain as fallback).
+      return;
+    }
+    const lastBootId = getAgentLastBootId(this.db, agentId);
+    if (lastBootId === bootId) {
+      // Same process — network reconnect with a live executor. Attempts stay untouched.
+      return;
+    }
+
+    const attempts = this.db
+      .prepare(
+        `SELECT id, job_id, state FROM job_attempts
+         WHERE agent_id = ? AND state NOT IN ('completed')`,
+      )
+      .all(agentId) as Array<{ id: string; job_id: string; state: string }>;
+
+    for (const att of attempts) {
+      const attempt = getAttempt(this.db, att.id);
+      if (attempt && attempt.state !== 'completed') {
+        this.markLost(attempt);
+      }
+    }
+
+    logger.info('agent restart detected, swept leaked attempts', {
+      agentId,
+      swept: attempts.length,
+      bootId,
+      lastBootId,
+    });
   }
 
   onGraceElapsed(attemptId: string): void {

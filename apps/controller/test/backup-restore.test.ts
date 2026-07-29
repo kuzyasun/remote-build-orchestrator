@@ -90,7 +90,7 @@ describe('Backup and restore', () => {
   });
 
   it('backup-restore docs forbid copying agent private keys', async () => {
-    const doc = await readFile(join(process.cwd(), 'docs', 'ops', 'backup-restore.md'), 'utf8');
+    const doc = await readFile(join(process.cwd(), 'docs', 'user', 'backup-restore.md'), 'utf8');
     expect(doc.toLowerCase()).toMatch(/never copy agent private keys/);
     expect(doc.toLowerCase()).toMatch(/revoke/);
     expect(doc.toLowerCase()).toMatch(/re-pair|repair|pair/);

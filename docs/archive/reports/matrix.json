@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generated_at": "2026-07-21T00:00:00.000Z",
-  "policy": "Option A: verified only with recorded client/harness evidence; inferred compatibility is forbidden.",
+  "policy": "A client is verified only by recorded evidence; inferred compatibility is not claimed.",
   "cells": [
     {
       "client": "test-mcp-client",
@@ -10,9 +10,9 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "vitest-mcp-sdk",
-      "config_ref": "docs/compatibility/snippets/codex.md",
+      "config_ref": "docs/user/client-integration/codex.md",
       "workflow": "submit→wait→logs→artifacts→materialize; cancel",
-      "evidence_path": "docs/compatibility/evidence/test-mcp-client-stdio.md",
+      "evidence_path": "docs/archive/reports/evidence/test-mcp-client-stdio.md",
       "limitation": "Harness only — not a product AI client UI"
     },
     {
@@ -22,9 +22,9 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "vitest-mcp-sdk",
-      "config_ref": "docs/compatibility/snippets/codex.md",
+      "config_ref": "docs/user/client-integration/codex.md",
       "workflow": "submit→wait→logs→artifacts→materialize; cancel",
-      "evidence_path": "docs/compatibility/evidence/test-mcp-client-http.md",
+      "evidence_path": "docs/archive/reports/evidence/test-mcp-client-http.md",
       "limitation": "Harness only — not a product AI client UI"
     },
     {
@@ -34,7 +34,7 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/codex.md",
+      "config_ref": "docs/user/client-integration/codex.md",
       "workflow": "submit→wait→logs→cancel",
       "limitation": "client_not_launched_on_host"
     },
@@ -45,7 +45,7 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/codex.md",
+      "config_ref": "docs/user/client-integration/codex.md",
       "workflow": "submit→wait→logs→cancel",
       "limitation": "client_not_launched_on_host"
     },
@@ -56,7 +56,7 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/claude.md",
+      "config_ref": "docs/user/client-integration/claude.md",
       "workflow": "submit→wait→logs",
       "limitation": "client_not_launched_on_host"
     },
@@ -67,7 +67,7 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/claude.md",
+      "config_ref": "docs/user/client-integration/claude.md",
       "workflow": "submit→wait→logs",
       "limitation": "client_not_launched_on_host"
     },
@@ -78,7 +78,7 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/cursor.md",
+      "config_ref": "docs/user/client-integration/cursor.md",
       "workflow": "submit→wait→artifacts",
       "limitation": "client_not_launched_on_host"
     },
@@ -89,7 +89,7 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/cursor.md",
+      "config_ref": "docs/user/client-integration/cursor.md",
       "workflow": "submit→wait→artifacts",
       "limitation": "client_not_launched_on_host"
     },
@@ -100,7 +100,7 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/antigravity.md",
+      "config_ref": "docs/user/client-integration/antigravity.md",
       "workflow": "submit→wait→logs",
       "limitation": "client_not_launched_on_host"
     },
@@ -111,7 +111,7 @@
       "revision": "9c12c13",
       "os": "win32",
       "client_version": "n/a",
-      "config_ref": "docs/compatibility/snippets/antigravity.md",
+      "config_ref": "docs/user/client-integration/antigravity.md",
       "workflow": "submit→wait→logs",
       "limitation": "client_not_launched_on_host"
     }

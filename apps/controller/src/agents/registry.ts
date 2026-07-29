@@ -20,8 +20,23 @@ export function updateAgentCapabilities(
   // Keep agents.max_jobs in sync with the live capability report (agent.json max_jobs).
   // Pairing inserts a default of 1; without this, `rbo agents` stays stuck at 1 forever.
   db.prepare(
-    'UPDATE agents SET capabilities_json = ?, hostname = ?, max_jobs = ?, last_seen_at = ? WHERE id = ?',
-  ).run(JSON.stringify(report), report.hostname, report.execution.max_jobs, nowIso(), agentId);
+    'UPDATE agents SET capabilities_json = ?, hostname = ?, max_jobs = ?, last_boot_id = ?, last_seen_at = ? WHERE id = ?',
+  ).run(
+    JSON.stringify(report),
+    report.hostname,
+    report.execution.max_jobs,
+    report.boot_id ?? null,
+    nowIso(),
+    agentId,
+  );
+}
+
+/** Last known agent process boot_id, or null when none recorded (pre-v4 / older Agent). */
+export function getAgentLastBootId(db: ControllerDatabase, agentId: string): string | null {
+  const row = db.prepare('SELECT last_boot_id FROM agents WHERE id = ?').get(agentId) as
+    | { last_boot_id: string | null }
+    | undefined;
+  return row?.last_boot_id ?? null;
 }
 
 /** Merge heartbeat cpu_load into stored capabilities for §19.2 scoring. */

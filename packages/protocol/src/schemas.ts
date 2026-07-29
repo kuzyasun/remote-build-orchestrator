@@ -39,6 +39,7 @@ export const JobOutcomeSchema = z.enum(['succeeded', 'failed', 'timed_out', 'can
 export const RiskLevelSchema = z.enum(['safe', 'normal', 'destructive', 'hardware']);
 export type RiskLevel = z.infer<typeof RiskLevelSchema>;
 export const QueuePolicySchema = z.enum(['local_fallback', 'wait', 'fail_fast']);
+export type QueuePolicy = z.infer<typeof QueuePolicySchema>;
 
 // --- Execution (§13.1) ---
 
@@ -139,7 +140,7 @@ export const JobRequestSchema = z.object({
   execution: ExecutionConfigSchema,
   requirements: RequirementsConfigSchema.optional(),
   preferences: PreferencesConfigSchema.optional(),
-  queue_policy: QueuePolicySchema.default('local_fallback'),
+  queue_policy: QueuePolicySchema.optional(),
   risk_level: RiskLevelSchema.default('normal'),
   intent: z.string().nullable().optional(),
   source_policy: SourcePolicySchema.optional(),
@@ -334,6 +335,13 @@ export const AgentCapabilityReportSchema = z.object({
     .optional(),
   /** Phase 6: false under disk/spool pressure — Agent also lease_rejects. */
   accepting_jobs: z.boolean().optional(),
+  /**
+   * Unique marker of the Agent process, generated once at process start and stable across network
+   * reconnects. The Controller compares it to the last known value: a change means the Agent
+   * process restarted, so in-flight attempts pinned to it are leaked and get swept to `lost`.
+   * Optional — when absent (older Agents) no restart detection runs (grace/orphan timers remain).
+   */
+  boot_id: z.string().min(1).optional(),
   /**
    * Operator-configured scheduling priority (§19.2 / §19.3). When unset, the
    * Controller applies OS-family defaults at schedule time.

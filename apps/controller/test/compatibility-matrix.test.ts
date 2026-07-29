@@ -4,8 +4,8 @@ import { CompatibilityMatrixSchema } from '@rbo/protocol';
 import { describe, expect, it } from 'vitest';
 
 const ROOT = join(process.cwd());
-const MATRIX_PATH = join(ROOT, 'docs', 'compatibility', 'matrix.json');
-const SNIPPETS_DIR = join(ROOT, 'docs', 'compatibility', 'snippets');
+const MATRIX_PATH = join(ROOT, 'docs', 'archive', 'reports', 'matrix.json');
+const SNIPPETS_DIR = join(ROOT, 'docs', 'user', 'client-integration');
 
 describe('Compatibility matrix', () => {
   it('parses matrix.json against CompatibilityMatrixSchema', async () => {
@@ -28,7 +28,7 @@ describe('Compatibility matrix', () => {
   });
 
   it('keeps snippets free of secrets and developer absolute home paths', async () => {
-    const files = await readdir(SNIPPETS_DIR);
+    const files = (await readdir(SNIPPETS_DIR)).filter((file) => file !== 'README.md');
     expect(files.length).toBeGreaterThanOrEqual(4);
     for (const file of files) {
       const text = await readFile(join(SNIPPETS_DIR, file), 'utf8');

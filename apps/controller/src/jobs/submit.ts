@@ -3,7 +3,7 @@ import { rm } from 'node:fs/promises';
 import { cpus, freemem } from 'node:os';
 import { join } from 'node:path';
 import { appendEvent, readLogTail } from '@rbo/executor';
-import type { AgentCapabilityReport, JobRequest } from '@rbo/protocol';
+import type { AgentCapabilityReport, JobRequest, QueuePolicy } from '@rbo/protocol';
 import { JobRequestSchema } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
 import {
@@ -63,6 +63,11 @@ export interface SubmitJobContext extends LocalRunnerContext {
   controllerPublicHost?: string;
   dataPlaneBaseUrl?: string;
   allowLocalFallback?: boolean;
+  /**
+   * Queue policy applied when a job's `JobRequest.queue_policy` is not explicitly set by the
+   * client. Falls back to `'local_fallback'` when omitted (back-compat for tests/programmatic use).
+   */
+  defaultQueuePolicy?: QueuePolicy;
   /**
    * Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). Omitted means
    * unchanged, backward-compatible behavior (host load not considered).
@@ -132,6 +137,15 @@ export async function handleJobSubmit(
     });
   }
   const request = parsed.data;
+  // Resolve the queue policy once, here, so the persisted `request_json` always carries a
+  // concrete value: an explicit client choice wins; otherwise the Controller-level default
+  // (`config.defaultQueuePolicy`) applies. Downstream readers (`selectAgentForJob`,
+  // `handleRemoteLeaseReject`) then see a concrete policy without re-deriving it.
+  const effectiveQueuePolicy: QueuePolicy =
+    request.queue_policy ?? ctx.defaultQueuePolicy ?? 'local_fallback';
+  if (request.queue_policy !== effectiveQueuePolicy) {
+    request.queue_policy = effectiveQueuePolicy;
+  }
   const reserve = reserveSubmission(ctx.db, ctx.clientId, request.client_request_id);
   if (!reserve.created) {
     const existing = reserve.submission;

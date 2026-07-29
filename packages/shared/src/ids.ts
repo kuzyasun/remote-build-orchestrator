@@ -1,8 +1,8 @@
 import { ulid } from 'ulid';
 
-export type IdPrefix = 'job' | 'att' | 'agt' | 'snp' | 'art' | 'lease' | 'msg' | 'req';
+export type IdPrefix = 'job' | 'att' | 'agt' | 'snp' | 'art' | 'lease' | 'msg' | 'req' | 'boot';
 
-const ID_REGEX = /^(job|att|agt|snp|art|lease|msg|req)_[0-7][0-9A-HJKMNP-TV-Z]{25}$/i;
+const ID_REGEX = /^(job|att|agt|snp|art|lease|msg|req|boot)_[0-7][0-9A-HJKMNP-TV-Z]{25}$/i;
 
 export function generateId(prefix: IdPrefix): string {
   return `${prefix}_${ulid()}`;

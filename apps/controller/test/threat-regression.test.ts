@@ -12,7 +12,7 @@ import {
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 
 const ROOT = process.cwd();
-const THREAT_PATH = join(ROOT, 'docs', 'acceptance', 'threat-coverage.json');
+const THREAT_PATH = join(ROOT, 'docs', 'archive', 'reports', 'threat-coverage.json');
 
 const REQUIRED_THREAT_KEYS = [
   'path_traversal',

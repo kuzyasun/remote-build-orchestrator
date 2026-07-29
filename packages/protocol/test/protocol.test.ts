@@ -20,6 +20,7 @@ import {
   JobOutcomeSchema,
   JobRequestSchema,
   JobStateSchema,
+  QueuePolicySchema,
   SourcePolicySchema,
   WireMessageEnvelopeSchema,
   negotiateProtocolVersion,
@@ -230,6 +231,26 @@ describe('Protocol Schemas (Section 13.1)', () => {
         execution: { script: '' },
       }),
     ).toThrow();
+  });
+
+  it('leaves queue_policy unset when the client omits it (Controller resolves the default)', () => {
+    // queue_policy is optional on the wire: an explicit client choice wins, otherwise the
+    // Controller applies its `default_queue_policy` at submit time (§13.1 / §35 Phase 4).
+    const parsed = JobRequestSchema.parse({
+      client_request_id: 'req_1',
+      source: { project_root: '/app' },
+      execution: { script: 'echo ok' },
+    });
+    expect(parsed.queue_policy).toBeUndefined();
+
+    const explicit = JobRequestSchema.parse({
+      client_request_id: 'req_2',
+      source: { project_root: '/app' },
+      execution: { script: 'echo ok' },
+      queue_policy: 'wait',
+    });
+    expect(explicit.queue_policy).toBe('wait');
+    expect(QueuePolicySchema.options).toEqual(['local_fallback', 'wait', 'fail_fast']);
   });
 
   it('should reject source.cwd with .. or absolute segments', () => {

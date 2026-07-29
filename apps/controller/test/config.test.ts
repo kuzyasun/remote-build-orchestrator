@@ -14,6 +14,7 @@ const ENV_KEYS = [
   'RBO_MCP_PORT',
   'RBO_ALLOW_LOCAL_FALLBACK',
   'RBO_ALLOW_FULL_SNAPSHOT_FALLBACK',
+  'RBO_DEFAULT_QUEUE_POLICY',
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
@@ -48,6 +49,39 @@ describe('allow_full_snapshot_fallback (§10.4)', () => {
 
     process.env.RBO_ALLOW_FULL_SNAPSHOT_FALLBACK = 'false';
     expect(loadControllerConfig({ dataDir }).allowFullSnapshotFallback).toBe(false);
+  });
+});
+
+describe('default_queue_policy (queue when no Agent has capacity)', () => {
+  it('defaults to "wait" so jobs queue for an eligible Agent instead of falling back locally', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    expect(loadControllerConfig({ configPath: null }).defaultQueuePolicy).toBe('wait');
+  });
+
+  it('honours the config file, and env overrides it', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(path, JSON.stringify({ default_queue_policy: 'fail_fast' }), 'utf8');
+    expect(loadControllerConfig({ dataDir }).defaultQueuePolicy).toBe('fail_fast');
+
+    process.env.RBO_DEFAULT_QUEUE_POLICY = 'local_fallback';
+    expect(loadControllerConfig({ dataDir }).defaultQueuePolicy).toBe('local_fallback');
+  });
+
+  it('rejects an unknown policy value from the file', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(path, JSON.stringify({ default_queue_policy: 'bogus' }), 'utf8');
+    expect(() => readControllerConfigFile(path)).toThrow();
+  });
+
+  it('an explicit programmatic override still wins over the environment variable', () => {
+    process.env.RBO_DEFAULT_QUEUE_POLICY = 'local_fallback';
+    expect(
+      loadControllerConfig({ configPath: null, defaultQueuePolicy: 'wait' }).defaultQueuePolicy,
+    ).toBe('wait');
   });
 });
 

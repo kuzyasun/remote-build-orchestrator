@@ -1,6 +1,6 @@
-export const RBO_CONTROLLER_VERSION = '0.4.0';
-export const RBO_AGENT_VERSION = '0.4.0';
-export const RBO_STDIO_ADAPTER_VERSION = '0.4.0';
+export const RBO_CONTROLLER_VERSION = '0.6.0';
+export const RBO_AGENT_VERSION = '0.6.0';
+export const RBO_STDIO_ADAPTER_VERSION = '0.6.0';
 
 export const RBO_WIRE_PROTOCOL_MIN_VERSION = 1;
 export const RBO_WIRE_PROTOCOL_MAX_VERSION = 1;
@@ -12,4 +12,4 @@ export const RBO_WIRE_PROTOCOL_MAX_VERSION = 1;
  * apps/controller/test asserts `MIGRATIONS.length === RBO_CONTROLLER_SCHEMA_VERSION` so the two
  * never silently drift.
  */
-export const RBO_CONTROLLER_SCHEMA_VERSION = 3;
+export const RBO_CONTROLLER_SCHEMA_VERSION = 4;

@@ -1,17 +1,17 @@
 {
   "schema_version": 1,
   "os": "windows",
-  "package_version": "0.4.0",
+  "package_version": "0.6.0",
   "wire_protocol": {
     "min": 1,
     "max": 1
   },
   "components": {
-    "controller": "0.4.0",
-    "agent": "0.4.0",
-    "cli": "0.4.0",
-    "mcp_stdio": "0.4.0",
-    "windows_executor": "0.4.0"
+    "controller": "0.6.0",
+    "agent": "0.6.0",
+    "cli": "0.6.0",
+    "mcp_stdio": "0.6.0",
+    "windows_executor": "0.6.0"
   },
   "files": [
     {

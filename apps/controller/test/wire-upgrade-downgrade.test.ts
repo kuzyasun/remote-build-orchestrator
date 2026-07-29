@@ -44,7 +44,7 @@ describe('Wire protocol upgrade/downgrade compatibility', () => {
   });
 
   it('runbook documents install through uninstall procedures', async () => {
-    const runbook = await readFile(join(process.cwd(), 'docs', 'ops', 'runbook.md'), 'utf8');
+    const runbook = await readFile(join(process.cwd(), 'docs', 'user', 'runbook.md'), 'utf8');
     for (const heading of [
       '## Install',
       '## Pair',

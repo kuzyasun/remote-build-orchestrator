@@ -1,6 +1,6 @@
 {
   "name": "@gemslibe/rbo",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "type": "module",
   "main": "./dist/rbo.js",
   "bin": {
@@ -35,7 +35,7 @@
     "zod": "^3.24.2"
   },
   "optionalDependencies": {
-    "@gemslibe/rbo-windows-executor-win32-x64": "0.4.0"
+    "@gemslibe/rbo-windows-executor-win32-x64": "0.6.0"
   },
   "devDependencies": {
     "@rbo/agent": "workspace:*",

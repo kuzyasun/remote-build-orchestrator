@@ -3,7 +3,7 @@
 How to cut an RBO release from this monorepo and publish to npm.
 
 Audience: maintainers releasing from this repo. Operators installing an already-published package
-should use [`docs/ops/getting-started.md`](../ops/getting-started.md).
+should use [`docs/user/getting-started.md`](../user/getting-started.md).
 
 | Package | Monorepo path | What it ships |
 | --- | --- | --- |
@@ -13,10 +13,6 @@ should use [`docs/ops/getting-started.md`](../ops/getting-started.md).
 Other workspace packages (`@rbo/*`) are **not** published; they are inlined into the `@gemslibe/rbo`
 esbuild bundle. OS archives (see [Offline archives](#offline-archives)) are an offline/air-gap
 fallback at the **same** product semver.
-
-Product packaging decisions live in
-[`docs/dev/global-cli-packaging-plan.md`](./global-cli-packaging-plan.md). This document is the
-publish runbook only.
 
 There is **no** mega-script that bumps, packs, and publishes in one shot. Bump is interactive;
 publish is gated. Run the commands below in order.
@@ -50,7 +46,7 @@ rbo --help
 rbo doctor   # expect: OK windows_executor
 ```
 
-Then follow [`docs/ops/getting-started.md`](../ops/getting-started.md) (init → start → pair → submit).
+Then follow [`docs/user/getting-started.md`](../user/getting-started.md) (init → start → pair → submit).
 
 ---
 
@@ -242,7 +238,7 @@ Package scripts for the Windows executor:
 before packing. Published `"files"`: `dist/rbo.js`, `dist/rbo-mcp-stdio.js`,
 `config/controller.json`, `config/agent.json`, `scripts/stop-running-rbo.mjs`, `LICENSE`,
 `README.md`. The stop script is the `preinstall` / `preuninstall` hook that terminates running
-Controller/Agent processes before global reinstall (see `docs/ops/getting-started.md`).
+Controller/Agent processes before global reinstall (see `docs/user/getting-started.md`).
 
 #### Dry-run smoke from local tarballs
 
@@ -309,7 +305,7 @@ On a **clean Windows x64** machine (no monorepo checkout required):
 1. Node.js ≥ 22.14 installed.
 2. `npm install -g @gemslibe/rbo`
 3. Confirm bins: `rbo --help`, `rbo-mcp-stdio` on `PATH`.
-4. Follow [`docs/ops/getting-started.md`](../ops/getting-started.md):
+4. Follow [`docs/user/getting-started.md`](../user/getting-started.md):
    - `rbo controller init` and `rbo agent init`
    - `rbo controller start` / `rbo agent start`
    - Pair Agent → Controller
@@ -396,8 +392,9 @@ Be honest when writing release notes:
   `rbo.js agent start --state-dir …`; `--execute` (and elevation) required for real changes.
   Unit/plist files are not shipped yet — operators must create them from the printed hints.
 - **Wire protocol** is a single version today (`min = max = 1`).
-- **AI client compatibility** stays `not_verified` until someone records evidence in
-  [`docs/compatibility/report.md`](../compatibility/report.md).
+- **AI client compatibility** must be checked against the client versions named in the release
+  notes. The transport workflow is automated, but real client UI/configuration smoke tests are
+  environment-gated.
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "name": "@gemslibe/rbo-windows-executor-win32-x64",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "Windows x64 Job Object helper binary for @gemslibe/rbo (rbo-windows-executor.exe)",
   "license": "AGPL-3.0-only",
   "os": ["win32"],

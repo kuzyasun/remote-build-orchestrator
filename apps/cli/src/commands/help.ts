@@ -35,5 +35,5 @@ Environment:
   RBO_DATA_DIR              Controller data dir (default ~/.rbo)
   RBO_AGENT_STATE_DIR       Agent state dir (default ~/.rbo/agent)
 
-See docs/ops/getting-started.md for setup.`;
+See docs/user/getting-started.md for setup.`;
 }

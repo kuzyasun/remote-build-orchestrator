@@ -54,6 +54,8 @@ export interface AgentPlaneDispatchContext {
   maxConcurrentJobs?: number;
   gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
   allowLocalFallback?: boolean;
+  /** Controller-level queue policy used when a job does not set one explicitly. */
+  defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
   /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
   getHostCpuBusyFraction?: () => number;
   maxHostCpuBusyFraction?: number;
@@ -158,6 +160,7 @@ export async function startAgentPlaneServer(
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
     allowedProjectRoots: options.dispatchContext?.allowedProjectRoots,
     maxGitBundleBytes: options.maxGitBundleBytes,
+    defaultQueuePolicy: options.dispatchContext?.defaultQueuePolicy,
   });
 
   const buildSubmitContext = () => {
@@ -181,6 +184,7 @@ export async function startAgentPlaneServer(
       controllerPublicHost: options.controllerPublicHost,
       dataPlaneBaseUrl: options.dataPlaneBaseUrl,
       allowLocalFallback: options.dispatchContext.allowLocalFallback,
+      defaultQueuePolicy: options.dispatchContext.defaultQueuePolicy,
       getHostCpuBusyFraction: options.dispatchContext.getHostCpuBusyFraction,
       maxHostCpuBusyFraction: options.dispatchContext.maxHostCpuBusyFraction,
     };
@@ -335,6 +339,9 @@ export async function startAgentPlaneServer(
             }
             const parsed = AgentCapabilityReportSchema.safeParse(message.payload);
             if (parsed.success) {
+              // Detect an Agent process restart via boot_id (before updateAgentCapabilities
+              // persists the new one) and sweep leaked in-flight attempts pinned to it.
+              recovery.onAgentConnect(authenticated.agentId, parsed.data.boot_id);
               updateAgentCapabilities(db, authenticated.agentId, parsed.data);
               maybeDispatchQueued();
             }

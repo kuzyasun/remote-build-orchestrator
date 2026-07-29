@@ -77,6 +77,12 @@ export interface RemoteExecutionOptions {
   allowedProjectRoots?: string[];
   /** Max git bundle bytes; defaults to DEFAULT_MAX_GIT_BUNDLE_BYTES. */
   maxGitBundleBytes?: number;
+  /**
+   * Controller-level queue policy used as the safety-net in `handleRemoteLeaseReject` when a job's
+   * persisted `queue_policy` is absent (legacy rows). Normally already concrete after submit-time
+   * normalization.
+   */
+  defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
 }
 
 function snapshotManifestMode(manifest: unknown): 'full' | 'git_overlay' {
@@ -853,7 +859,7 @@ export function handleRemoteLeaseReject(
   });
 
   const request = getJobRequest(opts.db, attempt.job_id);
-  const queuePolicy = request?.queue_policy ?? 'local_fallback';
+  const queuePolicy = request?.queue_policy ?? opts.defaultQueuePolicy ?? 'local_fallback';
   if (queuePolicy === 'fail_fast') {
     transitionJobState(opts.db, attempt.job_id, 'completed', {
       outcome: 'failed',

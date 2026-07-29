@@ -44,6 +44,8 @@ export interface ToolContext {
   gitAllowlist?: GitUrlAllowlist;
   allowLocalFallback?: boolean;
   allowFullSnapshotFallback?: boolean;
+  /** Controller-level queue policy used when a job does not set one explicitly. */
+  defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
   /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
   getHostCpuBusyFraction?: () => number;
   maxHostCpuBusyFraction?: number;
@@ -80,6 +82,7 @@ function submitContext(ctx: ToolContext) {
     dataPlaneBaseUrl: ctx.dataPlaneBaseUrl,
     allowLocalFallback: ctx.allowLocalFallback,
     allowFullSnapshotFallback: ctx.allowFullSnapshotFallback,
+    defaultQueuePolicy: ctx.defaultQueuePolicy,
     getHostCpuBusyFraction: ctx.getHostCpuBusyFraction,
     maxHostCpuBusyFraction: ctx.maxHostCpuBusyFraction,
   };
