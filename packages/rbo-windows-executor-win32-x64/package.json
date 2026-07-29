@@ -1,8 +1,31 @@
 {
   "name": "@gemslibe/rbo-windows-executor-win32-x64",
-  "version": "0.6.0",
-  "description": "Windows x64 Job Object helper binary for @gemslibe/rbo (rbo-windows-executor.exe)",
+  "version": "0.6.1",
+  "description": "Windows x64 Job Object process-isolation helper for @gemslibe/rbo.",
+  "keywords": [
+    "rbo",
+    "windows",
+    "job-object",
+    "process-isolation",
+    "remote-build"
+  ],
   "license": "AGPL-3.0-only",
+  "author": {
+    "name": "Serge Martyniuk",
+    "email": "smdev42@proton.me"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kuzyasun/remote-build-orchestrator.git",
+    "directory": "packages/rbo-windows-executor-win32-x64"
+  },
+  "bugs": {
+    "url": "https://github.com/kuzyasun/remote-build-orchestrator/issues"
+  },
+  "homepage": "https://github.com/kuzyasun/remote-build-orchestrator#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "os": ["win32"],
   "cpu": ["x64"],
   "engines": {

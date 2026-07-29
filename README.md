@@ -85,6 +85,8 @@ Start with the document that matches your goal:
 | Operate, update, back up, or remove RBO | [Operator runbook](docs/user/runbook.md) |
 | Understand the codebase | [Architecture](docs/dev/architecture.md) |
 | Build or publish a release | [Release guide](docs/dev/release-builds.md) |
+| Review release changes | [Changelog](CHANGELOG.md) |
+| Report a vulnerability | [Security policy](SECURITY.md) |
 | Work on this repository | [Contributor guidance](AGENTS.md) |
 | Read the complete design contract | [Design specification](remote-build-orchestrator-design.md) |
 
@@ -105,3 +107,10 @@ should use it only when changing a protocol, state machine, scheduler rule, or s
 
 See [AGENTS.md](AGENTS.md) for repository conventions, canonical commands, and the required
 `pnpm format` followed by `pnpm verify` validation gate.
+
+## License
+
+RBO is available under the [GNU Affero General Public License v3.0](LICENSE).
+
+For commercial licensing, contact Serge Martyniuk at
+[smdev42@proton.me](mailto:smdev42@proton.me).

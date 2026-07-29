@@ -9,7 +9,8 @@
  * Sites (see docs/dev/release-builds.md — Detailed steps → Bump version):
  *   - packages/shared/src/versions.ts (three runtime constants)
  *   - root package.json
- *   - apps/cli/package.json (version + optionalDependency pin)
+ *   - apps/cli/package.json (version + workspace optionalDependency pin)
+ *   - pnpm-lock.yaml (workspace optionalDependency specifier)
  *   - packages/rbo-windows-executor-win32-x64/package.json
  *   - packaging/{windows,macos,linux}/MANIFEST.json (package_version + components)
  */
@@ -25,6 +26,7 @@ const SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const VERSIONS_TS = join(ROOT, 'packages', 'shared', 'src', 'versions.ts');
 const ROOT_PKG = join(ROOT, 'package.json');
 const CLI_PKG = join(ROOT, 'apps', 'cli', 'package.json');
+const PNPM_LOCK = join(ROOT, 'pnpm-lock.yaml');
 const EXECUTOR_PKG = join(ROOT, 'packages', 'rbo-windows-executor-win32-x64', 'package.json');
 const PACKAGING_DIR = join(ROOT, 'packaging');
 const OPTIONAL_DEP = '@gemslibe/rbo-windows-executor-win32-x64';
@@ -67,13 +69,24 @@ async function listManifestPaths() {
   return paths.sort();
 }
 
-function readCurrentVersions(versionsSource, rootPkg, cliPkg, executorPkg, manifests) {
+function extractLockVersion(source) {
+  const dependency = escapeRegExp(OPTIONAL_DEP);
+  const match = source.match(
+    new RegExp(`'${dependency}':\\r?\\n\\s+specifier: workspace:([^\\r\\n]+)`),
+  );
+  return match?.[1]?.trim() ?? null;
+}
+
+function readCurrentVersions(versionsSource, rootPkg, cliPkg, executorPkg, lockSource, manifests) {
   const fromTs = CONST_NAMES.map((name) => extractConstVersion(versionsSource, name));
+  const cliOptionalRaw = cliPkg.optionalDependencies?.[OPTIONAL_DEP] ?? null;
   return {
     versionsTs: fromTs,
     root: rootPkg.version ?? null,
     cli: cliPkg.version ?? null,
-    cliOptional: cliPkg.optionalDependencies?.[OPTIONAL_DEP] ?? null,
+    cliOptionalRaw,
+    cliOptional: cliOptionalRaw?.replace(/^workspace:/, '') ?? null,
+    lock: extractLockVersion(lockSource),
     executor: executorPkg.version ?? null,
     manifests: manifests.map((m) => ({
       path: m.path,
@@ -98,13 +111,22 @@ function assertConsistent(current) {
   if (current.cliOptional == null) {
     fail(`missing optionalDependencies["${OPTIONAL_DEP}"] in ${rel(CLI_PKG)}`);
   }
+  if (current.cliOptionalRaw !== `workspace:${current.cli}`) {
+    fail(
+      `optionalDependencies["${OPTIONAL_DEP}"] must equal "workspace:${current.cli}" in ${rel(CLI_PKG)}`,
+    );
+  }
   if (current.executor == null) fail(`missing "version" in ${rel(EXECUTOR_PKG)}`);
+  if (current.lock == null) {
+    fail(`missing workspace optionalDependency specifier in ${rel(PNPM_LOCK)}`);
+  }
 
   const all = [
     ...current.versionsTs,
     current.root,
     current.cli,
     current.cliOptional,
+    current.lock,
     current.executor,
   ];
 
@@ -194,11 +216,11 @@ async function writePackageVersion(path, currentVersion, next, { optionalDep } =
 
   if (optionalDep) {
     const optRe = new RegExp(
-      `("${escapeRegExp(OPTIONAL_DEP)}"\\s*:\\s*")${escapeRegExp(currentVersion)}(")`,
+      `("${escapeRegExp(OPTIONAL_DEP)}"\\s*:\\s*"workspace:)${escapeRegExp(currentVersion)}(")`,
     );
     if (!optRe.test(text)) {
       fail(
-        `could not find optionalDependencies["${OPTIONAL_DEP}"] = "${currentVersion}" in ${rel(path)}`,
+        `could not find optionalDependencies["${OPTIONAL_DEP}"] = "workspace:${currentVersion}" in ${rel(path)}`,
       );
     }
     text = text.replace(optRe, `$1${next}$2`);
@@ -206,6 +228,22 @@ async function writePackageVersion(path, currentVersion, next, { optionalDep } =
 
   await writeFile(path, text, 'utf8');
   return rel(path);
+}
+
+async function writeLockfileVersion(currentVersion, next) {
+  let text = await readFile(PNPM_LOCK, 'utf8');
+  const dependency = escapeRegExp(OPTIONAL_DEP);
+  const specifierRe = new RegExp(
+    `('${dependency}':\\r?\\n\\s+specifier: workspace:)${escapeRegExp(currentVersion)}(\\r?\\n)`,
+  );
+  if (!specifierRe.test(text)) {
+    fail(
+      `could not find ${OPTIONAL_DEP} workspace specifier ${currentVersion} in ${rel(PNPM_LOCK)}`,
+    );
+  }
+  text = text.replace(specifierRe, `$1${next}$2`);
+  await writeFile(PNPM_LOCK, text, 'utf8');
+  return rel(PNPM_LOCK);
 }
 
 /** Update package_version and every components.* string that matches currentVersion. */
@@ -226,15 +264,24 @@ async function writeManifestVersions(path, currentVersion, next) {
 
 async function main() {
   const manifestPaths = await listManifestPaths();
-  const [versionsSource, rootPkg, cliPkg, executorPkg, ...manifestFiles] = await Promise.all([
-    readFile(VERSIONS_TS, 'utf8'),
-    readJson(ROOT_PKG),
-    readJson(CLI_PKG),
-    readJson(EXECUTOR_PKG),
-    ...manifestPaths.map(async (path) => ({ path, data: await readJson(path) })),
-  ]);
+  const [versionsSource, rootPkg, cliPkg, executorPkg, lockSource, ...manifestFiles] =
+    await Promise.all([
+      readFile(VERSIONS_TS, 'utf8'),
+      readJson(ROOT_PKG),
+      readJson(CLI_PKG),
+      readJson(EXECUTOR_PKG),
+      readFile(PNPM_LOCK, 'utf8'),
+      ...manifestPaths.map(async (path) => ({ path, data: await readJson(path) })),
+    ]);
 
-  const current = readCurrentVersions(versionsSource, rootPkg, cliPkg, executorPkg, manifestFiles);
+  const current = readCurrentVersions(
+    versionsSource,
+    rootPkg,
+    cliPkg,
+    executorPkg,
+    lockSource,
+    manifestFiles,
+  );
   const currentVersion = assertConsistent(current);
 
   console.log(`Current product version: ${currentVersion}`);
@@ -249,6 +296,7 @@ async function main() {
   changed.push(await writeVersionsTs(next));
   changed.push(await writePackageVersion(ROOT_PKG, currentVersion, next));
   changed.push(await writePackageVersion(CLI_PKG, currentVersion, next, { optionalDep: true }));
+  changed.push(await writeLockfileVersion(currentVersion, next));
   changed.push(await writePackageVersion(EXECUTOR_PKG, currentVersion, next));
   for (const path of manifestPaths) {
     changed.push(await writeManifestVersions(path, currentVersion, next));
@@ -260,7 +308,9 @@ async function main() {
     if (file === rel(VERSIONS_TS)) {
       console.log(`  - ${file} (${CONST_NAMES.join(', ')})`);
     } else if (file === rel(CLI_PKG)) {
-      console.log(`  - ${file} (version, optionalDependencies["${OPTIONAL_DEP}"])`);
+      console.log(`  - ${file} (version, workspace optionalDependencies["${OPTIONAL_DEP}"])`);
+    } else if (file === rel(PNPM_LOCK)) {
+      console.log(`  - ${file} (workspace optionalDependency specifier)`);
     } else if (file.startsWith('packaging/')) {
       console.log(`  - ${file} (package_version, components)`);
     } else {

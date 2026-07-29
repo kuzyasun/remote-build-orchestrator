@@ -5,15 +5,16 @@
  * Safety gate: requires RELEASE_CONFIRM=1 or --yes / -y.
  * Does not bump versions or pack; run verify → build → bump-version → release:pack first.
  *
- * Prerequisites:
- *   npm login (account with publish rights under the gemslibe org)
+ * Authentication:
+ *   - npm Trusted Publishing (OIDC) in GitHub Actions, or
+ *   - npm login for the manual fallback
  *
  * Usage (from repo root):
  *   RELEASE_CONFIRM=1 pnpm release:publish
  *   pnpm release:publish --yes
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -22,6 +23,12 @@ const EXECUTOR_DIR = join(ROOT, 'packages', 'rbo-windows-executor-win32-x64');
 const CLI_DIR = join(ROOT, 'apps', 'cli');
 const STAGED_EXE = join(EXECUTOR_DIR, 'bin', 'rbo-windows-executor.exe');
 const CLI_BUNDLES = [join(CLI_DIR, 'dist', 'rbo.js'), join(CLI_DIR, 'dist', 'rbo-mcp-stdio.js')];
+
+function packedTarball(packageDir) {
+  const packageJson = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'));
+  const filename = `${packageJson.name.replace(/^@/, '').replaceAll('/', '-')}-${packageJson.version}.tgz`;
+  return join(packageDir, filename);
+}
 
 function fail(message) {
   console.error(`error: ${message}`);
@@ -66,7 +73,7 @@ function run(command, args, opts = {}) {
 function main() {
   if (!confirmed()) {
     fail(
-      'refusing to publish without confirmation.\n  Set RELEASE_CONFIRM=1 or pass --yes / -y.\n  Example (PowerShell):\n    $env:RELEASE_CONFIRM=1; pnpm release:publish\n    pnpm release:publish --yes\n  Requires: npm login to an account that can publish under the gemslibe org.',
+      'refusing to publish without confirmation.\n  Set RELEASE_CONFIRM=1 or pass --yes / -y.\n  Example (PowerShell):\n    $env:RELEASE_CONFIRM=1; pnpm release:publish\n    pnpm release:publish --yes\n  Authentication: npm Trusted Publishing in GitHub Actions, or npm login for the manual fallback.',
     );
   }
 
@@ -80,12 +87,26 @@ function main() {
       fail(`missing ${bundle}. Run \`pnpm build\` then \`pnpm release:pack\` before publish.`);
     }
   }
+  const executorTarball = packedTarball(EXECUTOR_DIR);
+  const cliTarball = packedTarball(CLI_DIR);
+  for (const tarball of [executorTarball, cliTarball]) {
+    if (!existsSync(tarball)) {
+      fail(`missing ${tarball}. Run \`pnpm release:pack\` before publish.`);
+    }
+  }
 
   console.log('Publishing optional package first, then @gemslibe/rbo…');
-  console.log('(npm login / gemslibe org membership + 2FA as required by npm)');
+  const usingTrustedPublishing = Boolean(
+    process.env.ACTIONS_ID_TOKEN_REQUEST_URL && process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN,
+  );
+  console.log(
+    usingTrustedPublishing
+      ? '(npm Trusted Publishing via GitHub Actions OIDC)'
+      : '(interactive npm authentication with @gemslibe publish access required)',
+  );
 
-  run('npm', ['publish', '--access', 'public'], { cwd: EXECUTOR_DIR });
-  run('npm', ['publish', '--access', 'public'], { cwd: CLI_DIR });
+  run('npm', ['publish', '--access', 'public', executorTarball], { cwd: EXECUTOR_DIR });
+  run('npm', ['publish', '--access', 'public', cliTarball], { cwd: CLI_DIR });
 
   console.log('release:publish ok — both packages published');
 }

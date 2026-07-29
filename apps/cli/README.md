@@ -8,7 +8,9 @@ Remote Build Orchestrator (RBO) — global CLI, Controller, Agent, and MCP stdio
 npm install -g @gemslibe/rbo
 ```
 
-Requires Node.js ≥ 22.14. See the monorepo [`docs/user/getting-started.md`](../../docs/user/getting-started.md) for Controller/Agent setup and MCP client wiring.
+Requires Node.js ≥ 22.14. See the
+[getting-started guide](https://github.com/kuzyasun/remote-build-orchestrator/blob/main/docs/user/getting-started.md)
+for Controller/Agent setup and MCP client wiring.
 
 Global reinstall/uninstall runs `scripts/stop-running-rbo.mjs` (`preinstall` /
 `preuninstall`) to stop live Controller/Agent processes so native deps can be replaced on
@@ -39,6 +41,13 @@ On Windows x64, `@gemslibe/rbo` pulls in `@gemslibe/rbo-windows-executor-win32-x
 optional dependency (the `rbo-windows-executor.exe` helper). Other platforms skip it; `rbo doctor`
 prints a WARN when the helper is unavailable.
 
+## Project links
+
+- [Documentation](https://github.com/kuzyasun/remote-build-orchestrator#documentation)
+- [Changelog](https://github.com/kuzyasun/remote-build-orchestrator/blob/main/CHANGELOG.md)
+- [Security policy](https://github.com/kuzyasun/remote-build-orchestrator/security/policy)
+- [Issue tracker](https://github.com/kuzyasun/remote-build-orchestrator/issues)
+
 ## License
 
 **Default terms: [AGPL-3.0-only](LICENSE).**
@@ -46,4 +55,5 @@ prints a WARN when the helper is unavailable.
 - Using RBO locally as a tool on your own machines is permitted under the AGPL.
 - Offering RBO (or a modified or embedded form) **as a network service**, or **embedding it into a proprietary product** without complying with the AGPL, requires a **separate commercial license** from the copyright holder.
 
-To request a commercial license, contact the copyright holder (gemslibe).
+To request a commercial license, contact Serge Martyniuk at
+[smdev42@proton.me](mailto:smdev42@proton.me).

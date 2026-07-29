@@ -24,25 +24,34 @@ const dir = process.env.CCACHE_DIR;
 if (!dir) { console.error('CCACHE_DIR missing'); process.exit(2); }
 const sentinel = path.join(dir, 'sentinel');
 if (fs.existsSync(sentinel)) {
+  console.log('warm');
   process.exit(0);
 }
 const start = Date.now();
 while (Date.now() - start < 1000) { /* cold populate */ }
 fs.mkdirSync(dir, { recursive: true });
 fs.writeFileSync(sentinel, 'populated');
+console.log('cold');
 process.exit(0);
 `;
 
-function runSynthetic(ccacheDir: string): Promise<{ durationMs: number; code: number | null }> {
+function runSynthetic(
+  ccacheDir: string,
+): Promise<{ durationMs: number; code: number | null; mode: string }> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
+    let stdout = '';
     const child = spawn(process.execPath, ['-e', SYNTHETIC_WORKLOAD], {
       env: { ...process.env, CCACHE_DIR: ccacheDir },
       windowsHide: true,
     });
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
     child.on('error', reject);
     child.on('close', (code) => {
-      resolve({ durationMs: Date.now() - started, code });
+      resolve({ durationMs: Date.now() - started, code, mode: stdout.trim() });
     });
   });
 }
@@ -94,6 +103,7 @@ describe('build-cache warm vs cold (synthetic)', () => {
 
     const cold = await runSynthetic(coldAcquire.path);
     expect(cold.code).toBe(0);
+    expect(cold.mode).toBe('cold');
     expect(cold.durationMs).toBeGreaterThanOrEqual(900);
     await access(join(coldAcquire.path, 'sentinel'));
 
@@ -118,8 +128,7 @@ describe('build-cache warm vs cold (synthetic)', () => {
 
     const warm = await runSynthetic(warmAcquire.path);
     expect(warm.code).toBe(0);
-    expect(warm.durationMs).toBeLessThan(500);
-    expect(warm.durationMs).toBeLessThan(cold.durationMs / 2);
+    expect(warm.mode).toBe('warm');
 
     await warmAcquire.release();
 

@@ -14,29 +14,29 @@ Other workspace packages (`@rbo/*`) are **not** published; they are inlined into
 esbuild bundle. OS archives (see [Offline archives](#offline-archives)) are an offline/air-gap
 fallback at the **same** product semver.
 
-There is **no** mega-script that bumps, packs, and publishes in one shot. Bump is interactive;
-publish is gated. Run the commands below in order.
+The primary release path is `.github/workflows/publish-npm.yml`. Publishing a non-prerelease
+GitHub Release runs verification and builds on a GitHub-hosted Windows runner, then publishes both
+packages through npm Trusted Publishing. No long-lived npm write token is stored in GitHub.
 
 ---
 
 ## Quick release
 
-From the repo root on a **Windows x64** machine (required for the optional package):
+Prepare the release from the repository root on Windows x64:
 
 ```powershell
-pnpm format          # optional but recommended before verify
-pnpm verify          # lint + Vitest + Rust fmt/test (does not build)
-pnpm build           # tsc + esbuild → apps/cli/dist
+pnpm bump-version 1.2.3
+# Move the CHANGELOG.md "Unreleased" notes into a new 1.2.3 section.
+pnpm format
+pnpm verify
+pnpm build
 pnpm package:archives
 pnpm package:verify
-pnpm bump-version    # or: pnpm bump-version 1.2.3
-pnpm release:pack    # cargo release build (win32-x64) + pack .tgz
-$env:RELEASE_CONFIRM=1; pnpm release:publish
-# equivalent: pnpm release:publish --yes
 ```
 
-`pnpm verify` runs checks and tests only. `pnpm build` produces distributable JS bundles.
-Format is separate; run `pnpm format` when you want autofix before the gate.
+Commit and merge those changes. Then create a GitHub Release with the exact tag `v1.2.3`. Publishing
+the release triggers the workflow, which repeats the checks, builds the Windows helper, verifies the
+package contents, and publishes the optional package before the main package.
 
 After publish, smoke on a clean Windows x64 host:
 
@@ -58,12 +58,11 @@ Then follow [`docs/user/getting-started.md`](../user/getting-started.md) (init �
 | pnpm | 10.5.2 (pinned via `"packageManager"` in root `package.json`) |
 | Git | on `PATH` |
 | Rust | 1.93.0 (`rust-toolchain.toml`) — **required on the Windows x64 host that packs/publishes the optional package** |
-| npm | logged in with permission to publish under the **`gemslibe`** org |
+| npm | Trusted Publisher configured for both `@gemslibe` packages |
 
 ```powershell
 node -v          # v22.14.x or newer
 pnpm -v          # 10.5.2
-npm whoami       # must succeed; account must publish under @gemslibe
 ```
 
 First-time clone:
@@ -77,6 +76,36 @@ pnpm install
 > **Windows host for the optional package.** That package's `prepack` hard-requires a real
 > `rbo-windows-executor.exe`. Build and publish from Windows x64. You can develop elsewhere, but do
 > not skip the Windows step for a public release.
+
+### One-time Trusted Publishing setup
+
+The workflow must be present on the repository's default branch before configuring npm.
+
+Create a GitHub environment named `npm` and require a maintainer approval. Limit deployments to
+release tags if your repository settings support that restriction.
+
+For **each** package, open its npm package settings and add the same
+[GitHub Actions trusted publisher](https://docs.npmjs.com/trusted-publishers/):
+
+| Setting | Value |
+| --- | --- |
+| Organization or user | `kuzyasun` |
+| Repository | `remote-build-orchestrator` |
+| Workflow filename | `publish-npm.yml` |
+| Environment | `npm` |
+| Allowed action | `npm publish` |
+
+Configure both:
+
+- `@gemslibe/rbo`
+- `@gemslibe/rbo-windows-executor-win32-x64`
+
+The filename and environment are case-sensitive. Enter only `publish-npm.yml`, not the
+`.github/workflows/` path.
+
+After the first successful OIDC release, set npm publishing access to **Require two-factor
+authentication and disallow tokens**, then revoke obsolete automation tokens. Keep an interactive
+maintainer recovery path until the first Trusted Publishing release succeeds.
 
 ---
 
@@ -136,7 +165,8 @@ left alone.
 | Location | Field(s) |
 | --- | --- |
 | `packages/shared/src/versions.ts` | `RBO_CONTROLLER_VERSION`, `RBO_AGENT_VERSION`, `RBO_STDIO_ADAPTER_VERSION` |
-| `apps/cli/package.json` | `"version"` **and** `optionalDependencies["@gemslibe/rbo-windows-executor-win32-x64"]` |
+| `apps/cli/package.json` | `"version"` **and** the matching `workspace:` optionalDependency |
+| `pnpm-lock.yaml` | Matching workspace optionalDependency specifier |
 | `packages/rbo-windows-executor-win32-x64/package.json` | `"version"` |
 | Root `package.json` | `"version"` (workspace label; not read at runtime) |
 | `packaging/{windows,macos,linux}/MANIFEST.json` | `package_version` and `components.*` |
@@ -159,6 +189,10 @@ Also in `versions.ts` (bump only when the contract/schema actually changes — n
 
 `bump-version` does **not** pack or publish. Commit the version bump before tagging/publishing
 (human judgment on commit/tag message).
+
+The source package uses `workspace:<version>` for the Windows helper so a frozen install resolves
+the local package before it exists on npm. `pnpm pack` converts that reference to the exact
+published version.
 
 ### 3. Build and pack (`pnpm release:pack`)
 
@@ -253,23 +287,25 @@ rbo doctor
 npm uninstall -g @gemslibe/rbo
 ```
 
-### 4. Publish (`pnpm release:publish`)
+### 4. Publish from GitHub Actions
 
 Publish `@gemslibe/rbo-windows-executor-win32-x64` **before** `@gemslibe/rbo`. The main package pins
 that optionalDependency at the **same** semver; publishing main first leaves Windows installs unable
 to fetch a matching helper.
 
-**Safety gate:** publish refuses to run unless you confirm:
+Create a GitHub Release whose tag is exactly `v<package version>`. For example, package version
+`1.2.3` requires tag `v1.2.3`. Publish it as a normal release, not a prerelease.
 
-```powershell
-$env:RELEASE_CONFIRM=1; pnpm release:publish
-# or:
-pnpm release:publish --yes
-```
+The `Publish npm packages` workflow:
 
-Requires `npm login` to an account that can publish under the **`gemslibe`** org (2FA/OTP as npm
-requires). The script publishes from each package directory (`npm publish --access public`):
-optional first, then main.
+1. waits for approval on the `npm` GitHub environment;
+2. verifies the release tag and lockstep package versions;
+3. runs `pnpm verify`, builds all bundles, and verifies packaging manifests;
+4. builds and packs the Windows x64 executor;
+5. publishes the optional package, then the main package, using short-lived OIDC credentials.
+
+npm automatically attaches provenance when Trusted Publishing runs from this public repository.
+The workflow does not use `NPM_TOKEN`.
 
 Confirm on the registry:
 
@@ -279,19 +315,20 @@ npm view @gemslibe/rbo version
 # expect: the same product semver you bumped
 ```
 
-#### Manual publish (one package at a time)
+#### Manual fallback
+
+Use the manual path only if Trusted Publishing is unavailable. It requires an interactive npm
+account with publish permission and the repository already verified and packed on Windows x64.
+
+The guarded helper publishes the packed tarballs in the correct order:
 
 ```powershell
-cd .\packages\rbo-windows-executor-win32-x64
-npm publish --access public
-cd ..\..
-
-cd .\apps\cli
-npm publish --access public
-cd ..\..
+$env:RELEASE_CONFIRM=1; pnpm release:publish
+# or:
+pnpm release:publish --yes
 ```
 
-Or publish the packed tarballs (replace the version in the filename):
+To publish one package at a time, use the packed tarballs (replace the version in the filename):
 
 ```powershell
 npm publish --access public .\packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-0.1.0.tgz
@@ -369,8 +406,11 @@ Archives are the air-gap fallback; **npm remains the primary** distribution chan
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `prepack` / `prepare-binary:require` / `release:pack` exits 1 | No `.exe` in Cargo `target/{release,debug}/` and none staged under `bin/` | Build on Windows x64: `cargo build --release --manifest-path native/windows-executor/Cargo.toml`, then `prepare-binary:require` |
+| Trusted Publishing reports `ENEEDAUTH` | npm publisher fields do not match the workflow, or OIDC permission is missing | Verify `kuzyasun/remote-build-orchestrator`, `publish-npm.yml`, environment `npm`, and `id-token: write` |
+| Publish workflow does not start | The GitHub Release is still a draft, is a prerelease, or Actions are disabled | Publish a normal release and inspect the repository Actions settings |
+| Publish workflow rejects the tag | The release tag does not equal `v<package version>` | Correct the version commit or recreate the release with the matching tag |
 | `release:publish` refuses without confirmation | Missing safety gate | `$env:RELEASE_CONFIRM=1; pnpm release:publish` or `pnpm release:publish --yes` |
-| `npm publish` 403 / forbidden | Not logged in, missing `gemslibe` org rights, or 2FA/OTP required | `npm login`; complete org invite; provide OTP if prompted |
+| Manual `npm publish` returns 403 | Not logged in, missing `gemslibe` org rights, or interactive publishing is disabled | Prefer the trusted workflow; use the manual recovery path only with explicit npm access |
 | `engines` / install warnings | Node &lt; 22.14 | Upgrade Node; `rbo doctor` also surfaces mismatches |
 | Optional package skipped | Non-Windows or non-x64 host (`os`/`cpu` in package.json) | Expected; `rbo doctor` WARNs. Only win32-x64 gets the helper automatically |
 | `windows_executor` WARN on win32-x64 after `npm install -g` | Optional package not published yet, wrong semver pin, or network/registry failure | Publish optional package first at matching semver; reinstall; check `npm ls -g @gemslibe/rbo-windows-executor-win32-x64` |
@@ -400,18 +440,18 @@ Be honest when writing release notes:
 
 ## Pre-release checklist
 
-- [ ] `pnpm format` (optional) then `pnpm verify` exit 0
-- [ ] `pnpm build` then `pnpm package:archives` && `pnpm package:verify`
 - [ ] `pnpm bump-version` (or `pnpm bump-version x.y.z`) — lockstep sites updated
-- [ ] Semver matches in `versions.ts`, `apps/cli/package.json` (including `optionalDependencies`),
+- [ ] Move `CHANGELOG.md` notes from Unreleased into the new version section
+- [ ] `pnpm format` then `pnpm verify` exit 0
+- [ ] `pnpm build` then `pnpm package:archives` && `pnpm package:verify`
+- [ ] Semver matches in `versions.ts`, `apps/cli/package.json` (including its `workspace:` optionalDependency),
       `packages/rbo-windows-executor-win32-x64/package.json`, and root `package.json`
 - [ ] `LICENSE` + AGPL/`README` commercial note present on both publish packages
-- [ ] `pnpm release:pack` on Windows x64 (or manual cargo → prepare-binary:require → pack steps)
-- [ ] Optional `.tgz` contains `bin\rbo-windows-executor.exe`
-- [ ] Dry-run smoke from tarballs (optional)
-- [ ] `npm whoami` — logged in as a `gemslibe` publisher
-- [ ] `$env:RELEASE_CONFIRM=1; pnpm release:publish` (optional package first, then main)
+- [ ] Release preparation is committed and merged
+- [ ] Normal GitHub Release uses the exact tag `v<package version>`
+- [ ] `npm` environment approval granted after reviewing the workflow summary
+- [ ] `Publish npm packages` workflow exits 0
 - [ ] Registry versions match: `npm view` both packages
 - [ ] Clean Windows x64: global install → init → start → pair → submit
 - [ ] `rbo doctor` shows `OK windows_executor`
-- [ ] Tag / release notes updated; compatibility evidence only if actually tested
+- [ ] Release notes include compatibility evidence only if it was actually tested
