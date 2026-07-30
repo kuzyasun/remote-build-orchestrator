@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-30
+
 ### Added
 
 - Complete npm package metadata for the project, author, repository, issue tracker, and keywords.
@@ -20,6 +22,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Fixed
 
 - Made the synthetic warm-cache test verify the executed path instead of relying on runner timing.
+- Normalized repository text files to LF so release builds are reproducible on Windows runners.
+- Build and pack the Windows helper before verifying packaging manifests in the release workflow.
 
 ## [0.6.0] - 2026-07-29
 
@@ -29,5 +33,6 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.2
 [0.6.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.0

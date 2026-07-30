@@ -1,7 +1,7 @@
 {
   "name": "rbo-monorepo",
   "private": true,
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Remote Build Orchestrator for running isolated build, test, QEMU, and Docker jobs on local or remote workers.",
   "license": "AGPL-3.0-only",
   "author": {

@@ -69,15 +69,15 @@ jobs:
       - name: Build release
         run: pnpm build
 
+      - name: Pack release
+        run: pnpm release:pack
+
       - name: Verify packaging manifests
         shell: pwsh
         run: |
           pnpm package:archives
           git diff --exit-code -- packaging
           pnpm package:verify
-
-      - name: Pack release
-        run: pnpm release:pack
 
       - name: Publish with npm Trusted Publishing
         run: pnpm release:publish --yes
