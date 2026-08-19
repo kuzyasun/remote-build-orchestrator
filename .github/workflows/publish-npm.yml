@@ -64,7 +64,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # TODO: Restore `pnpm verify` after Windows-hosted CI test isolation is stabilized.
+      - name: Verify source
+        run: pnpm verify
 
       - name: Build release
         run: pnpm build

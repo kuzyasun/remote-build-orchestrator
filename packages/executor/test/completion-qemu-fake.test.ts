@@ -206,6 +206,9 @@ async function finishLikeAgent(harness: Awaited<ReturnType<typeof createHarness>
     await harness.child.kill(harness.execution.cancel_grace_seconds);
   }
   await harness.child.waitForExit().catch(() => undefined);
+  // Drain any in-flight durable log appends before cleanup/teardown removes
+  // the logs dir, so a late stdout/stderr chunk can't land on a deleted file.
+  await harness.child.drainLogs();
 
   const cleanup = await runCleanupScript({
     attemptId: 'att_fake_qemu',

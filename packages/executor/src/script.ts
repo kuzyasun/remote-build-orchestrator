@@ -27,6 +27,19 @@ export class ManagedChildProcess extends EventEmitter {
     signal: NodeJS.Signals | null;
   }>;
   private readonly killImpl: (graceSeconds: number) => Promise<void>;
+  /**
+   * Chain of every fire-and-forget durable log append started by attachLogPipes
+   * (the default attachLogs path). Resolves only once each queued append has
+   * settled, so a caller can drain before deleting the logs directory — and the
+   * close handler can drain before ending the streams.
+   *
+   * Production callers (Agent, Controller) run with attachLogs:false and own
+   * their own drain (spoolWriteChain / logWriteChain), leaving this chain empty
+   * for them; this only covers the attachLogs:true path used by tests and simple
+   * callers.
+   */
+  private logWriteChain: Promise<void> = Promise.resolve();
+  private streamsEnded = false;
 
   constructor(input: {
     pid: number;
@@ -45,6 +58,35 @@ export class ManagedChildProcess extends EventEmitter {
 
   kill(graceSeconds = 10): Promise<void> {
     return this.killImpl(graceSeconds);
+  }
+
+  /**
+   * Track an in-flight durable log append so it can be awaited via drainLogs.
+   * The append must not reject (wrap with .catch at the call site), so the chain
+   * never settles rejected and drainLogs never throws.
+   */
+  trackLogAppend(append: Promise<unknown>): void {
+    this.logWriteChain = this.logWriteChain.then(() => append).then(() => undefined);
+  }
+
+  /** Resolve once every tracked durable log append has settled. */
+  async drainLogs(): Promise<void> {
+    await this.logWriteChain;
+  }
+
+  /**
+   * Await all in-flight durable log appends, then end the stdout/stderr
+   * PassThrough streams. Called from each adapter's child 'close' handler so a
+   * late append can never race teardown (dir deletion / stream end). Idempotent.
+   */
+  async endStreamsAfterDrain(): Promise<void> {
+    await this.logWriteChain;
+    if (this.streamsEnded) {
+      return;
+    }
+    this.streamsEnded = true;
+    this.stdout.end();
+    this.stderr.end();
   }
 }
 
@@ -184,11 +226,24 @@ function attachLogPipes(
     });
     return;
   }
+  // Track each durable append so drainLogs()/endStreamsAfterDrain() can await
+  // every in-flight write before a caller deletes the logs directory or the
+  // close handler ends the streams. Catching here keeps the chain settled so a
+  // late chunk landing on a removed dir (e.g. after teardown) rejects silently
+  // instead of becoming an unhandled rejection.
   child.stdout.on('data', (chunk: Buffer | string) => {
-    void appendStdout(logs, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    child.trackLogAppend(
+      appendStdout(logs, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)).catch(
+        () => undefined,
+      ),
+    );
   });
   child.stderr.on('data', (chunk: Buffer | string) => {
-    void appendStderr(logs, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    child.trackLogAppend(
+      appendStderr(logs, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)).catch(
+        () => undefined,
+      ),
+    );
   });
 }
 
@@ -432,8 +487,10 @@ function spawnNodeProcess(input: {
     managed.stderr.write(chunk);
   });
   child.on('close', () => {
-    managed.stdout.end();
-    managed.stderr.end();
+    // Drain durable appends before ending the streams: a late stdout/stderr
+    // chunk arriving just before close would otherwise be appended to a file
+    // the caller may have already torn down, racing teardown.
+    void managed.endStreamsAfterDrain();
   });
 
   if (input.onLogChunk || input.attachLogs !== false) {
@@ -576,12 +633,15 @@ function spawnWindowsHelperProcess(input: {
     }
     exitCode = resolvedExit;
     resolved = true;
-    managed.stdout.end();
-    managed.stderr.end();
-    managed.emit('exit', exitCode, null);
-    for (const waiter of waiters) {
-      waiter({ exitCode, signal: null });
-    }
+    // Drain durable appends (see attachLogPipes) before ending the streams and
+    // unblocking waitForExit waiters — callers wait on exit, then tear down, so
+    // a late append must be flushed first.
+    void managed.endStreamsAfterDrain().then(() => {
+      managed.emit('exit', exitCode, null);
+      for (const waiter of waiters) {
+        waiter({ exitCode, signal: null });
+      }
+    });
   });
 
   if (input.onLogChunk || input.attachLogs !== false) {
