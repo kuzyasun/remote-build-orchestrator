@@ -38,6 +38,7 @@ import {
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
 import type { ConnectedAgent } from '../websocket/server.js';
+import { subscribeToJobLifecycle } from './lifecycle-notifier.js';
 import {
   createJob,
   createJobEvent,
@@ -55,6 +56,7 @@ const logger = createLogger('controller.jobs.submit');
 
 const CONFIRMATION_TTL_SECONDS = 300;
 const DEFAULT_WAIT_TAIL_MAX_BYTES = 16 * 1024;
+const WAIT_FALLBACK_INTERVAL_MS = 1_000;
 
 export interface SubmitJobContext extends LocalRunnerContext {
   clientId: string;
@@ -482,10 +484,17 @@ export async function handleJobConfirm(
 }
 
 export interface WaitForJobOptions {
-  /** Called after each poll while waiting (for MCP progress heartbeats). */
+  /** Called before each durable wait (for MCP progress heartbeats). */
   onTick?: (job: NonNullable<ReturnType<typeof getJob>>) => void | Promise<void>;
   /** Explicit bounded tail requested by the legacy job_wait contract. */
   includeLogTailLines?: number;
+  /** Cancels the wait without changing the durable job state. */
+  signal?: AbortSignal;
+  /** Deterministic race injection for the focused waiter tests. */
+  testHooks?: {
+    beforeSubscribe?: () => void | Promise<void>;
+    afterSubscribe?: () => void | Promise<void>;
+  };
 }
 
 export interface BoundedFileTail {
@@ -557,11 +566,79 @@ export async function waitForJob(
     };
   }
 
-  while (job && !isTerminalJobState(job.state) && Date.now() < deadline) {
+  while (
+    job &&
+    !isTerminalJobState(job.state) &&
+    !options?.signal?.aborted &&
+    Date.now() < deadline
+  ) {
     if (options?.onTick) {
       await options.onTick(job);
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
+
+    // The initial read, subscribe, and second read form one lost-wakeup-safe
+    // protocol: a transition in either read/subscribe gap is observed by the
+    // second durable read, while a transition after the second read wakes the
+    // waiter through the runtime-owned notifier.
+    let wake: (() => void) | undefined;
+    let unsubscribe: () => void = () => undefined;
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+    const wakePromise = new Promise<void>((resolvePromise) => {
+      wake = resolvePromise;
+    });
+    const fallbackPromise = new Promise<void>((resolvePromise) => {
+      const remainingMs = Math.max(0, deadline - Date.now());
+      fallbackTimer = setTimeout(resolvePromise, Math.min(WAIT_FALLBACK_INTERVAL_MS, remainingMs));
+    });
+    const signal = options?.signal;
+    const abortPromise = signal
+      ? new Promise<void>((resolvePromise) => {
+          if (signal.aborted) {
+            resolvePromise();
+            return;
+          }
+          abortListener = () => resolvePromise();
+          signal.addEventListener('abort', abortListener, { once: true });
+        })
+      : undefined;
+
+    try {
+      const beforeSubscribe = options?.testHooks?.beforeSubscribe;
+      if (beforeSubscribe) await beforeSubscribe();
+      try {
+        unsubscribe = subscribeToJobLifecycle(ctx.db, jobId, () => wake?.());
+      } catch (error) {
+        // Tests and embedded callers may not bind the Controller runtime
+        // notifier. The durable fallback remains safe, only less immediate.
+        if (
+          !(error instanceof Error) ||
+          error.message !== 'No job lifecycle notifier is bound to this database'
+        ) {
+          throw error;
+        }
+      }
+      const afterSubscribe = options?.testHooks?.afterSubscribe;
+      if (afterSubscribe) await afterSubscribe();
+      const reread = getJob(ctx.db, jobId);
+      if (!reread || isTerminalJobState(reread.state)) {
+        job = reread;
+        continue;
+      }
+      job = reread;
+
+      await Promise.race(
+        [wakePromise, fallbackPromise, abortPromise].filter(
+          (promise): promise is Promise<void> => promise !== undefined,
+        ),
+      );
+    } finally {
+      unsubscribe();
+      if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
+      if (abortListener && signal) {
+        signal.removeEventListener('abort', abortListener);
+      }
+    }
     job = getJob(ctx.db, jobId);
   }
 
