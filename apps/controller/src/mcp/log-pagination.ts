@@ -14,6 +14,7 @@ export type LogCursor = {
   profile: 'ansi-v1';
   /** Parser carry is scoped to each durable stream; stdout controls must not affect stderr. */
   states?: Partial<Record<'stdout' | 'stderr', LogPresentationState>>;
+  positions?: Partial<Record<'stdout' | 'stderr', { seq: number; off: number }>>;
 };
 
 const PRESENTATION_MODES: readonly LogPresentationState['mode'][] = [
@@ -25,10 +26,15 @@ const PRESENTATION_MODES: readonly LogPresentationState['mode'][] = [
   'discard',
 ];
 type CompactPresentationState = [number, number, number, number];
+type CompactStreamPosition = [number, number];
 
-function compactCursor(cursor: LogCursor): Omit<LogCursor, 'states'> & { states?: unknown } {
+function compactCursor(
+  cursor: LogCursor,
+): Omit<LogCursor, 'states' | 'positions'> & { states?: unknown; positions?: unknown } {
   const states = cursor.states;
-  if (!states || (!states.stdout && !states.stderr)) return cursor;
+  const positions = cursor.positions;
+  if ((!states || (!states.stdout && !states.stderr)) && !positions) return cursor;
+  const safeStates = states ?? {};
   const encodeState = (state: LogPresentationState | undefined): CompactPresentationState | null =>
     state
       ? [
@@ -40,7 +46,15 @@ function compactCursor(cursor: LogCursor): Omit<LogCursor, 'states'> & { states?
       : null;
   return {
     ...cursor,
-    states: [encodeState(states.stdout), encodeState(states.stderr)],
+    states: [encodeState(safeStates.stdout), encodeState(safeStates.stderr)],
+    ...(positions
+      ? {
+          positions: [
+            positions.stdout ? [positions.stdout.seq, positions.stdout.off] : null,
+            positions.stderr ? [positions.stderr.seq, positions.stderr.off] : null,
+          ] as Array<CompactStreamPosition | null>,
+        }
+      : {}),
   };
 }
 
@@ -56,6 +70,14 @@ export function encodeCursor(identity: ControllerIdentity, cursor: LogCursor): s
 
 export function decodeCursor(identity: ControllerIdentity, value: string): LogCursor | null {
   if (value.length > 512) return null;
+  const parts = value.split('.');
+  if (
+    parts.length !== 3 ||
+    parts.some(
+      (part) => part.length === 0 || Buffer.from(part, 'base64url').toString('base64url') !== part,
+    )
+  )
+    return null;
   const claims = verifyEdDsaJwt(identity.signingPublicKeyPem, value);
   const candidate = claims?.cursor;
   if (!claims || !candidate || typeof candidate !== 'object') return null;
@@ -85,6 +107,17 @@ export function decodeCursor(identity: ControllerIdentity, value: string): LogCu
           : {}),
       }
     : undefined;
+  const positionsValue = (c as { positions?: unknown }).positions;
+  const positions: LogCursor['positions'] = Array.isArray(positionsValue)
+    ? {
+        ...(positionsValue[0]
+          ? { stdout: { seq: positionsValue[0][0], off: positionsValue[0][1] } }
+          : {}),
+        ...(positionsValue[1]
+          ? { stderr: { seq: positionsValue[1][0], off: positionsValue[1][1] } }
+          : {}),
+      }
+    : undefined;
   const allowedModes = new Set(PRESENTATION_MODES);
   const stateValid =
     statesValue === undefined ||
@@ -108,6 +141,20 @@ export function decodeCursor(identity: ControllerIdentity, value: string): LogCu
           state.controlLength <= 4096
         );
       }));
+  const positionsValid =
+    positionsValue === undefined ||
+    (Array.isArray(positionsValue) &&
+      positionsValue.length === 2 &&
+      positionsValue.every(
+        (position: unknown) =>
+          position === null ||
+          (Array.isArray(position) &&
+            position.length === 2 &&
+            Number.isSafeInteger(position[0]) &&
+            Number.isSafeInteger(position[1]) &&
+            position[0] >= 0 &&
+            position[1] >= 0),
+      ));
   if (
     c.v !== 1 ||
     typeof c.job !== 'string' ||
@@ -119,12 +166,13 @@ export function decodeCursor(identity: ControllerIdentity, value: string): LogCu
     (c.off ?? -1) < 0 ||
     c.profile !== 'ansi-v1' ||
     !stateValid ||
+    !positionsValid ||
     claims.sub !== 'job_logs_cursor' ||
     claims.aud !== 'rbo-controller'
   ) {
     return null;
   }
-  return { ...c, states } as LogCursor;
+  return { ...c, states, positions } as LogCursor;
 }
 
 export async function readIndexedRange(
@@ -182,8 +230,19 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
   } catch {
     throw new Error('indexed log source is unavailable');
   }
+  const positions: Partial<Record<'stdout' | 'stderr', { seq: number; off: number }>> = {
+    ...(cursor.positions ?? {}),
+  };
+  const knownPositions = Object.values(positions);
+  const firstSequence =
+    knownPositions.length > 0
+      ? Math.min(cursor.seq, ...knownPositions.map((p) => p.seq))
+      : cursor.seq;
   const entries: ChunkIndexEntry[] = [];
-  for await (const entry of iterChunkIndexEntriesAfter(logs, cursor.seq > 0 ? cursor.seq - 1 : 0)) {
+  for await (const entry of iterChunkIndexEntriesAfter(
+    logs,
+    firstSequence > 0 ? firstSequence - 1 : 0,
+  )) {
     entries.push(entry);
     if (entries.length >= 129) break;
   }
@@ -195,13 +254,27 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
   let nextSeq = cursor.seq;
   let nextOff = cursor.off;
   let truncated = false;
+  const blockedStreams = new Set<'stdout' | 'stderr'>();
+  let hasPendingIntervening = false;
   for (let index = 0; index < Math.min(128, entries.length); index += 1) {
     if (maxBytes - returned < 4) {
       truncated = true;
       break;
     }
     const entry = entries[index];
-    const startOffset = entry.sequence === cursor.seq ? cursor.off : 0;
+    let position = positions[entry.stream];
+    if (!position) {
+      position = { seq: 0, off: 0 };
+      positions[entry.stream] = position;
+    }
+    if (blockedStreams.has(entry.stream)) continue;
+    if (
+      entry.sequence < position.seq ||
+      (entry.sequence === position.seq && position.off >= entry.byte_length)
+    ) {
+      continue;
+    }
+    const startOffset = entry.sequence === position.seq ? position.off : 0;
     const bytes = await readIndexedRange(logs, entry, startOffset);
     if (!bytes) throw new Error('indexed log source is unavailable');
     if (!bytes.length) continue;
@@ -211,24 +284,27 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
       stripAnsi: true,
     });
     let consumedFromNext = 0;
-    if (
-      !page.data.length &&
-      !page.truncated &&
-      page.consumedRawBytes < bytes.length &&
-      index + 1 < entries.length
-    ) {
-      const needed = utf8ContinuationBytesNeeded(bytes);
-      const look =
-        needed > 0 && entries[index + 1].stream === stream
-          ? await readIndexedRange(logs, entries[index + 1], 0)
-          : undefined;
-      const lookahead = look?.subarray(0, needed);
-      if (lookahead?.length) {
+    let consumedNextEntry: ChunkIndexEntry | undefined;
+    const needed = !page.truncated ? utf8ContinuationBytesNeeded(bytes) : 0;
+    if (needed > 0 && !page.data.length && page.consumedRawBytes < bytes.length) {
+      for (let lookIndex = index + 1; lookIndex < entries.length; lookIndex += 1) {
+        const lookEntry = entries[lookIndex];
+        if (lookEntry.stream !== stream) {
+          hasPendingIntervening = true;
+          nextSeq =
+            nextSeq === cursor.seq ? lookEntry.sequence : Math.min(nextSeq, lookEntry.sequence);
+          continue;
+        }
+        const look = await readIndexedRange(logs, lookEntry, 0);
+        const lookahead = look?.subarray(0, needed);
+        if (lookahead?.length !== needed) break;
         page = presentLogChunks([bytes, lookahead], states[stream], {
           maxBytes: maxBytes - returned,
           stripAnsi: true,
         });
         consumedFromNext = Math.max(0, page.consumedRawBytes - bytes.length);
+        consumedNextEntry = lookEntry;
+        break;
       }
     }
     states[stream] = page.state;
@@ -242,22 +318,38 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
       });
       returned += page.data.length;
     }
-    if (page.consumedRawBytes < bytes.length || page.truncated) {
-      nextSeq = entry.sequence;
-      nextOff = startOffset + page.consumedRawBytes;
-      truncated = true;
-      break;
+    const incomplete = needed > 0 && page.consumedRawBytes < bytes.length && consumedFromNext === 0;
+    if (
+      (page.consumedRawBytes < bytes.length && consumedNextEntry === undefined) ||
+      page.truncated
+    ) {
+      const consumed = page.consumedRawBytes;
+      position.seq = entry.sequence;
+      position.off = startOffset + consumed;
+      nextSeq = position.seq;
+      nextOff = position.off;
+      if (!incomplete || page.truncated) {
+        truncated = true;
+        break;
+      }
+      blockedStreams.add(stream);
+      continue;
     }
     if (consumedFromNext > 0) {
-      nextSeq = entries[index + 1].sequence;
-      nextOff = consumedFromNext;
-      truncated = consumedFromNext < entries[index + 1].byte_length;
+      const nextEntry = consumedNextEntry;
+      if (!nextEntry) throw new Error('indexed log source is unavailable');
+      position.seq = nextEntry.sequence;
+      position.off = consumedFromNext;
+      if (!hasPendingIntervening) {
+        nextSeq = position.seq;
+        nextOff = position.off;
+      }
+      truncated = consumedFromNext < nextEntry.byte_length;
       if (truncated) break;
-      index += 1;
-      nextSeq = entries[index].sequence + 1;
-      nextOff = 0;
     } else {
-      nextSeq = entry.sequence + 1;
+      position.seq = entry.sequence + 1;
+      position.off = 0;
+      nextSeq = position.seq;
       nextOff = 0;
     }
   }
@@ -268,6 +360,10 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
       compactStates[stream] = state;
     }
   }
+  if (!hasPendingIntervening && nextSeq === cursor.seq) {
+    const progressed = Object.values(positions).map((position) => position?.seq ?? cursor.seq);
+    if (progressed.length > 0) nextSeq = Math.min(...progressed);
+  }
   return {
     chunks: output,
     next: {
@@ -275,6 +371,7 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
       seq: nextSeq,
       off: nextOff,
       states: Object.keys(compactStates).length > 0 ? compactStates : undefined,
+      positions,
     },
     returned,
     hasMore: truncated || entries.length > 128,

@@ -1,10 +1,69 @@
 import { describe, expect, it } from 'vitest';
-import { presentLogChunks } from '../src/log-presentation.js';
+import { presentLogChunks, presentLogTail } from '../src/log-presentation.js';
 
 const run = (chunks: Buffer[], maxBytes = 1024, extra = {}) =>
   presentLogChunks(chunks, undefined, { maxBytes, ...extra });
 
 describe('log presentation', () => {
+  it.each([
+    ['TypeScript', 'tsc --noEmit'],
+    ['Vitest', 'vitest run'],
+    ['Cargo', 'cargo test'],
+    ['GCC', 'gcc -Wall'],
+    ['ESP-IDF', 'idf.py build'],
+    ['Biome', 'biome check'],
+  ])('keeps a bounded stderr-first tail for %s fixtures', (tool, command) => {
+    const stderr = Buffer.from(
+      `${'noise '.repeat(5000)}\nERROR: ${tool} failed while running ${command}\n`,
+    );
+    const stdout = Buffer.from(
+      `progress ${tool}\n\x1b]0;SECRET_TOKEN=fixture-secret\x07finished\n`,
+    );
+    const result = presentLogTail([stderr.subarray(-16 * 1024)], [stdout], {
+      maxBytes: 16 * 1024,
+      maxLines: 8,
+      stderrPrefixComplete: true,
+      stdoutPrefixComplete: true,
+    });
+    expect(result.length).toBeLessThanOrEqual(16 * 1024);
+    expect(result.toString('utf8')).toContain(`ERROR: ${tool} failed`);
+    expect(result.toString('utf8')).not.toContain('fixture-secret');
+    expect(result.includes(0x1b)).toBe(false);
+    expect(result.includes(0x07)).toBe(false);
+    expect(result.toString('utf8')).not.toContain('\ufffd');
+  });
+
+  it('retains an error sentinel and never splits a UTF-8 scalar at the cap', () => {
+    const result = presentLogTail(
+      [Buffer.from(`${'é'.repeat(20_000)}\nERROR: sentinel\n`).subarray(-16 * 1024)],
+      [Buffer.from('stdout\n')],
+      {
+        maxBytes: 16 * 1024,
+        maxLines: 1000,
+        stderrPrefixComplete: true,
+        stdoutPrefixComplete: true,
+      },
+    );
+    expect(result.toString('utf8')).toContain('ERROR: sentinel');
+    expect(result.toString('utf8')).not.toContain('\ufffd');
+    expect(result.length).toBeLessThanOrEqual(16 * 1024);
+  });
+
+  it.each([
+    ['OSC', 'SECRET_TOKEN=osc-payload'],
+    ['CSI', '31mSECRET_TOKEN=csi-payload'],
+  ])('omits a stream whose bounded suffix starts inside %s', (_kind, payload) => {
+    const result = presentLogTail([Buffer.from(payload)], [Buffer.from('safe stdout\n')], {
+      maxBytes: 16 * 1024,
+      maxLines: 8,
+      stderrPrefixComplete: false,
+      stdoutPrefixComplete: true,
+    });
+    expect(result.toString('utf8')).toBe('safe stdout\n');
+    expect(result.toString('utf8')).not.toContain('SECRET_TOKEN');
+    expect(result.toString('utf8')).not.toContain('\ufffd');
+  });
+
   it('strips CSI and OSC across chunk boundaries', () => {
     const a = run([
       Buffer.from('ok\x1b[31'),

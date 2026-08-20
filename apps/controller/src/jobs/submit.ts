@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { open, rm, stat } from 'node:fs/promises';
 import { cpus, freemem } from 'node:os';
 import { join } from 'node:path';
-import { appendEvent, presentLogChunks } from '@rbo/executor';
+import { appendEvent, presentLogTail } from '@rbo/executor';
 import type { AgentCapabilityReport, JobRequest, QueuePolicy } from '@rbo/protocol';
 import { JobRequestSchema } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
@@ -488,7 +488,16 @@ export interface WaitForJobOptions {
   includeLogTailLines?: number;
 }
 
-async function readBoundedFileTail(path: string, maxBytes: number): Promise<Buffer> {
+export interface BoundedFileTail {
+  data: Buffer;
+  /** False when the returned suffix may begin inside an escape sequence. */
+  prefixComplete: boolean;
+}
+
+export async function readBoundedFileTail(
+  path: string,
+  maxBytes: number,
+): Promise<BoundedFileTail> {
   try {
     const size = (await stat(path)).size;
     const start = Math.max(0, size - maxBytes);
@@ -501,12 +510,15 @@ async function readBoundedFileTail(path: string, maxBytes: number): Promise<Buff
         if (result.bytesRead === 0) break;
         offset += result.bytesRead;
       }
-      return output.subarray(0, offset);
+      return {
+        data: output.subarray(0, offset),
+        prefixComplete: start === 0 && offset === output.length,
+      };
     } finally {
       await handle.close();
     }
   } catch {
-    return Buffer.alloc(0);
+    return { data: Buffer.alloc(0), prefixComplete: true };
   }
 }
 
@@ -523,28 +535,12 @@ async function readJobWaitTail(
     readBoundedFileTail(join(logDir, 'stderr.log'), perStreamBytes),
     readBoundedFileTail(join(logDir, 'stdout.log'), perStreamBytes),
   ]);
-  const stderrText = presentLogChunks([stderr], undefined, {
-    maxBytes: perStreamBytes,
-    stripAnsi: true,
-  }).data.toString('utf8');
-  const stdoutText = presentLogChunks([stdout], undefined, {
-    maxBytes: perStreamBytes,
-    stripAnsi: true,
-  }).data.toString('utf8');
-  const combined = `${stderrText}${stdoutText}`;
-  const selected = combined.split(/\r?\n/).slice(-lines).join('\n');
-  const bytes = Buffer.from(selected, 'utf8');
-  if (bytes.length <= DEFAULT_WAIT_TAIL_MAX_BYTES) return selected;
-  let suffix = bytes.subarray(bytes.length - DEFAULT_WAIT_TAIL_MAX_BYTES);
-  const decoder = new TextDecoder('utf-8', { fatal: true });
-  while (suffix.length > 0) {
-    try {
-      return decoder.decode(suffix);
-    } catch {
-      suffix = suffix.subarray(1);
-    }
-  }
-  return '';
+  return presentLogTail([stderr.data], [stdout.data], {
+    maxBytes: DEFAULT_WAIT_TAIL_MAX_BYTES,
+    maxLines: lines,
+    stderrPrefixComplete: stderr.prefixComplete,
+    stdoutPrefixComplete: stdout.prefixComplete,
+  }).toString('utf8');
 }
 
 export async function waitForJob(

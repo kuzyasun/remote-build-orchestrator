@@ -160,6 +160,51 @@ describe('Controller job_logs contract and durable paging', () => {
     ).toBeTruthy();
   });
 
+  it('does not replay or livelock a split scalar when another stream intervenes', async () => {
+    const scalar = Buffer.from('Ж');
+    await append('stdout', scalar.subarray(0, 1), 1);
+    await append('stderr', 'err', 2);
+    await append('stdout', scalar.subarray(1), 3);
+
+    const first = await handleToolCall(ctx, 'job_logs', {
+      job_id: jobId,
+      attempt_id: attemptId,
+      mode: 'logs',
+      max_bytes: 4,
+    });
+    expect(first).not.toHaveProperty('error');
+    expect(
+      (first.chunks as Array<{ sequence: number; text: string }>).map((chunk) => chunk.text),
+    ).toEqual(['Ж']);
+    expect((first.chunks as Array<{ sequence: number }>).map((chunk) => chunk.sequence)).toEqual([
+      1,
+    ]);
+    expect(first.has_more).toBe(true);
+
+    const second = await handleToolCall(ctx, 'job_logs', {
+      job_id: jobId,
+      mode: 'logs',
+      cursor: first.next_cursor,
+      max_bytes: 4,
+    });
+    expect(second).not.toHaveProperty('error');
+    expect(
+      (second.chunks as Array<{ sequence: number; text: string }>).map((chunk) => chunk.text),
+    ).toEqual(['err']);
+    expect((second.chunks as Array<{ sequence: number }>).map((chunk) => chunk.sequence)).toEqual([
+      2,
+    ]);
+    expect(second.has_more).toBe(true);
+    const done = await handleToolCall(ctx, 'job_logs', {
+      job_id: jobId,
+      mode: 'logs',
+      cursor: second.next_cursor,
+      max_bytes: 4,
+    });
+    expect(done.chunks).toEqual([]);
+    expect(done.has_more).toBe(false);
+  });
+
   it('bounds pages to 128 chunks and returns a structured error when a source disappears', async () => {
     for (let sequence = 1; sequence <= 130; sequence += 1)
       await append('stdout', `x${sequence},`, sequence);

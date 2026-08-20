@@ -25,6 +25,16 @@ export interface PresentLogResult {
   truncated: boolean;
 }
 
+export interface PresentLogTailOptions {
+  /** Maximum number of UTF-8 bytes in the returned, presentation-safe tail. */
+  maxBytes: number;
+  /** Number of trailing lines to request from each stream. */
+  maxLines: number;
+  /** Whether the first byte of each stream is known to be the stream prefix. */
+  stderrPrefixComplete: boolean;
+  stdoutPrefixComplete: boolean;
+}
+
 const MIN_BUDGET = 4;
 const DEFAULT_RAW_SCAN_CAP = 1024 * 1024;
 const MAX_CONTROL_BYTES = 4096;
@@ -308,4 +318,91 @@ export function presentLogChunks(
     scannedRawBytes: scanned,
     truncated,
   };
+}
+
+function removeResidualControls(data: Buffer): Buffer {
+  const output = Buffer.allocUnsafe(data.length);
+  let length = 0;
+  for (const byte of data) {
+    // Newline, carriage return, and tab are log layout; all other C0/DEL bytes
+    // are control payload and must not reach an AI-facing response.
+    if ((byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) || byte === 0x7f) {
+      continue;
+    }
+    output[length] = byte;
+    length += 1;
+  }
+  return output.subarray(0, length);
+}
+
+function trailingLines(data: Buffer, maxLines: number): Buffer {
+  if (data.length === 0 || maxLines <= 0) return Buffer.alloc(0);
+  let start = 0;
+  let lines = 0;
+  for (let index = data.length - 1; index >= 0; index -= 1) {
+    if (data[index] !== 0x0a) continue;
+    lines += 1;
+    if (lines >= maxLines) {
+      start = index + 1;
+      break;
+    }
+  }
+  return data.subarray(start);
+}
+
+function utf8Suffix(data: Buffer, maxBytes: number): Buffer {
+  if (maxBytes <= 0 || data.length === 0) return Buffer.alloc(0);
+  let suffix = data.subarray(Math.max(0, data.length - maxBytes));
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  while (suffix.length > 0) {
+    try {
+      decoder.decode(suffix);
+      return suffix;
+    } catch {
+      suffix = suffix.subarray(1);
+    }
+  }
+  return Buffer.alloc(0);
+}
+
+/**
+ * Build the bounded explicit `job_wait` tail from already bounded raw reads.
+ * Stderr is deliberately given priority and is emitted before stdout. Raw
+ * files are never modified and control-sequence payloads are never returned.
+ */
+export function presentLogTail(
+  stderrChunks: readonly Buffer[],
+  stdoutChunks: readonly Buffer[],
+  options: PresentLogTailOptions,
+): Buffer {
+  if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < MIN_BUDGET) {
+    throw new RangeError(`maxBytes must be at least ${MIN_BUDGET}`);
+  }
+  if (!Number.isSafeInteger(options.maxLines) || options.maxLines < 1) {
+    throw new RangeError('maxLines must be positive');
+  }
+  const present = (chunks: readonly Buffer[], prefixComplete: boolean): Buffer => {
+    // A bounded suffix can begin in the middle of an OSC/CSI sequence. Without
+    // the prefix, a fresh parser cannot distinguish its payload from text.
+    // Omitting that stream is fail-closed and avoids leaking control metadata.
+    if (!prefixComplete) return Buffer.alloc(0);
+    return removeResidualControls(
+      presentLogChunks(chunks, undefined, {
+        maxBytes: options.maxBytes,
+        rawScanCap: options.maxBytes,
+        stripAnsi: true,
+      }).data,
+    );
+  };
+  const stderr = trailingLines(
+    present(stderrChunks, options.stderrPrefixComplete),
+    options.maxLines,
+  );
+  const stdout = trailingLines(
+    present(stdoutChunks, options.stdoutPrefixComplete),
+    options.maxLines,
+  );
+  const stderrSuffix = utf8Suffix(stderr, options.maxBytes);
+  const stdoutSuffix = utf8Suffix(stdout, options.maxBytes - stderrSuffix.length);
+  return Buffer.concat([stderrSuffix, stdoutSuffix], stderrSuffix.length + stdoutSuffix.length);
 }
