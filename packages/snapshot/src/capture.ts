@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { lstat } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import type { JobAdditionalRootSchema } from '@rbo/protocol';
@@ -6,14 +6,17 @@ import {
   RboError,
   assertRealPathContained,
   generateId,
-  isPathContained,
   isSafeRelativePath,
   normalizeRepositoryUrl,
   resolveRealPath,
   sha256,
 } from '@rbo/shared';
 import type { z } from 'zod';
-import { type TarEntryInput, writeZstdTarArchiveFile } from './archive.js';
+import {
+  type TarEntryInput,
+  type WrittenArchiveCandidateResult,
+  writeZstdTarArchiveCandidate,
+} from './archive.js';
 import { attachContentId } from './canonical.js';
 import {
   type GitSourceRequirements,
@@ -101,6 +104,29 @@ function countRetainedContentBytes(files: CapturedFile[]): number {
   return total;
 }
 
+function applyArchivedFileResults(
+  files: CapturedFile[],
+  archive: WrittenArchiveCandidateResult,
+): void {
+  const byPath = new Map(archive.entries.map((entry) => [entry.path, entry]));
+  for (const file of files) {
+    if (file.entry.type !== 'file') continue;
+    const archived = byPath.get(file.tarEntry.path);
+    if (!archived) {
+      throw new RboError(
+        'materialization',
+        `Archive did not contain captured file '${file.tarEntry.path}'`,
+        false,
+      );
+    }
+    file.entry = {
+      ...file.entry,
+      size: archived.size,
+      sha256: archived.sha256,
+    };
+  }
+}
+
 function throwIfSecretViolations(violations: SecretPolicyViolation[]): void {
   if (violations.length === 0) {
     return;
@@ -109,6 +135,16 @@ function throwIfSecretViolations(violations: SecretPolicyViolation[]): void {
   throw new RboError('secret_blocked', `Secret files blocked: ${paths.join(', ')}`, false, {
     violations,
   });
+}
+
+function archiveCaptureError(error: unknown): RboError {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('Source file changed while archiving')) {
+    return new RboError('workspace_changed', message, true, {
+      reason: 'file_identity_changed',
+    });
+  }
+  return new RboError('materialization', message, false);
 }
 
 export interface CaptureFullSnapshotResult {
@@ -577,8 +613,7 @@ async function captureFileEntry(
     throw new RboError('materialization', `Expected regular file: ${wirePath}`);
   }
 
-  const content = await readFile(absolute);
-  const hash = sha256(content);
+  const size = info.size;
   const violations = findSecretPolicyViolations(wirePath, sourcePolicy.secret_policy);
 
   const gitMode = stageModes.get(wirePath);
@@ -588,13 +623,13 @@ async function captureFileEntry(
     path: wirePath,
     type: 'file',
     mode,
-    size: content.length,
-    sha256: hash,
+    size,
+    // Replaced with the digest of the bytes actually archived below.
+    sha256: '',
   };
   return {
     wirePath,
     entry,
-    content,
     secretWarnings:
       sourcePolicy.secret_policy === 'warn' && violations.length > 0 ? violations : undefined,
     secretViolations:
@@ -603,7 +638,7 @@ async function captureFileEntry(
       path: wirePath,
       mode: mode === '100755' ? 0o755 : 0o644,
       type: 'file',
-      content,
+      contentPath: absolute,
     },
   };
 }
@@ -661,6 +696,7 @@ export async function captureFullSnapshot(
   const stageModes = await gitLsFilesStageModes(repoRoot);
 
   const capturedFiles: CapturedFile[] = [];
+  const archivedFiles: CapturedFile[] = [];
   try {
     const caseCollisions = findCaseCollisions(wirePaths);
     if (caseCollisions.length > 0) {
@@ -697,27 +733,17 @@ export async function captureFullSnapshot(
       }
       const captured = await captureFileEntry(repoRoot, wirePath, stageModes, input.sourcePolicy);
       capturedFiles.push(captured);
+      archivedFiles.push(captured);
       if (captured.secretWarnings) {
         secretWarnings.push(...captured.secretWarnings);
       }
       if (captured.secretViolations) {
         secretBlockedViolations.push(...captured.secretViolations);
       }
-      if (captured.content) {
-        const dest = join(contentStorageDir, wirePath);
-        await mkdir(join(dest, '..'), { recursive: true });
-        await writeFile(dest, captured.content);
-        captured.tarEntry = {
-          ...captured.tarEntry,
-          content: undefined,
-          contentPath: dest,
-        };
-        captured.content = undefined;
-      }
     }
 
     const emptyDirectories = await findEmptyUntrackedDirectories(repoRoot);
-    const additionalRootsManifest = [];
+    const additionalRootCaptures: Array<{ root: JobAdditionalRoot; files: CapturedFile[] }> = [];
     const additionalTarEntries: TarEntryInput[] = [];
 
     for (const root of input.additionalRoots ?? []) {
@@ -745,8 +771,6 @@ export async function captureFullSnapshot(
           `Additional root is not under allowed project roots: ${root.source_path}`,
         );
       }
-      const additionalBase = join(contentStorageDir, 'additional');
-      await mkdir(additionalBase, { recursive: true });
       const rootPaths = await enumerateAdditionalRootPaths(root);
       const rootCaptured: CapturedFile[] = [];
       for (const relPath of rootPaths) {
@@ -765,6 +789,7 @@ export async function captureFullSnapshot(
           entry: { ...captured.entry, path: mountPath },
           tarEntry: { ...captured.tarEntry, path: mountPath },
         });
+        archivedFiles.push(rootCaptured[rootCaptured.length - 1] as CapturedFile);
         if (captured.secretWarnings) {
           secretWarnings.push(
             ...captured.secretWarnings.map((warning) => ({
@@ -781,47 +806,8 @@ export async function captureFullSnapshot(
             })),
           );
         }
-        if (captured.content) {
-          const dest = join(additionalBase, root.mount_path, relPath);
-          if (!isPathContained(additionalBase, dest)) {
-            throw new RboError(
-              'validation',
-              `additional root content path escapes snapshot storage: ${root.mount_path}`,
-              false,
-            );
-          }
-          await mkdir(join(dest, '..'), { recursive: true });
-          await writeFile(dest, captured.content);
-          const last = rootCaptured[rootCaptured.length - 1];
-          if (last) {
-            last.tarEntry = {
-              ...last.tarEntry,
-              content: undefined,
-              contentPath: dest,
-            };
-            last.content = undefined;
-          }
-          captured.content = undefined;
-        }
       }
-      const fileEntries = rootCaptured
-        .map((f) => f.entry)
-        .filter((e): e is Extract<SnapshotFileEntry, { type: 'file' }> => e.type === 'file');
-      const totalSize = fileEntries.reduce((sum, e) => sum + e.size, 0);
-      const treeHash = sha256(
-        fileEntries
-          .map((e) => e.sha256)
-          .sort()
-          .join('\n'),
-      );
-      additionalRootsManifest.push({
-        id: basename(root.mount_path),
-        mount: normalizeWirePath(root.mount_path),
-        file_count: fileEntries.length,
-        total_size: totalSize,
-        tree_sha256: treeHash,
-        mode: root.mode ?? 'read_only',
-      });
+      additionalRootCaptures.push({ root, files: rootCaptured });
       // Additional roots go only into the archive under their mount path — not into
       // source.files (and not twice into the tar via capturedFiles).
       additionalTarEntries.push(...rootCaptured.map((f) => f.tarEntry));
@@ -842,13 +828,32 @@ export async function captureFullSnapshot(
     ];
 
     const archivePath = join(contentStorageDir, 'full-source.tar.zst');
-    let archive: Awaited<ReturnType<typeof writeZstdTarArchiveFile>>;
+    let archive: WrittenArchiveCandidateResult;
     try {
-      archive = await writeZstdTarArchiveFile(archivePath, tarEntries);
+      archive = await writeZstdTarArchiveCandidate(archivePath, tarEntries);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new RboError('materialization', message, false);
+      throw archiveCaptureError(error);
     }
+    await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, input.additionalRoots ?? []);
+    applyArchivedFileResults(archivedFiles, archive);
+    const additionalRootsManifest = additionalRootCaptures.map(({ root, files }) => {
+      const fileEntries = files
+        .map((f) => f.entry)
+        .filter((e): e is Extract<SnapshotFileEntry, { type: 'file' }> => e.type === 'file');
+      return {
+        id: basename(root.mount_path),
+        mount: normalizeWirePath(root.mount_path),
+        file_count: fileEntries.length,
+        total_size: fileEntries.reduce((sum, e) => sum + e.size, 0),
+        tree_sha256: sha256(
+          fileEntries
+            .map((e) => e.sha256)
+            .sort()
+            .join('\n'),
+        ),
+        mode: root.mode ?? 'read_only',
+      };
+    });
     releaseCapturedFileBuffers(capturedFiles);
 
     const manifestBody = {
@@ -891,7 +896,7 @@ export async function captureFullSnapshot(
     return {
       instance,
       manifest,
-      archivePath,
+      archivePath: archive.candidatePath,
       contentStorageDir,
       secretWarnings,
       gitSourceRequirements,
@@ -1076,6 +1081,7 @@ export async function captureGitOverlaySnapshot(
   );
 
   const capturedFiles: CapturedFile[] = [];
+  const archivedFiles: CapturedFile[] = [];
   const secretWarnings: Array<{ path: string; pattern: string }> = [];
   const secretBlockedViolations: SecretPolicyViolation[] = [];
   try {
@@ -1108,22 +1114,12 @@ export async function captureGitOverlaySnapshot(
         input.sourcePolicy,
       );
       capturedFiles.push(captured);
+      archivedFiles.push(captured);
       if (captured.secretWarnings) {
         secretWarnings.push(...captured.secretWarnings);
       }
       if (captured.secretViolations) {
         secretBlockedViolations.push(...captured.secretViolations);
-      }
-      if (captured.content) {
-        const dest = join(contentStorageDir, 'overlay-staging', wirePath);
-        await mkdir(join(dest, '..'), { recursive: true });
-        await writeFile(dest, captured.content);
-        captured.tarEntry = {
-          ...captured.tarEntry,
-          content: undefined,
-          contentPath: dest,
-        };
-        captured.content = undefined;
       }
     }
 
@@ -1131,7 +1127,7 @@ export async function captureGitOverlaySnapshot(
       plan.files.some((f) => f === dir || f.startsWith(`${dir}/`)),
     );
 
-    const additionalRootsManifest: CaptureFullSnapshotResult['manifest']['additional_roots'] = [];
+    const additionalRootCaptures: Array<{ root: JobAdditionalRoot; files: CapturedFile[] }> = [];
     const additionalTarEntries: TarEntryInput[] = [];
     for (const root of input.additionalRoots ?? []) {
       const realSource = await resolveRealPath(root.source_path);
@@ -1150,6 +1146,7 @@ export async function captureGitOverlaySnapshot(
               : { ...captured.entry, path: archivePath },
           tarEntry: { ...captured.tarEntry, path: archivePath },
         });
+        archivedFiles.push(rootCaptured[rootCaptured.length - 1] as CapturedFile);
         if (captured.secretWarnings) {
           secretWarnings.push(...captured.secretWarnings.map((w) => ({ ...w, path: archivePath })));
         }
@@ -1159,39 +1156,7 @@ export async function captureGitOverlaySnapshot(
           );
         }
       }
-      for (const f of rootCaptured) {
-        if (f.entry.type === 'file') {
-          const dest = join(contentStorageDir, 'additional-staging', f.wirePath);
-          await mkdir(join(dest, '..'), { recursive: true });
-          if (f.content) {
-            await writeFile(dest, f.content);
-            f.tarEntry = {
-              ...f.tarEntry,
-              content: undefined,
-              contentPath: dest,
-            };
-            f.content = undefined;
-          }
-        }
-      }
-      const fileEntries = rootCaptured
-        .map((f) => f.entry)
-        .filter((e): e is Extract<SnapshotFileEntry, { type: 'file' }> => e.type === 'file');
-      const totalSize = fileEntries.reduce((sum, e) => sum + e.size, 0);
-      const treeHash = sha256(
-        fileEntries
-          .map((e) => e.sha256)
-          .sort()
-          .join('\n'),
-      );
-      additionalRootsManifest.push({
-        id: basename(root.mount_path),
-        mount: normalizeWirePath(root.mount_path),
-        file_count: fileEntries.length,
-        total_size: totalSize,
-        tree_sha256: treeHash,
-        mode: root.mode ?? 'read_only',
-      });
+      additionalRootCaptures.push({ root, files: rootCaptured });
       additionalTarEntries.push(...rootCaptured.map((f) => f.tarEntry));
     }
 
@@ -1271,13 +1236,92 @@ export async function captureGitOverlaySnapshot(
     ];
 
     const archivePath = join(contentStorageDir, 'overlay.tar.zst');
-    let archive: Awaited<ReturnType<typeof writeZstdTarArchiveFile>>;
+    let archive: WrittenArchiveCandidateResult;
     try {
-      archive = await writeZstdTarArchiveFile(archivePath, tarEntries);
+      archive = await writeZstdTarArchiveCandidate(archivePath, tarEntries);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new RboError('materialization', message, false);
+      throw archiveCaptureError(error);
     }
+    const postArchiveStatus = await gitStatusPorcelainV2(repoRoot);
+    if (postArchiveStatus.head !== guard.head) {
+      throw new RboError('workspace_changed', 'HEAD changed during overlay capture', true, {
+        reason: 'head_changed',
+      });
+    }
+    for (const [subPath, expectedHead] of subRes.submoduleHeads) {
+      let currentHead = expectedHead;
+      try {
+        currentHead = await gitRevParseHead(resolveInside(repoRoot, subPath));
+      } catch {
+        // ignore if missing; the identity guard below will reject the capture
+      }
+      if (currentHead !== expectedHead) {
+        throw new RboError(
+          'workspace_changed',
+          `Submodule ${subPath} HEAD changed during overlay capture`,
+          true,
+          { reason: 'head_changed', path: subPath },
+        );
+      }
+    }
+    for (const wirePath of guard.wirePaths) {
+      const before = guard.identities.get(wirePath);
+      const after = await statFileIdentity(repoRoot, wirePath);
+      if (!before || !identitiesEqual(before, after)) {
+        throw new RboError('workspace_changed', 'Workspace changed during overlay capture', true, {
+          reason: 'file_identity_changed',
+          path: wirePath,
+        });
+      }
+    }
+    for (const rootGuard of guard.additionalRoots) {
+      const root = (input.additionalRoots ?? []).find(
+        (candidate) => normalizeWirePath(candidate.mount_path) === rootGuard.mount,
+      );
+      if (!root) {
+        throw new RboError(
+          'workspace_changed',
+          'Additional root disappeared during capture',
+          true,
+          {
+            reason: 'additional_root_missing',
+            mount: rootGuard.mount,
+          },
+        );
+      }
+      const realSource = await resolveRealPath(root.source_path);
+      for (const relPath of rootGuard.paths) {
+        const before = rootGuard.identities.get(relPath);
+        const after = await statFileIdentity(realSource, relPath);
+        if (!before || !identitiesEqual(before, after)) {
+          throw new RboError(
+            'workspace_changed',
+            'Additional root changed during overlay capture',
+            true,
+            { reason: 'additional_root_identity_changed', mount: rootGuard.mount, path: relPath },
+          );
+        }
+      }
+    }
+    applyArchivedFileResults(archivedFiles, archive);
+    const additionalRootsManifest = additionalRootCaptures.map(({ root, files }) => {
+      const fileEntries = files
+        .map((f) => f.entry)
+        .filter((e): e is Extract<SnapshotFileEntry, { type: 'file' }> => e.type === 'file');
+      return {
+        id: basename(root.mount_path),
+        mount: normalizeWirePath(root.mount_path),
+        file_count: fileEntries.length,
+        total_size: fileEntries.reduce((sum, e) => sum + e.size, 0),
+        tree_sha256: sha256(
+          fileEntries
+            .map((e) => e.sha256)
+            .sort()
+            .join('\n'),
+        ),
+        mode: root.mode ?? 'read_only',
+      };
+    });
     releaseCapturedFileBuffers(capturedFiles);
 
     const manifestBody = {
@@ -1323,7 +1367,7 @@ export async function captureGitOverlaySnapshot(
     return {
       instance,
       manifest,
-      archivePath,
+      archivePath: archive.candidatePath,
       contentStorageDir,
       secretWarnings,
       overlayBytes: archive.size,

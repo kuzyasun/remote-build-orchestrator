@@ -94,17 +94,6 @@ function writeTarHeader(entry: TarEntryInput, fileSize = 0): Buffer {
   return header;
 }
 
-async function resolveFileContent(entry: TarEntryInput): Promise<Buffer> {
-  if (entry.content) {
-    return entry.content;
-  }
-  if (entry.contentPath) {
-    const { readFile } = await import('node:fs/promises');
-    return readFile(entry.contentPath);
-  }
-  return Buffer.alloc(0);
-}
-
 /** Build an uncompressed POSIX ustar archive from captured entries. */
 export function createTarArchive(entries: TarEntryInput[]): Buffer {
   const chunks: Buffer[] = [];
@@ -159,63 +148,165 @@ export interface WrittenArchiveResult {
   size: number;
 }
 
+export interface WrittenArchiveEntryResult {
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface WrittenArchiveCandidateResult extends WrittenArchiveResult {
+  candidatePath: string;
+  entries: WrittenArchiveEntryResult[];
+}
+
 /**
- * Write a zstd tar archive directly to disk.
- * Reads at most one file payload at a time when entries use `contentPath`, streams zstd
- * compression, and does not retain the compressed payload Buffer on the result.
+ * Write a compressed archive to a unique private candidate.
+ * Publication/rename of the candidate is deliberately owned by the caller.
  */
-export async function writeZstdTarArchiveFile(
+export async function writeZstdTarArchiveCandidate(
   archivePath: string,
   entries: TarEntryInput[],
-): Promise<WrittenArchiveResult> {
+): Promise<WrittenArchiveCandidateResult> {
   const { createReadStream, createWriteStream } = await import('node:fs');
-  const { mkdtemp, open, rm } = await import('node:fs/promises');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
+  const { open, rm } = await import('node:fs/promises');
   const { pipeline } = await import('node:stream/promises');
+  const { Transform, Readable } = await import('node:stream');
   const { createZstdCompress } = await import('node:zlib');
-  const { createHash } = await import('node:crypto');
+  const { createHash, randomUUID } = await import('node:crypto');
 
-  const tmpDir = await mkdtemp(join(tmpdir(), 'rbo-tar-'));
-  const tarPath = join(tmpDir, 'payload.tar');
-  const handle = await open(tarPath, 'w');
-  try {
-    const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
+  // Keep the candidate beside the requested path so the final rename is atomic.
+  // The requested path is never opened until the complete compressed stream succeeds.
+  const candidatePath = `${archivePath}.candidate-${randomUUID()}`;
+  const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
+  const entryResults: WrittenArchiveEntryResult[] = [];
+  async function* tarChunks(): AsyncGenerator<Buffer> {
     for (const entry of sorted) {
+      let fileSize = 0;
+      const fileHash = createHash('sha256');
       if (entry.type === 'file') {
-        const content = await resolveFileContent(entry);
-        await handle.write(writeTarHeader(entry, content.length));
-        if (content.length > 0) {
-          await handle.write(content);
+        if (entry.content) {
+          fileSize = entry.content.length;
+        } else if (entry.contentPath) {
+          const handle = await open(entry.contentPath, 'r');
+          try {
+            const before = await handle.stat({ bigint: true });
+            if (!before.isFile()) {
+              throw new Error(`Source path is not a regular file: '${entry.path}'`);
+            }
+            if (before.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+              throw new Error(`Source file is too large to archive safely: '${entry.path}'`);
+            }
+            fileSize = Number(before.size);
+            yield writeTarHeader(entry, fileSize);
+            let streamed = 0;
+            if (fileSize > 0) {
+              for await (const chunk of createReadStream(entry.contentPath, {
+                fd: handle.fd,
+                autoClose: false,
+                start: 0,
+                end: fileSize - 1,
+              })) {
+                const bytes = chunk as Buffer;
+                streamed += bytes.length;
+                fileHash.update(bytes);
+                yield bytes;
+              }
+            }
+            const after = await handle.stat({ bigint: true });
+            if (
+              streamed !== fileSize ||
+              after.size !== before.size ||
+              after.mtimeNs !== before.mtimeNs ||
+              after.ctimeNs !== before.ctimeNs ||
+              after.dev !== before.dev ||
+              after.ino !== before.ino
+            ) {
+              throw new Error(`Source file changed while archiving '${entry.path}'`);
+            }
+          } finally {
+            await handle.close();
+          }
+          const remainder = fileSize % 512;
+          if (remainder !== 0) {
+            yield Buffer.alloc(512 - remainder);
+          }
+          entryResults.push({ path: entry.path, size: fileSize, sha256: fileHash.digest('hex') });
+          continue;
         }
-        const remainder = content.length % 512;
-        if (remainder !== 0) {
-          await handle.write(Buffer.alloc(512 - remainder));
-        }
-      } else {
-        await handle.write(writeTarHeader(entry, 0));
+      }
+      yield writeTarHeader(entry, fileSize);
+
+      if (entry.type !== 'file') {
+        continue;
+      }
+      if (fileSize === 0) {
+        entryResults.push({ path: entry.path, size: 0, sha256: fileHash.digest('hex') });
+        continue;
+      }
+      if (entry.content) {
+        fileHash.update(entry.content);
+        yield entry.content;
+      }
+      const remainder = fileSize % 512;
+      if (remainder !== 0) {
+        yield Buffer.alloc(512 - remainder);
+      }
+      if (entry.type === 'file') {
+        entryResults.push({ path: entry.path, size: fileSize, sha256: fileHash.digest('hex') });
       }
     }
-    await handle.write(Buffer.alloc(1024));
-  } finally {
-    await handle.close();
+    yield Buffer.alloc(1024);
   }
 
   const hash = createHash('sha256');
   let size = 0;
-  const compress = createZstdCompress();
-  compress.on('data', (chunk: Buffer) => {
-    hash.update(chunk);
-    size += chunk.length;
+  const digest = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      hash.update(chunk);
+      size += chunk.length;
+      callback(null, chunk);
+    },
   });
-  await pipeline(createReadStream(tarPath), compress, createWriteStream(archivePath));
-  await rm(tmpDir, { recursive: true, force: true });
+  try {
+    await pipeline(
+      Readable.from(tarChunks()),
+      createZstdCompress(),
+      digest,
+      createWriteStream(candidatePath, { flags: 'wx' }),
+    );
+  } catch (error) {
+    await rm(candidatePath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 
   return {
     format: 'tar',
     compression: 'zstd',
+    candidatePath,
+    entries: entryResults,
     sha256: hash.digest('hex'),
     size,
+  };
+}
+
+/** Compatibility wrapper that publishes the completed candidate to archivePath. */
+export async function writeZstdTarArchiveFile(
+  archivePath: string,
+  entries: TarEntryInput[],
+): Promise<WrittenArchiveResult> {
+  const { rename, rm } = await import('node:fs/promises');
+  const candidate = await writeZstdTarArchiveCandidate(archivePath, entries);
+  try {
+    await rename(candidate.candidatePath, archivePath);
+  } catch (error) {
+    await rm(candidate.candidatePath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+  return {
+    format: candidate.format,
+    compression: candidate.compression,
+    sha256: candidate.sha256,
+    size: candidate.size,
   };
 }
 

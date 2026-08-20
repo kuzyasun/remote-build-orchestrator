@@ -1,5 +1,5 @@
-import { mkdir, readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { ensureControllerIdentity } from '@rbo/shared';
 import { createGitFixtureRepo } from '@rbo/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -308,5 +308,11 @@ describe('Controller source_need → bundle_download', () => {
     );
     expect(manifest.payload.mode).toBe('full');
     expect(capture.contentId).toBeDefined();
+    const snapshot = db
+      .prepare('SELECT payload_path FROM snapshots WHERE id = ?')
+      .get(capture.snapshotId) as { payload_path: string };
+    expect(snapshot.payload_path).toContain('full-source.tar.zst');
+    expect(snapshot.payload_path).not.toContain('.candidate-');
+    expect(await readdir(dirname(snapshot.payload_path))).toContain('full-source.tar.zst');
   });
 });

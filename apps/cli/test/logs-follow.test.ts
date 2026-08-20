@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { followJobLogsRemote, getJobLogsRemote } from '../src/commands/jobs.js';
 
 describe('CLI job logs helpers', () => {
-  it('getJobLogsRemote defaults streams to stdout/stderr (not events)', async () => {
+  it('getJobLogsRemote defaults to logs mode with an opaque null cursor', async () => {
     let body: Record<string, unknown> | undefined;
     const server = createServer((req, res) => {
       const chunks: Buffer[] = [];
@@ -12,7 +12,14 @@ describe('CLI job logs helpers', () => {
         body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(
-          JSON.stringify({ job_id: 'job_1', attempt_id: 'att_1', data: 'hi', next_cursor: 2 }),
+          JSON.stringify({
+            job_id: 'job_1',
+            attempt_id: 'att_1',
+            mode: 'logs',
+            chunks: [{ sequence: 1, stream: 'stdout', text: 'hi', complete: true }],
+            next_cursor: 'opaque-2',
+            has_more: false,
+          }),
         );
       });
     });
@@ -21,8 +28,47 @@ describe('CLI job logs helpers', () => {
     const port = typeof addr === 'object' && addr ? addr.port : 0;
 
     const result = await getJobLogsRemote(`http://127.0.0.1:${port}`, 'job_1');
-    expect(body?.streams).toEqual(['stdout', 'stderr']);
-    expect(result.data).toBe('hi');
+    expect(body?.mode).toBe('logs');
+    expect(body?.cursor).toBeNull();
+    expect(body).not.toHaveProperty('streams');
+    expect(result.mode).toBe('logs');
+    expect(result.next_cursor).toBe('opaque-2');
+
+    await new Promise<void>((resolvePromise, rejectPromise) =>
+      server.close((err) => (err ? rejectPromise(err) : resolvePromise())),
+    );
+  });
+
+  it('accepts and forwards opaque cursors without numeric coercion', async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(c as Buffer));
+      req.on('end', () => {
+        requests.push(
+          JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>,
+        );
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({ mode: 'logs', chunks: [], next_cursor: 'signed.next', has_more: false }),
+        );
+      });
+    });
+    await new Promise<void>((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    await getJobLogsRemote(`http://127.0.0.1:${port}`, 'job_1', {
+      mode: 'logs',
+      cursor: 'signed.cursor.with.dots',
+      max_bytes: 4096,
+    });
+    expect(requests[0]).toMatchObject({
+      mode: 'logs',
+      cursor: 'signed.cursor.with.dots',
+      max_bytes: 4096,
+    });
+    expect(requests[0]).not.toHaveProperty('streams');
 
     await new Promise<void>((resolvePromise, rejectPromise) =>
       server.close((err) => (err ? rejectPromise(err) : resolvePromise())),

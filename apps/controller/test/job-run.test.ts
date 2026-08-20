@@ -1,5 +1,48 @@
-import { describe, expect, it } from 'vitest';
-import { buildJobRunRequest, wrapCommandAsExecution } from '../src/jobs/job-run.js';
+import * as executor from '@rbo/executor';
+import { JOB_RUN_INPUT } from '@rbo/protocol';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import { buildJobRunRequest, handleJobRun, wrapCommandAsExecution } from '../src/jobs/job-run.js';
+import * as lifecycle from '../src/jobs/lifecycle.js';
+import * as submit from '../src/jobs/submit.js';
+import * as pagination from '../src/mcp/log-pagination.js';
+
+vi.mock('../src/jobs/submit.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...(actual as object),
+    waitForJob: vi.fn(),
+    handleJobSubmit: vi.fn(),
+    handleJobArtifacts: vi.fn(),
+  };
+});
+vi.mock('../src/jobs/lifecycle.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...(actual as object),
+    getJob: vi.fn(),
+    isTerminalJobState: (state: string) => state === 'completed' || state === 'failed',
+    getLatestAttempt: vi.fn(),
+  };
+});
+vi.mock('../src/mcp/log-pagination.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...(actual as object),
+    readJobLogsPage: vi.fn(),
+    readIndexedRange: vi.fn(),
+    decodeCursor: vi.fn(),
+    encodeCursor: vi.fn(),
+  };
+});
+vi.mock('@rbo/executor', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...(actual as object),
+    presentLogChunks: vi.fn(),
+    readChunkIndexTail: vi.fn(),
+  };
+});
 
 describe('wrapCommandAsExecution', () => {
   it('wraps Windows commands with PowerShell fail-closed exit handling', () => {
@@ -61,5 +104,260 @@ describe('buildJobRunRequest', () => {
 
   it('rejects build without command/project_root', () => {
     expect(() => buildJobRunRequest({ command: 'echo hi' }, 'linux')).toThrow(/project_root/);
+  });
+});
+
+describe('JOB_RUN_INPUT validation', () => {
+  const schema = z.object(JOB_RUN_INPUT).strict();
+  it('max_output_bytes min=4 validation', () => {
+    const base = { command: 'echo 1', project_root: 'foo' };
+    expect(schema.safeParse({ ...base, max_output_bytes: 3 }).success).toBe(false);
+    expect(schema.safeParse({ ...base, max_output_bytes: 4 }).success).toBe(true);
+    expect(schema.safeParse({ ...base, max_output_bytes: 1024 * 1024 }).success).toBe(true);
+  });
+});
+
+describe('handleJobRun responses', () => {
+  const db = {} as Record<string, unknown>;
+  const ctx = { db, dataDir: '/data', controllerIdentity: {} as Record<string, unknown> };
+  const testCtx = ctx as unknown as Parameters<typeof handleJobRun>[0];
+  const rawInput = { job_id: 'job-1', max_output_bytes: 1024 };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: { state: 'running' } });
+    vi.mocked(submit.handleJobArtifacts).mockReturnValue({ artifacts: [] });
+    // biome-ignore lint/suspicious/noExplicitAny: mock partial JobRow
+    vi.mocked(lifecycle.getJob).mockReturnValue({ state: 'running' } as any);
+  });
+
+  it('Sparse success (no null/empty fields, <=2 KiB serialized)', async () => {
+    const jobRow = { state: 'completed', outcome: 'succeeded', exit_code: 0 };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+
+    // biome-ignore lint/suspicious/noExplicitAny: partial SubmitJobContext mock
+    const res = await handleJobRun(ctx as any, rawInput);
+
+    expect(res).toEqual({
+      job_id: 'job-1',
+      state: 'completed',
+      outcome: 'succeeded',
+      exit_code: 0,
+    });
+    expect(JSON.stringify(res).length).toBeLessThan(2048);
+  });
+
+  it('Failure with diagnostic_excerpt (bounded by max_output_bytes)', async () => {
+    const jobRow = { state: 'failed', outcome: 'failed', exit_code: 1, failure_category: 'test' };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    // biome-ignore lint/suspicious/noExplicitAny: mock partial AttemptRow
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue({ id: 'att-1' } as any);
+
+    vi.mocked(executor.readChunkIndexTail).mockResolvedValue([
+      { stream: 'stderr', byte_length: 10, sequence: 1, byte_offset: 0 },
+    ]);
+    vi.mocked(pagination.readIndexedRange).mockResolvedValue(Buffer.from('failed log'));
+    vi.mocked(executor.presentLogChunks).mockReturnValue({
+      data: Buffer.from('failed log'),
+      // biome-ignore lint/suspicious/noExplicitAny: mock partial LogPresentationState
+      state: {} as any,
+      consumedRawBytes: 10,
+      scannedRawBytes: 10,
+      truncated: false,
+    });
+
+    // biome-ignore lint/suspicious/noExplicitAny: partial SubmitJobContext mock
+    const res = await handleJobRun(ctx as any, rawInput);
+    expect(res).toMatchObject({
+      job_id: 'job-1',
+      state: 'failed',
+      outcome: 'failed',
+      exit_code: 1,
+      failure_category: 'test',
+      diagnostic_excerpt: 'failed log',
+    });
+  });
+
+  it('Non-terminal resume with log_chunks and next_log_cursor', async () => {
+    const jobRow = { state: 'running' };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    // biome-ignore lint/suspicious/noExplicitAny: mock partial AttemptRow
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue({ id: 'att-1' } as any);
+
+    vi.mocked(pagination.readJobLogsPage).mockResolvedValue({
+      chunks: [{ sequence: 1, stream: 'stdout', text: 'hi', complete: true }],
+      // biome-ignore lint/suspicious/noExplicitAny: mock partial LogCursor
+      next: { v: 1 } as any,
+      returned: 2,
+      hasMore: false,
+      truncated: false,
+    });
+    vi.mocked(pagination.encodeCursor).mockReturnValue('encoded_cursor');
+
+    // biome-ignore lint/suspicious/noExplicitAny: partial SubmitJobContext mock
+    const res = await handleJobRun(ctx as any, rawInput);
+    expect(res).toMatchObject({
+      job_id: 'job-1',
+      state: 'running',
+      resume: true,
+      log_chunks: [{ sequence: 1, stream: 'stdout', text: 'hi', complete: true }],
+      next_log_cursor: 'encoded_cursor',
+      returned_bytes: 2,
+    });
+  });
+
+  it('Input log_cursor passed through on no-progress', async () => {
+    const jobRow = { state: 'completed', outcome: 'succeeded', exit_code: 0 };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    vi.mocked(pagination.decodeCursor).mockReturnValue({
+      v: 1,
+      job: 'job-1',
+      attempt: 'att-1',
+      mode: 'logs',
+      seq: 0,
+      off: 0,
+      profile: 'ansi-v1',
+    });
+
+    // biome-ignore lint/suspicious/noExplicitAny: partial SubmitJobContext mock
+    const res = await handleJobRun(ctx as any, { job_id: 'job-1', log_cursor: 'old_cursor' });
+    expect(res).toMatchObject({
+      job_id: 'job-1',
+      next_log_cursor: 'old_cursor',
+    });
+  });
+
+  it('Rejects malformed or stale log cursors instead of replaying from zero', async () => {
+    const jobRow = { state: 'running' };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue({
+      id: 'att-2',
+    } as unknown as lifecycle.AttemptRow);
+    vi.mocked(pagination.decodeCursor).mockReturnValue({
+      v: 1,
+      job: 'job-1',
+      attempt: 'att-1',
+      mode: 'logs',
+      seq: 0,
+      off: 0,
+      profile: 'ansi-v1',
+    });
+
+    const res = await handleJobRun(testCtx, { job_id: 'job-1', log_cursor: 'stale' });
+    expect(res).toEqual({
+      error: {
+        category: 'validation',
+        message: 'Cursor does not match job, attempt, or mode',
+        retryable: false,
+      },
+    });
+    expect(pagination.readJobLogsPage).not.toHaveBeenCalled();
+  });
+
+  it('Rejects malformed cursors on terminal responses', async () => {
+    vi.mocked(submit.waitForJob).mockResolvedValue({
+      job: { state: 'completed', outcome: 'succeeded', exit_code: 0 },
+    });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue({
+      id: 'att-1',
+    } as unknown as lifecycle.AttemptRow);
+    vi.mocked(pagination.decodeCursor).mockReturnValue(null);
+
+    const res = await handleJobRun(testCtx, { job_id: 'job-1', log_cursor: 'malformed' });
+    expect(res).toMatchObject({ error: { category: 'validation', retryable: false } });
+    expect(pagination.readJobLogsPage).not.toHaveBeenCalled();
+  });
+
+  it('Advances over a control-only page and errors when the cursor cannot be encoded', async () => {
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: { state: 'running' } });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue({
+      id: 'att-1',
+    } as unknown as lifecycle.AttemptRow);
+    vi.mocked(pagination.readJobLogsPage).mockResolvedValue({
+      chunks: [],
+      next: {
+        v: 1,
+        job: 'job-1',
+        attempt: 'att-1',
+        mode: 'logs',
+        seq: 2,
+        off: 0,
+        profile: 'ansi-v1',
+      },
+      returned: 0,
+      hasMore: false,
+      truncated: false,
+    });
+    vi.mocked(pagination.encodeCursor).mockReturnValue(null);
+
+    const res = await handleJobRun(testCtx, { job_id: 'job-1', max_output_bytes: 4 });
+    expect(res).toEqual({
+      error: { category: 'internal', message: 'Unable to encode log cursor', retryable: true },
+    });
+  });
+
+  it('Bounds diagnostic index window and artifact metadata', async () => {
+    const jobRow = { state: 'failed', outcome: 'failed', exit_code: 1 };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue({
+      id: 'att-1',
+    } as unknown as lifecycle.AttemptRow);
+    vi.mocked(submit.handleJobArtifacts).mockReturnValue({
+      artifacts: [
+        { path: 'old', detail: 'x'.repeat(9000) },
+        { path: 'new', size: 100 },
+      ],
+    });
+    vi.mocked(executor.readChunkIndexTail).mockResolvedValue([
+      { stream: 'stderr', byte_length: 100, sequence: 1, byte_offset: 0 },
+      { stream: 'stderr', byte_length: 100, sequence: 2, byte_offset: 100 },
+    ]);
+    vi.mocked(pagination.readIndexedRange).mockImplementation(async (_logs, entry) =>
+      entry.sequence === 2 ? Buffer.from('newest') : Buffer.from('old'),
+    );
+    vi.mocked(executor.presentLogChunks).mockImplementation(([bytes]) => ({
+      data: bytes,
+      state: {} as executor.LogPresentationState,
+      consumedRawBytes: bytes.length,
+      scannedRawBytes: bytes.length,
+      truncated: false,
+    }));
+
+    const res = await handleJobRun(testCtx, { job_id: 'job-1', max_output_bytes: 4 });
+    expect(res.diagnostic_excerpt).toBe('west');
+    expect(pagination.readIndexedRange).toHaveBeenCalledTimes(1);
+    expect(res).toMatchObject({ artifact_count: 2, artifacts_truncated: true });
+    expect(JSON.stringify(res).length).toBeLessThan(1024);
+  });
+
+  it('Caps successful artifact metadata to the compact response budget', async () => {
+    const jobRow = { state: 'completed', outcome: 'succeeded', exit_code: 0 };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    vi.mocked(submit.handleJobArtifacts).mockReturnValue({
+      artifacts: [{ path: 'large', detail: 'x'.repeat(9000) }],
+    });
+
+    const res = await handleJobRun(testCtx, { job_id: 'job-1' });
+    expect(JSON.stringify(res).length).toBeLessThanOrEqual(2048);
+    expect(res).toMatchObject({ artifact_count: 1, artifacts_truncated: true });
+  });
+
+  it('Bounds failure metadata and preserves UTF-8 boundaries', async () => {
+    const jobRow = {
+      state: 'failed',
+      outcome: 'failed',
+      exit_code: 1,
+      failure_category: 'é'.repeat(5000),
+      failure_message: '界'.repeat(5000),
+    };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue(undefined);
+    vi.mocked(submit.handleJobArtifacts).mockReturnValue({ artifacts: [] });
+
+    const res = await handleJobRun(testCtx, { job_id: 'job-1', max_output_bytes: 4 });
+    const { diagnostic_excerpt: _diagnosticExcerpt, ...metadata } = res;
+    expect(Buffer.byteLength(JSON.stringify(metadata), 'utf8')).toBeLessThanOrEqual(8192);
+    expect(res.failure_category).not.toContain('\ufffd');
+    expect(res.failure_message).not.toContain('\ufffd');
   });
 });

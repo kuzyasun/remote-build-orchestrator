@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   appendEvent,
@@ -678,6 +678,15 @@ export async function captureAndPersistSnapshot(
     JSON.stringify(captured.gitSourceRequirements),
   );
 
+  // S-02 returns a private writer candidate. Keep the pre-S-03 publication behavior
+  // in the Controller persistence boundary, so the database never points at a candidate
+  // filename while S-03 is still responsible for the lease-aware publication protocol.
+  const publishedPayloadPath = captured.archivePath.replace(/\.candidate-[^\\/]+$/, '');
+  if (publishedPayloadPath === captured.archivePath) {
+    throw new RboError('internal', 'Snapshot capture did not return a private archive candidate');
+  }
+  await rename(captured.archivePath, publishedPayloadPath);
+
   persistSnapshot(ctx.db, {
     snapshotId: captured.instance.snapshot_id,
     contentId: captured.manifest.content_id,
@@ -685,7 +694,7 @@ export async function captureAndPersistSnapshot(
     baseCommit: captured.manifest.repo?.base_commit ?? null,
     dirty: true,
     manifestPath,
-    payloadPath: captured.archivePath,
+    payloadPath: publishedPayloadPath,
     sizeBytes: captured.manifest.payload.size,
     sha256: captured.manifest.payload.sha256,
   });

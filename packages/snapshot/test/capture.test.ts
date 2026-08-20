@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import * as fsPromises from 'node:fs/promises';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -50,6 +51,10 @@ describe('captureFullSnapshot (§11, Appendix C)', () => {
       });
 
       expect(result.manifest.payload.mode).toBe('full');
+      expect(result.archivePath).toContain('full-source.tar.zst.candidate-');
+      expect(await readdir(join(storage, result.instance.snapshot_id))).not.toContain(
+        'full-source.tar.zst',
+      );
       expect(result.manifest.source.files.map((f) => f.path).sort()).toEqual([
         'tracked.txt',
         'untracked.txt',
@@ -304,6 +309,100 @@ describe('captureFullSnapshot (§11, Appendix C)', () => {
       });
 
       vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+    } finally {
+      await cleanup();
+      await rm(storage, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('rejects source mutation detected by the archive writer and cleans the candidate', async () => {
+    const { dir, cleanup } = await createFixtureRepo();
+    const storage = await mkdtemp(join(tmpdir(), 'rbo-capture-'));
+    const sourcePath = join(dir, 'tracked.txt');
+    try {
+      await writeFile(sourcePath, 'original-content');
+      await runGit(dir, ['add', 'tracked.txt']);
+      await runGit(dir, ['commit', '-m', 'init']);
+
+      vi.resetModules();
+      vi.doMock('node:fs/promises', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('node:fs/promises')>();
+        return {
+          ...actual,
+          open: async (...args: Parameters<typeof actual.open>) => {
+            const handle = await actual.open(...args);
+            if (String(args[0]) !== sourcePath) return handle;
+            const originalStat = handle.stat.bind(handle);
+            let statCalls = 0;
+            const mutableHandle = handle as unknown as {
+              stat: (...statArgs: Parameters<typeof handle.stat>) => ReturnType<typeof handle.stat>;
+            };
+            mutableHandle.stat = async (...statArgs: Parameters<typeof handle.stat>) => {
+              const result = await originalStat(...statArgs);
+              statCalls += 1;
+              if (statCalls === 2) await writeFile(sourcePath, 'mutated-content');
+              return result;
+            };
+            return handle;
+          },
+        };
+      });
+      const { captureFullSnapshot: captureWithMock } = await import('../src/capture.js');
+
+      await expect(
+        captureWithMock({
+          projectRoot: dir,
+          allowedProjectRoots: [dir],
+          sourcePolicy: { include_untracked: true, include_ignored: [], secret_policy: 'allow' },
+          contentStorageDir: storage,
+        }),
+      ).rejects.toMatchObject({ category: 'workspace_changed' });
+      expect(await fsPromises.readdir(storage)).toEqual([]);
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+    } finally {
+      await cleanup();
+      await rm(storage, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('rejects a post-archive workspace mutation and removes the private candidate', async () => {
+    const { dir, cleanup } = await createFixtureRepo();
+    const storage = await mkdtemp(join(tmpdir(), 'rbo-capture-'));
+    const sourcePath = join(dir, 'tracked.txt');
+    try {
+      await writeFile(sourcePath, 'original-content');
+      await runGit(dir, ['add', 'tracked.txt']);
+      await runGit(dir, ['commit', '-m', 'init']);
+
+      let calls = 0;
+      vi.resetModules();
+      vi.doMock('../src/git-status.js', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('../src/git-status.js')>();
+        return {
+          ...actual,
+          gitStatusPorcelainV2: async (...args: Parameters<typeof actual.gitStatusPorcelainV2>) => {
+            const status = await actual.gitStatusPorcelainV2(...args);
+            calls += 1;
+            // Full capture status calls: initial, empty-dir scan, pre-archive, post-archive.
+            if (calls === 4) await writeFile(sourcePath, 'post-archive-mutation');
+            return status;
+          },
+        };
+      });
+      const { captureFullSnapshot: captureWithMock } = await import('../src/capture.js');
+
+      await expect(
+        captureWithMock({
+          projectRoot: dir,
+          allowedProjectRoots: [dir],
+          sourcePolicy: { include_untracked: true, include_ignored: [], secret_policy: 'allow' },
+          contentStorageDir: storage,
+        }),
+      ).rejects.toMatchObject({ category: 'workspace_changed' });
+      expect(await fsPromises.readdir(storage)).toEqual([]);
+      vi.doUnmock('../src/git-status.js');
       vi.resetModules();
     } finally {
       await cleanup();

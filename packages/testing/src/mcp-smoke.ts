@@ -152,10 +152,15 @@ export async function runPhase8SmokeWorkflow(
   const logs = (await call('job_logs', {
     job_id: jobId,
     attempt_id: null,
-    cursor: 0,
+    cursor: null,
+    mode: 'logs',
     max_bytes: 65536,
-    streams: ['stdout', 'stderr', 'events'],
-  })) as { attempt_id?: string | null; next_cursor?: number; chunks?: unknown[] };
+  })) as {
+    attempt_id?: string | null;
+    next_cursor?: string | null;
+    returned_bytes?: number;
+    chunks?: unknown[];
+  };
 
   const artifacts = (await call('job_artifacts', { job_id: jobId })) as {
     artifacts?: Array<{ id: string; artifact_id?: string }>;
@@ -180,7 +185,7 @@ export async function runPhase8SmokeWorkflow(
     jobId,
     attemptId: logs.attempt_id ?? null,
     artifactIds,
-    logBytes: typeof logs.next_cursor === 'number' ? logs.next_cursor : 0,
+    logBytes: typeof logs.returned_bytes === 'number' ? logs.returned_bytes : 0,
     transcript,
   };
 }

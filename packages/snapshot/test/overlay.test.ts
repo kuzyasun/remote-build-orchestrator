@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGitFixtureRepo } from '@rbo/testing';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { captureGitOverlaySnapshot } from '../src/capture.js';
 import { gitStatusPorcelainV2 } from '../src/git-status.js';
 import { applyGitOverlay } from '../src/materialize.js';
@@ -144,4 +144,46 @@ describe('Overlay plan + apply', () => {
     expect(paths).toContain('юнікод/файл.txt');
     expect(captured.overlayBytes).toBeLessThan(64 * 1024);
   });
+
+  it('rejects an overlay mutation after archive completion and cleans private storage', async () => {
+    const repo = await createGitFixtureRepo({
+      committed: [{ path: 'tracked.txt', content: 'before' }],
+      unstaged: [{ path: 'tracked.txt', content: 'dirty' }],
+    });
+    cleanups.push(repo.cleanup);
+    const storage = await mkdtemp(join(tmpdir(), 'rbo-overlay-post-'));
+    cleanups.push(async () => rm(storage, { recursive: true, force: true }));
+
+    let calls = 0;
+    vi.resetModules();
+    vi.doMock('../src/git-status.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../src/git-status.js')>();
+      return {
+        ...actual,
+        gitStatusPorcelainV2: async (...args: Parameters<typeof actual.gitStatusPorcelainV2>) => {
+          const status = await actual.gitStatusPorcelainV2(...args);
+          calls += 1;
+          // Overlay status calls: initial, pre-archive, post-archive.
+          if (calls === 3) await writeFile(join(repo.root, 'tracked.txt'), 'post-archive');
+          return status;
+        },
+      };
+    });
+    const { captureGitOverlaySnapshot: captureWithMock } = await import('../src/capture.js');
+    try {
+      await expect(
+        captureWithMock({
+          projectRoot: repo.root,
+          allowedProjectRoots: [repo.root],
+          sourcePolicy: { include_untracked: true, include_ignored: [], secret_policy: 'allow' },
+          contentStorageDir: storage,
+          repoUrl: 'git@github.com:kuzyasun/esp32-boilerplate.git',
+        }),
+      ).rejects.toMatchObject({ category: 'workspace_changed' });
+      expect(await readdir(storage)).toEqual([]);
+    } finally {
+      vi.doUnmock('../src/git-status.js');
+      vi.resetModules();
+    }
+  }, 30_000);
 });

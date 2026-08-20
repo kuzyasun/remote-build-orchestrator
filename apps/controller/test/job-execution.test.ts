@@ -147,9 +147,10 @@ describe('Local job execution', () => {
     expect(result.state).toBe('completed');
     expect(result.outcome).toBe('succeeded');
     expect(result.exit_code).toBe(0);
-    expect(result.resume).toBe(false);
-    expect(result.artifacts.length).toBeGreaterThan(0);
-    expect(result.log_tail?.stdout?.length).toBeGreaterThan(0);
+    // P-02 sparse success: terminal responses omit resume field
+    expect(result.resume).toBeUndefined();
+    // Artifacts are only present when non-empty
+    expect(result.artifacts?.length ?? 0).toBeGreaterThan(0);
     await client.close();
   }, 120_000);
 
@@ -188,13 +189,14 @@ describe('Local job execution', () => {
             arguments: {
               job_id: first.job_id,
               mcp_wait_slice_seconds: 5,
-              include_log_tail_lines: 20,
+              max_output_bytes: 4096,
             },
           }),
         ),
       );
     }
-    expect(final.resume).toBe(false);
+    // P-02 sparse success: terminal responses omit resume field
+    expect(final.resume).toBeUndefined();
     expect(final.state).toBe('completed');
     expect(final.outcome).toBe('succeeded');
     await client.close();
@@ -221,6 +223,19 @@ describe('Local job execution', () => {
     expect(result.resume).toBe(false);
     expect(result.outcome).toBeNull();
     expect(result.artifacts).toEqual([]);
+    const resumed = JSON.parse(
+      textOf(
+        await client.callTool({
+          name: 'job_run',
+          arguments: { job_id: result.job_id },
+        }),
+      ),
+    );
+    expect(resumed.state).toBe('awaiting_confirmation');
+    expect(resumed.confirmation_required).toBe(true);
+    expect(resumed.confirmation_token).toBe(result.confirmation_token);
+    expect(resumed.snapshot_id).toBe(result.snapshot_id);
+    expect(resumed.content_id).toBe(result.content_id);
     await client.close();
   }, 60_000);
 
@@ -243,6 +258,7 @@ describe('Local job execution', () => {
     );
     expect(waited.job.state).toBe('completed');
     expect(waited.job.outcome).toBe('succeeded');
+    expect(waited.log_tail).toEqual(expect.any(String));
 
     const artifacts = JSON.parse(
       textOf(
@@ -489,9 +505,9 @@ describe('Local job execution', () => {
             name: 'job_logs',
             arguments: {
               job_id: submit.job_id,
-              streams: ['events'],
+              mode: 'events',
               max_bytes: 65_536,
-              cursor: 0,
+              cursor: null,
             },
           }),
         ),
@@ -555,9 +571,9 @@ describe('Local job execution', () => {
           name: 'job_logs',
           arguments: {
             job_id: submit.job_id,
-            streams: ['events'],
+            mode: 'events',
             max_bytes: 65_536,
-            cursor: 0,
+            cursor: null,
           },
         }),
       ),

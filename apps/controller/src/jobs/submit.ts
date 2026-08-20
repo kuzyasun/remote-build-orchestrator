@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { rm } from 'node:fs/promises';
+import { open, rm, stat } from 'node:fs/promises';
 import { cpus, freemem } from 'node:os';
 import { join } from 'node:path';
-import { appendEvent, readLogTail } from '@rbo/executor';
+import { appendEvent, presentLogChunks } from '@rbo/executor';
 import type { AgentCapabilityReport, JobRequest, QueuePolicy } from '@rbo/protocol';
 import { JobRequestSchema } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
@@ -54,6 +54,7 @@ import { completeSubmission, reserveSubmission } from './submissions.js';
 const logger = createLogger('controller.jobs.submit');
 
 const CONFIRMATION_TTL_SECONDS = 300;
+const DEFAULT_WAIT_TAIL_MAX_BYTES = 16 * 1024;
 
 export interface SubmitJobContext extends LocalRunnerContext {
   clientId: string;
@@ -483,13 +484,73 @@ export async function handleJobConfirm(
 export interface WaitForJobOptions {
   /** Called after each poll while waiting (for MCP progress heartbeats). */
   onTick?: (job: NonNullable<ReturnType<typeof getJob>>) => void | Promise<void>;
+  /** Explicit bounded tail requested by the legacy job_wait contract. */
+  includeLogTailLines?: number;
+}
+
+async function readBoundedFileTail(path: string, maxBytes: number): Promise<Buffer> {
+  try {
+    const size = (await stat(path)).size;
+    const start = Math.max(0, size - maxBytes);
+    const handle = await open(path, 'r');
+    try {
+      const output = Buffer.alloc(size - start);
+      let offset = 0;
+      while (offset < output.length) {
+        const result = await handle.read(output, offset, output.length - offset, start + offset);
+        if (result.bytesRead === 0) break;
+        offset += result.bytesRead;
+      }
+      return output.subarray(0, offset);
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return Buffer.alloc(0);
+  }
+}
+
+async function readJobWaitTail(
+  ctx: LocalRunnerContext,
+  jobId: string,
+  lines: number,
+): Promise<string> {
+  const attempt = getLatestAttempt(ctx.db, jobId);
+  if (!attempt || lines <= 0) return '';
+  const logDir = attemptLogDir(ctx.dataDir, attempt.id);
+  const perStreamBytes = Math.min(DEFAULT_WAIT_TAIL_MAX_BYTES, Math.max(1024, lines * 1024));
+  const [stderr, stdout] = await Promise.all([
+    readBoundedFileTail(join(logDir, 'stderr.log'), perStreamBytes),
+    readBoundedFileTail(join(logDir, 'stdout.log'), perStreamBytes),
+  ]);
+  const stderrText = presentLogChunks([stderr], undefined, {
+    maxBytes: perStreamBytes,
+    stripAnsi: true,
+  }).data.toString('utf8');
+  const stdoutText = presentLogChunks([stdout], undefined, {
+    maxBytes: perStreamBytes,
+    stripAnsi: true,
+  }).data.toString('utf8');
+  const combined = `${stderrText}${stdoutText}`;
+  const selected = combined.split(/\r?\n/).slice(-lines).join('\n');
+  const bytes = Buffer.from(selected, 'utf8');
+  if (bytes.length <= DEFAULT_WAIT_TAIL_MAX_BYTES) return selected;
+  let suffix = bytes.subarray(bytes.length - DEFAULT_WAIT_TAIL_MAX_BYTES);
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  while (suffix.length > 0) {
+    try {
+      return decoder.decode(suffix);
+    } catch {
+      suffix = suffix.subarray(1);
+    }
+  }
+  return '';
 }
 
 export async function waitForJob(
   ctx: LocalRunnerContext,
   jobId: string,
   waitSeconds: number,
-  includeLogTailLines: number,
   options?: WaitForJobOptions,
 ): Promise<Record<string, unknown>> {
   const deadline = Date.now() + waitSeconds * 1000;
@@ -508,19 +569,11 @@ export async function waitForJob(
     job = getJob(ctx.db, jobId);
   }
 
-  const response: Record<string, unknown> = { job };
-  if (includeLogTailLines > 0 && job) {
-    const attempt = getLatestAttempt(ctx.db, jobId);
-    if (attempt) {
-      const logDir = attemptLogDir(ctx.dataDir, attempt.id);
-      response.log_tail = {
-        stdout: (await readLogTail(join(logDir, 'stdout.log'), includeLogTailLines)).lines,
-        stderr: (await readLogTail(join(logDir, 'stderr.log'), includeLogTailLines)).lines,
-        attempt_id: attempt.id,
-      };
-    }
+  const result: Record<string, unknown> = { job };
+  if (options?.includeLogTailLines && options.includeLogTailLines > 0) {
+    result.log_tail = await readJobWaitTail(ctx, jobId, options.includeLogTailLines);
   }
-  return response;
+  return result;
 }
 
 export async function handleJobCancel(

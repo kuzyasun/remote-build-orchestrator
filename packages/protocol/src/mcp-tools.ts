@@ -28,16 +28,15 @@ export const JOB_WAIT_INPUT = {
 
 export const JOB_LOGS_INPUT = {
   job_id: z.string().min(1),
-  // null means "current active attempt, or terminal attempt for a terminal job" (§23.5)
   attempt_id: z.string().nullable().default(null),
-  cursor: z.number().int().min(0).default(0),
+  cursor: z.string().max(512).nullable().default(null),
+  mode: z.enum(['logs', 'events']),
   max_bytes: z
     .number()
     .int()
-    .positive()
+    .min(4)
     .max(1024 * 1024)
     .default(65536),
-  streams: z.array(z.enum(['stdout', 'stderr', 'events'])).default(['stdout', 'stderr']),
 };
 
 export const JOB_CANCEL_INPUT = {
@@ -77,7 +76,13 @@ export const JOB_RUN_INPUT = {
   risk_level: JobRequestSchema.shape.risk_level,
   client_request_id: z.string().min(1).optional(),
   name: z.string().optional(),
-  include_log_tail_lines: z.number().int().min(0).max(1000).default(80),
+  log_cursor: z.string().max(512).nullable().default(null),
+  max_output_bytes: z
+    .number()
+    .int()
+    .min(4)
+    .max(1024 * 1024)
+    .default(16384),
 };
 
 export type McpToolName =

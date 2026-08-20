@@ -1,11 +1,18 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
+import { mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
-import { createZstdTarArchive, writeZstdTarArchiveFile } from '../src/archive.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  createZstdTarArchive,
+  decompressTarZstd,
+  parseTarArchive,
+  writeZstdTarArchiveCandidate,
+  writeZstdTarArchiveFile,
+} from '../src/archive.js';
 import { captureFullSnapshot } from '../src/capture.js';
 
 const execFileAsync = promisify(execFile);
@@ -17,6 +24,127 @@ describe('writeZstdTarArchiveFile memory hygiene', () => {
     while (cleanups.length > 0) {
       await cleanups.pop()?.();
     }
+  });
+
+  it('streams contentPath into a private candidate without creating the requested path', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rbo-archive-candidate-'));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+    const sourcePath = join(dir, 'source.bin');
+    const requestedPath = join(dir, 'snapshot.tar.zst');
+    const source = Buffer.alloc(8 * 1024 * 1024 + 17, 0x5a);
+    await writeFile(sourcePath, source);
+
+    const candidate = await writeZstdTarArchiveCandidate(requestedPath, [
+      { path: 'source.bin', mode: 0o644, type: 'file', contentPath: sourcePath },
+    ]);
+
+    expect(candidate.candidatePath).not.toBe(requestedPath);
+    expect(candidate.candidatePath).toContain('.candidate-');
+    await expect(readFile(requestedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(candidate.entries).toEqual([
+      expect.objectContaining({
+        path: 'source.bin',
+        size: source.length,
+        sha256: createHash('sha256').update(source).digest('hex'),
+      }),
+    ]);
+    const candidateTar = decompressTarZstd(await readFile(candidate.candidatePath));
+    const expectedTar = createZstdTarArchive([
+      { path: 'source.bin', mode: 0o644, type: 'file', content: source },
+    ]);
+    expect(candidateTar.equals(decompressTarZstd(expectedTar.data))).toBe(true);
+    const parsed = parseTarArchive(candidateTar);
+    expect(parsed[0]?.content.equals(source)).toBe(true);
+    await rm(candidate.candidatePath, { force: true });
+  });
+
+  it('cleans the private candidate when a contentPath cannot be opened', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rbo-archive-failure-'));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+    const requestedPath = join(dir, 'snapshot.tar.zst');
+
+    await expect(
+      writeZstdTarArchiveCandidate(requestedPath, [
+        { path: 'missing.bin', mode: 0o644, type: 'file', contentPath: join(dir, 'missing.bin') },
+      ]),
+    ).rejects.toThrow();
+    await expect(readFile(requestedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await readdir(dir)).filter((name) => name.includes('.candidate-'))).toEqual([]);
+  });
+
+  it('rejects a short/unreadable contentPath and cleans its candidate', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rbo-archive-mutation-'));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+    const sourcePath = join(dir, 'source-dir');
+    const requestedPath = join(dir, 'snapshot.tar.zst');
+    await mkdir(sourcePath);
+    await expect(
+      writeZstdTarArchiveCandidate(requestedPath, [
+        { path: 'source.bin', mode: 0o644, type: 'file', contentPath: sourcePath },
+      ]),
+    ).rejects.toThrow();
+    await expect(readFile(requestedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await readdir(dir)).filter((name) => name.includes('.candidate-'))).toEqual([]);
+  });
+
+  it('rejects a source mutation between the pre-read and post-read handle stats', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rbo-archive-mutation-'));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+    const sourcePath = join(dir, 'source.bin');
+    const requestedPath = join(dir, 'snapshot.tar.zst');
+    await writeFile(sourcePath, Buffer.alloc(1024 * 1024, 0x5a));
+
+    const probe = await open(sourcePath, 'r');
+    const fileHandlePrototype = Object.getPrototypeOf(probe) as typeof probe;
+    await probe.close();
+    const originalStat = fileHandlePrototype.stat;
+    const statSpy = vi.spyOn(fileHandlePrototype, 'stat').mockImplementationOnce(async function (
+      this: typeof probe,
+      options?: { bigint?: boolean },
+    ) {
+      const result = await originalStat.call(this, options);
+      writeFileSync(sourcePath, Buffer.from([0x51]), { flag: 'r+' });
+      return result;
+    });
+    try {
+      await expect(
+        writeZstdTarArchiveCandidate(requestedPath, [
+          { path: 'source.bin', mode: 0o644, type: 'file', contentPath: sourcePath },
+        ]),
+      ).rejects.toThrow(/changed while archiving/);
+    } finally {
+      statSpy.mockRestore();
+    }
+    await expect(readFile(requestedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await readdir(dir)).filter((name) => name.includes('.candidate-'))).toEqual([]);
+  });
+
+  it('reports an empty contentPath file and its empty-payload hash', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rbo-archive-empty-'));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+    const sourcePath = join(dir, 'empty.bin');
+    const requestedPath = join(dir, 'snapshot.tar.zst');
+    await writeFile(sourcePath, Buffer.alloc(0));
+    const candidate = await writeZstdTarArchiveCandidate(requestedPath, [
+      { path: 'empty.bin', mode: 0o644, type: 'file', contentPath: sourcePath },
+    ]);
+    expect(candidate.entries).toEqual([
+      { path: 'empty.bin', size: 0, sha256: createHash('sha256').update('').digest('hex') },
+    ]);
+    expect(parseTarArchive(decompressTarZstd(await readFile(candidate.candidatePath)))).toEqual([
+      expect.objectContaining({ path: 'empty.bin', type: 'file', content: Buffer.alloc(0) }),
+    ]);
+    await rm(candidate.candidatePath, { force: true });
   });
 
   it('writes archive to disk, returns no payload buffer, and hashes the on-disk bytes', async () => {

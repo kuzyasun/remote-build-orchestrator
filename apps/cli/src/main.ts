@@ -237,21 +237,42 @@ async function main(): Promise<void> {
         await followJobLogsRemote(controllerUrl, jobId);
         return;
       }
-      // Pull historical stdout/stderr as terminal text (not events JSON).
-      let cursor = 0;
+      // Pull historical stdout/stderr using the opaque, attempt-scoped MCP cursor.
+      let cursor: string | null = null;
       for (;;) {
         const result = await getJobLogsRemote(controllerUrl, jobId, {
-          streams: ['stdout', 'stderr'],
+          mode: 'logs',
           cursor,
           max_bytes: 65_536,
         });
-        const data = typeof result.data === 'string' ? result.data : '';
-        if (data.length > 0) {
-          process.stdout.write(data);
+        if (result.mode !== 'logs' || !Array.isArray(result.chunks)) {
+          throw new Error('Malformed job_logs response: expected mode=logs and chunks[]');
         }
-        const next = typeof result.next_cursor === 'number' ? result.next_cursor : cursor;
-        if (next <= cursor || data.length === 0) {
+        for (const chunk of result.chunks) {
+          if (
+            !chunk ||
+            typeof chunk !== 'object' ||
+            typeof (chunk as { sequence?: unknown }).sequence !== 'number' ||
+            ((chunk as { stream?: unknown }).stream !== 'stdout' &&
+              (chunk as { stream?: unknown }).stream !== 'stderr') ||
+            typeof (chunk as { text?: unknown }).text !== 'string' ||
+            typeof (chunk as { complete?: unknown }).complete !== 'boolean'
+          ) {
+            throw new Error('Malformed job_logs response: invalid log chunk');
+          }
+          const stream = (chunk as { stream: 'stdout' | 'stderr' }).stream;
+          const text = (chunk as { text: string }).text;
+          (stream === 'stderr' ? process.stderr : process.stdout).write(text);
+        }
+        const next = result.next_cursor;
+        if (next !== null && typeof next !== 'string') {
+          throw new Error('Malformed job_logs response: next_cursor must be string or null');
+        }
+        if (result.has_more !== true) {
           break;
+        }
+        if (next === cursor) {
+          throw new Error('job_logs made no cursor progress while has_more=true');
         }
         cursor = next;
       }

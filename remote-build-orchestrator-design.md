@@ -2090,8 +2090,8 @@ agent-data/logs/<attempt-id>/
 {
   "job_id": "job_01J...",
   "attempt_id": "att_01J...",
-  "cursor": 92812,
-  "next_cursor": 95331,
+  "cursor": null,
+  "next_cursor": "<opaque-attempt-mode-presentation-cursor>",
   "complete": false,
   "chunks": [
     {
@@ -2280,15 +2280,25 @@ Tool повертає terminal state або поточний state + tail.
 {
   "job_id": "job_01J...",
   "attempt_id": null,
-  "cursor": 0,
-  "max_bytes": 65536,
-  "streams": ["stdout", "stderr"]
+  "mode": "logs",
+  "cursor": null,
+  "max_bytes": 65536
 }
 ```
 
-Cursor завжди scoped до однієї `attempt_id`. `attempt_id=null` означає поточну
-active attempt, а для terminal job — terminal attempt. Result MUST повертати
-resolved `attempt_id`. Cursor однієї attempt не приймається для іншої.
+`mode` MUST be either `logs` or `events`; the two result shapes are separate and
+must not be mixed. `logs` returns `chunks` with `{sequence, stream, text,
+complete}`, while `events` returns an `events` array. `cursor` is an opaque
+string or `null`; clients MUST return `next_cursor` unchanged on the next call.
+It is attempt-, mode-, Controller-identity-, and presentation-profile-scoped;
+numeric cursors and the legacy `streams` field are invalid. `max_bytes` is
+bounded by the server (default 65536, minimum 4).
+
+`attempt_id=null` means the current active attempt, or the terminal attempt for
+a terminal job. The result MUST return the resolved `attempt_id`. A cursor for
+another job, attempt, mode, identity, or profile MUST be rejected with a
+structured validation error. When no more data is available, `has_more` is
+false and `next_cursor` may remain `null` (or repeat the supplied cursor).
 
 ### 23.6. `job_cancel`
 

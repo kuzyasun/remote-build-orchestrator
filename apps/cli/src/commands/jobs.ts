@@ -49,18 +49,17 @@ export function getJobLogsRemote(
   jobId: string,
   options?: {
     attempt_id?: string;
-    streams?: Array<'stdout' | 'stderr' | 'events'>;
+    mode?: 'logs' | 'events';
     max_bytes?: number;
-    cursor?: number;
+    cursor?: string | null;
   },
 ): Promise<Record<string, unknown>> {
   return postTool(baseUrl, 'job_logs', {
     job_id: jobId,
     attempt_id: options?.attempt_id ?? null,
-    // Default stdout/stderr only — including events switches the response shape.
-    streams: options?.streams ?? ['stdout', 'stderr'],
+    mode: options?.mode ?? 'logs',
     max_bytes: options?.max_bytes ?? 65_536,
-    cursor: options?.cursor ?? 0,
+    cursor: options?.cursor ?? null,
   });
 }
 

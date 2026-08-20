@@ -18,6 +18,22 @@ The primary release path is `.github/workflows/publish-npm.yml`. Publishing a no
 GitHub Release runs verification and builds on a GitHub-hosted Windows runner, then publishes both
 packages through npm Trusted Publishing. No long-lived npm write token is stored in GitHub.
 
+The source-verification path is separate from publishing: `.github/workflows/source-verification.yml`
+runs on pull requests and pushes to `master` on both `ubuntu-latest` and `windows-latest`. Each job
+uses the repository Node version from `.nvmrc`, installs pnpm 10.5.2, runs
+`pnpm install --frozen-lockfile`, and executes `pnpm build` followed by `pnpm verify`. The Windows
+job then runs `pnpm package:verify` against the checked-in packaging manifests; it does not regenerate
+or publish manifests. Superseded runs for the same branch or pull request are cancelled.
+
+This fast workflow intentionally skips Docker, QEMU, and large-log tests that require a separately
+provisioned environment. Those checks remain external, environment-gated evidence and must not be
+reported as covered by the hosted source-verification jobs.
+
+After confirming the workflow on a test pull request, a repository operator should configure branch
+protection or rulesets to require the appropriate `Source verification (Linux)` and
+`Source verification (Windows)` checks. GitHub settings are an operator action; this repository
+workflow does not change them.
+
 ---
 
 ## Quick release
