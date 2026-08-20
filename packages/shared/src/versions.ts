@@ -12,4 +12,4 @@ export const RBO_WIRE_PROTOCOL_MAX_VERSION = 1;
  * apps/controller/test asserts `MIGRATIONS.length === RBO_CONTROLLER_SCHEMA_VERSION` so the two
  * never silently drift.
  */
-export const RBO_CONTROLLER_SCHEMA_VERSION = 4;
+export const RBO_CONTROLLER_SCHEMA_VERSION = 5;

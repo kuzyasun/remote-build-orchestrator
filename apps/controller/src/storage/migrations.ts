@@ -194,4 +194,28 @@ ALTER TABLE agents ADD COLUMN last_boot_id TEXT;
 -- SQLite cannot DROP COLUMN portably in all versions used here; no-op downgrade.
 `,
   },
+  {
+    version: 5,
+    name: 'capture-owner-leases',
+    up: `
+CREATE TABLE snapshot_capture_leases (
+  client_id TEXT NOT NULL,
+  client_request_id TEXT NOT NULL,
+  owner_token TEXT NOT NULL,
+  fencing_generation INTEGER NOT NULL CHECK (fencing_generation > 0),
+  lease_expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (client_id, client_request_id),
+  FOREIGN KEY (client_id, client_request_id)
+    REFERENCES job_submissions(client_id, client_request_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_snapshot_capture_leases_expires_at ON snapshot_capture_leases(lease_expires_at);
+`,
+    down: `
+DROP INDEX IF EXISTS idx_snapshot_capture_leases_expires_at;
+DROP TABLE IF EXISTS snapshot_capture_leases;
+`,
+  },
 ];
