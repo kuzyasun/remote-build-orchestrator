@@ -33,6 +33,10 @@ import {
   registerArtifactExpectations,
 } from '../http/data-plane.js';
 import {
+  assertJobLifecycleWriteAllowed,
+  notifyJobLifecycleChanged,
+} from '../jobs/lifecycle-notifier.js';
+import {
   bumpLeaseEpoch,
   createJobEvent,
   getJob,
@@ -870,6 +874,7 @@ export function handleRemoteLeaseReject(
     return;
   }
 
+  assertJobLifecycleWriteAllowed(opts.db);
   opts.db
     .prepare(
       `UPDATE jobs
@@ -883,6 +888,7 @@ export function handleRemoteLeaseReject(
        WHERE id = ?`,
     )
     .run(nowIso(), nowIso(), attempt.job_id);
+  notifyJobLifecycleChanged(opts.db, attempt.job_id);
 }
 
 /**
@@ -1101,6 +1107,7 @@ export function handleRemoteJobExit(
     outcome: payload.outcome,
   });
   updateAttempt(opts.db, attempt.id, { orphaned_at: null });
+  assertJobLifecycleWriteAllowed(opts.db);
   opts.db
     .prepare(
       `UPDATE jobs SET exit_code = ?, failure_category = ?, failure_message = ?, updated_at = ?
@@ -1113,6 +1120,7 @@ export function handleRemoteJobExit(
       nowIso(),
       attempt.job_id,
     );
+  notifyJobLifecycleChanged(opts.db, attempt.job_id);
   transitionJobState(opts.db, attempt.job_id, 'collecting_artifacts');
 }
 

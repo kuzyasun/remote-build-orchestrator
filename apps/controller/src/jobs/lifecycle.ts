@@ -3,6 +3,7 @@ import { JobEventSchema } from '@rbo/protocol';
 import { generateId } from '@rbo/shared';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
+import { assertJobLifecycleWriteAllowed, notifyJobLifecycleChanged } from './lifecycle-notifier.js';
 
 export interface JobRow {
   id: string;
@@ -132,6 +133,7 @@ export function transitionJobState(
     result_json: string;
   }> = {},
 ): JobRow {
+  assertJobLifecycleWriteAllowed(db);
   const sets = ['state = ?', 'updated_at = ?'];
   const values: unknown[] = [state, nowIso()];
   for (const [key, value] of Object.entries(fields)) {
@@ -144,6 +146,7 @@ export function transitionJobState(
   if (!row) {
     throw new Error(`Job not found after transition: ${jobId}`);
   }
+  notifyJobLifecycleChanged(db, jobId);
   return row;
 }
 

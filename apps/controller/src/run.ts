@@ -6,6 +6,11 @@ import {
 } from '@rbo/shared';
 import { type ControllerConfig, ensureDataDir, loadControllerConfig } from './config.js';
 import { startControllerServer } from './http/server.js';
+import {
+  JobLifecycleNotifier,
+  bindJobLifecycleNotifier,
+  unbindJobLifecycleNotifier,
+} from './jobs/lifecycle-notifier.js';
 import { migrateToLatest, openDatabase } from './storage/database.js';
 import { startAgentPlaneServer } from './websocket/server.js';
 
@@ -24,6 +29,8 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
 
   const db = openDatabase(config.databasePath);
   migrateToLatest(db);
+  const lifecycleNotifier = new JobLifecycleNotifier();
+  bindJobLifecycleNotifier(db, lifecycleNotifier);
 
   const identity = await ensureControllerIdentity(config.dataDir);
 
@@ -89,6 +96,8 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     hostCpuMonitor.stop();
     await httpServer.close();
     await agentPlane.close();
+    unbindJobLifecycleNotifier(db);
+    lifecycleNotifier.close();
     db.close();
     process.exit(0);
   };
