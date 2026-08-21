@@ -85,6 +85,11 @@ export interface ExpectedBuildCacheKey {
 export interface SchedulerOptions {
   allowLocalFallback?: boolean;
   /**
+   * Controller-local execution contract. Omit only for direct scheduler/programmatic callers
+   * that need the historical fallback behavior; production dispatch always supplies it.
+   */
+  localHostExecution?: LocalHostExecutionCapability;
+  /**
    * Canonical repository id for the job (normalized). When set with
    * prefer_repo_cache, agents advertising a matching repository_cache entry
    * receive the §19.2 repository_cache_hit bonus (+500).
@@ -128,6 +133,12 @@ export interface HostLoadSnapshot {
   capacityScore: number;
   /** Currently-running local-fallback jobs on this Controller's own host. */
   runningJobs: number;
+}
+
+/** Conservative built-in shell set for the Controller host; optional shells are never assumed. */
+export interface LocalHostExecutionCapability {
+  os: 'windows' | 'linux' | 'macos';
+  shells: readonly JobRequest['execution']['shell'][];
 }
 
 export interface LocalFallbackDecisionInput {
@@ -292,6 +303,17 @@ function agentHasRequiredShell(agent: SchedulerAgent, requiredShell: string): bo
 function agentIsAtCapacity(agent: SchedulerAgent): boolean {
   const capacity = agent.capabilities.execution.max_jobs;
   return capacity <= 0 || agent.activeJobsCount >= capacity;
+}
+
+function localHostCanExecute(
+  request: JobRequest,
+  localHost: LocalHostExecutionCapability,
+): boolean {
+  if (!matchesOs(request.requirements?.os, localHost.os)) {
+    return false;
+  }
+  const requiredShell = normalizedShell(request.execution.shell ?? 'bash');
+  return localHost.shells.some((shell) => normalizedShell(shell) === requiredShell);
 }
 
 /**
@@ -865,6 +887,12 @@ export function selectAgentForJob(
   const riskLevel = request.risk_level ?? 'normal';
   const allowLocalFallback =
     (prefs.allow_local_fallback ?? true) && (options.allowLocalFallback ?? true);
+
+  // Production injects a conservative host capability. Preserve the historical pure-scheduler
+  // behavior when it is omitted, but never run an explicit incompatible shell/OS locally.
+  if (options.localHostExecution && !localHostCanExecute(request, options.localHostExecution)) {
+    return { action: 'fail_fast', reason: 'no_eligible_agent', noMatchDiagnostic };
+  }
 
   if (options.hostLoad) {
     const decision = decideLocalFallback({

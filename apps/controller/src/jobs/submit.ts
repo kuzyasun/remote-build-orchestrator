@@ -31,6 +31,7 @@ import {
 } from '../execution/runner.js';
 import {
   type HostLoadSnapshot,
+  type LocalHostExecutionCapability,
   type SchedulerAgent,
   getActiveJobsForAgents,
   getRecentFailurePenaltiesForAgents,
@@ -67,6 +68,21 @@ const CONFIRMATION_TTL_SECONDS = 300;
 const DEFAULT_WAIT_TAIL_MAX_BYTES = 16 * 1024;
 const WAIT_FALLBACK_INTERVAL_MS = 1_000;
 const CAPTURE_LEASE_RENEW_INTERVAL_MS = 10_000;
+
+function localHostExecutionCapability(
+  platform: NodeJS.Platform = process.platform,
+): LocalHostExecutionCapability | undefined {
+  switch (platform) {
+    case 'win32':
+      return { os: 'windows', shells: ['powershell', 'cmd', 'direct'] };
+    case 'linux':
+      return { os: 'linux', shells: ['bash', 'sh', 'direct'] };
+    case 'darwin':
+      return { os: 'macos', shells: ['bash', 'sh', 'direct'] };
+    default:
+      return undefined;
+  }
+}
 
 /**
  * Deterministic fault boundaries for the S-03 publication tests. These hooks
@@ -494,6 +510,7 @@ export async function dispatchJobExecution(
     estimatedTransferBytes: snapshotMeta?.size_bytes ?? null,
     recentFailurePenalties,
     registeredAgentCount: dbAgents.length,
+    localHostExecution: localHostExecutionCapability(),
     hostLoad,
     maxHostCpuBusyFraction: ctx.maxHostCpuBusyFraction,
   });

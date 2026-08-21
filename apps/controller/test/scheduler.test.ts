@@ -1,6 +1,7 @@
 import type { AgentCapabilityReport, JobRequest } from '@rbo/protocol';
 import { describe, expect, it } from 'vitest';
 import {
+  type LocalHostExecutionCapability,
   SCHEDULER_SCORE_BUILD_CACHE_HIT,
   SCHEDULER_SCORE_CONFIGURED_PRIORITY_MULTIPLIER,
   SCHEDULER_SCORE_CPU_LOAD_PENALTY,
@@ -62,6 +63,15 @@ function makeRequest(overrides: Partial<JobRequest> = {}): JobRequest {
     ...overrides,
   };
 }
+
+const WINDOWS_LOCAL_HOST: LocalHostExecutionCapability = {
+  os: 'windows',
+  shells: ['powershell', 'cmd', 'direct'],
+};
+const LINUX_LOCAL_HOST: LocalHostExecutionCapability = {
+  os: 'linux',
+  shells: ['bash', 'sh', 'direct'],
+};
 
 describe('Scheduler Engine (§19.2)', () => {
   it('selects candidate matching OS, Arch, and capabilities', () => {
@@ -251,6 +261,72 @@ describe('Scheduler Engine (§19.2)', () => {
     expect(selectAgentForJob([], reqFallback, { allowLocalFallback: false }).action).toBe(
       'fail_fast',
     );
+  });
+
+  it.each([
+    [
+      'Windows Controller with an explicit bash/Linux request',
+      WINDOWS_LOCAL_HOST,
+      { shell: 'bash' as const, script: 'echo test' },
+      ['linux'],
+    ],
+    [
+      'Linux Controller with an explicit PowerShell/Windows request',
+      LINUX_LOCAL_HOST,
+      { shell: 'powershell' as const, script: 'Write-Output test' },
+      ['windows'],
+    ],
+    [
+      'Windows Controller direct execution targeting Linux',
+      WINDOWS_LOCAL_HOST,
+      { shell: 'direct' as const, script: './build' },
+      ['linux'],
+    ],
+  ])('fails local_fallback for %s', (_label, localHostExecution, execution, os) => {
+    const decision = selectAgentForJob(
+      [],
+      makeRequest({
+        execution,
+        requirements: { os },
+        queue_policy: 'local_fallback',
+      }),
+      { allowLocalFallback: true, localHostExecution },
+    );
+
+    expect(decision.action).toBe('fail_fast');
+    expect(decision.noMatchDiagnostic).toMatchObject({
+      category: 'no_matching_agent',
+      required_shell: execution.shell,
+      target_os: os,
+    });
+  });
+
+  it.each([
+    [
+      WINDOWS_LOCAL_HOST,
+      { shell: 'powershell' as const, script: 'Write-Output test' },
+      ['windows'],
+    ],
+    [LINUX_LOCAL_HOST, { shell: 'bash' as const, script: 'echo test' }, ['linux']],
+    [WINDOWS_LOCAL_HOST, { shell: 'direct' as const, script: 'build.cmd' }, ['windows']],
+  ])('allows matching native local execution', (localHostExecution, execution, os) => {
+    expect(
+      selectAgentForJob(
+        [],
+        makeRequest({ execution, requirements: { os }, queue_policy: 'local_fallback' }),
+        { allowLocalFallback: true, localHostExecution },
+      ),
+    ).toEqual({ action: 'local_fallback' });
+  });
+
+  it('allows the omitted shell default when it matches the injected Linux host', () => {
+    expect(
+      selectAgentForJob(
+        [],
+        makeRequest({ requirements: { os: ['linux'] }, queue_policy: 'local_fallback' }),
+        { allowLocalFallback: true, localHostExecution: LINUX_LOCAL_HOST },
+      ),
+    ).toEqual({ action: 'local_fallback' });
   });
 
   it('returns a bounded, request-scoped diagnostic for an explicit shell and OS conflict', () => {

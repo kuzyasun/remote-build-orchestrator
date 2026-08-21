@@ -126,4 +126,55 @@ describe('allowLocalFallback config (§2.3)', () => {
     });
     db.close();
   });
+
+  it('dispatchJobExecution rejects a shell and target OS incompatible with the Controller host', async () => {
+    const db = openDatabase(':memory:');
+    migrateToLatest(db);
+
+    const controllerIsWindows = process.platform === 'win32';
+    const request = makeRequest({
+      execution: controllerIsWindows
+        ? { shell: 'bash', script: 'echo test' }
+        : { shell: 'powershell', script: 'Write-Output test' },
+      requirements: { os: [controllerIsWindows ? 'linux' : 'windows'] },
+      queue_policy: 'local_fallback',
+    });
+    const job = createJob(db, {
+      clientId: 'client',
+      clientRequestId: request.client_request_id,
+      request,
+      initialState: 'queued',
+    });
+    const keys = generateDeviceKeyPair();
+    const identity: ControllerIdentity = {
+      controllerId: 'controller_host_capability_test',
+      tlsCertPem: '',
+      tlsKeyPem: '',
+      signingPublicKeyPem: keys.publicKeyPem,
+      signingPrivateKeyPem: keys.privateKeyPem,
+      fingerprint: 'sha256:test',
+    };
+
+    await dispatchJobExecution(
+      {
+        clientId: 'client',
+        controllerIdentity: identity,
+        db,
+        dataDir: '/tmp/rbo-host-capability',
+        allowedProjectRoots: ['/tmp'],
+        allowedArtifactDestinations: [],
+        allowLocalFallback: true,
+      },
+      job.id,
+      request,
+    );
+
+    expect(getJob(db, job.id)).toMatchObject({
+      state: 'completed',
+      outcome: 'failed',
+      failure_category: 'no_matching_agent',
+    });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM job_attempts').get()).toEqual({ count: 0 });
+    db.close();
+  });
 });
