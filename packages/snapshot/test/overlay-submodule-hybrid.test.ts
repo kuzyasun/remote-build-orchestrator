@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
+import { decompressTarZstd, parseTarArchive } from '../src/archive.js';
 import { captureFullSnapshot, captureGitOverlaySnapshot } from '../src/capture.ts';
 
 const execFileAsync = promisify(execFile);
@@ -124,10 +125,12 @@ describe('git_overlay hybrid submodule capture (Approach A)', () => {
       expect(dirtyFileEntry).toBeDefined();
       expect(dirtyFileEntry?.type).toBe('file');
 
-      const packedContent = await readFile(
-        join(storage, result.instance.snapshot_id, 'overlay-staging', 'vendor/lib/hello.txt'),
-      );
-      expect(packedContent.toString()).toBe('dirty-content-update');
+      const archiveEntries = parseTarArchive(decompressTarZstd(await readFile(result.archivePath)));
+      expect(
+        archiveEntries
+          .find((candidate) => candidate.path === 'vendor/lib/hello.txt')
+          ?.content.toString(),
+      ).toBe('dirty-content-update');
     } finally {
       await fixture.cleanup();
       await rm(storage, { recursive: true, force: true });

@@ -1,5 +1,8 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parsePorcelainV2 } from '../src/git-status.js';
+import { gitStatusPorcelainV2, parsePorcelainV2 } from '../src/git-status.js';
 
 describe('git-status porcelain v2 parser', () => {
   it('parses tracked modified entry (v2 line 1)', () => {
@@ -51,5 +54,14 @@ describe('git-status porcelain v2 parser', () => {
     const output = '? файл_тест.txt\0? dir/with\nnewline\0';
     const entries = parsePorcelainV2(output);
     expect(entries.map((e) => e.path)).toEqual(['файл_тест.txt', 'dir/with\nnewline']);
+  });
+
+  it('reports a git failure when binary status output has buffered stderr', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rbo-git-status-non-repo-'));
+    try {
+      await expect(gitStatusPorcelainV2(dir)).rejects.toThrow(/not a git repository/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
+import { decompressTarZstd, parseTarArchive } from '../src/archive.js';
 import { captureFullSnapshot, captureGitOverlaySnapshot } from '../src/capture.js';
 import {
   assertLfsContentMaterialized,
@@ -114,10 +115,12 @@ describe('capture submodule policy (§11.14)', () => {
       expect(result.gitSourceRequirements.submodules).toBe(true);
       const entry = result.manifest.source.files.find((f) => f.path === 'vendor/lib/hello.txt');
       expect(entry?.type).toBe('file');
-      const bytes = await readFile(
-        join(storage, result.instance.snapshot_id, 'vendor/lib/hello.txt'),
-      );
-      expect(bytes.toString()).toBe('sub-content');
+      const archiveEntries = parseTarArchive(decompressTarZstd(await readFile(result.archivePath)));
+      expect(
+        archiveEntries
+          .find((candidate) => candidate.path === 'vendor/lib/hello.txt')
+          ?.content.toString(),
+      ).toBe('sub-content');
     } finally {
       await fixture.cleanup();
       await rm(storage, { recursive: true, force: true });
