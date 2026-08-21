@@ -68,7 +68,11 @@ export const JOB_RUN_INPUT = {
   project_root: z.string().min(1).optional(),
   job_id: z.string().min(1).optional(),
   shell: ShellIdSchema.optional(),
-  target_os: z.array(z.enum(['macos', 'windows', 'linux'])).min(1).optional(),
+  target_os: z
+    .array(z.enum(['macos', 'windows', 'linux']))
+    .min(1)
+    .optional(),
+  queue_policy: JobRequestSchema.shape.queue_policy,
   cwd: z.string().default('.'),
   timeout_seconds: z.number().positive().max(3600).default(3600),
   wait_seconds: z.number().int().min(0).max(3600).optional(),

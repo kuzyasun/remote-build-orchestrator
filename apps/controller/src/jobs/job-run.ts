@@ -1,6 +1,12 @@
 import { join } from 'node:path';
 import { presentLogChunks, readChunkIndexTail } from '@rbo/executor';
-import type { ArtifactRule, ExecutionConfig, JobRequest, RiskLevel } from '@rbo/protocol';
+import type {
+  ArtifactRule,
+  ExecutionConfig,
+  JobRequest,
+  QueuePolicy,
+  RiskLevel,
+} from '@rbo/protocol';
 import { JobRequestSchema } from '@rbo/protocol';
 import { RboError, generateId } from '@rbo/shared';
 import { attemptLogDir } from '../execution/runner.js';
@@ -36,6 +42,7 @@ export interface JobRunInput {
   job_id?: string;
   shell?: ShellId;
   target_os?: Array<'macos' | 'windows' | 'linux'>;
+  queue_policy?: QueuePolicy;
   cwd?: string;
   timeout_seconds?: number;
   wait_seconds?: number;
@@ -92,9 +99,7 @@ export function wrapCommandAsExecution(
       return {
         shell,
         script:
-          platform === 'win32'
-            ? cmdScript
-            : `#!/usr/bin/env bash\nset -euo pipefail\n${command}\n`,
+          platform === 'win32' ? cmdScript : `#!/usr/bin/env bash\nset -euo pipefail\n${command}\n`,
         timeout_seconds: timeoutSeconds,
       };
   }
@@ -128,7 +133,9 @@ export function buildJobRunRequest(
     input.shell === 'direct' &&
     (input.target_os?.length !== 1 || !CANONICAL_TARGET_OS.has(input.target_os[0]))
   ) {
-    throw RboError.validation('job_run shell=direct requires exactly one canonical target_os value');
+    throw RboError.validation(
+      'job_run shell=direct requires exactly one canonical target_os value',
+    );
   }
   const timeoutSeconds = input.timeout_seconds ?? 3600;
   return JobRequestSchema.parse({
@@ -145,6 +152,7 @@ export function buildJobRunRequest(
       input.shell,
     ),
     requirements: input.target_os ? { os: input.target_os } : undefined,
+    queue_policy: input.queue_policy,
     risk_level: input.risk_level ?? 'normal',
     artifacts: input.artifacts ?? [],
   });

@@ -150,6 +150,34 @@ describe('buildJobRunRequest', () => {
     expect(request.requirements).toEqual({ os: ['windows'] });
   });
 
+  it.each(['local_fallback', 'wait', 'fail_fast'] as const)(
+    'maps explicit queue_policy=%s into the canonical request',
+    (queue_policy) => {
+      const request = buildJobRunRequest(
+        {
+          command: 'echo policy',
+          project_root: '/tmp/app',
+          queue_policy,
+        },
+        'linux',
+      );
+
+      expect(request.queue_policy).toBe(queue_policy);
+    },
+  );
+
+  it('leaves an omitted queue_policy undefined for Controller default normalization', () => {
+    const request = buildJobRunRequest(
+      {
+        command: 'echo default policy',
+        project_root: '/tmp/app',
+      },
+      'linux',
+    );
+
+    expect(request.queue_policy).toBeUndefined();
+  });
+
   it('uses a single explicit target OS to wrap legacy direct scripts safely', () => {
     const windowsRequest = buildJobRunRequest(
       {
@@ -216,6 +244,22 @@ describe('JOB_RUN_INPUT validation', () => {
     expect(schema.safeParse({ ...base, shell: 'fish' }).success).toBe(false);
     expect(schema.safeParse({ ...base, target_os: ['freebsd'] }).success).toBe(false);
     expect(schema.safeParse({ ...base, target_os: [] }).success).toBe(false);
+  });
+
+  it.each(['local_fallback', 'wait', 'fail_fast'] as const)(
+    'accepts canonical queue_policy=%s',
+    (queue_policy) => {
+      expect(
+        schema.safeParse({ command: 'echo 1', project_root: 'foo', queue_policy }).success,
+      ).toBe(true);
+    },
+  );
+
+  it('rejects a non-canonical queue_policy', () => {
+    expect(
+      schema.safeParse({ command: 'echo 1', project_root: 'foo', queue_policy: 'queue_forever' })
+        .success,
+    ).toBe(false);
   });
 });
 

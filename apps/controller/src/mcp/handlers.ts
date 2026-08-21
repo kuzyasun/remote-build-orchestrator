@@ -1,7 +1,7 @@
 import { createReadStream } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import type { ArtifactRule, McpToolName, RiskLevel } from '@rbo/protocol';
+import type { ArtifactRule, McpToolName, QueuePolicy, RiskLevel } from '@rbo/protocol';
 import { getMcpToolDef, parseJobEventLine } from '@rbo/protocol';
 import type { ControllerIdentity, GitUrlAllowlist, StructuredErrorDetails } from '@rbo/shared';
 import { RboError } from '@rbo/shared';
@@ -180,6 +180,7 @@ export async function handleToolCall(
           job_id: args.job_id as string | undefined,
           shell: args.shell as JobRunInput['shell'],
           target_os: args.target_os as JobRunInput['target_os'],
+          queue_policy: args.queue_policy as QueuePolicy | undefined,
           cwd: args.cwd as string | undefined,
           timeout_seconds: args.timeout_seconds as number | undefined,
           wait_seconds: args.wait_seconds as number | undefined,
