@@ -79,6 +79,8 @@ export interface RemoteExecutionOptions {
   /** Full base URL override (e.g. https://192.168.1.10:7411). Wins over host+port. */
   dataPlaneBaseUrl?: string;
   allowedProjectRoots?: string[];
+  /** Metadata-admission limits for on-demand full snapshot transfer fallback (§4.3). */
+  snapshotCaptureLimits?: import('@rbo/snapshot').SnapshotCaptureLimits;
   /** Max git bundle bytes; defaults to DEFAULT_MAX_GIT_BUNDLE_BYTES. */
   maxGitBundleBytes?: number;
   /**
@@ -359,6 +361,7 @@ async function ensureFullFallbackArchive(
     },
     additionalRoots: request.source.additional_roots,
     contentStorageDir: transferDir,
+    limits: opts.snapshotCaptureLimits,
   });
   try {
     await copyFile(captured.archivePath, archivePath);

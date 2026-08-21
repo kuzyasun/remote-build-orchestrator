@@ -20,6 +20,7 @@ import {
 } from '@rbo/shared';
 import {
   type GitSourceRequirements,
+  type SnapshotCaptureLimits,
   captureFullSnapshot,
   captureGitOverlaySnapshot,
   gitFindRoot,
@@ -76,6 +77,8 @@ export interface LocalRunnerContext {
    * instead of silently transferring the entire repository.
    */
   allowFullSnapshotFallback?: boolean;
+  /** Controller metadata-admission limits for temporary snapshot capture (§4.3). */
+  snapshotCaptureLimits?: SnapshotCaptureLimits;
 }
 
 const activeCancels = new Map<string, () => Promise<void>>();
@@ -677,6 +680,7 @@ export async function captureAndPersistSnapshot(
         additionalRoots: normalizedRequest.source.additional_roots,
         contentStorageDir: storageDir,
         fencingGeneration,
+        limits: ctx.snapshotCaptureLimits,
         ...(overlayRemoteUrl ? { repoUrl: overlayRemoteUrl } : {}),
       })
     : await captureFullSnapshot({
@@ -687,6 +691,7 @@ export async function captureAndPersistSnapshot(
         additionalRoots: normalizedRequest.source.additional_roots,
         contentStorageDir: storageDir,
         fencingGeneration,
+        limits: ctx.snapshotCaptureLimits,
       });
 
   const candidateMatch = captured.archivePath.match(

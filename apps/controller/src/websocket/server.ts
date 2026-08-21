@@ -53,6 +53,7 @@ export interface AgentPlaneDispatchContext {
   allowedArtifactDestinations?: string[];
   maxConcurrentJobs?: number;
   gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
+  snapshotCaptureLimits?: import('@rbo/snapshot').SnapshotCaptureLimits;
   allowLocalFallback?: boolean;
   /** Controller-level queue policy used when a job does not set one explicitly. */
   defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
@@ -159,6 +160,7 @@ export async function startAgentPlaneServer(
     controllerPublicHost: options.controllerPublicHost,
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
     allowedProjectRoots: options.dispatchContext?.allowedProjectRoots,
+    snapshotCaptureLimits: options.dispatchContext?.snapshotCaptureLimits,
     maxGitBundleBytes: options.maxGitBundleBytes,
     defaultQueuePolicy: options.dispatchContext?.defaultQueuePolicy,
   });
@@ -177,6 +179,7 @@ export async function startAgentPlaneServer(
         [],
       maxConcurrentJobs: options.dispatchContext.maxConcurrentJobs ?? 1,
       gitAllowlist: options.dispatchContext.gitAllowlist,
+      snapshotCaptureLimits: options.dispatchContext.snapshotCaptureLimits,
       clientId: 'agent-plane-dispatcher',
       controllerIdentity: identity,
       connectedAgents,

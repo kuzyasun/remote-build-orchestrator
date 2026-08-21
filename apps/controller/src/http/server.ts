@@ -44,6 +44,8 @@ export interface ControllerServerOptions {
   allowLocalFallback?: boolean;
   /** Opt in to full working-tree snapshot when overlay capture is impossible. Default false. */
   allowFullSnapshotFallback?: boolean;
+  /** Metadata-admission limits for Controller snapshot capture (§4.3). */
+  snapshotCaptureLimits?: import('@rbo/snapshot').SnapshotCaptureLimits;
   /** Controller-level queue policy used when a job does not set one explicitly. */
   defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
   /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
@@ -108,6 +110,7 @@ function buildToolContext(
     gitAllowlist: options.gitAllowlist,
     allowLocalFallback: options.allowLocalFallback,
     allowFullSnapshotFallback: options.allowFullSnapshotFallback,
+    snapshotCaptureLimits: options.snapshotCaptureLimits,
     defaultQueuePolicy: options.defaultQueuePolicy,
     getHostCpuBusyFraction: options.getHostCpuBusyFraction,
     maxHostCpuBusyFraction: options.maxHostCpuBusyFraction,

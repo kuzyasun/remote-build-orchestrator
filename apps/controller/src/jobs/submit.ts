@@ -507,6 +507,7 @@ export async function dispatchJobExecution(
         serverPort: ctx.agentPlanePort,
         controllerPublicHost: ctx.controllerPublicHost,
         dataPlaneBaseUrl: ctx.dataPlaneBaseUrl,
+        snapshotCaptureLimits: ctx.snapshotCaptureLimits,
       },
       jobId,
       decision.selectedAgent.agentId,

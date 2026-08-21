@@ -58,6 +58,25 @@ export interface SourcePolicyInput {
   secret_policy: 'block' | 'warn' | 'allow';
 }
 
+/**
+ * Controller-provided, capture-local resource limits. These are deliberately
+ * not part of the snapshot manifest or wire protocol: they govern admission
+ * on the Controller that is about to create temporary capture artifacts.
+ */
+export interface SnapshotCaptureLimits {
+  maxTotalSourceBytes: number;
+  maxRegularFileCount: number;
+  maxSingleFileBytes: number;
+  maxTemporarySnapshotBytes: number;
+}
+
+const CAPTURE_LIMIT_CONFIG_KEYS: Record<keyof SnapshotCaptureLimits, string> = {
+  maxTotalSourceBytes: 'max_snapshot_source_bytes',
+  maxRegularFileCount: 'max_snapshot_file_count',
+  maxSingleFileBytes: 'max_snapshot_single_file_bytes',
+  maxTemporarySnapshotBytes: 'max_snapshot_temporary_bytes',
+};
+
 export interface CaptureFullSnapshotInput {
   projectRoot: string;
   allowedProjectRoots: string[];
@@ -68,6 +87,8 @@ export interface CaptureFullSnapshotInput {
   mainMount?: string;
   /** Optional controller fencing generation embedded in a private archive candidate name. */
   fencingGeneration?: number;
+  /** Controller capture limits, checked from metadata before compression. */
+  limits?: SnapshotCaptureLimits;
 }
 
 export interface CapturedFile {
@@ -104,6 +125,101 @@ function countRetainedContentBytes(files: CapturedFile[]): number {
     }
   }
   return total;
+}
+
+function assertCaptureLimit(
+  limitKey: keyof SnapshotCaptureLimits,
+  actual: number,
+  limit: number,
+  remediation: string,
+): void {
+  if (actual <= limit) return;
+  const configKey = CAPTURE_LIMIT_CONFIG_KEYS[limitKey];
+  throw new RboError(
+    'validation',
+    `Snapshot capture exceeds ${configKey}: actual ${actual} exceeds configured limit ${limit}. ${remediation}`,
+    false,
+    { limit_key: configKey, actual, limit, remediation },
+  );
+}
+
+/** Check discovered file metadata before the archive writer opens any file. */
+function assertSourceCaptureLimits(
+  files: CapturedFile[],
+  limits: SnapshotCaptureLimits | undefined,
+): void {
+  if (!limits) return;
+  const regularFiles = files.filter(
+    (file): file is CapturedFile & { entry: Extract<SnapshotFileEntry, { type: 'file' }> } =>
+      file.entry.type === 'file',
+  );
+  assertCaptureLimit(
+    'maxRegularFileCount',
+    regularFiles.length,
+    limits.maxRegularFileCount,
+    'Reduce the capture scope or raise "max_snapshot_file_count" in controller.json.',
+  );
+  let totalSourceBytes = 0;
+  for (const file of regularFiles) {
+    assertCaptureLimit(
+      'maxSingleFileBytes',
+      file.entry.size,
+      limits.maxSingleFileBytes,
+      `Exclude or split '${file.entry.path}', or explicitly raise "max_snapshot_single_file_bytes" in controller.json.`,
+    );
+    totalSourceBytes += file.entry.size;
+  }
+  assertCaptureLimit(
+    'maxTotalSourceBytes',
+    totalSourceBytes,
+    limits.maxTotalSourceBytes,
+    'Reduce the capture scope (including additional roots) or raise "max_snapshot_source_bytes" in controller.json.',
+  );
+}
+
+/**
+ * Exact uncompressed ustar byte count for the pending entries. This is a
+ * conservative, metadata-only admission estimate for the Controller's
+ * temporary snapshot budget; it avoids starting zstd when the candidate could
+ * not fit the configured working budget.
+ */
+function estimateTemporarySnapshotBytes(
+  files: CapturedFile[],
+  emptyDirectoryCount: number,
+): number {
+  const tarEntryBytes = files.reduce((total, file) => {
+    const contentBytes = file.entry.type === 'file' ? file.entry.size : 0;
+    return total + 512 + Math.ceil(contentBytes / 512) * 512;
+  }, 0);
+  return tarEntryBytes + emptyDirectoryCount * 512 + 1024;
+}
+
+function assertTemporarySnapshotLimit(
+  files: CapturedFile[],
+  emptyDirectoryCount: number,
+  limits: SnapshotCaptureLimits | undefined,
+): void {
+  if (!limits) return;
+  const estimatedBytes = estimateTemporarySnapshotBytes(files, emptyDirectoryCount);
+  assertCaptureLimit(
+    'maxTemporarySnapshotBytes',
+    estimatedBytes,
+    limits.maxTemporarySnapshotBytes,
+    'Reduce the capture scope or raise "max_snapshot_temporary_bytes" after provisioning sufficient Controller disk space.',
+  );
+}
+
+function assertWrittenTemporarySnapshotLimit(
+  actualBytes: number,
+  limits: SnapshotCaptureLimits | undefined,
+): void {
+  if (!limits) return;
+  assertCaptureLimit(
+    'maxTemporarySnapshotBytes',
+    actualBytes,
+    limits.maxTemporarySnapshotBytes,
+    'Raise "max_snapshot_temporary_bytes" only after provisioning sufficient Controller disk space.',
+  );
 }
 
 function applyArchivedFileResults(
@@ -829,6 +945,8 @@ export async function captureFullSnapshot(
       additionalTarEntries.push(...rootCaptured.map((f) => f.tarEntry));
     }
 
+    assertSourceCaptureLimits(archivedFiles, input.limits);
+
     throwIfSecretViolations(secretBlockedViolations);
 
     await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, input.additionalRoots ?? []);
@@ -842,6 +960,7 @@ export async function captureFullSnapshot(
       })),
       ...additionalTarEntries,
     ];
+    assertTemporarySnapshotLimit(archivedFiles, emptyDirectories.length, input.limits);
 
     const archivePath = archivePathForGeneration(
       contentStorageDir,
@@ -854,6 +973,7 @@ export async function captureFullSnapshot(
     } catch (error) {
       throw archiveCaptureError(error);
     }
+    assertWrittenTemporarySnapshotLimit(archive.size, input.limits);
     await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, input.additionalRoots ?? []);
     applyArchivedFileResults(archivedFiles, archive);
     const additionalRootsManifest = additionalRootCaptures.map(({ root, files }) => {
@@ -940,6 +1060,8 @@ export interface CaptureGitOverlaySnapshotInput {
   fencingGeneration?: number;
   /** Allowlisted remote URL for the overlay manifest (any matching remote, not only origin). */
   repoUrl?: string;
+  /** Controller capture limits, checked from metadata before compression. */
+  limits?: SnapshotCaptureLimits;
 }
 
 export interface CaptureGitOverlaySnapshotResult {
@@ -1182,6 +1304,8 @@ export async function captureGitOverlaySnapshot(
       additionalTarEntries.push(...rootCaptured.map((f) => f.tarEntry));
     }
 
+    assertSourceCaptureLimits(archivedFiles, input.limits);
+
     throwIfSecretViolations(secretBlockedViolations);
 
     // Overlay guard: only the dirty path set + submodule HEADs are tracked.
@@ -1256,6 +1380,7 @@ export async function captureGitOverlaySnapshot(
       })),
       ...additionalTarEntries,
     ];
+    assertTemporarySnapshotLimit(archivedFiles, emptyDirectories.length, input.limits);
 
     const archivePath = archivePathForGeneration(
       contentStorageDir,
@@ -1268,6 +1393,7 @@ export async function captureGitOverlaySnapshot(
     } catch (error) {
       throw archiveCaptureError(error);
     }
+    assertWrittenTemporarySnapshotLimit(archive.size, input.limits);
     const postArchiveStatus = await gitStatusPorcelainV2(repoRoot);
     if (postArchiveStatus.head !== guard.head) {
       throw new RboError('workspace_changed', 'HEAD changed during overlay capture', true, {

@@ -15,6 +15,10 @@ const ENV_KEYS = [
   'RBO_ALLOW_LOCAL_FALLBACK',
   'RBO_ALLOW_FULL_SNAPSHOT_FALLBACK',
   'RBO_DEFAULT_QUEUE_POLICY',
+  'RBO_MAX_SNAPSHOT_SOURCE_BYTES',
+  'RBO_MAX_SNAPSHOT_FILE_COUNT',
+  'RBO_MAX_SNAPSHOT_SINGLE_FILE_BYTES',
+  'RBO_MAX_SNAPSHOT_TEMPORARY_BYTES',
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
@@ -82,6 +86,67 @@ describe('default_queue_policy (queue when no Agent has capacity)', () => {
     expect(
       loadControllerConfig({ configPath: null, defaultQueuePolicy: 'wait' }).defaultQueuePolicy,
     ).toBe('wait');
+  });
+});
+
+describe('snapshot capture limits (§4.3)', () => {
+  it('uses conservative defaults and lets file/env/programmatic values override them', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    const defaults = loadControllerConfig({ configPath: null }).snapshotCaptureLimits;
+    expect(defaults).toEqual({
+      maxTotalSourceBytes: 1024 * 1024 * 1024,
+      maxRegularFileCount: 100_000,
+      maxSingleFileBytes: 256 * 1024 * 1024,
+      maxTemporarySnapshotBytes: 1280 * 1024 * 1024,
+    });
+
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        max_snapshot_source_bytes: 1000,
+        max_snapshot_file_count: 20,
+        max_snapshot_single_file_bytes: 500,
+        max_snapshot_temporary_bytes: 1200,
+      }),
+      'utf8',
+    );
+    expect(loadControllerConfig({ dataDir }).snapshotCaptureLimits).toEqual({
+      maxTotalSourceBytes: 1000,
+      maxRegularFileCount: 20,
+      maxSingleFileBytes: 500,
+      maxTemporarySnapshotBytes: 1200,
+    });
+
+    process.env.RBO_MAX_SNAPSHOT_SINGLE_FILE_BYTES = '600';
+    expect(loadControllerConfig({ dataDir }).snapshotCaptureLimits.maxSingleFileBytes).toBe(600);
+    expect(
+      loadControllerConfig({
+        dataDir,
+        snapshotCaptureLimits: {
+          maxTotalSourceBytes: 2000,
+          maxRegularFileCount: 30,
+          maxSingleFileBytes: 700,
+          maxTemporarySnapshotBytes: 2200,
+        },
+      }).snapshotCaptureLimits,
+    ).toEqual({
+      maxTotalSourceBytes: 2000,
+      maxRegularFileCount: 30,
+      maxSingleFileBytes: 700,
+      maxTemporarySnapshotBytes: 2200,
+    });
+  });
+
+  it('rejects non-positive snapshot limit values from controller.json and the environment', () => {
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(path, JSON.stringify({ max_snapshot_source_bytes: 0 }), 'utf8');
+    expect(() => readControllerConfigFile(path)).toThrow();
+
+    process.env.RBO_MAX_SNAPSHOT_FILE_COUNT = '0';
+    expect(() => loadControllerConfig({ configPath: null })).toThrow(/RBO_MAX_SNAPSHOT_FILE_COUNT/);
   });
 });
 

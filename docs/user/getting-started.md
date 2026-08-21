@@ -115,6 +115,13 @@ can reach:
 }
 ```
 
+Snapshot capture is bounded before compression by conservative Controller defaults: 1 GiB total
+source bytes, 100,000 regular files, 256 MiB per file, and a 1.25 GiB temporary tar estimate.
+If a known large workspace needs more capacity, raise the corresponding
+`max_snapshot_source_bytes`, `max_snapshot_file_count`, `max_snapshot_single_file_bytes`, or
+`max_snapshot_temporary_bytes` value in `controller.json` only after confirming available
+Controller disk space.
+
 Start the Controller and print the fingerprint you will use when configuring Agents:
 
 ```bash

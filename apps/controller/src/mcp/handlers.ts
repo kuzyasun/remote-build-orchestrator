@@ -55,6 +55,7 @@ export interface ToolContext {
   gitAllowlist?: GitUrlAllowlist;
   allowLocalFallback?: boolean;
   allowFullSnapshotFallback?: boolean;
+  snapshotCaptureLimits?: import('@rbo/snapshot').SnapshotCaptureLimits;
   /** Controller-level queue policy used when a job does not set one explicitly. */
   defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
   /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
@@ -109,6 +110,7 @@ function runnerContext(ctx: ToolContext) {
     allowedArtifactDestinations: ctx.allowedArtifactDestinations ?? ctx.allowedProjectRoots ?? [],
     maxConcurrentJobs: ctx.maxConcurrentJobs ?? 1,
     gitAllowlist: ctx.gitAllowlist,
+    snapshotCaptureLimits: ctx.snapshotCaptureLimits,
   };
 }
 
