@@ -2,7 +2,12 @@ import { readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { RboError, ensureControllerIdentity } from '@rbo/shared';
 import { createGitFixtureRepo } from '@rbo/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  JobLifecycleNotifier,
+  bindJobLifecycleNotifier,
+  unbindJobLifecycleNotifier,
+} from '../src/jobs/lifecycle-notifier.js';
 import { getSubmission } from '../src/jobs/submissions.js';
 import { type SnapshotPublicationTestHooks, handleJobSubmit } from '../src/jobs/submit.js';
 import { recoverSnapshotPublications } from '../src/recovery/snapshot-publication.js';
@@ -182,5 +187,72 @@ describe('S-03 snapshot publication failure boundaries', () => {
     expect(recoveredNames.filter((name) => /\.g2$/.test(name))).toHaveLength(4);
     await expect(exists(snapshot.manifest_path)).resolves.toBe(true);
     await expect(exists(snapshot.payload_path)).resolves.toBe(true);
+  });
+
+  it('rolls back post-persist publication failure without a submission response or notifier wakeup', async () => {
+    const clientRequestId = 'rollback-after-snapshot-persist';
+    const notifier = new JobLifecycleNotifier();
+    bindJobLifecycleNotifier(db, notifier);
+    const notifyAfterCommit = vi.spyOn(notifier, 'notifyAfterCommit');
+    const notify = vi.spyOn(notifier, 'notify');
+
+    try {
+      await expect(
+        submit(clientRequestId, { afterSnapshotPersisted: injectedFailure }),
+      ).resolves.toMatchObject({ error: { category: 'lease_expired' } });
+
+      expect(db.prepare('SELECT COUNT(*) AS count FROM snapshots').get()).toMatchObject({
+        count: 0,
+      });
+      expect(db.prepare('SELECT COUNT(*) AS count FROM jobs').get()).toMatchObject({ count: 0 });
+      expect(getSubmission(db, 'publication-failure-client', clientRequestId)).toMatchObject({
+        state: 'capturing',
+        job_id: null,
+        response_json: null,
+        error_json: null,
+      });
+      expect(notifyAfterCommit).not.toHaveBeenCalled();
+      expect(notify).not.toHaveBeenCalled();
+
+      const publishedNames = await snapshotNames();
+      expect(publishedNames.filter((name) => /\.g1$/.test(name))).toHaveLength(4);
+      expect(publishedNames.filter((name) => name.includes('.candidate-'))).toEqual([]);
+
+      const retry = await submit(clientRequestId);
+      expect(retry).toMatchObject({ state: 'queued', snapshot_captured: true });
+      expect(db.prepare('SELECT COUNT(*) AS count FROM snapshots').get()).toMatchObject({
+        count: 1,
+      });
+      expect(db.prepare('SELECT COUNT(*) AS count FROM jobs').get()).toMatchObject({ count: 1 });
+      expect(getSubmission(db, 'publication-failure-client', clientRequestId)).toMatchObject({
+        state: 'captured',
+      });
+
+      const snapshot = db.prepare('SELECT manifest_path, payload_path FROM snapshots').get() as {
+        manifest_path: string;
+        payload_path: string;
+      };
+      expect(snapshot.manifest_path).toMatch(/\.g2$/);
+      expect(snapshot.payload_path).toMatch(/\.g2$/);
+      await expect(exists(snapshot.manifest_path)).resolves.toBe(true);
+      await expect(exists(snapshot.payload_path)).resolves.toBe(true);
+
+      expect((await snapshotNames()).filter((name) => /\.g1$/.test(name))).toHaveLength(4);
+      expect((await snapshotNames()).filter((name) => /\.g2$/.test(name))).toHaveLength(4);
+      await expect(
+        recoverSnapshotPublications({ db, dataDir, now: new Date(Date.now() + 1_000) }),
+      ).resolves.toMatchObject({ skippedForActiveLease: false });
+
+      const recoveredNames = await snapshotNames();
+      expect(recoveredNames.filter((name) => /\.g1$/.test(name))).toEqual([]);
+      expect(recoveredNames.filter((name) => /\.g2$/.test(name))).toHaveLength(4);
+      await expect(exists(snapshot.manifest_path)).resolves.toBe(true);
+      await expect(exists(snapshot.payload_path)).resolves.toBe(true);
+    } finally {
+      notifyAfterCommit.mockRestore();
+      notify.mockRestore();
+      unbindJobLifecycleNotifier(db);
+      notifier.close();
+    }
   });
 });

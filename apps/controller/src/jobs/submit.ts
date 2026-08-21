@@ -79,6 +79,8 @@ export interface SnapshotPublicationTestHooks {
   afterCandidatePublication?: (finalPath: string, index: number) => void;
   afterPublicationDirectoryFlush?: () => void;
   beforeTransactionAuthorityCheck?: () => void;
+  /** Runs inside the lifecycle transaction after the snapshot row is written. */
+  afterSnapshotPersisted?: () => void;
 }
 
 function generationPath(candidatePath: string, generation: number): string {
@@ -322,6 +324,7 @@ export async function handleJobSubmit(
         sizeBytes: capturedSnapshot.sizeBytes,
         sha256: capturedSnapshot.sha256,
       });
+      ctx.snapshotPublicationTestHooks?.afterSnapshotPersisted?.();
       const job = createJob(ctx.db, {
         jobId: pendingJobId,
         clientId: ctx.clientId,
