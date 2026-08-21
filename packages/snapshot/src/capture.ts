@@ -47,16 +47,16 @@ import {
 import type { FullSnapshotManifest, SnapshotFileEntry, SnapshotInstance } from './index.js';
 import { FullSnapshotManifestSchema, GitOverlaySnapshotManifestSchema } from './index.js';
 import type { GitOverlaySnapshotManifest } from './index.js';
+import {
+  type CapturedFile,
+  type SourcePolicyInput,
+  captureMetadataPreflightEntry,
+} from './metadata-preflight.js';
 import { computeOverlayPlan } from './overlay.js';
-import { type SecretPolicyViolation, findSecretPolicyViolations } from './secret-policy.js';
+import type { SecretPolicyViolation } from './secret-policy.js';
 
 type JobAdditionalRoot = z.infer<typeof JobAdditionalRootSchema>;
-
-export interface SourcePolicyInput {
-  include_untracked: boolean;
-  include_ignored: string[];
-  secret_policy: 'block' | 'warn' | 'allow';
-}
+export type { CapturedFile, SourcePolicyInput } from './metadata-preflight.js';
 
 /**
  * Controller-provided, capture-local resource limits. These are deliberately
@@ -89,15 +89,6 @@ export interface CaptureFullSnapshotInput {
   fencingGeneration?: number;
   /** Controller capture limits, checked from metadata before compression. */
   limits?: SnapshotCaptureLimits;
-}
-
-export interface CapturedFile {
-  wirePath: string;
-  entry: SnapshotFileEntry;
-  content?: Buffer;
-  tarEntry: TarEntryInput;
-  secretWarnings?: Array<{ path: string; pattern: string }>;
-  secretViolations?: SecretPolicyViolation[];
 }
 
 function releaseCapturedFileBuffers(files: CapturedFile[]): number {
@@ -642,125 +633,6 @@ async function enumerateAdditionalRootPaths(root: JobAdditionalRoot): Promise<st
   return paths.sort();
 }
 
-async function readSymlinkTarget(absolutePath: string): Promise<string> {
-  const { readlink } = await import('node:fs/promises');
-  return readlink(absolutePath);
-}
-
-function isAbsoluteSymlinkTarget(target: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(target) || target.startsWith('/');
-}
-
-async function assertSymlinkAllowed(
-  repoRoot: string,
-  wirePath: string,
-  target: string,
-): Promise<void> {
-  if (isAbsoluteSymlinkTarget(target)) {
-    throw new RboError(
-      'materialization',
-      `Absolute symlink target is not allowed: ${wirePath}`,
-      false,
-      {
-        path: wirePath,
-        target,
-      },
-    );
-  }
-  const resolved = resolve(resolveInside(repoRoot, wirePath), '..', target);
-  try {
-    await assertRealPathContained(repoRoot, resolved);
-  } catch {
-    throw new RboError('materialization', `Symlink escapes workspace: ${wirePath}`, false, {
-      path: wirePath,
-      target,
-    });
-  }
-}
-
-async function captureFileEntry(
-  repoRoot: string,
-  wirePath: string,
-  stageModes: Map<string, string>,
-  sourcePolicy: SourcePolicyInput,
-): Promise<CapturedFile> {
-  const absolute = resolveInside(repoRoot, wirePath);
-  await assertRealPathContained(repoRoot, absolute);
-  const info = await lstat(absolute);
-
-  if (info.isSymbolicLink()) {
-    let target: string;
-    try {
-      target = await readSymlinkTarget(absolute);
-    } catch {
-      throw new RboError(
-        'materialization',
-        `Symlink unsupported on this platform: ${wirePath}`,
-        false,
-        {
-          reason: 'symlink_unsupported',
-          path: wirePath,
-        },
-      );
-    }
-    await assertSymlinkAllowed(repoRoot, wirePath, target);
-    const violations = findSecretPolicyViolations(wirePath, sourcePolicy.secret_policy);
-    const entry: SnapshotFileEntry = {
-      path: wirePath,
-      type: 'symlink',
-      mode: '120000',
-      target: normalizeWirePath(target),
-    };
-    return {
-      wirePath,
-      entry,
-      secretWarnings:
-        sourcePolicy.secret_policy === 'warn' && violations.length > 0 ? violations : undefined,
-      secretViolations:
-        sourcePolicy.secret_policy === 'block' && violations.length > 0 ? violations : undefined,
-      tarEntry: {
-        path: wirePath,
-        mode: 0o120000,
-        type: 'symlink',
-        target: normalizeWirePath(target),
-      },
-    };
-  }
-
-  if (!info.isFile()) {
-    throw new RboError('materialization', `Expected regular file: ${wirePath}`);
-  }
-
-  const size = info.size;
-  const violations = findSecretPolicyViolations(wirePath, sourcePolicy.secret_policy);
-
-  const gitMode = stageModes.get(wirePath);
-  const mode: '100644' | '100755' =
-    gitMode === '100755' || (info.mode & 0o111) !== 0 ? '100755' : '100644';
-  const entry: SnapshotFileEntry = {
-    path: wirePath,
-    type: 'file',
-    mode,
-    size,
-    // Replaced with the digest of the bytes actually archived below.
-    sha256: '',
-  };
-  return {
-    wirePath,
-    entry,
-    secretWarnings:
-      sourcePolicy.secret_policy === 'warn' && violations.length > 0 ? violations : undefined,
-    secretViolations:
-      sourcePolicy.secret_policy === 'block' && violations.length > 0 ? violations : undefined,
-    tarEntry: {
-      path: wirePath,
-      mode: mode === '100755' ? 0o755 : 0o644,
-      type: 'file',
-      contentPath: absolute,
-    },
-  };
-}
-
 async function findEmptyUntrackedDirectories(repoRoot: string): Promise<string[]> {
   const status = await gitStatusPorcelainV2(repoRoot);
   const emptyDirs: string[] = [];
@@ -863,7 +735,12 @@ export async function captureFullSnapshot(
       } catch {
         continue;
       }
-      const captured = await captureFileEntry(repoRoot, wirePath, stageModes, input.sourcePolicy);
+      const captured = await captureMetadataPreflightEntry(
+        repoRoot,
+        wirePath,
+        stageModes,
+        input.sourcePolicy,
+      );
       capturedFiles.push(captured);
       archivedFiles.push(captured);
       if (captured.secretWarnings) {
@@ -914,7 +791,12 @@ export async function captureFullSnapshot(
             false,
           );
         }
-        const captured = await captureFileEntry(realSource, relPath, new Map(), input.sourcePolicy);
+        const captured = await captureMetadataPreflightEntry(
+          realSource,
+          relPath,
+          new Map(),
+          input.sourcePolicy,
+        );
         rootCaptured.push({
           ...captured,
           wirePath: mountPath,
@@ -1251,7 +1133,7 @@ export async function captureGitOverlaySnapshot(
       if (!isSafeRelativePath(wirePath)) {
         throw new RboError('materialization', `Unsafe overlay path: ${wirePath}`);
       }
-      const captured = await captureFileEntry(
+      const captured = await captureMetadataPreflightEntry(
         repoRoot,
         wirePath,
         combinedStageModes,
@@ -1278,7 +1160,12 @@ export async function captureGitOverlaySnapshot(
       const rootPaths = await enumerateAdditionalRootPaths(root);
       const rootCaptured: CapturedFile[] = [];
       for (const relPath of rootPaths) {
-        const captured = await captureFileEntry(realSource, relPath, new Map(), input.sourcePolicy);
+        const captured = await captureMetadataPreflightEntry(
+          realSource,
+          relPath,
+          new Map(),
+          input.sourcePolicy,
+        );
         const mount = normalizeWirePath(root.mount_path);
         const archivePath = `${mount}/${relPath}`.replace(/\\/g, '/');
         rootCaptured.push({
