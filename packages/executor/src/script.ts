@@ -361,16 +361,21 @@ function spawnNodeProcess(input: {
       return;
     }
     if (isWindows) {
-      child.kill();
-      if (graceSeconds > 0) {
-        await new Promise((r) => setTimeout(r, graceSeconds * 1000));
-      }
       try {
+        // Keep the wrapper alive until taskkill captures its process tree.
+        // Terminating it first can reparent a still-running descendant, making
+        // a subsequent `/T` miss the orphan entirely.
         await execFileAsync('taskkill', ['/pid', String(pid), '/T', '/F'], {
           windowsHide: true,
         });
       } catch {
-        // process may already be gone
+        // If taskkill cannot inspect the process (for example, it already
+        // exited), retain the best-effort root termination fallback.
+        try {
+          child.kill();
+        } catch {
+          // process may already be gone
+        }
       }
       return;
     }
