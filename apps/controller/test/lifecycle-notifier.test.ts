@@ -6,7 +6,7 @@ import {
   subscribeToJobLifecycle,
   unbindJobLifecycleNotifier,
 } from '../src/jobs/lifecycle-notifier.js';
-import { createJob, transitionJobState } from '../src/jobs/lifecycle.js';
+import { createJob, runLifecycleTransaction, transitionJobState } from '../src/jobs/lifecycle.js';
 import { type ControllerDatabase, migrateToLatest, openDatabase } from '../src/storage/database.js';
 
 describe('JobLifecycleNotifier', () => {
@@ -216,5 +216,27 @@ describe('JobLifecycleNotifier', () => {
       (db.prepare('SELECT state FROM jobs WHERE id = ?').get(job.id) as { state: string }).state,
     ).toBe('created');
     unbindJobLifecycleNotifier(db);
+  });
+
+  it('keeps rollback atomicity when the lifecycle notifier is unbound', () => {
+    db = openDatabase(':memory:');
+    migrateToLatest(db);
+    const job = createJob(db, {
+      clientId: 'client',
+      clientRequestId: 'request-unbound-rollback',
+      request: { command: 'echo ok', project_root: '.', risk_level: 'safe' },
+      initialState: 'created',
+    });
+
+    expect(() =>
+      runLifecycleTransaction(db, () => {
+        transitionJobState(db, job.id, 'queued');
+        throw new Error('unbound rollback');
+      }),
+    ).toThrow('unbound rollback');
+
+    expect(
+      (db.prepare('SELECT state FROM jobs WHERE id = ?').get(job.id) as { state: string }).state,
+    ).toBe('created');
   });
 });

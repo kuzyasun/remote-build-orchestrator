@@ -3,7 +3,12 @@ import { JobEventSchema } from '@rbo/protocol';
 import { generateId } from '@rbo/shared';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
-import { assertJobLifecycleWriteAllowed, notifyJobLifecycleChanged } from './lifecycle-notifier.js';
+import {
+  assertJobLifecycleWriteAllowed,
+  notifyJobLifecycleChanged,
+  runJobLifecycleTransaction,
+  runUnboundJobLifecycleTransaction,
+} from './lifecycle-notifier.js';
 
 export interface JobRow {
   id: string;
@@ -45,6 +50,28 @@ export interface AttemptRow {
 /** Phase 6 attempt states/outcomes — no SQLite CHECK on state; callers use these literals. */
 export const ATTEMPT_STATE_ORPHANED = 'orphaned' as const;
 export const ATTEMPT_OUTCOME_LOST = 'lost' as const;
+
+/**
+ * Use the runtime-owned transaction when available. Unit/programmatic callers
+ * may not bind a notifier; still run their operation in an SQLite transaction
+ * so rollback semantics remain identical while production lifecycle writes keep
+ * their post-commit notification behavior.
+ */
+export function runLifecycleTransaction<T>(db: ControllerDatabase, operation: () => T): T {
+  try {
+    return runJobLifecycleTransaction(db, operation);
+  } catch (error) {
+    if (
+      !(error instanceof Error) ||
+      error.message !== 'No job lifecycle notifier is bound to this database'
+    ) {
+      throw error;
+    }
+    // Without a runtime notifier there is no post-commit wakeup path, but the
+    // lifecycle operation still needs the same rollback boundary.
+    return runUnboundJobLifecycleTransaction(db, operation);
+  }
+}
 
 export interface SnapshotRow {
   id: string;

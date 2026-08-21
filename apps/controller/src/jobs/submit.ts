@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { open, rm, stat } from 'node:fs/promises';
+import { link, open, rm, stat, unlink } from 'node:fs/promises';
 import { cpus, freemem } from 'node:os';
+import { dirname } from 'node:path';
 import { join } from 'node:path';
 import { appendEvent, presentLogTail } from '@rbo/executor';
 import type { AgentCapabilityReport, JobRequest, QueuePolicy } from '@rbo/protocol';
@@ -38,6 +39,12 @@ import {
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
 import type { ConnectedAgent } from '../websocket/server.js';
+import {
+  hasCaptureLeaseAuthority,
+  releaseCaptureLease,
+  renewCaptureLease,
+  reserveCaptureLease,
+} from './capture-lease.js';
 import { subscribeToJobLifecycle } from './lifecycle-notifier.js';
 import {
   createJob,
@@ -46,17 +53,71 @@ import {
   getLatestAttempt,
   isDestructiveRisk,
   isTerminalJobState,
+  persistSnapshot,
   recordEvent,
+  runLifecycleTransaction,
   transitionAttemptState,
   transitionJobState,
 } from './lifecycle.js';
-import { completeSubmission, reserveSubmission } from './submissions.js';
+import { completeSubmission } from './submissions.js';
 
 const logger = createLogger('controller.jobs.submit');
 
 const CONFIRMATION_TTL_SECONDS = 300;
 const DEFAULT_WAIT_TAIL_MAX_BYTES = 16 * 1024;
 const WAIT_FALLBACK_INTERVAL_MS = 1_000;
+const CAPTURE_LEASE_RENEW_INTERVAL_MS = 10_000;
+
+function generationPath(candidatePath: string, generation: number): string {
+  const suffix = candidatePath.match(new RegExp(`\\.g${generation}(\\.candidate-[^\\\\/]+)$`))?.[1];
+  if (!suffix) {
+    throw RboError.internal(
+      'Snapshot capture did not return a generation-scoped private candidate',
+    );
+  }
+  return candidatePath.slice(0, -suffix.length);
+}
+
+async function flushFile(path: string): Promise<void> {
+  const handle = await open(path, 'r');
+  try {
+    try {
+      await handle.sync();
+    } catch {
+      // Windows may reject fsync on a read-only handle; close still completes the guard.
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Best-effort directory durability; directory handles are unsupported on some Windows builds. */
+async function flushDirectory(path: string): Promise<void> {
+  try {
+    const handle = await open(path, 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // The file publication remains atomic; Windows does not consistently expose directory fsync.
+  }
+}
+
+/** Publish without clobbering an existing generation: link is atomic and no-replace. */
+async function publishCandidate(candidatePath: string, generation: number): Promise<string> {
+  const finalPath = generationPath(candidatePath, generation);
+  await link(candidatePath, finalPath);
+  try {
+    await unlink(candidatePath);
+  } catch (error) {
+    await unlink(finalPath).catch(() => undefined);
+    throw error;
+  }
+  await flushDirectory(dirname(finalPath));
+  return finalPath;
+}
 
 export interface SubmitJobContext extends LocalRunnerContext {
   clientId: string;
@@ -149,9 +210,15 @@ export async function handleJobSubmit(
   if (request.queue_policy !== effectiveQueuePolicy) {
     request.queue_policy = effectiveQueuePolicy;
   }
-  const reserve = reserveSubmission(ctx.db, ctx.clientId, request.client_request_id);
-  if (!reserve.created) {
+  const reserve = reserveCaptureLease(ctx.db, {
+    clientId: ctx.clientId,
+    clientRequestId: request.client_request_id,
+  });
+  if (!reserve.acquired) {
     const existing = reserve.submission;
+    if (!existing) {
+      throw RboError.internal('Capture lease reservation returned no submission');
+    }
     if (existing.state === 'capturing') {
       throw RboError.validation('Submission is still capturing snapshot', {
         client_request_id: request.client_request_id,
@@ -163,51 +230,122 @@ export async function handleJobSubmit(
     if (existing.state === 'failed' && existing.error_json) {
       return { error: JSON.parse(existing.error_json) };
     }
+    throw RboError.validation('Submission cannot acquire a capture lease', {
+      client_request_id: request.client_request_id,
+      reason: reserve.reason ?? 'missing',
+    });
+  }
+  const captureLease = reserve.lease;
+  if (!captureLease) {
+    throw RboError.internal('Capture lease reservation returned no lease');
   }
 
   const initialState = 'created';
   const pendingJobId = generateId('job');
+  let captured: Awaited<ReturnType<typeof captureAndPersistSnapshot>> | undefined;
+  let leaseRenewal: ReturnType<typeof setInterval> | undefined;
 
   try {
+    leaseRenewal = setInterval(() => {
+      renewCaptureLease(ctx.db, captureLease);
+    }, CAPTURE_LEASE_RENEW_INTERVAL_MS);
+    leaseRenewal.unref?.();
     const captureCtx: LocalRunnerContext = {
       ...ctx,
       remoteCapable: (ctx.connectedAgents?.size ?? 0) > 0,
       gitAllowlist: ctx.gitAllowlist,
     };
-    const {
-      snapshotId,
-      contentId,
-      secretWarnings,
-      request: normalizedRequest,
-    } = await captureAndPersistSnapshot(captureCtx, pendingJobId, request);
+    const capturedSnapshot = await captureAndPersistSnapshot(
+      captureCtx,
+      pendingJobId,
+      request,
+      captureLease.fencingGeneration,
+    );
+    captured = capturedSnapshot;
+    const { snapshotId, contentId, secretWarnings, request: normalizedRequest } = capturedSnapshot;
     const hash = requestHash(normalizedRequest);
 
-    const job = createJob(ctx.db, {
-      jobId: pendingJobId,
-      clientId: ctx.clientId,
-      clientRequestId: normalizedRequest.client_request_id,
-      request: normalizedRequest,
-      initialState,
-      name: normalizedRequest.name,
-    });
-    transitionJobState(ctx.db, job.id, job.state, { snapshot_id: snapshotId });
+    const candidatePaths = [
+      capturedSnapshot.archivePath,
+      capturedSnapshot.manifestPath,
+      capturedSnapshot.secretWarningsPath,
+      capturedSnapshot.gitSourceRequirementsPath,
+    ];
+    await Promise.all(candidatePaths.map((path) => flushFile(path)));
+    for (const candidatePath of candidatePaths) {
+      if (!hasCaptureLeaseAuthority(ctx.db, captureLease)) {
+        throw new RboError('lease_expired', 'Snapshot capture lease lost before publication', true);
+      }
+      await publishCandidate(candidatePath, captureLease.fencingGeneration);
+    }
+    await flushDirectory(join(ctx.dataDir, 'snapshots', pendingJobId));
 
-    if (isDestructiveRisk(normalizedRequest.risk_level)) {
-      const confirmation_token = issueConfirmationToken(ctx.controllerIdentity, {
-        job_id: job.id,
-        request_hash: hash,
-        content_id: contentId,
-        risk_level: normalizedRequest.risk_level,
+    const committed = runLifecycleTransaction(ctx.db, () => {
+      if (!hasCaptureLeaseAuthority(ctx.db, captureLease)) {
+        throw new RboError(
+          'lease_expired',
+          'Snapshot capture lease lost before database commit',
+          true,
+        );
+      }
+      persistSnapshot(ctx.db, {
+        snapshotId,
+        contentId,
+        repoId: capturedSnapshot.repoId,
+        baseCommit: capturedSnapshot.baseCommit,
+        dirty: true,
+        manifestPath: generationPath(capturedSnapshot.manifestPath, captureLease.fencingGeneration),
+        payloadPath: generationPath(capturedSnapshot.archivePath, captureLease.fencingGeneration),
+        sizeBytes: capturedSnapshot.sizeBytes,
+        sha256: capturedSnapshot.sha256,
       });
-      transitionJobState(ctx.db, job.id, 'awaiting_confirmation', { queued_at: nowIso() });
+      const job = createJob(ctx.db, {
+        jobId: pendingJobId,
+        clientId: ctx.clientId,
+        clientRequestId: normalizedRequest.client_request_id,
+        request: normalizedRequest,
+        initialState,
+        name: normalizedRequest.name,
+      });
+      transitionJobState(ctx.db, job.id, job.state, { snapshot_id: snapshotId });
+
+      if (isDestructiveRisk(normalizedRequest.risk_level)) {
+        const confirmation_token = issueConfirmationToken(ctx.controllerIdentity, {
+          job_id: job.id,
+          request_hash: hash,
+          content_id: contentId,
+          risk_level: normalizedRequest.risk_level,
+        });
+        transitionJobState(ctx.db, job.id, 'awaiting_confirmation', { queued_at: nowIso() });
+        const response = {
+          job_id: job.id,
+          state: 'awaiting_confirmation',
+          snapshot_id: snapshotId,
+          content_id: contentId,
+          snapshot_captured: true,
+          selected_agent: null,
+          confirmation_token,
+          secret_warnings: secretWarnings.map((w) => w.path),
+        };
+        completeSubmission(
+          ctx.db,
+          ctx.clientId,
+          normalizedRequest.client_request_id,
+          'captured',
+          response,
+          job.id,
+        );
+        return { response, dispatch: false };
+      }
+
+      transitionJobState(ctx.db, job.id, 'queued', { queued_at: nowIso() });
       const response = {
         job_id: job.id,
-        state: 'awaiting_confirmation',
+        state: 'queued',
         snapshot_id: snapshotId,
         content_id: contentId,
         snapshot_captured: true,
         selected_agent: null,
-        confirmation_token,
         secret_warnings: secretWarnings.map((w) => w.path),
       };
       completeSubmission(
@@ -218,53 +356,40 @@ export async function handleJobSubmit(
         response,
         job.id,
       );
-      return response;
-    }
-
-    transitionJobState(ctx.db, job.id, 'queued', { queued_at: nowIso() });
-    const response = {
-      job_id: job.id,
-      state: 'queued',
-      snapshot_id: snapshotId,
-      content_id: contentId,
-      snapshot_captured: true,
-      selected_agent: null,
-      secret_warnings: secretWarnings.map((w) => w.path),
-    };
-    completeSubmission(
-      ctx.db,
-      ctx.clientId,
-      normalizedRequest.client_request_id,
-      'captured',
-      response,
-      job.id,
-    );
-    void dispatchJobExecution(ctx, job.id, normalizedRequest).catch((error) => {
-      // Never pass raw Error objects to console.* — Node 24.11+ util.inspect can
-      // throw on ZodError and kill the Controller process.
-      logger.error('job execution dispatch failed', {
-        jobId: job.id,
-        error: formatUnknownError(error),
-      });
+      return { response, dispatch: true };
     });
-    return response;
+    clearInterval(leaseRenewal);
+    leaseRenewal = undefined;
+    releaseCaptureLease(ctx.db, captureLease);
+    if (committed.dispatch) {
+      void dispatchJobExecution(ctx, pendingJobId, normalizedRequest).catch((error) => {
+        // Never pass raw Error objects to console.* — Node 24.11+ util.inspect can
+        // throw on ZodError and kill the Controller process.
+        logger.error('job execution dispatch failed', {
+          jobId: pendingJobId,
+          error: formatUnknownError(error),
+        });
+      });
+    }
+    return committed.response;
   } catch (error) {
-    await rm(join(ctx.dataDir, 'snapshots', pendingJobId), {
-      recursive: true,
-      force: true,
-    }).catch(() => undefined);
+    if (leaseRenewal) clearInterval(leaseRenewal);
+    await captured?.cleanupCandidate();
 
     const payload =
       error instanceof RboError
         ? error.toJSON()
         : { category: 'internal', message: String(error), retryable: false };
-    completeSubmission(
-      ctx.db,
-      ctx.clientId,
-      request.client_request_id,
-      'failed',
-      payload as Record<string, unknown>,
-    );
+    releaseCaptureLease(ctx.db, captureLease);
+    if (!(error instanceof RboError && error.category === 'lease_expired')) {
+      completeSubmission(
+        ctx.db,
+        ctx.clientId,
+        request.client_request_id,
+        'failed',
+        payload as Record<string, unknown>,
+      );
+    }
     return { error: payload };
   }
 }

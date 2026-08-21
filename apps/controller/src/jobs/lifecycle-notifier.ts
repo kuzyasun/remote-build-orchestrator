@@ -101,6 +101,7 @@ export class JobLifecycleNotifier {
 }
 
 const notifierByDatabase = new WeakMap<ControllerDatabase, JobLifecycleNotifier>();
+const unboundManagedTransactions = new WeakSet<ControllerDatabase>();
 
 /** Attach the runtime-owned notifier to a Controller database. */
 export function bindJobLifecycleNotifier(
@@ -145,6 +146,32 @@ export function runJobLifecycleTransaction<T>(db: ControllerDatabase, operation:
   return notifier.runTransaction(db, operation);
 }
 
+/**
+ * Execute lifecycle writes atomically for isolated/programmatic callers that
+ * do not have a runtime notifier. The managed marker keeps lifecycle guards
+ * fail-closed for raw SQLite transactions while intentionally providing no
+ * wakeup callbacks.
+ */
+export function runUnboundJobLifecycleTransaction<T>(
+  db: ControllerDatabase,
+  operation: () => T,
+): T {
+  if (db.inTransaction) {
+    throw new Error(
+      'Cannot start a job lifecycle transaction inside an existing SQLite transaction; wrap the outer transaction with runLifecycleTransaction',
+    );
+  }
+  const transaction = db.transaction(() => {
+    unboundManagedTransactions.add(db);
+    try {
+      return operation();
+    } finally {
+      unboundManagedTransactions.delete(db);
+    }
+  });
+  return transaction();
+}
+
 /** Called by lifecycle writers after a successful durable mutation. */
 export function notifyJobLifecycleChanged(db: ControllerDatabase, jobId: string): void {
   notifierByDatabase.get(db)?.notifyAfterCommit(db, jobId);
@@ -154,7 +181,7 @@ export function notifyJobLifecycleChanged(db: ControllerDatabase, jobId: string)
 export function assertJobLifecycleWriteAllowed(db: ControllerDatabase): void {
   if (!db.inTransaction) return;
   const notifier = notifierByDatabase.get(db);
-  if (notifier?.isManagedTransaction(db)) return;
+  if (notifier?.isManagedTransaction(db) || unboundManagedTransactions.has(db)) return;
   throw new Error(
     'Job lifecycle writes inside a SQLite transaction must use runJobLifecycleTransaction at the outer boundary',
   );

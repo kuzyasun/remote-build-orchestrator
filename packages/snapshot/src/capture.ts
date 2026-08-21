@@ -66,6 +66,8 @@ export interface CaptureFullSnapshotInput {
   additionalRoots?: JobAdditionalRoot[];
   contentStorageDir: string;
   mainMount?: string;
+  /** Optional controller fencing generation embedded in a private archive candidate name. */
+  fencingGeneration?: number;
 }
 
 export interface CapturedFile {
@@ -670,6 +672,20 @@ async function cleanupContentStorage(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
+function archivePathForGeneration(
+  contentStorageDir: string,
+  basename: string,
+  fencingGeneration: number | undefined,
+): string {
+  if (fencingGeneration === undefined) {
+    return join(contentStorageDir, basename);
+  }
+  if (!Number.isSafeInteger(fencingGeneration) || fencingGeneration < 1) {
+    throw new RboError('validation', 'fencingGeneration must be a positive safe integer', false);
+  }
+  return join(contentStorageDir, `${basename}.g${fencingGeneration}`);
+}
+
 export async function captureFullSnapshot(
   input: CaptureFullSnapshotInput,
 ): Promise<CaptureFullSnapshotResult> {
@@ -827,7 +843,11 @@ export async function captureFullSnapshot(
       ...additionalTarEntries,
     ];
 
-    const archivePath = join(contentStorageDir, 'full-source.tar.zst');
+    const archivePath = archivePathForGeneration(
+      contentStorageDir,
+      'full-source.tar.zst',
+      input.fencingGeneration,
+    );
     let archive: WrittenArchiveCandidateResult;
     try {
       archive = await writeZstdTarArchiveCandidate(archivePath, tarEntries);
@@ -916,6 +936,8 @@ export interface CaptureGitOverlaySnapshotInput {
   additionalRoots?: JobAdditionalRoot[];
   contentStorageDir: string;
   mainMount?: string;
+  /** Optional controller fencing generation embedded in a private archive candidate name. */
+  fencingGeneration?: number;
   /** Allowlisted remote URL for the overlay manifest (any matching remote, not only origin). */
   repoUrl?: string;
 }
@@ -1235,7 +1257,11 @@ export async function captureGitOverlaySnapshot(
       ...additionalTarEntries,
     ];
 
-    const archivePath = join(contentStorageDir, 'overlay.tar.zst');
+    const archivePath = archivePathForGeneration(
+      contentStorageDir,
+      'overlay.tar.zst',
+      input.fencingGeneration,
+    );
     let archive: WrittenArchiveCandidateResult;
     try {
       archive = await writeZstdTarArchiveCandidate(archivePath, tarEntries);

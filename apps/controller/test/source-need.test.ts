@@ -1,11 +1,11 @@
-import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, readFile, rename, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import { ensureControllerIdentity } from '@rbo/shared';
 import { createGitFixtureRepo } from '@rbo/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { handleRemoteSourceNeed } from '../src/execution/remote-execution.js';
 import { captureAndPersistSnapshot } from '../src/execution/runner.js';
-import { createJob, transitionJobState } from '../src/jobs/lifecycle.js';
+import { createJob, persistSnapshot, transitionJobState } from '../src/jobs/lifecycle.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 
@@ -47,6 +47,31 @@ describe('Controller source_need → bundle_download', () => {
     db.close();
     await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
   });
+
+  function generationPath(candidatePath: string): string {
+    return candidatePath.replace(/\.candidate-[^\\/]+$/, '');
+  }
+
+  async function publishCapture(capture: Awaited<ReturnType<typeof captureAndPersistSnapshot>>) {
+    const candidatePaths = [
+      capture.archivePath,
+      capture.manifestPath,
+      capture.secretWarningsPath,
+      capture.gitSourceRequirementsPath,
+    ];
+    await Promise.all(candidatePaths.map((path) => rename(path, generationPath(path))));
+    persistSnapshot(db, {
+      snapshotId: capture.snapshotId,
+      contentId: capture.contentId,
+      repoId: capture.repoId,
+      baseCommit: capture.baseCommit,
+      dirty: true,
+      manifestPath: generationPath(capture.manifestPath),
+      payloadPath: generationPath(capture.archivePath),
+      sizeBytes: capture.sizeBytes,
+      sha256: capture.sha256,
+    });
+  }
 
   it('creates a bundle and sends bundle_download on base_commit_missing', async () => {
     const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
@@ -91,7 +116,9 @@ describe('Controller source_need → bundle_download', () => {
         source: { project_root: fixture.root, cwd: '.' },
         execution: { shell: 'bash', script: 'true' },
       },
+      1,
     );
+    await publishCapture(capture);
 
     db.prepare(
       `INSERT INTO agents (id, display_name, hostname, state, capabilities_json, paired_at)
@@ -105,9 +132,7 @@ describe('Controller source_need → bundle_download', () => {
 
     db.prepare('UPDATE jobs SET snapshot_id = ? WHERE id = ?').run(capture.snapshotId, job.id);
 
-    const manifest = JSON.parse(
-      await readFile(join(tempDir, 'snapshots', job.id, 'manifest.json'), 'utf8'),
-    );
+    const manifest = JSON.parse(await readFile(generationPath(capture.manifestPath), 'utf8'));
     expect(manifest.payload.mode).toBe('git_overlay');
 
     await handleRemoteSourceNeed(
@@ -187,7 +212,9 @@ describe('Controller source_need → bundle_download', () => {
         source: { project_root: fixture.root, cwd: '.' },
         execution: { shell: 'bash', script: 'true' },
       },
+      1,
     );
+    await publishCapture(capture);
 
     db.prepare(
       `INSERT INTO agents (id, display_name, hostname, state, capabilities_json, paired_at)
@@ -281,7 +308,7 @@ describe('Controller source_need → bundle_download', () => {
 
     const { jobSuffix: _unused, ...ctx } = disallowedRemoteCtx('strict');
     await expect(
-      captureAndPersistSnapshot(ctx, job.id, disallowedRequest('req_disallowed_strict')),
+      captureAndPersistSnapshot(ctx, job.id, disallowedRequest('req_disallowed_strict'), 1),
     ).rejects.toThrow(
       /no fetch remote is allowed by git_allowlist[\s\S]*disabled by default[\s\S]*allow_full_snapshot_fallback/,
     );
@@ -301,18 +328,13 @@ describe('Controller source_need → bundle_download', () => {
       ctx,
       job.id,
       disallowedRequest('req_disallowed'),
+      1,
     );
 
-    const manifest = JSON.parse(
-      await readFile(join(tempDir, 'snapshots', job.id, 'manifest.json'), 'utf8'),
-    );
+    const manifest = JSON.parse(await readFile(capture.manifestPath, 'utf8'));
     expect(manifest.payload.mode).toBe('full');
+    expect(capture.manifestPath).toContain('.candidate-');
     expect(capture.contentId).toBeDefined();
-    const snapshot = db
-      .prepare('SELECT payload_path FROM snapshots WHERE id = ?')
-      .get(capture.snapshotId) as { payload_path: string };
-    expect(snapshot.payload_path).toContain('full-source.tar.zst');
-    expect(snapshot.payload_path).not.toContain('.candidate-');
-    expect(await readdir(dirname(snapshot.payload_path))).toContain('full-source.tar.zst');
+    expect(db.prepare('SELECT COUNT(*) AS count FROM snapshots').get()).toMatchObject({ count: 0 });
   });
 });

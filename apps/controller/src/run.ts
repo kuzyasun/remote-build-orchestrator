@@ -11,6 +11,7 @@ import {
   bindJobLifecycleNotifier,
   unbindJobLifecycleNotifier,
 } from './jobs/lifecycle-notifier.js';
+import { recoverSnapshotPublications } from './recovery/snapshot-publication.js';
 import { migrateToLatest, openDatabase } from './storage/database.js';
 import { startAgentPlaneServer } from './websocket/server.js';
 
@@ -29,6 +30,7 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
 
   const db = openDatabase(config.databasePath);
   migrateToLatest(db);
+  await recoverSnapshotPublications({ db, dataDir: config.dataDir });
   const lifecycleNotifier = new JobLifecycleNotifier();
   bindJobLifecycleNotifier(db, lifecycleNotifier);
 
