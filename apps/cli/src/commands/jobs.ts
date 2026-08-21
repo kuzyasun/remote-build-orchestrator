@@ -89,6 +89,8 @@ export interface FollowLogsOptions {
   signal?: AbortSignal;
   /** Poll interval for job terminal state (ms). */
   pollMs?: number;
+  /** Bound one SSE connection attempt; an established live stream is not timed out. */
+  connectTimeoutMs?: number;
 }
 
 const TERMINAL_JOB_STATES = new Set(['completed']);
@@ -118,6 +120,7 @@ export async function followJobLogsRemote(
   const root = baseUrl.replace(/\/+$/, '');
   const onChunk = options.onChunk ?? writeChunkDefault;
   const pollMs = options.pollMs ?? 500;
+  const connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
   let lastSequence = 0;
   let lastState: string | null = null;
 
@@ -184,8 +187,13 @@ export async function followJobLogsRemote(
     }
 
     let res: Response;
+    const connectAbort = new AbortController();
+    const timeout = setTimeout(() => connectAbort.abort(), connectTimeoutMs);
     try {
-      res = await fetch(buildUrl(), { headers, signal: options.signal });
+      const signal = options.signal
+        ? AbortSignal.any([options.signal, connectAbort.signal])
+        : connectAbort.signal;
+      res = await fetch(buildUrl(), { headers, signal });
     } catch {
       if (options.signal?.aborted) {
         break;
@@ -203,6 +211,8 @@ export async function followJobLogsRemote(
       }
       await new Promise((r) => setTimeout(r, pollMs));
       continue;
+    } finally {
+      clearTimeout(timeout);
     }
 
     if (!res.ok || !res.body) {

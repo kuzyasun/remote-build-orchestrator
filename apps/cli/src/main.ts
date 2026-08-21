@@ -31,9 +31,9 @@ import {
   cancelJobRemote,
   followJobLogsRemote,
   getJobLogsRemote,
-  runJobRemote,
   submitJobRemote,
 } from './commands/jobs.js';
+import { runJobToTerminal, takeRunFollowFlag } from './commands/run-runtime.js';
 import { parseRunCommandArgs } from './commands/run.js';
 import {
   type ServiceAction,
@@ -230,8 +230,9 @@ async function main(): Promise<void> {
     }
 
     case 'run': {
-      const { request } = parseRunCommandArgs(rest);
-      const result = await runJobRemote(controllerUrl, request);
+      const { follow, args } = takeRunFollowFlag(rest);
+      const { request } = parseRunCommandArgs(args);
+      const result = await runJobToTerminal(controllerUrl, request, { follow });
       console.log(JSON.stringify(result, null, 2));
       return;
     }

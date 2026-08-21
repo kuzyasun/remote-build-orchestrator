@@ -25,6 +25,7 @@ describe('rbo --help', () => {
     expect(help).toContain('doctor');
     expect(help).toContain('--replace');
     expect(help).toContain('run [options] -- <shell-command-string>');
+    expect(help).toContain('--follow                 Stream live logs until the job completes');
     expect(help).toContain('not an argv-safe direct execution API');
   });
 });

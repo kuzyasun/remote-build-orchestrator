@@ -260,4 +260,51 @@ describe('CLI job logs helpers', () => {
       server.close((err) => (err ? rejectPromise(err) : resolvePromise())),
     );
   });
+
+  it('bounds a stalled SSE connection attempt before reconnecting', async () => {
+    let connections = 0;
+    const printed: string[] = [];
+    const server = createServer((req, res) => {
+      if (req.url?.startsWith('/internal/v1/tools/job_get')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ job: { id: 'job_1', state: 'completed' } }));
+        return;
+      }
+      if (!req.url?.includes('/logs/stream')) {
+        res.writeHead(404).end();
+        return;
+      }
+      connections += 1;
+      if (connections === 1) {
+        // Deliberately never send response headers; the client must abort this attempt.
+        req.on('close', () => res.end());
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        [
+          'event: log\nid: 1\ndata: {"sequence":1,"stream":"stdout","text":"tail"}\n\n',
+          'event: done\ndata: {"state":"completed","last_sequence":1}\n\n',
+        ].join(''),
+      );
+    });
+
+    await new Promise<void>((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    const result = await followJobLogsRemote(`http://127.0.0.1:${port}`, 'job_1', {
+      onChunk: (_stream, text) => printed.push(text),
+      pollMs: 1,
+      connectTimeoutMs: 20,
+    });
+
+    expect(printed).toEqual(['tail']);
+    expect(result).toEqual({ lastSequence: 1, state: 'completed' });
+    expect(connections).toBe(2);
+
+    await new Promise<void>((resolvePromise, rejectPromise) =>
+      server.close((err) => (err ? rejectPromise(err) : resolvePromise())),
+    );
+  });
 });
