@@ -27,8 +27,23 @@ Commands:
   agents
   doctor [--data-dir <dir>]
   submit <job-request.json>
+  run [options] -- <shell-command-string>
   logs <job-id> [--follow]
   cancel <job-id> [reason]
+
+rbo run options:
+  --project <path>         Project root (default current directory)
+  --cwd <relative-path>    Working directory inside the project
+  --shell <shell>          Target shell
+  --target-os <os>         Repeatable target OS constraint
+  --timeout <seconds>      Remote execution timeout
+  --risk <level>           Job risk level
+  --artifact <glob>        Repeatable optional artifact rule
+  --queue-policy <policy>  local_fallback|wait|fail_fast
+
+Pass exactly one target-shell command string after \`--\`. Your local shell removes
+outer quoting; RBO sends the remaining string unchanged to the target shell. For
+example: \`rbo run -- "pnpm test"\`. This is not an argv-safe direct execution API.
 
 Environment:
   RBO_CONTROLLER_URL_HTTP   Controller HTTP base (default http://127.0.0.1:7410)

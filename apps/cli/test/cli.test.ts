@@ -24,6 +24,8 @@ describe('rbo --help', () => {
     expect(help).toContain('agent stop-process');
     expect(help).toContain('doctor');
     expect(help).toContain('--replace');
+    expect(help).toContain('run [options] -- <shell-command-string>');
+    expect(help).toContain('not an argv-safe direct execution API');
   });
 });
 

@@ -1,3 +1,5 @@
+import type { JobRunInput } from './run.js';
+
 // Thin HTTP client for Controller job MCP tools via /internal/v1/tools/* (§23).
 
 async function postTool<T>(baseUrl: string, tool: string, body: unknown): Promise<T> {
@@ -25,6 +27,14 @@ export function submitJobRemote(
   request: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   return postTool(baseUrl, 'job_submit', request);
+}
+
+/** Submit the shared compact `job_run` input without local protocol revalidation. */
+export function runJobRemote(
+  baseUrl: string,
+  input: JobRunInput,
+): Promise<Record<string, unknown>> {
+  return postTool(baseUrl, 'job_run', input);
 }
 
 export function getJobRemote(baseUrl: string, jobId: string): Promise<Record<string, unknown>> {

@@ -31,8 +31,10 @@ import {
   cancelJobRemote,
   followJobLogsRemote,
   getJobLogsRemote,
+  runJobRemote,
   submitJobRemote,
 } from './commands/jobs.js';
+import { parseRunCommandArgs } from './commands/run.js';
 import {
   type ServiceAction,
   detectPlatform,
@@ -223,6 +225,13 @@ async function main(): Promise<void> {
       }
       const request = JSON.parse(await readFile(requestPath, 'utf8')) as Record<string, unknown>;
       const result = await submitJobRemote(controllerUrl, request);
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    case 'run': {
+      const { request } = parseRunCommandArgs(rest);
+      const result = await runJobRemote(controllerUrl, request);
       console.log(JSON.stringify(result, null, 2));
       return;
     }
