@@ -307,4 +307,41 @@ describe('CLI job logs helpers', () => {
       server.close((err) => (err ? rejectPromise(err) : resolvePromise())),
     );
   });
+
+  it('aborts a pending catch-up job_get promptly after an SSE reconnect failure', async () => {
+    const controller = new AbortController();
+    let jobGetRequests = 0;
+    const server = createServer((req, res) => {
+      if (req.url?.startsWith('/internal/v1/tools/job_get')) {
+        jobGetRequests += 1;
+        controller.abort();
+        // The request must be aborted by the lifecycle signal, rather than waiting for its 15s bound.
+        req.on('close', () => res.end());
+        return;
+      }
+      if (req.url?.includes('/logs/stream')) {
+        req.socket.destroy();
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    await new Promise<void>((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+    const startedAt = Date.now();
+
+    const result = await followJobLogsRemote(`http://127.0.0.1:${port}`, 'job_abort_get', {
+      signal: controller.signal,
+      pollMs: 1,
+    });
+
+    expect(result).toEqual({ lastSequence: 0, state: null });
+    expect(jobGetRequests).toBe(1);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+
+    await new Promise<void>((resolvePromise, rejectPromise) =>
+      server.close((err) => (err ? rejectPromise(err) : resolvePromise())),
+    );
+  });
 });

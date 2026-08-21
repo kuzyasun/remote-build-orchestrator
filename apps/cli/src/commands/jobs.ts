@@ -241,7 +241,7 @@ export async function followJobLogsRemote(
       if (options.signal?.aborted) {
         break;
       }
-      const payload = await getJobRemote(root, jobId).catch(() => null);
+      const payload = await getJobRemote(root, jobId, { signal: options.signal }).catch(() => null);
       const state = jobStateFromGet(payload);
       lastState = state ?? lastState;
       if (state && isTerminalState(state)) {
@@ -262,7 +262,9 @@ export async function followJobLogsRemote(
       const text = await res.text().catch(() => '');
       // Attempt may not exist yet (queued) — validation 400 is retryable.
       if (res.status === 400 || res.status === 404) {
-        const payload = await getJobRemote(root, jobId).catch(() => null);
+        const payload = await getJobRemote(root, jobId, { signal: options.signal }).catch(
+          () => null,
+        );
         const state = jobStateFromGet(payload);
         lastState = state ?? lastState;
         if (!payload || !state) {
@@ -330,7 +332,7 @@ export async function followJobLogsRemote(
       break;
     }
 
-    const payload = await getJobRemote(root, jobId).catch(() => null);
+    const payload = await getJobRemote(root, jobId, { signal: options.signal }).catch(() => null);
     const state = jobStateFromGet(payload);
     lastState = state ?? lastState;
     if (state && isTerminalState(state)) {
