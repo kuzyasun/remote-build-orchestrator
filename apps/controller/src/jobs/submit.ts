@@ -493,6 +493,7 @@ export async function dispatchJobExecution(
     buildCacheProjectIdentity,
     estimatedTransferBytes: snapshotMeta?.size_bytes ?? null,
     recentFailurePenalties,
+    registeredAgentCount: dbAgents.length,
     hostLoad,
     maxHostCpuBusyFraction: ctx.maxHostCpuBusyFraction,
   });
@@ -522,11 +523,18 @@ export async function dispatchJobExecution(
   }
 
   if (decision.action === 'fail_fast') {
+    const failureMessage =
+      decision.noMatchDiagnostic?.hint ?? 'No eligible agent available to execute job';
+    logger.info('no matching agent available for job', {
+      jobId,
+      diagnostic: decision.noMatchDiagnostic,
+    });
     transitionJobState(ctx.db, jobId, 'completed', {
       outcome: 'failed',
       finished_at: nowIso(),
       failure_category: 'no_matching_agent',
-      failure_message: 'No eligible agent available to execute job',
+      failure_message: failureMessage,
+      result_json: JSON.stringify({ no_match: decision.noMatchDiagnostic }),
     });
     return;
   }

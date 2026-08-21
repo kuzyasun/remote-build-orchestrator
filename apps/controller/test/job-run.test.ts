@@ -324,6 +324,96 @@ describe('handleJobRun responses', () => {
     });
   });
 
+  it('returns the persisted no-match diagnostic without Agent details', async () => {
+    const jobRow = {
+      state: 'failed',
+      outcome: 'failed',
+      exit_code: null,
+      failure_category: 'no_matching_agent',
+      failure_message: 'No online Agent provides bash on windows.',
+      result_json: JSON.stringify({
+        no_match: {
+          category: 'no_matching_agent',
+          retryable: false,
+          required_shell: 'bash',
+          target_os: ['windows'],
+          hint: 'No online Agent provides bash on windows.',
+        },
+      }),
+    };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue(undefined);
+
+    // biome-ignore lint/suspicious/noExplicitAny: partial SubmitJobContext mock
+    const res = await handleJobRun(ctx as any, rawInput);
+
+    expect(res.no_match).toEqual({
+      category: 'no_matching_agent',
+      retryable: false,
+      required_shell: 'bash',
+      target_os: ['windows'],
+      hint: 'No online Agent provides bash on windows.',
+    });
+    expect(JSON.stringify(res.no_match)).not.toContain('private/agent-hostname');
+  });
+
+  it.each([
+    ['a successful job', { state: 'completed', outcome: 'succeeded', exit_code: 0 }],
+    [
+      'an unrelated failed job',
+      { state: 'failed', outcome: 'failed', exit_code: 1, failure_category: 'process_exit' },
+    ],
+  ])('does not expose no_match for %s', async (_label, jobState) => {
+    const result_json = JSON.stringify({
+      no_match: {
+        category: 'no_matching_agent',
+        retryable: false,
+        required_shell: 'bash',
+        target_os: ['linux'],
+        hint: 'No online Agent provides bash on linux.',
+      },
+    });
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: { ...jobState, result_json } });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue(undefined);
+
+    // biome-ignore lint/suspicious/noExplicitAny: partial SubmitJobContext mock
+    const res = await handleJobRun(ctx as any, rawInput);
+
+    expect(res.no_match).toBeUndefined();
+  });
+
+  it.each([
+    ['required_shell', { required_shell: 'x'.repeat(17) }],
+    ['target_os entry', { target_os: ['linux', 'windows', 'macos', 'freebsd'] }],
+    ['hint', { hint: 'x'.repeat(257) }],
+  ])('omits malformed overlong no_match %s', async (_label, override) => {
+    const result_json = JSON.stringify({
+      no_match: {
+        category: 'no_matching_agent',
+        retryable: false,
+        required_shell: 'bash',
+        target_os: ['linux'],
+        hint: 'No online Agent provides bash on linux.',
+        ...override,
+      },
+    });
+    vi.mocked(submit.waitForJob).mockResolvedValue({
+      job: {
+        state: 'failed',
+        outcome: 'failed',
+        exit_code: null,
+        failure_category: 'no_matching_agent',
+        result_json,
+      },
+    });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue(undefined);
+
+    // biome-ignore lint/suspicious/noExplicitAny: partial SubmitJobContext mock
+    const res = await handleJobRun(ctx as any, rawInput);
+
+    expect(res.no_match).toBeUndefined();
+  });
+
   it('Non-terminal resume with log_chunks and next_log_cursor', async () => {
     const jobRow = { state: 'running' };
     vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });

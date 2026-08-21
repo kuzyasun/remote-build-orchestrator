@@ -253,6 +253,117 @@ describe('Scheduler Engine (§19.2)', () => {
     );
   });
 
+  it('returns a bounded, request-scoped diagnostic for an explicit shell and OS conflict', () => {
+    const windowsPowerShellOnly = makeAgent('agt_windows', {
+      hostname: 'C:/private/controller/host-path-must-not-leak',
+      os: { family: 'windows', version: '10', arch: 'x64' },
+      execution: {
+        max_jobs: 1,
+        shells: ['powershell'],
+        supports_tty: false,
+        supports_process_tree_kill: true,
+      },
+    });
+    const request = makeRequest({
+      execution: { shell: 'bash', script: 'echo test' },
+      requirements: { os: ['windows'] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([windowsPowerShellOnly], request);
+
+    expect(decision).toMatchObject({
+      action: 'fail_fast',
+      noMatchDiagnostic: {
+        category: 'no_matching_agent',
+        retryable: false,
+        required_shell: 'bash',
+        target_os: ['windows'],
+      },
+    });
+    expect(decision.noMatchDiagnostic?.hint).toContain('bash on windows');
+    expect(
+      Buffer.byteLength(JSON.stringify(decision.noMatchDiagnostic), 'utf8'),
+    ).toBeLessThanOrEqual(512);
+    expect(JSON.stringify(decision.noMatchDiagnostic)).not.toContain('private/controller');
+  });
+
+  it('reports a capacity-only remote mismatch without changing fail_fast selection', () => {
+    const busyBashLinux = makeAgent(
+      'agt_busy',
+      {
+        os: { family: 'linux', version: '6', arch: 'x64' },
+        execution: {
+          max_jobs: 1,
+          shells: ['bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      1,
+    );
+    const request = makeRequest({
+      execution: { shell: 'bash', script: 'echo test' },
+      requirements: { os: ['linux'] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([busyBashLinux], request, { allowLocalFallback: true });
+
+    expect(decision.action).toBe('fail_fast');
+    expect(decision.noMatchDiagnostic?.hint).toContain('at capacity');
+  });
+
+  it('identifies an offline registered Agent without exposing its capabilities', () => {
+    const request = makeRequest({
+      execution: { shell: 'powershell', script: 'Write-Output test' },
+      requirements: { os: ['windows'] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([], request, { registeredAgentCount: 1 });
+
+    expect(decision.noMatchDiagnostic).toEqual({
+      category: 'no_matching_agent',
+      retryable: false,
+      required_shell: 'powershell',
+      target_os: ['windows'],
+      hint: 'No registered Agent is online. Reconnect an Agent or use queue_policy="wait".',
+    });
+  });
+
+  it('preserves the legacy bash default in an actionable OS mismatch diagnostic', () => {
+    const windowsAgent = makeAgent('agt_windows', {
+      os: { family: 'windows', version: '10', arch: 'x64' },
+    });
+    const request = makeRequest({
+      requirements: { os: ['linux'] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([windowsAgent], request);
+
+    expect(decision.noMatchDiagnostic).toMatchObject({
+      required_shell: 'bash',
+      target_os: ['linux'],
+    });
+    expect(decision.noMatchDiagnostic?.hint).toContain('target_os linux');
+  });
+
+  it('bounds diagnostic serialization for oversized programmatic target requirements', () => {
+    const request = makeRequest({
+      execution: { shell: 'bash', script: 'echo test' },
+      requirements: { os: ['界'.repeat(100), '測'.repeat(100), '試'.repeat(100)] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([makeAgent('agt_windows')], request);
+
+    expect(
+      Buffer.byteLength(JSON.stringify(decision.noMatchDiagnostic), 'utf8'),
+    ).toBeLessThanOrEqual(512);
+  });
+
   it('supports mocked macOS capability selection as scheduler unit coverage', () => {
     const macAgent = makeAgent('agt_macos_mock', {
       os: { family: 'macos', version: '14.0', arch: 'arm64' },

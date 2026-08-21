@@ -27,6 +27,7 @@ export interface JobRow {
   exit_code: number | null;
   failure_category: string | null;
   failure_message: string | null;
+  result_json: string | null;
 }
 
 export interface AttemptRow {
@@ -127,7 +128,7 @@ export function getJob(db: ControllerDatabase, jobId: string): JobRow | null {
     .prepare(
       `SELECT id, client_id, client_request_id, name, state, outcome, created_at, updated_at,
               queued_at, started_at, finished_at, agent_id, snapshot_id, exit_code,
-              failure_category, failure_message
+              failure_category, failure_message, result_json
        FROM jobs WHERE id = ?`,
     )
     .get(jobId);

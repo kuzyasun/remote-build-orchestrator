@@ -30,6 +30,10 @@ export const DEFAULT_MCP_WAIT_SLICE_SECONDS = 50;
 
 type ShellId = ExecutionConfig['shell'];
 const CANONICAL_TARGET_OS = new Set(['macos', 'windows', 'linux']);
+const MAX_NO_MATCH_DIAGNOSTIC_BYTES = 512;
+const MAX_NO_MATCH_FIELD_BYTES = 16;
+const MAX_NO_MATCH_TARGET_OS = 3;
+const MAX_NO_MATCH_HINT_BYTES = 256;
 
 export interface JobRunProgressUpdate {
   progress: number;
@@ -57,6 +61,60 @@ export interface JobRunInput {
 
 export interface JobRunOptions {
   onProgress?: (update: JobRunProgressUpdate) => void | Promise<void>;
+}
+
+interface NoMatchDiagnosticResponse {
+  category: 'no_matching_agent';
+  retryable: false;
+  required_shell: string;
+  target_os?: string[];
+  hint: string;
+}
+
+function isBoundedNoMatchString(value: unknown, maxBytes: number): value is string {
+  return (
+    typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= maxBytes
+  );
+}
+
+function readNoMatchDiagnostic(resultJson: string | null): NoMatchDiagnosticResponse | undefined {
+  if (!resultJson || Buffer.byteLength(resultJson, 'utf8') > MAX_NO_MATCH_DIAGNOSTIC_BYTES * 2) {
+    return undefined;
+  }
+  try {
+    const result = JSON.parse(resultJson) as { no_match?: unknown };
+    const diagnostic = result.no_match;
+    if (!diagnostic || typeof diagnostic !== 'object' || Array.isArray(diagnostic)) {
+      return undefined;
+    }
+    const candidate = diagnostic as Record<string, unknown>;
+    const targetOs = candidate.target_os;
+    if (
+      candidate.category !== 'no_matching_agent' ||
+      candidate.retryable !== false ||
+      !isBoundedNoMatchString(candidate.required_shell, MAX_NO_MATCH_FIELD_BYTES) ||
+      !isBoundedNoMatchString(candidate.hint, MAX_NO_MATCH_HINT_BYTES) ||
+      (targetOs !== undefined &&
+        (!Array.isArray(targetOs) ||
+          targetOs.length === 0 ||
+          targetOs.length > MAX_NO_MATCH_TARGET_OS ||
+          targetOs.some((os) => !isBoundedNoMatchString(os, MAX_NO_MATCH_FIELD_BYTES))))
+    ) {
+      return undefined;
+    }
+    const noMatch: NoMatchDiagnosticResponse = {
+      category: 'no_matching_agent',
+      retryable: false,
+      required_shell: candidate.required_shell,
+      ...(targetOs ? { target_os: targetOs } : {}),
+      hint: candidate.hint,
+    };
+    return Buffer.byteLength(JSON.stringify(noMatch), 'utf8') <= MAX_NO_MATCH_DIAGNOSTIC_BYTES
+      ? noMatch
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Build fail-closed shell execution from a single command string (AI does not pass boilerplate). */
@@ -423,6 +481,10 @@ async function finishJobRunResponse(
     if (job.failure_category != null)
       out.failure_category = truncateUtf8(job.failure_category, 1024);
     if (job.failure_message != null) out.failure_message = truncateUtf8(job.failure_message, 2048);
+    if (job.failure_category === 'no_matching_agent') {
+      const noMatch = readNoMatchDiagnostic(job.result_json);
+      if (noMatch) out.no_match = noMatch;
+    }
     Object.assign(out, artifactPayload);
 
     if (attempt) {

@@ -61,6 +61,20 @@ export interface SchedulingDecision {
   selectedAgent?: SchedulerAgent;
   selectedToolchains?: ToolchainProfile[];
   reason?: string;
+  /** Compact, request-scoped explanation when no remote Agent is currently eligible. */
+  noMatchDiagnostic?: NoMatchingAgentDiagnostic;
+}
+
+/**
+ * Intentionally excludes agent identity, hostname, paths, and complete capability reports.
+ * It is safe to persist or log without revealing Agent details.
+ */
+export interface NoMatchingAgentDiagnostic {
+  category: 'no_matching_agent';
+  retryable: false;
+  required_shell: string;
+  target_os?: string[];
+  hint: string;
 }
 
 export interface ExpectedBuildCacheKey {
@@ -96,6 +110,8 @@ export interface SchedulerOptions {
   estimatedTransferBytes?: number | null;
   /** Controller-computed recent_failure_penalty per agent id (§19.2). */
   recentFailurePenalties?: ReadonlyMap<string, number>;
+  /** Registered, non-disabled Agents before the online connection filter is applied. */
+  registeredAgentCount?: number;
   /**
    * Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). When omitted, local
    * fallback behaves exactly as before (host load is not considered) — fully backward compatible.
@@ -235,6 +251,108 @@ function matchesSecretRefs(requestRefs: string[], agentRefs: string[]): boolean 
   }
   const agentSet = new Set(agentRefs);
   return requestRefs.every((ref) => agentSet.has(ref));
+}
+
+const MAX_DIAGNOSTIC_FIELD_BYTES = 16;
+const MAX_DIAGNOSTIC_TARGET_OS = 3;
+
+function truncateDiagnosticText(value: string, maxBytes = MAX_DIAGNOSTIC_FIELD_BYTES): string {
+  let bytes = 0;
+  let output = '';
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (bytes + characterBytes > maxBytes) {
+      break;
+    }
+    output += character;
+    bytes += characterBytes;
+  }
+  return output;
+}
+
+function normalizedTargetOs(requestOs: string[] | undefined): string[] | undefined {
+  if (!requestOs || requestOs.length === 0) {
+    return undefined;
+  }
+  return [...new Set(requestOs.map((os) => os.trim().toLowerCase()).filter(Boolean))]
+    .slice(0, MAX_DIAGNOSTIC_TARGET_OS)
+    .map((os) => truncateDiagnosticText(os));
+}
+
+function normalizedShell(shell: string): string {
+  return shell.replace(/\.exe$/i, '').toLowerCase();
+}
+
+function agentHasRequiredShell(agent: SchedulerAgent, requiredShell: string): boolean {
+  return agent.capabilities.execution.shells.some(
+    (shell) => normalizedShell(shell) === requiredShell,
+  );
+}
+
+function agentIsAtCapacity(agent: SchedulerAgent): boolean {
+  const capacity = agent.capabilities.execution.max_jobs;
+  return capacity <= 0 || agent.activeJobsCount >= capacity;
+}
+
+/**
+ * Summarize only the request and aggregate matching state. Never include individual Agent
+ * capabilities: the diagnostic is exposed on a job failure and must remain compact.
+ */
+export function describeNoMatchingAgent(
+  agents: readonly SchedulerAgent[],
+  request: JobRequest,
+  options: Pick<SchedulerOptions, 'registeredAgentCount'> = {},
+): NoMatchingAgentDiagnostic {
+  const requestedOs = request.requirements?.os;
+  const targetOs = normalizedTargetOs(requestedOs);
+  // Programmatic callers may bypass Zod's default; retain the existing bash default in that case.
+  const requiredShell = normalizedShell(request.execution.shell ?? 'bash');
+  const diagnosticShell = truncateDiagnosticText(requiredShell);
+  const targetLabel = targetOs?.join(' or ') ?? 'the requested target OS';
+  const base = {
+    category: 'no_matching_agent' as const,
+    retryable: false as const,
+    required_shell: diagnosticShell,
+    ...(targetOs ? { target_os: targetOs } : {}),
+  };
+
+  if (agents.length === 0) {
+    return {
+      ...base,
+      hint:
+        options.registeredAgentCount && options.registeredAgentCount > 0
+          ? 'No registered Agent is online. Reconnect an Agent or use queue_policy="wait".'
+          : 'No online Agent is available. Connect an Agent or use queue_policy="wait".',
+    };
+  }
+
+  const osMatches = agents.filter((agent) => matchesOs(requestedOs, agent.capabilities.os.family));
+  if (requestedOs && requestedOs.length > 0 && osMatches.length === 0) {
+    return {
+      ...base,
+      hint: `No online Agent matches target_os ${targetLabel}. Choose target_os and shell supported by the same Agent.`,
+    };
+  }
+
+  const shellMatches = osMatches.filter((agent) => agentHasRequiredShell(agent, requiredShell));
+  if (shellMatches.length === 0) {
+    return {
+      ...base,
+      hint: `No online Agent provides ${diagnosticShell} on ${targetLabel}. Specify shell and target_os supported by the same Agent.`,
+    };
+  }
+
+  if (shellMatches.every(agentIsAtCapacity)) {
+    return {
+      ...base,
+      hint: 'All online Agents matching shell and target_os are at capacity. Use queue_policy="wait" or retry when capacity is available.',
+    };
+  }
+
+  return {
+    ...base,
+    hint: 'No online Agent satisfies the requested execution requirements.',
+  };
 }
 
 /** §19.3 default configured_priority by OS family (remote agents). */
@@ -673,10 +791,8 @@ export function selectAgentForJob(
     }
 
     // 7. Required shell (§19.1)
-    const requiredShell = (request.execution.shell ?? 'bash').replace(/\.exe$/i, '').toLowerCase();
-    const hasShell = caps.execution.shells.some(
-      (s) => s.replace(/\.exe$/i, '').toLowerCase() === requiredShell,
-    );
+    const requiredShell = normalizedShell(request.execution.shell ?? 'bash');
+    const hasShell = agentHasRequiredShell(candidate, requiredShell);
     if (!hasShell) {
       continue;
     }
@@ -735,13 +851,14 @@ export function selectAgentForJob(
 
   // Fallback Handling Table (§35 Phase 4)
   const queuePolicy = request.queue_policy ?? 'local_fallback';
+  const noMatchDiagnostic = describeNoMatchingAgent(agents, request, options);
 
   if (queuePolicy === 'wait') {
     return { action: 'wait', reason: 'no_eligible_agent' };
   }
 
   if (queuePolicy === 'fail_fast') {
-    return { action: 'fail_fast', reason: 'no_eligible_agent' };
+    return { action: 'fail_fast', reason: 'no_eligible_agent', noMatchDiagnostic };
   }
 
   // local_fallback — hardware/destructive remain ineligible (§19 / Phase 4)
@@ -762,7 +879,7 @@ export function selectAgentForJob(
     }
     return decision.reason === 'host_busy'
       ? { action: 'wait', reason: 'host_busy' }
-      : { action: 'fail_fast', reason: 'no_eligible_agent' };
+      : { action: 'fail_fast', reason: 'no_eligible_agent', noMatchDiagnostic };
   }
 
   // No host load reading supplied — unchanged, backward-compatible behavior.
@@ -770,7 +887,7 @@ export function selectAgentForJob(
     return { action: 'local_fallback' };
   }
 
-  return { action: 'fail_fast', reason: 'no_eligible_agent' };
+  return { action: 'fail_fast', reason: 'no_eligible_agent', noMatchDiagnostic };
 }
 
 export function getActiveJobsForAgents(db: ControllerDatabase): Map<string, number> {
