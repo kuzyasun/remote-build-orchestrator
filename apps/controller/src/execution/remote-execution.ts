@@ -23,7 +23,7 @@ import type {
 } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
 import { RboError, createLogger, generateId, sha256File } from '@rbo/shared';
-import { captureFullSnapshot } from '@rbo/snapshot';
+import { captureFullSnapshot, discardCapturedContent } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
 import { DEFAULT_MAX_GIT_BUNDLE_BYTES } from '../config.js';
@@ -360,14 +360,21 @@ async function ensureFullFallbackArchive(
     additionalRoots: request.source.additional_roots,
     contentStorageDir: transferDir,
   });
-  await copyFile(captured.archivePath, archivePath);
-  await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
-  return {
-    archivePath,
-    sizeBytes: captured.manifest.payload.size,
-    sha256: captured.manifest.payload.sha256,
-    manifest: captured.manifest,
-  };
+  try {
+    await copyFile(captured.archivePath, archivePath);
+    await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
+    return {
+      archivePath,
+      sizeBytes: captured.manifest.payload.size,
+      sha256: captured.manifest.payload.sha256,
+      manifest: captured.manifest,
+    };
+  } finally {
+    // `captureFullSnapshot` always writes into a private child of transferDir.
+    // The stable transfer artifacts above are the only files this fallback owns
+    // after the copy attempt, so discard the candidate on both success and error.
+    await discardCapturedContent(captured.contentStorageDir);
+  }
 }
 
 function resolveDataPlaneBaseUrl(opts: RemoteExecutionOptions): string {

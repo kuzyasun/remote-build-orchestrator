@@ -102,7 +102,7 @@ export function createTarArchive(entries: TarEntryInput[]): Buffer {
   for (const entry of sorted) {
     if (entry.type === 'file' && entry.contentPath && !entry.content) {
       throw new Error(
-        `createTarArchive requires in-memory content for '${entry.path}' (use writeZstdTarArchiveFile for contentPath)`,
+        `createTarArchive requires in-memory content for '${entry.path}' (use writeZstdTarArchiveCandidate for contentPath)`,
       );
     }
     const fileSize = entry.type === 'file' && entry.content ? entry.content.length : 0;
@@ -286,27 +286,6 @@ export async function writeZstdTarArchiveCandidate(
     entries: entryResults,
     sha256: hash.digest('hex'),
     size,
-  };
-}
-
-/** Compatibility wrapper that publishes the completed candidate to archivePath. */
-export async function writeZstdTarArchiveFile(
-  archivePath: string,
-  entries: TarEntryInput[],
-): Promise<WrittenArchiveResult> {
-  const { rename, rm } = await import('node:fs/promises');
-  const candidate = await writeZstdTarArchiveCandidate(archivePath, entries);
-  try {
-    await rename(candidate.candidatePath, archivePath);
-  } catch (error) {
-    await rm(candidate.candidatePath, { force: true }).catch(() => undefined);
-    throw error;
-  }
-  return {
-    format: candidate.format,
-    compression: candidate.compression,
-    sha256: candidate.sha256,
-    size: candidate.size,
   };
 }
 

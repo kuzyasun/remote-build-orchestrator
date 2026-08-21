@@ -11,13 +11,12 @@ import {
   decompressTarZstd,
   parseTarArchive,
   writeZstdTarArchiveCandidate,
-  writeZstdTarArchiveFile,
 } from '../src/archive.js';
 import { captureFullSnapshot } from '../src/capture.js';
 
 const execFileAsync = promisify(execFile);
 
-describe('writeZstdTarArchiveFile memory hygiene', () => {
+describe('writeZstdTarArchiveCandidate memory hygiene', () => {
   const cleanups: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
@@ -147,7 +146,7 @@ describe('writeZstdTarArchiveFile memory hygiene', () => {
     await rm(candidate.candidatePath, { force: true });
   });
 
-  it('writes archive to disk, returns no payload buffer, and hashes the on-disk bytes', async () => {
+  it('writes a private candidate, returns no payload buffer, and hashes its on-disk bytes', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'rbo-archive-'));
     cleanups.push(async () => {
       await rm(dir, { recursive: true, force: true });
@@ -166,14 +165,15 @@ describe('writeZstdTarArchiveFile memory hygiene', () => {
         content: Buffer.from('hello-b'),
       },
     ];
-    const outPath = join(dir, 'out.tar.zst');
-    const written = await writeZstdTarArchiveFile(outPath, entries);
+    const requestedPath = join(dir, 'out.tar.zst');
+    const written = await writeZstdTarArchiveCandidate(requestedPath, entries);
 
     expect(written.format).toBe('tar');
     expect(written.compression).toBe('zstd');
     expect('data' in written).toBe(false);
 
-    const onDisk = await readFile(outPath);
+    await expect(readFile(requestedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    const onDisk = await readFile(written.candidatePath);
     expect(createHash('sha256').update(onDisk).digest('hex')).toBe(written.sha256);
     expect(onDisk.length).toBe(written.size);
 
@@ -185,6 +185,7 @@ describe('writeZstdTarArchiveFile memory hygiene', () => {
     expect(streamedEntries.map((e) => ({ path: e.path, size: e.content.length }))).toEqual(
       syncEntries.map((e) => ({ path: e.path, size: e.content.length })),
     );
+    await rm(written.candidatePath, { force: true });
   });
 
   it('full capture drops in-memory file buffers after writing the archive', async () => {
