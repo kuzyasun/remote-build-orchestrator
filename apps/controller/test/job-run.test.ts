@@ -133,21 +133,37 @@ describe('buildJobRunRequest', () => {
     expect(request.execution.shell).toBe('bash');
   });
 
-  it('maps explicit cross-platform shell and OS constraints into the canonical request', () => {
-    const request = buildJobRunRequest(
-      {
-        command: 'Write-Output done',
-        project_root: '/tmp/app',
-        shell: 'pwsh',
-        target_os: ['windows'],
-      },
+  it.each([
+    ['Windows Controller to Bash/Linux', 'win32', 'bash', ['linux'], 'printf "$HOME"'],
+    [
+      'Linux Controller to PowerShell/Windows',
       'linux',
+      'pwsh',
+      ['windows'],
+      'Write-Output $env:HOME',
+    ],
+    ['Bash on non-default Windows', 'win32', 'bash', ['windows'], 'echo "$HOME"'],
+  ] as const)(
+    'maps explicit shell and OS constraints for %s without translating the command',
+    (_label, platform, shell, target_os, command) => {
+      const request = buildJobRunRequest(
+        { command, project_root: '/tmp/app', shell, target_os },
+        platform,
+      );
+
+      expect(request.execution.shell).toBe(shell);
+      expect(request.execution.script).toContain(command);
+      expect(request.requirements).toEqual({ os: target_os });
+    },
+  );
+
+  it('uses the Windows omitted-shell convenience default before fake Agent matching', () => {
+    const request = buildJobRunRequest(
+      { command: 'Write-Output $env:HOME', project_root: '/tmp/app' },
+      'win32',
     );
-    expect(request.execution).toMatchObject({
-      shell: 'pwsh',
-      script: expect.stringContaining('Write-Output done'),
-    });
-    expect(request.requirements).toEqual({ os: ['windows'] });
+
+    expect(request.execution.shell).toBe('powershell');
   });
 
   it.each(['local_fallback', 'wait', 'fail_fast'] as const)(

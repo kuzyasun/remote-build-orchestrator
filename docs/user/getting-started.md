@@ -228,6 +228,29 @@ rbo submit job.json
 rbo logs <job-id> --follow
 ```
 
+### Select a remote shell and OS explicitly
+
+`job_run` is the compact MCP path for an AI client. When the chosen Agent differs from the
+Controller's OS, the client should name both the shell and target OS. RBO schedules that exact
+shell; it never translates command syntax between shell families.
+
+```json
+{
+  "command": "printf '%s\\n' \"$HOME\"",
+  "project_root": "/home/you/projects/my-app",
+  "shell": "bash",
+  "target_os": ["linux"],
+  "queue_policy": "fail_fast"
+}
+```
+
+`queue_policy` is optional: use `fail_fast` when a missing compatible Agent should return an
+immediate answer, `wait` to leave the job queued for one, or `local_fallback` only when local
+execution is acceptable. An omitted shell keeps the Controller's same-platform convenience default;
+do not rely on it for a cross-platform command. A no-match result includes a compact `no_match`
+object with the required shell, target OS, and an actionable hint. It intentionally does not expose
+Agent hostnames or complete capabilities.
+
 The AI client can also retrieve declared artifacts. RBO never writes job output into your live
 checkout unless the client explicitly materializes an artifact into an allowed destination.
 
@@ -240,9 +263,11 @@ short rule like this to the target project's `AGENTS.md` or equivalent:
 ## Remote builds with RBO
 
 Prefer the RBO MCP tools for builds, tests, and long-running commands when a compatible Agent is
-available. Use `agents_list` to check the target OS and tools, then use `job_run`. Match the command
-and shell to the Agent OS. Read the returned outcome, exit code, and log tail; request artifacts
-only when a file is needed locally. Ask before falling back to the live local checkout.
+available. Use `job_run` with explicit `shell` and `target_os` for cross-platform work; RBO does not
+translate command syntax between shell families. Read the returned outcome, exit code, and log tail;
+request artifacts only when a file is needed locally. A compact `no_match` result is actionable in
+normal cases, so do not call `agents_list` solely to diagnose it. Ask before falling back to the live
+local checkout.
 ```
 
 For destructive or hardware-risk work, the client must present RBO's confirmation request before

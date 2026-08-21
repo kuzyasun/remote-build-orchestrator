@@ -6,19 +6,22 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { appendIndexedLogChunk, ensureAttemptLogs } from '@rbo/executor';
 import { MCP_TOOL_DEFS } from '@rbo/protocol';
-import { ensureControllerIdentity } from '@rbo/shared';
+import { ensureControllerIdentity, generateDeviceKeyPair } from '@rbo/shared';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createStdioProxyServer } from '../../mcp-stdio/src/proxy.js';
 import { attemptLogDir } from '../src/execution/runner.js';
 import { startControllerServer } from '../src/http/server.js';
 import type { RunningControllerServer } from '../src/http/server.js';
+import type { ControllerDatabase } from '../src/storage/database.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 
 let running: RunningControllerServer;
+let db: ControllerDatabase;
 
 beforeAll(async () => {
-  const db = openDatabase(':memory:');
+  db = openDatabase(':memory:');
   migrateToLatest(db);
+  const keys = generateDeviceKeyPair();
   running = await startControllerServer({
     // These fixtures use local repos with no allowlisted remote, so overlay
     // capture is impossible; opt in to the full-snapshot path explicitly.
@@ -26,6 +29,14 @@ beforeAll(async () => {
     host: '127.0.0.1',
     port: 0,
     db,
+    identity: {
+      controllerId: 'controller_transport_test',
+      tlsCertPem: '',
+      tlsKeyPem: '',
+      signingPublicKeyPem: keys.publicKeyPem,
+      signingPrivateKeyPem: keys.privateKeyPem,
+      fingerprint: 'sha256:transport-test',
+    },
   });
 });
 
@@ -100,6 +111,61 @@ describe('MCP transports', () => {
 
     await httpClient.close();
     await stdioClient.close();
+  });
+
+  it('returns the same compact no-match job_run result over stdio and HTTP', async () => {
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO jobs (
+        id, client_id, client_request_id, state, outcome, created_at, updated_at, finished_at,
+        failure_category, failure_message, result_json, request_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'job_transport_no_match',
+      'transport-test',
+      'no-match',
+      'completed',
+      'failed',
+      now,
+      now,
+      now,
+      'no_matching_agent',
+      'No online Agent provides bash on linux. Specify shell and target_os supported by the same Agent.',
+      JSON.stringify({
+        no_match: {
+          category: 'no_matching_agent',
+          retryable: false,
+          required_shell: 'bash',
+          target_os: ['linux'],
+          hint: 'No online Agent provides bash on linux. Specify shell and target_os supported by the same Agent.',
+        },
+      }),
+      '{}',
+    );
+
+    const httpClient = await connectHttpClient();
+    const stdioClient = await connectStdioStyleClient();
+    try {
+      const call = { name: 'job_run' as const, arguments: { job_id: 'job_transport_no_match' } };
+      const viaHttp = JSON.parse(textOf(await httpClient.callTool(call)));
+      const viaStdio = JSON.parse(textOf(await stdioClient.callTool(call)));
+
+      expect(viaStdio).toEqual(viaHttp);
+      expect(viaHttp).toMatchObject({
+        state: 'completed',
+        outcome: 'failed',
+        failure_category: 'no_matching_agent',
+        no_match: {
+          category: 'no_matching_agent',
+          retryable: false,
+          required_shell: 'bash',
+          target_os: ['linux'],
+        },
+      });
+    } finally {
+      await httpClient.close();
+      await stdioClient.close();
+    }
   });
 
   it('agent_probe returns the real probe payload shape', async () => {

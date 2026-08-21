@@ -368,6 +368,27 @@ On a **clean Windows x64** machine (no monorepo checkout required):
 
 Treat the release as incomplete until this smoke path passes.
 
+### Cross-platform shell-selection smoke (E-XP, operator-gated)
+
+The automated tests use fake Agent capability reports and verify MCP stdio/Streamable HTTP parity.
+They do **not** demonstrate a real cross-platform execution. Before declaring release readiness,
+an operator must run this smoke using the exact final release artifact and record the result:
+
+1. Record the package version or final source identity, Controller OS, Agent OS, Agent version, and
+   MCP client/transport used.
+2. Pair a real Agent whose OS family differs from the Controller. For example, use a Windows
+   Controller and Linux Agent with `shell: "bash"`, `target_os: ["linux"]`, and a harmless Bash
+   command, or the inverse with a Windows PowerShell Agent.
+3. Submit through `job_run`, wait or resume until terminal state, and retain the request, job ID,
+   terminal result, and relevant durable log excerpt. The command must succeed on the remote Agent;
+   a simulated test or a no-match response is not E-XP evidence.
+4. Confirm that the persisted request kept the exact requested shell and target OS and that the
+   command was not rewritten for the Controller's shell family.
+
+If the required mixed-OS Controller/Agent pair or release artifact is unavailable, record E-XP as
+`operator_required` with the missing precondition. Do not infer a pass from local tests, packaging,
+or fake capability fixtures.
+
 ---
 
 ## Offline archives

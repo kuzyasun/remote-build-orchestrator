@@ -329,6 +329,93 @@ describe('Scheduler Engine (§19.2)', () => {
     ).toEqual({ action: 'local_fallback' });
   });
 
+  it.each([
+    [
+      'Bash/Linux requested by a Windows Controller',
+      'agt_linux_bash',
+      {
+        os: { family: 'linux', version: '6', arch: 'x64' },
+        execution: {
+          max_jobs: 1,
+          shells: ['bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      { shell: 'bash' as const, script: 'printf "$HOME"' },
+      ['linux'],
+    ],
+    [
+      'PowerShell/Windows requested by a Linux Controller',
+      'agt_windows_powershell',
+      {
+        os: { family: 'windows', version: '11', arch: 'x64' },
+        execution: {
+          max_jobs: 1,
+          shells: ['powershell'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      { shell: 'powershell' as const, script: 'Write-Output $env:HOME' },
+      ['windows'],
+    ],
+    [
+      'Bash explicitly available on non-default Windows',
+      'agt_windows_bash',
+      {
+        os: { family: 'windows', version: '11', arch: 'x64' },
+        execution: {
+          max_jobs: 1,
+          shells: ['bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      { shell: 'bash' as const, script: 'echo "$HOME"' },
+      ['windows'],
+    ],
+  ] as const)(
+    'selects a fake capability report for %s without translating the requested shell',
+    (_label, agentId, capabilities, execution, os) => {
+      const request = makeRequest({
+        execution,
+        requirements: { os },
+        queue_policy: 'fail_fast',
+      });
+      const decision = selectAgentForJob([makeAgent(agentId, capabilities)], request);
+
+      expect(decision.action).toBe('remote');
+      expect(decision.selectedAgent?.agentId).toBe(agentId);
+      expect(request.execution).toEqual(execution);
+    },
+  );
+
+  it('returns an actionable no-match for the Windows omitted-shell default against fake Linux Agents', () => {
+    const request = makeRequest({
+      execution: { shell: 'powershell', script: 'Write-Output $env:HOME' },
+      queue_policy: 'fail_fast',
+    });
+    const linuxBashOnly = makeAgent('agt_linux_bash', {
+      os: { family: 'linux', version: '6', arch: 'x64' },
+      execution: {
+        max_jobs: 1,
+        shells: ['bash'],
+        supports_tty: false,
+        supports_process_tree_kill: true,
+      },
+    });
+
+    const decision = selectAgentForJob([linuxBashOnly], request);
+
+    expect(decision.action).toBe('fail_fast');
+    expect(decision.noMatchDiagnostic).toMatchObject({
+      category: 'no_matching_agent',
+      required_shell: 'powershell',
+    });
+    expect(decision.noMatchDiagnostic?.hint).toContain('Specify shell and target_os');
+  });
+
   it('returns a bounded, request-scoped diagnostic for an explicit shell and OS conflict', () => {
     const windowsPowerShellOnly = makeAgent('agt_windows', {
       hostname: 'C:/private/controller/host-path-must-not-leak',
