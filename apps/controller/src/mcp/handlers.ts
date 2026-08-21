@@ -11,7 +11,7 @@ import { listAgents } from '../agents/service.js';
 import { materializeArtifactToDestination } from '../execution/artifacts.js';
 import { attemptLogDir } from '../execution/runner.js';
 import { handleJobRun } from '../jobs/job-run.js';
-import type { JobRunOptions } from '../jobs/job-run.js';
+import type { JobRunInput, JobRunOptions } from '../jobs/job-run.js';
 import { getAttempt, getJob, getLatestAttempt } from '../jobs/lifecycle.js';
 import {
   handleJobArtifacts,
@@ -178,6 +178,8 @@ export async function handleToolCall(
           command: args.command as string | undefined,
           project_root: args.project_root as string | undefined,
           job_id: args.job_id as string | undefined,
+          shell: args.shell as JobRunInput['shell'],
+          target_os: args.target_os as JobRunInput['target_os'],
           cwd: args.cwd as string | undefined,
           timeout_seconds: args.timeout_seconds as number | undefined,
           wait_seconds: args.wait_seconds as number | undefined,

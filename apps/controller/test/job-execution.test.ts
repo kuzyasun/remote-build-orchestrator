@@ -16,7 +16,7 @@ import {
 } from '../src/execution/runner.js';
 import { startControllerServer } from '../src/http/server.js';
 import type { RunningControllerServer } from '../src/http/server.js';
-import { getLatestAttempt } from '../src/jobs/lifecycle.js';
+import { getJobRequest, getLatestAttempt } from '../src/jobs/lifecycle.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
 
@@ -124,6 +124,9 @@ async function connectClient(clientId: string): Promise<Client> {
 describe('Local job execution', () => {
   it('runs a command via job_run and returns outcome + artifacts', async () => {
     const client = await connectClient('client-job-run');
+    const shell = process.platform === 'win32' ? 'powershell' : 'bash';
+    const targetOs =
+      process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : 'linux';
     const command =
       process.platform === 'win32'
         ? 'Write-Output "hello"; Set-Content -Path out.txt -Value "artifact-data"'
@@ -135,6 +138,8 @@ describe('Local job execution', () => {
           arguments: {
             command,
             project_root: fixtureDir,
+            shell,
+            target_os: [targetOs],
             client_request_id: `job-run-${Date.now()}`,
             timeout_seconds: 60,
             artifacts: [{ glob: 'out.txt', required: true }],
@@ -147,6 +152,10 @@ describe('Local job execution', () => {
     expect(result.state).toBe('completed');
     expect(result.outcome).toBe('succeeded');
     expect(result.exit_code).toBe(0);
+    expect(getJobRequest(db, result.job_id)).toMatchObject({
+      execution: { shell },
+      requirements: { os: [targetOs] },
+    });
     // P-02 sparse success: terminal responses omit resume field
     expect(result.resume).toBeUndefined();
     // Artifacts are only present when non-empty

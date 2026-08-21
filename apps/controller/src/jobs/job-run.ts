@@ -22,6 +22,9 @@ import {
 
 export const DEFAULT_MCP_WAIT_SLICE_SECONDS = 50;
 
+type ShellId = ExecutionConfig['shell'];
+const CANONICAL_TARGET_OS = new Set(['macos', 'windows', 'linux']);
+
 export interface JobRunProgressUpdate {
   progress: number;
   message: string;
@@ -31,6 +34,8 @@ export interface JobRunInput {
   command?: string;
   project_root?: string;
   job_id?: string;
+  shell?: ShellId;
+  target_os?: Array<'macos' | 'windows' | 'linux'>;
   cwd?: string;
   timeout_seconds?: number;
   wait_seconds?: number;
@@ -52,23 +57,47 @@ export function wrapCommandAsExecution(
   command: string,
   timeoutSeconds: number,
   platform: NodeJS.Platform = process.platform,
+  explicitShell?: ShellId,
 ): Pick<ExecutionConfig, 'shell' | 'script' | 'timeout_seconds'> {
-  if (platform === 'win32') {
-    return {
-      shell: 'powershell',
-      script: [
-        "$ErrorActionPreference = 'Stop'",
-        command,
-        'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
-      ].join('\n'),
-      timeout_seconds: timeoutSeconds,
-    };
+  const shell = explicitShell ?? (platform === 'win32' ? 'powershell' : 'bash');
+  const powerShellScript = [
+    "$ErrorActionPreference = 'Stop'",
+    command,
+    'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
+  ].join('\n');
+  const cmdScript = ['@echo off', command, 'if errorlevel 1 exit /b %errorlevel%'].join('\r\n');
+
+  switch (shell) {
+    case 'bash':
+    case 'zsh':
+      return {
+        shell,
+        script: `set -euo pipefail\n${command}\n`,
+        timeout_seconds: timeoutSeconds,
+      };
+    case 'sh':
+      return {
+        shell,
+        script: `set -eu\n${command}\n`,
+        timeout_seconds: timeoutSeconds,
+      };
+    case 'powershell':
+    case 'pwsh':
+      return { shell, script: powerShellScript, timeout_seconds: timeoutSeconds };
+    case 'cmd':
+      return { shell, script: cmdScript, timeout_seconds: timeoutSeconds };
+    case 'direct':
+      // `direct` is legacy script execution: cmd.exe on Windows and an executable script on POSIX.
+      // It remains a single compact command string, not a future executable/args interface.
+      return {
+        shell,
+        script:
+          platform === 'win32'
+            ? cmdScript
+            : `#!/usr/bin/env bash\nset -euo pipefail\n${command}\n`,
+        timeout_seconds: timeoutSeconds,
+      };
   }
-  return {
-    shell: 'bash',
-    script: `set -euo pipefail\n${command}\n`,
-    timeout_seconds: timeoutSeconds,
-  };
 }
 
 function deriveJobName(command: string): string {
@@ -79,6 +108,14 @@ function deriveJobName(command: string): string {
   return `${compact.slice(0, 69)}...`;
 }
 
+function directWrappingPlatform(
+  targetOs: JobRunInput['target_os'],
+  controllerPlatform: NodeJS.Platform,
+): NodeJS.Platform {
+  if (targetOs?.length !== 1) return controllerPlatform;
+  return targetOs[0] === 'windows' ? 'win32' : targetOs[0] === 'macos' ? 'darwin' : 'linux';
+}
+
 /** Map job_run MCP args → canonical JobRequest (Controller owns shell wrapping). */
 export function buildJobRunRequest(
   input: JobRunInput,
@@ -86,6 +123,12 @@ export function buildJobRunRequest(
 ): JobRequest {
   if (!input.command || !input.project_root) {
     throw RboError.validation('job_run requires command and project_root unless job_id is set');
+  }
+  if (
+    input.shell === 'direct' &&
+    (input.target_os?.length !== 1 || !CANONICAL_TARGET_OS.has(input.target_os[0]))
+  ) {
+    throw RboError.validation('job_run shell=direct requires exactly one canonical target_os value');
   }
   const timeoutSeconds = input.timeout_seconds ?? 3600;
   return JobRequestSchema.parse({
@@ -95,7 +138,13 @@ export function buildJobRunRequest(
       project_root: input.project_root,
       cwd: input.cwd ?? '.',
     },
-    execution: wrapCommandAsExecution(input.command, timeoutSeconds, platform),
+    execution: wrapCommandAsExecution(
+      input.command,
+      timeoutSeconds,
+      input.shell === 'direct' ? directWrappingPlatform(input.target_os, platform) : platform,
+      input.shell,
+    ),
+    requirements: input.target_os ? { os: input.target_os } : undefined,
     risk_level: input.risk_level ?? 'normal',
     artifacts: input.artifacts ?? [],
   });

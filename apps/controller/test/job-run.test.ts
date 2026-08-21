@@ -60,6 +60,37 @@ describe('wrapCommandAsExecution', () => {
     expect(exec.timeout_seconds).toBe(60);
     expect(exec.script).toBe('set -euo pipefail\nmake test\n');
   });
+
+  it.each([
+    ['bash', 'set -euo pipefail\nmake test\n'],
+    ['zsh', 'set -euo pipefail\nmake test\n'],
+    ['sh', 'set -eu\nmake test\n'],
+    [
+      'powershell',
+      "$ErrorActionPreference = 'Stop'\nmake test\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+    ],
+    [
+      'pwsh',
+      "$ErrorActionPreference = 'Stop'\nmake test\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+    ],
+    ['cmd', '@echo off\r\nmake test\r\nif errorlevel 1 exit /b %errorlevel%'],
+  ] as const)('wraps explicit %s commands without translating their syntax', (shell, script) => {
+    const exec = wrapCommandAsExecution('make test', 60, 'linux', shell);
+    expect(exec).toEqual({ shell, script, timeout_seconds: 60 });
+  });
+
+  it('uses the legacy direct script wrapper for each platform', () => {
+    expect(wrapCommandAsExecution('build.cmd', 60, 'win32', 'direct')).toEqual({
+      shell: 'direct',
+      script: '@echo off\r\nbuild.cmd\r\nif errorlevel 1 exit /b %errorlevel%',
+      timeout_seconds: 60,
+    });
+    expect(wrapCommandAsExecution('./build', 60, 'linux', 'direct')).toEqual({
+      shell: 'direct',
+      script: '#!/usr/bin/env bash\nset -euo pipefail\n./build\n',
+      timeout_seconds: 60,
+    });
+  });
 });
 
 describe('buildJobRunRequest', () => {
@@ -102,6 +133,69 @@ describe('buildJobRunRequest', () => {
     expect(request.execution.shell).toBe('bash');
   });
 
+  it('maps explicit cross-platform shell and OS constraints into the canonical request', () => {
+    const request = buildJobRunRequest(
+      {
+        command: 'Write-Output done',
+        project_root: '/tmp/app',
+        shell: 'pwsh',
+        target_os: ['windows'],
+      },
+      'linux',
+    );
+    expect(request.execution).toMatchObject({
+      shell: 'pwsh',
+      script: expect.stringContaining('Write-Output done'),
+    });
+    expect(request.requirements).toEqual({ os: ['windows'] });
+  });
+
+  it('uses a single explicit target OS to wrap legacy direct scripts safely', () => {
+    const windowsRequest = buildJobRunRequest(
+      {
+        command: 'build.cmd',
+        project_root: '/tmp/app',
+        shell: 'direct',
+        target_os: ['windows'],
+      },
+      'linux',
+    );
+    expect(windowsRequest.execution).toMatchObject({
+      shell: 'direct',
+      script: '@echo off\r\nbuild.cmd\r\nif errorlevel 1 exit /b %errorlevel%',
+    });
+    const posixRequest = buildJobRunRequest(
+      {
+        command: './build',
+        project_root: 'C:/app',
+        shell: 'direct',
+        target_os: ['linux'],
+      },
+      'win32',
+    );
+    expect(posixRequest.execution).toMatchObject({
+      shell: 'direct',
+      script: '#!/usr/bin/env bash\nset -euo pipefail\n./build\n',
+    });
+  });
+
+  it.each([undefined, ['windows', 'linux'], ['freebsd']])(
+    'rejects legacy direct scripts without exactly one canonical target OS: %j',
+    (target_os) => {
+      expect(() =>
+        buildJobRunRequest(
+          {
+            command: 'build',
+            project_root: '/tmp/app',
+            shell: 'direct',
+            target_os,
+          },
+          'linux',
+        ),
+      ).toThrow(/shell=direct requires exactly one canonical target_os/);
+    },
+  );
+
   it('rejects build without command/project_root', () => {
     expect(() => buildJobRunRequest({ command: 'echo hi' }, 'linux')).toThrow(/project_root/);
   });
@@ -114,6 +208,14 @@ describe('JOB_RUN_INPUT validation', () => {
     expect(schema.safeParse({ ...base, max_output_bytes: 3 }).success).toBe(false);
     expect(schema.safeParse({ ...base, max_output_bytes: 4 }).success).toBe(true);
     expect(schema.safeParse({ ...base, max_output_bytes: 1024 * 1024 }).success).toBe(true);
+  });
+
+  it('accepts canonical explicit shell and target OS values, rejecting invalid values', () => {
+    const base = { command: 'echo 1', project_root: 'foo' };
+    expect(schema.safeParse({ ...base, shell: 'pwsh', target_os: ['windows'] }).success).toBe(true);
+    expect(schema.safeParse({ ...base, shell: 'fish' }).success).toBe(false);
+    expect(schema.safeParse({ ...base, target_os: ['freebsd'] }).success).toBe(false);
+    expect(schema.safeParse({ ...base, target_os: [] }).success).toBe(false);
   });
 });
 
