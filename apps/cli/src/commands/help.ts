@@ -32,6 +32,7 @@ Commands:
   cancel <job-id> [reason]
 
 rbo run options:
+  --json                   Write one final JSON result to stdout (not with --follow)
   --follow                 Stream live logs until the job completes
   --project <path>         Project root (default current directory)
   --cwd <relative-path>    Working directory inside the project

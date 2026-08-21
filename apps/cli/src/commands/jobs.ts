@@ -2,7 +2,19 @@ import type { JobRunInput } from './run.js';
 
 // Thin HTTP client for Controller job MCP tools via /internal/v1/tools/* (§23).
 
-async function postTool<T>(baseUrl: string, tool: string, body: unknown): Promise<T> {
+const TOOL_REQUEST_TIMEOUT_MS = 15_000;
+
+export interface ToolCallOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+async function postTool<T>(
+  baseUrl: string,
+  tool: string,
+  body: unknown,
+  options?: ToolCallOptions,
+): Promise<T> {
   const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/internal/v1/tools/${tool}`, {
     method: 'POST',
     headers: {
@@ -10,6 +22,13 @@ async function postTool<T>(baseUrl: string, tool: string, body: unknown): Promis
       'x-rbo-client-id': process.env.RBO_CLIENT_ID ?? 'rbo-cli',
     },
     body: JSON.stringify(body ?? {}),
+    // Each request is bounded; resume polling itself intentionally has no total job deadline.
+    signal: options?.signal
+      ? AbortSignal.any([
+          options.signal,
+          AbortSignal.timeout(options.timeoutMs ?? TOOL_REQUEST_TIMEOUT_MS),
+        ])
+      : AbortSignal.timeout(options?.timeoutMs ?? TOOL_REQUEST_TIMEOUT_MS),
   });
   const json = (await res.json()) as { error?: { category: string; message: string } };
   if (!res.ok) {
@@ -33,12 +52,35 @@ export function submitJobRemote(
 export function runJobRemote(
   baseUrl: string,
   input: JobRunInput,
+  options?: ToolCallOptions,
 ): Promise<Record<string, unknown>> {
-  return postTool(baseUrl, 'job_run', input);
+  return postTool(baseUrl, 'job_run', input, options);
 }
 
-export function getJobRemote(baseUrl: string, jobId: string): Promise<Record<string, unknown>> {
-  return postTool(baseUrl, 'job_get', { job_id: jobId });
+/** Confirm a previously captured destructive or hardware job. */
+export function confirmJobRemote(
+  baseUrl: string,
+  jobId: string,
+  confirmationToken: string,
+  options?: ToolCallOptions,
+): Promise<Record<string, unknown>> {
+  return postTool(
+    baseUrl,
+    'job_confirm',
+    {
+      job_id: jobId,
+      confirmation_token: confirmationToken,
+    },
+    options,
+  );
+}
+
+export function getJobRemote(
+  baseUrl: string,
+  jobId: string,
+  options?: ToolCallOptions,
+): Promise<Record<string, unknown>> {
+  return postTool(baseUrl, 'job_get', { job_id: jobId }, options);
 }
 
 /** `job_get` returns `{ job: { state, ... } }` — not a flat job object. */
@@ -77,8 +119,9 @@ export function cancelJobRemote(
   baseUrl: string,
   jobId: string,
   reason?: string,
+  options?: ToolCallOptions,
 ): Promise<Record<string, unknown>> {
-  return postTool(baseUrl, 'job_cancel', { job_id: jobId, reason });
+  return postTool(baseUrl, 'job_cancel', { job_id: jobId, reason }, options);
 }
 
 export interface FollowLogsOptions {

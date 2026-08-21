@@ -2,9 +2,20 @@ import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { runJobRemote } from '../src/commands/jobs.js';
-import { parseRunCommandArgs } from '../src/commands/run.js';
+import { parseRunCommandArgs, takeRunJsonFlag } from '../src/commands/run.js';
 
 describe('rbo run parser', () => {
+  it('recognizes --json only before the target-shell command separator', () => {
+    expect(takeRunJsonFlag(['--json', '--', 'pnpm test'])).toEqual({
+      json: true,
+      args: ['--', 'pnpm test'],
+    });
+    expect(takeRunJsonFlag(['--', '--json'])).toEqual({
+      json: false,
+      args: ['--', '--json'],
+    });
+  });
+
   it('builds the shared compact job_run input without changing target-shell text', () => {
     const command = 'pnpm --filter "@rbo/controller" test && echo $HOME';
     const parsed = parseRunCommandArgs(

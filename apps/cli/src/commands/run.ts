@@ -124,3 +124,18 @@ export function parseRunCommandArgs(
     },
   };
 }
+
+/** Only recognize the JSON output flag before the target-shell command separator. */
+export function takeRunJsonFlag(args: string[]): { json: boolean; args: string[] } {
+  const separator = args.indexOf('--');
+  if (separator === -1) return { json: false, args };
+  let json = false;
+  const options = args.slice(0, separator).filter((arg) => {
+    if (arg === '--json') {
+      json = true;
+      return false;
+    }
+    return true;
+  });
+  return { json, args: [...options, ...args.slice(separator)] };
+}

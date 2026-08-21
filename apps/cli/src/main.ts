@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline/promises';
 import {
   RBO_CONTROLLER_VERSION,
   resolveAgentStateDir,
@@ -33,8 +34,16 @@ import {
   getJobLogsRemote,
   submitJobRemote,
 } from './commands/jobs.js';
-import { runJobToTerminal, takeRunFollowFlag } from './commands/run-runtime.js';
-import { parseRunCommandArgs } from './commands/run.js';
+import {
+  RunInterruptedError,
+  cancelAndAwaitJob,
+  runJobWithLifecycle,
+  runLifecycleErrorExitCode,
+  takeRunFollowFlag,
+  terminalExitCode,
+  writeRunResult,
+} from './commands/run-runtime.js';
+import { parseRunCommandArgs, takeRunJsonFlag } from './commands/run.js';
 import {
   type ServiceAction,
   detectPlatform,
@@ -50,6 +59,18 @@ function defaultControllerUrl(): string {
 
 function printPlan(action: string, plan: Parameters<typeof formatDryRunPlan>[1]): void {
   console.log(formatDryRunPlan(action, plan));
+}
+
+async function confirmOnTerminal(
+  prompt: string,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  const terminal = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return /^(y|yes)$/i.test((await terminal.question(prompt, { signal })).trim());
+  } finally {
+    terminal.close();
+  }
 }
 
 const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'status', 'stop']);
@@ -230,10 +251,76 @@ async function main(): Promise<void> {
     }
 
     case 'run': {
-      const { follow, args } = takeRunFollowFlag(rest);
+      const { follow, args: withoutFollow } = takeRunFollowFlag(rest);
+      const { json, args } = takeRunJsonFlag(withoutFollow);
+      if (json && follow) {
+        throw new Error('rbo run --json cannot be combined with --follow.');
+      }
       const { request } = parseRunCommandArgs(args);
-      const result = await runJobToTerminal(controllerUrl, request, { follow });
-      console.log(JSON.stringify(result, null, 2));
+      const interruption = new AbortController();
+      let jobId: string | null = null;
+      let interruptCount = 0;
+      const onInterrupt = () => {
+        interruptCount += 1;
+        if (interruptCount === 1) {
+          process.stderr.write('Interrupt received; requesting job cancellation.\n');
+          interruption.abort();
+        } else {
+          process.stderr.write(
+            jobId
+              ? `Cancellation already requested for job ${jobId}.\n`
+              : 'Cancellation will be requested when the Controller returns a job ID.\n',
+          );
+        }
+      };
+      process.on('SIGINT', onInterrupt);
+      try {
+        const result = await runJobWithLifecycle(controllerUrl, request, {
+          follow,
+          signal: interruption.signal,
+          onJobId: (id) => {
+            jobId = id;
+          },
+          io: {
+            isTTY: process.stdin.isTTY === true,
+            writeStderr: (text) => process.stderr.write(text),
+            confirm: confirmOnTerminal,
+          },
+        });
+        writeRunResult(result, {
+          json,
+          writeStdout: (text) => process.stdout.write(text),
+          writeStderr: (text) => process.stderr.write(text),
+        });
+        process.exitCode = terminalExitCode(result);
+      } catch (error) {
+        if (error instanceof RunInterruptedError) {
+          const interruptedJobId = error.jobId ?? jobId;
+          if (interruptedJobId) {
+            await cancelAndAwaitJob(controllerUrl, interruptedJobId, {
+              writeStderr: (text) => process.stderr.write(text),
+            });
+          } else {
+            process.stderr.write(
+              'No job ID was received; no cancellation request could be sent.\n',
+            );
+          }
+          process.exitCode = 130;
+          return;
+        }
+        const lifecycleExit = runLifecycleErrorExitCode(error);
+        if (lifecycleExit !== null) {
+          process.stderr.write(`${error.message}\n`);
+          process.exitCode = lifecycleExit;
+          return;
+        }
+        // A parsed request has already passed the Controller-owned protocol boundary. Remaining
+        // runtime errors are Controller, transport, or malformed-response failures.
+        process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        process.exitCode = 125;
+      } finally {
+        process.off('SIGINT', onInterrupt);
+      }
       return;
     }
 
