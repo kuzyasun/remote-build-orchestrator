@@ -198,7 +198,56 @@ Restart the AI client after changing its MCP configuration. If the client cannot
 The simplest test is to ask your AI client to use RBO for a build or test in an allowed project.
 RBO's primary MCP tool, `job_run`, submits the command and waits for a useful result.
 
-For a manual CLI test, create `job.json`:
+For a manual CLI test, run one command from the allowed project directory. `rbo run` captures the
+current project, submits the same compact request as MCP `job_run`, waits for its terminal result,
+and streams logs with `--follow`.
+
+POSIX shell:
+
+```bash
+cd /home/you/projects/my-app
+rbo run --follow --shell bash --target-os linux --timeout 600 -- 'printf "%s\\n" "RBO is working"'
+```
+
+PowerShell:
+
+```powershell
+Set-Location C:\projects\my-app
+rbo run --follow --shell powershell --target-os windows --timeout 600 -- 'Write-Output "RBO is working"'
+```
+
+Windows `cmd.exe`:
+
+```bat
+cd /d C:\projects\my-app
+rbo run --follow --shell cmd --target-os windows --timeout 600 -- "echo RBO is working"
+```
+
+Pass exactly one target-shell command string after `--`. The local shell removes its outer quoting;
+RBO sends the remaining text unchanged to the selected target shell. This is shell text, not an
+argv-safe direct-execution interface. Use the target's shell syntax and select a compatible
+`--shell` and `--target-os`; RBO never translates command syntax between shell families.
+
+`--timeout` is the remote execution timeout. It does not impose an overall CLI wait deadline:
+the CLI continues its resume loop while the job is active, although individual Controller requests
+and SSE reconnects are bounded. Use `--queue-policy fail_fast` when a missing compatible Agent
+should fail immediately, `wait` to queue until one is available, or `local_fallback` only when
+Controller-local execution is acceptable.
+
+Use `--json` for scripts. It writes exactly one final JSON object to stdout; CLI diagnostics stay
+on stderr. The initial interface rejects `--json --follow` rather than providing a JSONL log stream.
+
+For jobs that require confirmation, RBO writes the snapshot and warnings to stderr and prompts only
+when stdin is a TTY. A non-interactive invocation refuses without a bypass, exits 125, and prints
+the job ID with instructions to confirm from a TTY-enabled client. Ctrl+C sends one cancellation
+request, waits at most 10 seconds for cancellation to be confirmed, then exits 130; if confirmation
+does not arrive, stderr identifies the job so it can still be checked.
+
+### Use `rbo submit` for advanced requests
+
+`rbo submit <job-request.json>` remains available for full request JSON that `rbo run` intentionally
+does not expose. In particular, use it when an artifact must be required rather than the optional
+rules added by repeated `rbo run --artifact <glob>`:
 
 ```json
 {
@@ -210,23 +259,16 @@ For a manual CLI test, create `job.json`:
   },
   "execution": {
     "shell": "bash",
-    "script": "echo RBO is working",
-    "timeout_seconds": 60
+    "script": "pnpm test",
+    "timeout_seconds": 600
   },
   "risk_level": "safe",
-  "artifacts": []
+  "artifacts": [{ "glob": "coverage/**", "required": true }]
 }
 ```
 
-Change `project_root` to an allowed absolute path. On Windows, use an escaped Windows path,
-`"shell": "powershell"`, and a PowerShell command.
-
-Submit and inspect the job:
-
-```bash
-rbo submit job.json
-rbo logs <job-id> --follow
-```
+Submit the advanced request with `rbo submit job.json`; use `rbo logs <job-id> --follow` to inspect
+an existing job separately.
 
 ### Select a remote shell and OS explicitly
 

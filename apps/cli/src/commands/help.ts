@@ -36,9 +36,9 @@ rbo run options:
   --follow                 Stream live logs until the job completes
   --project <path>         Project root (default current directory)
   --cwd <relative-path>    Working directory inside the project
-  --shell <shell>          Target shell
-  --target-os <os>         Repeatable target OS constraint
-  --timeout <seconds>      Remote execution timeout
+  --shell <shell>          bash|zsh|sh|powershell|pwsh|cmd|direct
+  --target-os <os>         Repeatable macos|windows|linux constraint
+  --timeout <seconds>      Remote execution timeout, not a CLI wait deadline
   --risk <level>           Job risk level
   --artifact <glob>        Repeatable optional artifact rule
   --queue-policy <policy>  local_fallback|wait|fail_fast
@@ -46,6 +46,9 @@ rbo run options:
 Pass exactly one target-shell command string after \`--\`. Your local shell removes
 outer quoting; RBO sends the remaining string unchanged to the target shell. For
 example: \`rbo run -- "pnpm test"\`. This is not an argv-safe direct execution API.
+For confirmation-required jobs, RBO prompts only from a TTY; non-interactive runs
+exit 125 with confirmation instructions. Ctrl+C requests cancellation, waits up to
+10 seconds for confirmation, then exits 130.
 
 Environment:
   RBO_CONTROLLER_URL_HTTP   Controller HTTP base (default http://127.0.0.1:7410)

@@ -35,6 +35,17 @@ to defaults.
 | `rbo` | CLI — controller/agent lifecycle, job submit/logs/cancel, doctor |
 | `rbo-mcp-stdio` | MCP stdio proxy to the Controller's loopback HTTP endpoint |
 
+For a normal manual build or test from a project directory, use the one-command path:
+
+```bash
+rbo run --follow --shell bash --target-os linux -- "pnpm test"
+```
+
+`rbo run` accepts one target-shell command after `--`; the command is not argv-safe direct
+execution. Use `rbo submit <job-request.json>` for advanced full-JSON requests, including required
+artifact rules. See the [getting-started guide](https://github.com/kuzyasun/remote-build-orchestrator/blob/main/docs/user/getting-started.md#6-run-a-first-job)
+for shell-specific quoting, confirmation, cancellation, JSON, timeout, and queue-policy behavior.
+
 ## Windows Job Object helper
 
 On Windows x64, `@gemslibe/rbo` pulls in `@gemslibe/rbo-windows-executor-win32-x64` as an
