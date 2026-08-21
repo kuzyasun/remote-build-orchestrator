@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { ControllerDatabase } from '../storage/database.js';
+import { nowIso } from '../storage/database.js';
 import { type SubmissionRow, getSubmission, reserveSubmission } from './submissions.js';
 
 const DEFAULT_CAPTURE_LEASE_TTL_MS = 30_000;
@@ -274,18 +275,26 @@ export function reclaimExpiredCaptureLease(
   return info.changes === 1;
 }
 
-/** Release only the exact owner generation; stale owners cannot clean others. */
+/**
+ * Mark only the exact owner generation released while retaining its generation
+ * record. The next same-key capture must reclaim it and advance generation, so
+ * it can never collide with a late final orphan from this owner.
+ */
 export function releaseCaptureLease(
   db: ControllerDatabase,
   identity: CaptureLeaseIdentity,
 ): boolean {
+  const timestamp = nowIso();
   const info = db
     .prepare(
-      `DELETE FROM snapshot_capture_leases
+      `UPDATE snapshot_capture_leases
+          SET lease_expires_at = ?, updated_at = ?
         WHERE client_id = ? AND client_request_id = ?
           AND owner_token = ? AND fencing_generation = ?`,
     )
     .run(
+      '1970-01-01T00:00:00.000Z',
+      timestamp,
       identity.clientId,
       identity.clientRequestId,
       identity.ownerToken,

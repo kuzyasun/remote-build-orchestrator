@@ -72,9 +72,9 @@ function isRecoverableSnapshotFile(name: string): boolean {
   return PRIVATE_CANDIDATE_NAME.test(name) || GENERATION_FINAL_NAME.test(name);
 }
 
-async function listSnapshotDirectories(snapshotsRoot: string): Promise<Dirent[] | null> {
+async function listDirectory(path: string): Promise<Dirent[] | null> {
   try {
-    return await readdir(snapshotsRoot, { withFileTypes: true });
+    return await readdir(path, { withFileTypes: true });
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
@@ -100,23 +100,27 @@ export async function recoverSnapshotPublications(
   }
 
   const referenced = referencedSnapshotPaths(options.db, snapshotsRoot);
-  const directories = await listSnapshotDirectories(snapshotsRoot);
-  if (!directories) {
+  const rootEntries = await listDirectory(snapshotsRoot);
+  if (!rootEntries) {
     return { skippedForActiveLease: false, removedFiles: 0, removedDirectories: 0 };
   }
 
   let removedFiles = 0;
   let removedDirectories = 0;
-  for (const directory of directories) {
-    if (!directory.isDirectory()) continue;
-    const directoryPath = join(snapshotsRoot, directory.name);
-    const entries = await readdir(directoryPath, { withFileTypes: true });
+  async function recoverDirectory(directoryPath: string): Promise<void> {
+    const entries = await listDirectory(directoryPath);
+    if (!entries) return;
     for (const entry of entries) {
+      const path = join(directoryPath, entry.name);
+      if (entry.isDirectory()) {
+        await recoverDirectory(path);
+        continue;
+      }
       if (!entry.isFile() || !isRecoverableSnapshotFile(entry.name)) continue;
-      const path = resolve(directoryPath, entry.name);
+      const resolvedPath = resolve(path);
       const generation = generationForName(entry.name);
       if (
-        referenced.paths.has(path) ||
+        referenced.paths.has(resolvedPath) ||
         (generation !== null &&
           referenced.generations.has(generationKey(directoryPath, generation)))
       ) {
@@ -126,11 +130,14 @@ export async function recoverSnapshotPublications(
       removedFiles += 1;
     }
 
-    const remaining = await readdir(directoryPath);
-    if (remaining.length === 0) {
+    const remaining = await listDirectory(directoryPath);
+    if (remaining?.length === 0 && directoryPath !== snapshotsRoot) {
       await rm(directoryPath, { recursive: true, force: true });
       removedDirectories += 1;
     }
+  }
+  for (const directory of rootEntries) {
+    if (directory.isDirectory()) await recoverDirectory(join(snapshotsRoot, directory.name));
   }
 
   logger.info('snapshot publication recovery complete', { removedFiles, removedDirectories });

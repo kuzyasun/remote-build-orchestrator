@@ -68,6 +68,19 @@ const DEFAULT_WAIT_TAIL_MAX_BYTES = 16 * 1024;
 const WAIT_FALLBACK_INTERVAL_MS = 1_000;
 const CAPTURE_LEASE_RENEW_INTERVAL_MS = 10_000;
 
+/**
+ * Deterministic fault boundaries for the S-03 publication tests. These hooks
+ * are only supplied by in-process tests; production contexts leave them unset.
+ */
+export interface SnapshotPublicationTestHooks {
+  afterCapture?: () => void;
+  afterCandidateFlush?: (candidatePath: string, index: number) => void;
+  beforeCandidatePublication?: (candidatePath: string, index: number) => void;
+  afterCandidatePublication?: (finalPath: string, index: number) => void;
+  afterPublicationDirectoryFlush?: () => void;
+  beforeTransactionAuthorityCheck?: () => void;
+}
+
 function generationPath(candidatePath: string, generation: number): string {
   const suffix = candidatePath.match(new RegExp(`\\.g${generation}(\\.candidate-[^\\\\/]+)$`))?.[1];
   if (!suffix) {
@@ -138,6 +151,8 @@ export interface SubmitJobContext extends LocalRunnerContext {
    */
   getHostCpuBusyFraction?: () => number;
   maxHostCpuBusyFraction?: number;
+  /** In-process S-03 fault injection; never populated from an external request. */
+  snapshotPublicationTestHooks?: SnapshotPublicationTestHooks;
 }
 
 function requestHash(request: JobRequest): string {
@@ -262,6 +277,7 @@ export async function handleJobSubmit(
       captureLease.fencingGeneration,
     );
     captured = capturedSnapshot;
+    ctx.snapshotPublicationTestHooks?.afterCapture?.();
     const { snapshotId, contentId, secretWarnings, request: normalizedRequest } = capturedSnapshot;
     const hash = requestHash(normalizedRequest);
 
@@ -271,16 +287,23 @@ export async function handleJobSubmit(
       capturedSnapshot.secretWarningsPath,
       capturedSnapshot.gitSourceRequirementsPath,
     ];
-    await Promise.all(candidatePaths.map((path) => flushFile(path)));
-    for (const candidatePath of candidatePaths) {
+    for (const [index, candidatePath] of candidatePaths.entries()) {
+      await flushFile(candidatePath);
+      ctx.snapshotPublicationTestHooks?.afterCandidateFlush?.(candidatePath, index);
+    }
+    for (const [index, candidatePath] of candidatePaths.entries()) {
+      ctx.snapshotPublicationTestHooks?.beforeCandidatePublication?.(candidatePath, index);
       if (!hasCaptureLeaseAuthority(ctx.db, captureLease)) {
         throw new RboError('lease_expired', 'Snapshot capture lease lost before publication', true);
       }
-      await publishCandidate(candidatePath, captureLease.fencingGeneration);
+      const finalPath = await publishCandidate(candidatePath, captureLease.fencingGeneration);
+      ctx.snapshotPublicationTestHooks?.afterCandidatePublication?.(finalPath, index);
     }
     await flushDirectory(join(ctx.dataDir, 'snapshots', pendingJobId));
+    ctx.snapshotPublicationTestHooks?.afterPublicationDirectoryFlush?.();
 
     const committed = runLifecycleTransaction(ctx.db, () => {
+      ctx.snapshotPublicationTestHooks?.beforeTransactionAuthorityCheck?.();
       if (!hasCaptureLeaseAuthority(ctx.db, captureLease)) {
         throw new RboError(
           'lease_expired',

@@ -107,6 +107,32 @@ describe('capture-owner leases (§5.6)', () => {
     expect(releaseCaptureLease(db, requireLease(first.lease))).toBe(false);
   });
 
+  it('retains a released generation so a same-key retry cannot reuse its final names', () => {
+    const db = newDb();
+    databases.push(db);
+    const first = reserveCaptureLease(db, key, {
+      ownerToken: 'owner-1',
+      ttlMs: 10_000,
+      now: clockAt('2026-08-21T10:00:00.000Z'),
+    });
+    const firstLease = requireLease(first.lease);
+
+    expect(releaseCaptureLease(db, firstLease)).toBe(true);
+    expect(getCaptureLease(db, key)).toMatchObject({
+      ownerToken: 'owner-1',
+      fencingGeneration: 1,
+      expiresAt: '1970-01-01T00:00:00.000Z',
+    });
+
+    expect(
+      acquireCaptureLease(db, key, {
+        ownerToken: 'owner-2',
+        ttlMs: 10_000,
+        now: clockAt('2026-08-21T10:00:01.000Z'),
+      }),
+    ).toMatchObject({ acquired: true, reclaimed: true, lease: { fencingGeneration: 2 } });
+  });
+
   it('rejects stale renewal and authority after another owner reclaims', () => {
     const db = newDb();
     databases.push(db);
