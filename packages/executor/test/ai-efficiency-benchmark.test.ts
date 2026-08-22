@@ -71,45 +71,30 @@ describe('AI efficiency benchmark harnesses (small profile)', () => {
       ]);
       const before = memory();
       const started = performance.now();
-      const page: Array<{ sequence: number; stream: string; text: string }> = [];
+      let chunksReturned = 0;
+      let payloadBytesRead = 0;
       for await (const chunk of iterIndexedChunkBytesAfter(logs, afterSequence)) {
-        page.push({
-          sequence: chunk.sequence,
-          stream: chunk.stream,
-          text: chunk.bytes.toString('utf8'),
-        });
+        chunksReturned += 1;
+        payloadBytesRead += chunk.bytes.length;
       }
-      const response = {
-        job_id: 'job_benchmark',
-        attempt_id: 'att_benchmark',
-        mode: 'logs',
-        chunks: page,
-        returned_bytes: page.reduce(
-          (total, chunk) => total + Buffer.byteLength(chunk.text, 'utf8'),
-          0,
-        ),
-        has_more: false,
-        truncated: false,
-      };
-      const responseJsonBytes = Buffer.byteLength(JSON.stringify(response), 'utf8');
       measurement('indexed_log_page_8MiB', started, before, {
+        measurement_kind: 'indexed_iterator_io',
         bytes_read_upper_bound:
-          checkpointSize + (indexSize - checkpoint.byte_offset) + response.returned_bytes,
+          checkpointSize + (indexSize - checkpoint.byte_offset) + payloadBytesRead,
         bytes_written: 0,
         checkpoint_bytes_scanned: checkpointSize,
         index_bytes_scanned_upper_bound: indexSize - checkpoint.byte_offset,
-        payload_bytes_read: response.returned_bytes,
-        response_json_bytes: responseJsonBytes,
-        chunks_returned: page.length,
-        comparison: {
+        payload_bytes_read: payloadBytesRead,
+        chunks_returned: chunksReturned,
+        historical_comparison: {
           mode: 'head_only',
           baseline_available: false,
           historical_delta_available: false,
           reason: 'The removed whole-file readLogTail fixture is not a reproducible baseline.',
         },
       });
-      expect(page).toHaveLength(128);
-      expect(response.returned_bytes).toBe(128 * chunkBytes);
+      expect(chunksReturned).toBe(128);
+      expect(payloadBytesRead).toBe(128 * chunkBytes);
       expect(indexSize - checkpoint.byte_offset).toBeLessThan(16 * 1024);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -148,30 +133,27 @@ describe('AI efficiency benchmark harnesses (small profile)', () => {
         await writeFile(logs.chunksPath, `${JSON.stringify(entry)}\n`);
         const before = memory();
         const started = performance.now();
-        const page: Array<{ sequence: number; stream: string; text: string }> = [];
+        let chunksReturned = 0;
+        let payloadBytesRead = 0;
         for await (const indexedChunk of iterIndexedChunkBytesAfter(logs, 0)) {
-          page.push({
-            sequence: indexedChunk.sequence,
-            stream: indexedChunk.stream,
-            text: indexedChunk.bytes.toString('utf8'),
-          });
+          chunksReturned += 1;
+          payloadBytesRead += indexedChunk.bytes.length;
         }
-        const responseJsonBytes = Buffer.byteLength(JSON.stringify({ chunks: page }), 'utf8');
         measurement('indexed_log_page_1GiB_opt_in', started, before, {
+          measurement_kind: 'indexed_iterator_io',
           bytes_read_upper_bound: tailBytes + Buffer.byteLength(JSON.stringify(entry), 'utf8') + 1,
           bytes_written: 1024 * 1024 * 1024,
-          payload_bytes_read: tailBytes,
-          response_json_bytes: responseJsonBytes,
-          chunks_returned: page.length,
-          comparison: {
+          payload_bytes_read: payloadBytesRead,
+          chunks_returned: chunksReturned,
+          historical_comparison: {
             mode: 'head_only',
             baseline_available: false,
             historical_delta_available: false,
             reason: 'The removed whole-file readLogTail fixture is not a reproducible baseline.',
           },
         });
-        expect(page).toHaveLength(1);
-        expect(Buffer.byteLength(page[0]?.text ?? '', 'utf8')).toBe(tailBytes);
+        expect(chunksReturned).toBe(1);
+        expect(payloadBytesRead).toBe(tailBytes);
       } finally {
         await rm(dir, { recursive: true, force: true });
       }
