@@ -16,8 +16,8 @@
   "files": [
     {
       "path": "bin/rbo.js",
-      "sha256": "5be0caca4ce1673407707cab2a2088df344494f5eaff6e3d52793eb18ec91305",
-      "size_bytes": 702365,
+      "sha256": "2f11043a60d26f1e1786469592e0fef680fa8176defd6a910bab8926632381f6",
+      "size_bytes": 703707,
       "source": "apps/cli/dist/rbo.js"
     },
     {
