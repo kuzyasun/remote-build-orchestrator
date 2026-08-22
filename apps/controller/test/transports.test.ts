@@ -264,12 +264,15 @@ describe('job_logs transport parity with persistent cursor identity', () => {
         mode: 'logs' as const,
         max_bytes: 64,
       };
-      const viaHttp = JSON.parse(
-        textOf(await httpClient.callTool({ name: 'job_logs', arguments: arguments_ })),
+      const httpText = textOf(
+        await httpClient.callTool({ name: 'job_logs', arguments: arguments_ }),
       );
-      const viaStdio = JSON.parse(
-        textOf(await stdioClient.callTool({ name: 'job_logs', arguments: arguments_ })),
+      const stdioText = textOf(
+        await stdioClient.callTool({ name: 'job_logs', arguments: arguments_ }),
       );
+      expect(httpText).toBe(stdioText);
+      const viaHttp = JSON.parse(httpText);
+      const viaStdio = JSON.parse(stdioText);
       expect(viaHttp).toEqual(viaStdio);
       expect(viaHttp).toMatchObject({
         job_id: 'job_transport_logs',
