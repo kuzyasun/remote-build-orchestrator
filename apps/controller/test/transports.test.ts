@@ -7,7 +7,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { appendIndexedLogChunk, ensureAttemptLogs } from '@rbo/executor';
 import { MCP_TOOL_DEFS } from '@rbo/protocol';
 import { ensureControllerIdentity, generateDeviceKeyPair } from '@rbo/shared';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createStdioProxyServer } from '../../mcp-stdio/src/proxy.js';
 import { attemptLogDir } from '../src/execution/runner.js';
 import { startControllerServer } from '../src/http/server.js';
@@ -250,29 +250,37 @@ describe('job_logs transport parity with persistent cursor identity', () => {
   });
 
   it('returns byte-for-byte equal successful job_logs JSON through HTTP and stdio', async () => {
-    const httpClient = await connectHttpClient(fixtureServer);
-    const stdioClient = await connectStdioStyleClient(fixtureServer);
-    const arguments_ = {
-      job_id: 'job_transport_logs',
-      attempt_id: 'att_transport_logs',
-      mode: 'logs' as const,
-      max_bytes: 64,
-    };
-    const viaHttp = JSON.parse(
-      textOf(await httpClient.callTool({ name: 'job_logs', arguments: arguments_ })),
-    );
-    const viaStdio = JSON.parse(
-      textOf(await stdioClient.callTool({ name: 'job_logs', arguments: arguments_ })),
-    );
-    expect(viaHttp).toEqual(viaStdio);
-    expect(viaHttp).toMatchObject({
-      job_id: 'job_transport_logs',
-      attempt_id: 'att_transport_logs',
-      mode: 'logs',
-      chunks: [{ text: 'transport-parity' }],
-    });
-    await httpClient.close();
-    await stdioClient.close();
+    // The signed pagination cursor includes iat. Freeze only Date.now (not
+    // timers) so the two real transport requests exercise byte-for-byte parity.
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 0, 1));
+    let httpClient: Client | undefined;
+    let stdioClient: Client | undefined;
+    try {
+      httpClient = await connectHttpClient(fixtureServer);
+      stdioClient = await connectStdioStyleClient(fixtureServer);
+      const arguments_ = {
+        job_id: 'job_transport_logs',
+        attempt_id: 'att_transport_logs',
+        mode: 'logs' as const,
+        max_bytes: 64,
+      };
+      const viaHttp = JSON.parse(
+        textOf(await httpClient.callTool({ name: 'job_logs', arguments: arguments_ })),
+      );
+      const viaStdio = JSON.parse(
+        textOf(await stdioClient.callTool({ name: 'job_logs', arguments: arguments_ })),
+      );
+      expect(viaHttp).toEqual(viaStdio);
+      expect(viaHttp).toMatchObject({
+        job_id: 'job_transport_logs',
+        attempt_id: 'att_transport_logs',
+        mode: 'logs',
+        chunks: [{ text: 'transport-parity' }],
+      });
+    } finally {
+      nowSpy.mockRestore();
+      await Promise.allSettled([httpClient?.close(), stdioClient?.close()]);
+    }
   });
 });
 
