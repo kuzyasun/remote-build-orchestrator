@@ -347,7 +347,10 @@ describe('rbo run runtime', () => {
 
     await expect(
       cancelAndAwaitJob(baseUrl, 'job_cancelled', {
-        confirmationMs: 25,
+        // Local HTTP startup and one fetch round trip can exceed a few tens of
+        // milliseconds under parallel verification load. This is a success-path
+        // protocol assertion, not a deadline test.
+        confirmationMs: 1_000,
         pollMs: 1,
         writeStderr: (text) => stderr.push(text),
       }),
