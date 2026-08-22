@@ -205,6 +205,8 @@ export interface SubmitJobContext extends LocalRunnerContext {
    */
   getHostCpuBusyFraction?: () => number;
   maxHostCpuBusyFraction?: number;
+  /** Internal agent-plane shutdown fence for queued dispatch work. */
+  shouldContinueDispatch?: () => boolean;
   /** In-process S-03 fault injection; never populated from an external request. */
   snapshotPublicationTestHooks?: SnapshotPublicationTestHooks;
 }
@@ -491,6 +493,9 @@ export async function dispatchJobExecution(
   jobId: string,
   request: JobRequest,
 ): Promise<void> {
+  if (ctx.shouldContinueDispatch && !ctx.shouldContinueDispatch()) {
+    return;
+  }
   const connectedMap = ctx.connectedAgents ?? new Map();
   const dbAgents = ctx.db
     .prepare('SELECT id, capabilities_json, state FROM agents WHERE disabled_at IS NULL')
@@ -537,6 +542,9 @@ export async function dispatchJobExecution(
         : null;
 
   const gitSourceRequirements = await readGitSourceRequirements(ctx.dataDir, jobId);
+  if (ctx.shouldContinueDispatch && !ctx.shouldContinueDispatch()) {
+    return;
+  }
   const schedulingRequest = mergeGitSourceToolRequirements(request, gitSourceRequirements);
 
   const hostLoad: HostLoadSnapshot | undefined = ctx.getHostCpuBusyFraction
@@ -566,6 +574,9 @@ export async function dispatchJobExecution(
   });
 
   if (decision.action === 'remote' && decision.selectedAgent && ctx.agentPlanePort) {
+    if (ctx.shouldContinueDispatch && !ctx.shouldContinueDispatch()) {
+      return;
+    }
     await initiateRemoteAttempt(
       {
         db: ctx.db,
@@ -585,6 +596,9 @@ export async function dispatchJobExecution(
   }
 
   if (decision.action === 'local_fallback') {
+    if (ctx.shouldContinueDispatch && !ctx.shouldContinueDispatch()) {
+      return;
+    }
     await runLocalJob(ctx, jobId);
     return;
   }
@@ -629,6 +643,9 @@ export async function tryDispatchQueuedJobs(ctx: SubmitJobContext): Promise<void
     .all() as Array<{ id: string; request_json: string }>;
 
   for (const row of rows) {
+    if (ctx.shouldContinueDispatch && !ctx.shouldContinueDispatch()) {
+      return;
+    }
     let request: JobRequest;
     try {
       request = JobRequestSchema.parse(JSON.parse(row.request_json));

@@ -1049,11 +1049,14 @@ export function enqueueRemoteLogChunk(
   const prev = logChunkChains.get(key) ?? Promise.resolve();
   const next = prev.catch(() => undefined).then(() => handleRemoteLogChunk(opts, agentId, payload));
   logChunkChains.set(key, next);
-  void next.finally(() => {
+  const clearChain = (): void => {
     if (logChunkChains.get(key) === next) {
       logChunkChains.delete(key);
     }
-  });
+  };
+  // Do not discard a rejecting Promise produced by finally(). The caller owns
+  // error handling for `next`; this branch only performs bookkeeping.
+  void next.then(clearChain, clearChain);
   return next;
 }
 

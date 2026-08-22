@@ -141,6 +141,22 @@ export async function startAgentPlaneServer(
   });
   const wss = new WebSocketServer({ server: httpsServer, path: '/agent' });
   const connectedAgents = new Map<string, ConnectedAgent>();
+  const inFlightDispatches = new Set<Promise<void>>();
+  let shuttingDown = false;
+
+  const trackDispatch = (work: Promise<void>, context: string): void => {
+    inFlightDispatches.add(work);
+    void work.then(
+      () => {
+        inFlightDispatches.delete(work);
+      },
+      (error) => {
+        inFlightDispatches.delete(work);
+        logger.error(`${context} failed`, { error: String(error) });
+      },
+    );
+  };
+
   const recovery = new RecoveryCoordinator({
     db,
     connectedAgents,
@@ -190,19 +206,25 @@ export async function startAgentPlaneServer(
       defaultQueuePolicy: options.dispatchContext.defaultQueuePolicy,
       getHostCpuBusyFraction: options.dispatchContext.getHostCpuBusyFraction,
       maxHostCpuBusyFraction: options.dispatchContext.maxHostCpuBusyFraction,
+      shouldContinueDispatch: () => !shuttingDown,
     };
   };
 
   const maybeDispatchQueued = (): void => {
+    if (shuttingDown) {
+      return;
+    }
     const ctx = buildSubmitContext();
     if (!ctx) {
       return;
     }
-    void import('../jobs/submit.js')
-      .then(({ tryDispatchQueuedJobs }) => tryDispatchQueuedJobs(ctx))
-      .catch((error) => {
-        logger.error('queued job dispatch failed', { error: String(error) });
-      });
+    const dispatch = import('../jobs/submit.js').then(({ tryDispatchQueuedJobs }) => {
+      if (shuttingDown) {
+        return;
+      }
+      return tryDispatchQueuedJobs(ctx);
+    });
+    trackDispatch(dispatch, 'queued job dispatch');
   };
 
   httpsServer.on('request', (req, res) => {
@@ -235,6 +257,9 @@ export async function startAgentPlaneServer(
     let pendingCredential: string | null = null;
 
     socket.on('message', (raw) => {
+      if (shuttingDown) {
+        return;
+      }
       let message: WireMessage;
       try {
         message = JSON.parse(String(raw)) as WireMessage;
@@ -387,7 +412,10 @@ export async function startAgentPlaneServer(
             if (!authenticated) return;
             const payload = parsePayload(SourceNeedPayloadSchema, message.payload, message.type);
             if (!payload) return;
-            void handleRemoteSourceNeed(remoteOpts(), authenticated.agentId, payload);
+            trackDispatch(
+              handleRemoteSourceNeed(remoteOpts(), authenticated.agentId, payload),
+              'remote source_need handling',
+            );
             return;
           }
 
@@ -411,7 +439,10 @@ export async function startAgentPlaneServer(
             if (!authenticated) return;
             const payload = parsePayload(LogChunkPayloadSchema, message.payload, message.type);
             if (!payload) return;
-            void enqueueRemoteLogChunk(remoteOpts(), authenticated.agentId, payload);
+            trackDispatch(
+              enqueueRemoteLogChunk(remoteOpts(), authenticated.agentId, payload),
+              'remote log_chunk handling',
+            );
             return;
           }
 
@@ -472,6 +503,9 @@ export async function startAgentPlaneServer(
     });
 
     socket.on('close', () => {
+      if (shuttingDown) {
+        return;
+      }
       if (authenticated) {
         connectedAgents.delete(authenticated.agentId);
         markAgentSeen(db, authenticated.agentId, 'offline');
@@ -499,8 +533,9 @@ export async function startAgentPlaneServer(
     server: httpsServer,
     connectedAgents,
     recovery,
-    close: () =>
-      new Promise<void>((resolvePromise) => {
+    close: async () => {
+      shuttingDown = true;
+      await new Promise<void>((resolvePromise) => {
         clearInterval(leaseSweep);
         recovery.dispose();
         for (const client of wss.clients) {
@@ -509,6 +544,8 @@ export async function startAgentPlaneServer(
         wss.close(() => {
           httpsServer.close(() => resolvePromise());
         });
-      }),
+      });
+      await Promise.allSettled(inFlightDispatches);
+    },
   };
 }
