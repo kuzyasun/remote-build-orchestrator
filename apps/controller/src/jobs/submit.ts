@@ -97,6 +97,8 @@ export interface SnapshotPublicationTestHooks {
   beforeTransactionAuthorityCheck?: () => void;
   /** Runs inside the lifecycle transaction after the snapshot row is written. */
   afterSnapshotPersisted?: () => void;
+  /** Runs immediately before conditional terminal failure persistence. */
+  beforeConditionalTerminalSubmissionFailure?: () => void;
 }
 
 function generationPath(candidatePath: string, generation: number): string {
@@ -107,6 +109,40 @@ function generationPath(candidatePath: string, generation: number): string {
     );
   }
   return candidatePath.slice(0, -suffix.length);
+}
+
+function failSubmissionIfCaptureLeaseIsAuthoritative(
+  db: ControllerDatabase,
+  captureLease: Parameters<typeof releaseCaptureLease>[1],
+  payload: Record<string, unknown>,
+): boolean {
+  const timestamp = nowIso();
+  const info = db
+    .prepare(
+      `UPDATE job_submissions AS submission
+          SET state = 'failed', error_json = ?, updated_at = ?
+        WHERE submission.client_id = ? AND submission.client_request_id = ?
+          AND submission.state = 'capturing'
+          AND EXISTS (
+            SELECT 1
+              FROM snapshot_capture_leases AS lease
+             WHERE lease.client_id = submission.client_id
+               AND lease.client_request_id = submission.client_request_id
+               AND lease.owner_token = ?
+               AND lease.fencing_generation = ?
+               AND lease.lease_expires_at > ?
+          )`,
+    )
+    .run(
+      JSON.stringify(payload),
+      timestamp,
+      captureLease.clientId,
+      captureLease.clientRequestId,
+      captureLease.ownerToken,
+      captureLease.fencingGeneration,
+      timestamp,
+    );
+  return info.changes === 1;
 }
 
 async function flushFile(path: string): Promise<void> {
@@ -418,19 +454,33 @@ export async function handleJobSubmit(
     if (leaseRenewal) clearInterval(leaseRenewal);
     await captured?.cleanupCandidate();
 
-    const payload =
+    // A request may safely become terminal only when the capture failure says
+    // so explicitly. Unknown publication and transaction failures can happen
+    // after private or final generation-scoped files exist; keep the
+    // reservation reclaimable so the same idempotency key can capture g+1.
+    let payload =
       error instanceof RboError
         ? error.toJSON()
-        : { category: 'internal', message: String(error), retryable: false };
-    releaseCaptureLease(ctx.db, captureLease);
-    if (!(error instanceof RboError && error.category === 'lease_expired')) {
-      completeSubmission(
-        ctx.db,
-        ctx.clientId,
-        request.client_request_id,
-        'failed',
-        payload as Record<string, unknown>,
-      );
+        : { category: 'internal', message: String(error), retryable: true };
+    if (payload.retryable) {
+      releaseCaptureLease(ctx.db, captureLease);
+    } else {
+      ctx.snapshotPublicationTestHooks?.beforeConditionalTerminalSubmissionFailure?.();
+      if (
+        failSubmissionIfCaptureLeaseIsAuthoritative(
+          ctx.db,
+          captureLease,
+          payload as Record<string, unknown>,
+        )
+      ) {
+        releaseCaptureLease(ctx.db, captureLease);
+      } else {
+        payload = new RboError(
+          'lease_expired',
+          'Snapshot capture lease lost before recording terminal capture failure',
+          true,
+        ).toJSON();
+      }
     }
     return { error: payload };
   }
