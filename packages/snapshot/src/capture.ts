@@ -1013,12 +1013,7 @@ async function collectSubmodulePinsAndOverlay(
       });
     }
 
-    let childSubmodules: SubmoduleStatusEntry[] = [];
-    try {
-      childSubmodules = await gitSubmoduleStatus(subAbsRoot);
-    } catch {
-      childSubmodules = [];
-    }
+    const childSubmodules = await gitSubmoduleStatus(subAbsRoot);
     if (childSubmodules.length > 0) {
       const childRes = await collectSubmodulePinsAndOverlay(
         repoRoot,
@@ -1054,7 +1049,6 @@ export async function captureGitOverlaySnapshot(
 
   const captureId = generateId('snp');
   const contentStorageDir = join(input.contentStorageDir, captureId);
-  await mkdir(contentStorageDir, { recursive: true });
 
   const initialStatus = await gitStatusPorcelainV2(repoRoot);
   const repoInfo = await describeRepository(repoRoot);
@@ -1106,6 +1100,7 @@ export async function captureGitOverlaySnapshot(
     [],
   );
 
+  await mkdir(contentStorageDir, { recursive: true });
   const capturedFiles: CapturedFile[] = [];
   const archivedFiles: CapturedFile[] = [];
   const secretWarnings: Array<{ path: string; pattern: string }> = [];

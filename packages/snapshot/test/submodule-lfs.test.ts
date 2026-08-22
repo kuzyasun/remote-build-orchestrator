@@ -168,6 +168,23 @@ describe('capture submodule policy (§11.14)', () => {
     }
   }, 60_000);
 
+  it('reports a failed submodule status query distinctly', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rbo-submod-status-failure-'));
+    try {
+      await writeFile(
+        join(dir, '.gitmodules'),
+        '[submodule "vendor/lib"]\n\tpath = vendor/lib\n\turl = https://example.invalid/lib.git\n',
+      );
+      await expect(assertSubmodulesReadyForCapture(dir)).rejects.toMatchObject({
+        category: 'materialization',
+        retryable: true,
+        details: { reason: 'submodule_status_failed' },
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('allows clean submodule state for git_overlay capture', async () => {
     const fixture = await createSubmoduleFixture();
     const storage = await mkdtemp(join(tmpdir(), 'rbo-cap-submod-overlay-'));
