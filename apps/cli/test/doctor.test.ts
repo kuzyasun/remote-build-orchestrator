@@ -44,23 +44,24 @@ describe('rbo doctor (§33)', () => {
     }
   });
 
-  it('fails node_engines when runtime is below >=22.14', async () => {
+  it('fails node_engines when runtime is below >=24.0', async () => {
     const report = await runDoctor({
       dataDir: tempDir(),
       controllerUrl: null,
-      nodeVersion: 'v20.11.0',
+      nodeVersion: 'v22.14.0',
     });
     const check = report.checks.find((c) => c.name === 'node_engines');
     expect(check?.ok).toBe(false);
-    expect(check?.detail).toMatch(/v20\.11\.0/);
+    expect(check?.detail).toMatch(/v22\.14\.0/);
     expect(report.ok).toBe(false);
   });
 
   it('passes node_engines at the minimum engines floor', () => {
-    expect(checkNodeEngines('v22.14.0').ok).toBe(true);
-    expect(checkNodeEngines('v22.15.1').ok).toBe(true);
-    expect(checkNodeEngines('v23.0.0').ok).toBe(true);
-    expect(checkNodeEngines('v22.13.9').ok).toBe(false);
+    expect(checkNodeEngines('v24.0.0').ok).toBe(true);
+    expect(checkNodeEngines('v24.1.0').ok).toBe(true);
+    expect(checkNodeEngines('v25.0.0').ok).toBe(true);
+    expect(checkNodeEngines('v23.9.0').ok).toBe(false);
+    expect(checkNodeEngines('v22.14.0').ok).toBe(false);
   });
 
   it('marks data_dir_writable false when the directory cannot be created', async () => {

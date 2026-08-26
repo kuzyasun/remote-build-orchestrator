@@ -13,7 +13,7 @@ on another machine.
 
 Install these on every Controller and Agent machine:
 
-- Node.js 22.14 or newer;
+- Node.js 24.0 or newer;
 - Git;
 - the shells and build tools that jobs on that machine need.
 

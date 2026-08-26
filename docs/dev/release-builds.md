@@ -70,14 +70,14 @@ Then follow [`docs/user/getting-started.md`](../user/getting-started.md) (init �
 
 | Tool | Requirement |
 | --- | --- |
-| Node.js | ≥ 22.14 (see `.nvmrc`) |
+| Node.js | ≥ 24.0 (see `.nvmrc`) |
 | pnpm | 10.5.2 (pinned via `"packageManager"` in root `package.json`) |
 | Git | on `PATH` |
 | Rust | 1.93.0 (`rust-toolchain.toml`) — **required on the Windows x64 host that packs/publishes the optional package** |
 | npm | Trusted Publisher configured for both `@gemslibe` packages |
 
 ```powershell
-node -v          # v22.14.x or newer
+node -v          # v24.0.x or newer
 pnpm -v          # 10.5.2
 ```
 
@@ -355,7 +355,7 @@ npm publish --access public .\apps\cli\gemslibe-rbo-0.1.0.tgz
 
 On a **clean Windows x64** machine (no monorepo checkout required):
 
-1. Node.js ≥ 22.14 installed.
+1. Node.js ≥ 24.0 installed.
 2. `npm install -g @gemslibe/rbo`
 3. Confirm bins: `rbo --help`, `rbo-mcp-stdio` on `PATH`.
 4. Follow [`docs/user/getting-started.md`](../user/getting-started.md):
@@ -448,7 +448,7 @@ Archives are the air-gap fallback; **npm remains the primary** distribution chan
 | Publish workflow rejects the tag | The release tag does not equal `v<package version>` | Correct the version commit or recreate the release with the matching tag |
 | `release:publish` refuses without confirmation | Missing safety gate | `$env:RELEASE_CONFIRM=1; pnpm release:publish` or `pnpm release:publish --yes` |
 | Manual `npm publish` returns 403 | Not logged in, missing `gemslibe` org rights, or interactive publishing is disabled | Prefer the trusted workflow; use the manual recovery path only with explicit npm access |
-| `engines` / install warnings | Node &lt; 22.14 | Upgrade Node; `rbo doctor` also surfaces mismatches |
+| `engines` / install warnings | Node &lt; 24.0 | Upgrade Node; `rbo doctor` also surfaces mismatches |
 | Optional package skipped | Non-Windows or non-x64 host (`os`/`cpu` in package.json) | Expected; `rbo doctor` WARNs. Only win32-x64 gets the helper automatically |
 | `windows_executor` WARN on win32-x64 after `npm install -g` | Optional package not published yet, wrong semver pin, or network/registry failure | Publish optional package first at matching semver; reinstall; check `npm ls -g @gemslibe/rbo-windows-executor-win32-x64` |
 | Main pack missing `dist/*.js` | Forgot `pnpm build` before pack | `pnpm build` or `pnpm --filter @gemslibe/rbo build` |

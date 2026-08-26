@@ -8,7 +8,7 @@ Remote Build Orchestrator (RBO) — global CLI, Controller, Agent, and MCP stdio
 npm install -g @gemslibe/rbo
 ```
 
-Requires Node.js ≥ 22.14. See the
+Requires Node.js ≥ 24.0. See the
 [getting-started guide](https://github.com/kuzyasun/remote-build-orchestrator/blob/main/docs/user/getting-started.md)
 for Controller/Agent setup and MCP client wiring.
 

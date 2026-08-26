@@ -43,7 +43,7 @@ Destructive and hardware-risk jobs require explicit confirmation before they sta
 
 ## Quick start
 
-RBO requires Node.js 22.14 or newer on the Controller and every Agent.
+RBO requires Node.js 24.0 or newer on the Controller and every Agent.
 
 Install the CLI on each machine that will run a Controller or Agent:
 

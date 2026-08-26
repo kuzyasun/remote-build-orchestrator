@@ -19,7 +19,7 @@
   "type": "module",
   "packageManager": "pnpm@10.5.2",
   "engines": {
-    "node": ">=22.14.0"
+    "node": ">=24.0.0"
   },
   "scripts": {
     "build": "pnpm --filter \"@rbo/shared\" build && pnpm --filter \"@rbo/protocol\" build && pnpm --filter \"@rbo/snapshot\" build && pnpm --filter \"@rbo/executor\" build && pnpm --filter \"@rbo/testing\" build && pnpm --filter \"@rbo/controller\" build && pnpm --filter \"@rbo/agent\" build && pnpm --filter \"@gemslibe/rbo\" build && pnpm --filter \"@rbo/mcp-stdio\" build",
