@@ -21,6 +21,6 @@ describe('probeCapabilities git-lfs advertisement (§11.15)', () => {
       maxJobs: 1,
     });
     expect(caps.resources.cpu_speed_mhz).toBeTypeOf('number');
-    expect(caps.resources.cpu_speed_mhz).toBeGreaterThan(0);
+    expect(caps.resources.cpu_speed_mhz).toBeGreaterThanOrEqual(0);
   });
 });

@@ -1,7 +1,13 @@
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { runJobRemote, submitJobRemote } from '../src/commands/jobs.js';
+import {
+  JOB_RUN_INITIAL_TIMEOUT_MS,
+  JOB_RUN_WAIT_TIMEOUT_MS,
+  JOB_SUBMIT_TIMEOUT_MS,
+  runJobRemote,
+  submitJobRemote,
+} from '../src/commands/jobs.js';
 import { parseRunCommandArgs, takeRunJsonFlag } from '../src/commands/run.js';
 
 describe('rbo run parser', () => {
@@ -159,9 +165,21 @@ describe('rbo run HTTP helper', () => {
         project_root: '/work/project',
         cwd: '.',
       });
+      await runJobRemote(baseUrl, { job_id: 'job_1' });
       await submitJobRemote(baseUrl, { command: 'pnpm test', project_root: '/work/project' });
-      expect(timeouts.length).toBe(2);
-      expect(Math.min(...timeouts)).toBeGreaterThan(50_000);
+      await runJobRemote(
+        baseUrl,
+        { command: 'pnpm test', project_root: '/work/project', cwd: '.' },
+        { timeoutMs: 5_000 },
+      );
+      expect(timeouts).toEqual([
+        JOB_RUN_INITIAL_TIMEOUT_MS,
+        JOB_RUN_WAIT_TIMEOUT_MS,
+        JOB_SUBMIT_TIMEOUT_MS,
+        5_000,
+      ]);
+      expect(JOB_RUN_INITIAL_TIMEOUT_MS).toBeGreaterThan(55_000);
+      expect(JOB_RUN_WAIT_TIMEOUT_MS).toBeGreaterThan(55_000);
     } finally {
       AbortSignal.timeout = originalTimeout;
       await new Promise<void>((resolvePromise, rejectPromise) =>

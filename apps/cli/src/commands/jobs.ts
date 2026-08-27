@@ -3,8 +3,12 @@ import type { JobRunInput } from './run.js';
 // Thin HTTP client for Controller job MCP tools via /internal/v1/tools/* (§23).
 
 const TOOL_REQUEST_TIMEOUT_MS = 15_000;
-/** `mcp_wait_slice_seconds` max is 55s; include snapshot-capture and HTTP headroom. */
-const BLOCKING_TOOL_REQUEST_TIMEOUT_MS = 70_000;
+/** `mcp_wait_slice_seconds` max is 55s; include HTTP headroom for resume waits. */
+export const JOB_RUN_WAIT_TIMEOUT_MS = 70_000;
+/** Snapshot capture bound for `job_submit`. */
+export const JOB_SUBMIT_TIMEOUT_MS = 120_000;
+/** First `job_run` includes snapshot capture and then a wait slice. */
+export const JOB_RUN_INITIAL_TIMEOUT_MS = JOB_SUBMIT_TIMEOUT_MS + JOB_RUN_WAIT_TIMEOUT_MS;
 
 export interface ToolCallOptions {
   timeoutMs?: number;
@@ -47,7 +51,7 @@ export function submitJobRemote(
   baseUrl: string,
   request: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  return postTool(baseUrl, 'job_submit', request, { timeoutMs: BLOCKING_TOOL_REQUEST_TIMEOUT_MS });
+  return postTool(baseUrl, 'job_submit', request, { timeoutMs: JOB_SUBMIT_TIMEOUT_MS });
 }
 
 /** Submit the shared compact `job_run` input without local protocol revalidation. */
@@ -56,9 +60,11 @@ export function runJobRemote(
   input: JobRunInput,
   options?: ToolCallOptions,
 ): Promise<Record<string, unknown>> {
+  const hasJobId = typeof input.job_id === 'string' && input.job_id.length > 0;
   return postTool(baseUrl, 'job_run', input, {
     ...options,
-    timeoutMs: options?.timeoutMs ?? BLOCKING_TOOL_REQUEST_TIMEOUT_MS,
+    timeoutMs:
+      options?.timeoutMs ?? (hasJobId ? JOB_RUN_WAIT_TIMEOUT_MS : JOB_RUN_INITIAL_TIMEOUT_MS),
   });
 }
 

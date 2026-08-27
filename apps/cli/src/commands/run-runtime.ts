@@ -110,14 +110,24 @@ export async function runJobToTerminal(
   initialInput: JobRunInput,
   options: RunToTerminalOptions = {},
 ): Promise<Record<string, unknown>> {
-  interrupted(options.signal, null);
-  // Do not abort the initial wait: the Controller may already have captured and
-  // started the job, and job_id is only present on the first response.
+  // The Controller may already have captured and started a new job before the
+  // first response carries job_id, so that wait is not abortable. A resume that
+  // already has job_id stays cancellable.
+  const knownJobId =
+    typeof initialInput.job_id === 'string' && initialInput.job_id.length > 0
+      ? initialInput.job_id
+      : null;
+  interrupted(options.signal, knownJobId);
   let result: Record<string, unknown>;
   try {
-    result = await requestJobRun(baseUrl, initialInput, undefined, null);
+    result = await requestJobRun(
+      baseUrl,
+      initialInput,
+      knownJobId ? options.signal : undefined,
+      knownJobId,
+    );
   } catch (error) {
-    interrupted(options.signal, null);
+    interrupted(options.signal, knownJobId);
     throw error;
   }
   const initialJobId = jobIdFromResult(result);

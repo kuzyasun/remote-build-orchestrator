@@ -150,6 +150,8 @@ describe('snapshot capture limits (§4.3)', () => {
   });
 });
 
+const absPath = (p: string) => (process.platform === 'win32' ? `C:${p}` : p);
+
 describe('loadControllerConfig allowed roots/destinations (operator setup)', () => {
   it('defaults to empty (no jobs allowed) when unset — matches documented safe-by-default', () => {
     for (const key of ENV_KEYS) delete process.env[key];
@@ -159,20 +161,20 @@ describe('loadControllerConfig allowed roots/destinations (operator setup)', () 
   });
 
   it('parses RBO_ALLOWED_PROJECT_ROOTS / RBO_ALLOWED_ARTIFACT_DESTINATIONS as comma-separated lists', () => {
-    process.env.RBO_ALLOWED_PROJECT_ROOTS = 'C:/repos/one, C:/repos/two';
-    process.env.RBO_ALLOWED_ARTIFACT_DESTINATIONS = 'C:/out';
+    process.env.RBO_ALLOWED_PROJECT_ROOTS = `${absPath('/repos/one')}, ${absPath('/repos/two')}`;
+    process.env.RBO_ALLOWED_ARTIFACT_DESTINATIONS = absPath('/out');
     const config = loadControllerConfig({ configPath: null });
-    expect(config.allowedProjectRoots).toEqual(['C:/repos/one', 'C:/repos/two']);
-    expect(config.allowedArtifactDestinations).toEqual(['C:/out']);
+    expect(config.allowedProjectRoots).toEqual([absPath('/repos/one'), absPath('/repos/two')]);
+    expect(config.allowedArtifactDestinations).toEqual([absPath('/out')]);
   });
 
   it('an explicit override still wins over the environment variable', () => {
-    process.env.RBO_ALLOWED_PROJECT_ROOTS = 'C:/should-not-be-used';
+    process.env.RBO_ALLOWED_PROJECT_ROOTS = absPath('/should-not-be-used');
     const config = loadControllerConfig({
       configPath: null,
-      allowedProjectRoots: ['C:/explicit'],
+      allowedProjectRoots: [absPath('/explicit')],
     });
-    expect(config.allowedProjectRoots).toEqual(['C:/explicit']);
+    expect(config.allowedProjectRoots).toEqual([absPath('/explicit')]);
   });
 
   it('rejects empty, dot, and relative allowlist paths from file', () => {
@@ -195,12 +197,16 @@ describe('controller.json file load + precedence', () => {
     const dataDir = tempDir();
     const first = writeDefaultControllerConfigFile(dataDir);
     expect(first.written).toBe(true);
-    writeFileSync(first.path, '{"mcp_port":9999,"allowed_project_roots":["C:/kept"]}\n', 'utf8');
+    writeFileSync(
+      first.path,
+      JSON.stringify({ mcp_port: 9999, allowed_project_roots: [absPath('/kept')] }),
+      'utf8',
+    );
     const second = writeDefaultControllerConfigFile(dataDir);
     expect(second.written).toBe(false);
     const config = loadControllerConfig({ dataDir, configPath: first.path });
     expect(config.mcpPort).toBe(9999);
-    expect(config.allowedProjectRoots).toEqual(['C:/kept']);
+    expect(config.allowedProjectRoots).toEqual([absPath('/kept')]);
   });
 
   it('loads values from controller.json when env is unset', () => {
@@ -211,14 +217,14 @@ describe('controller.json file load + precedence', () => {
       path,
       JSON.stringify({
         mcp_port: 7500,
-        allowed_project_roots: ['C:/from-file'],
+        allowed_project_roots: [absPath('/from-file')],
         allow_local_fallback: false,
       }),
       'utf8',
     );
     const config = loadControllerConfig({ dataDir });
     expect(config.mcpPort).toBe(7500);
-    expect(config.allowedProjectRoots).toEqual(['C:/from-file']);
+    expect(config.allowedProjectRoots).toEqual([absPath('/from-file')]);
     expect(config.allowLocalFallback).toBe(false);
   });
 
@@ -227,22 +233,22 @@ describe('controller.json file load + precedence', () => {
     writeDefaultControllerConfigFile(dataDir);
     writeFileSync(
       join(dataDir, 'controller.json'),
-      JSON.stringify({ mcp_port: 7500, allowed_project_roots: ['C:/from-file'] }),
+      JSON.stringify({ mcp_port: 7500, allowed_project_roots: [absPath('/from-file')] }),
       'utf8',
     );
     process.env.RBO_MCP_PORT = '7600';
-    process.env.RBO_ALLOWED_PROJECT_ROOTS = 'C:/from-env';
+    process.env.RBO_ALLOWED_PROJECT_ROOTS = absPath('/from-env');
     const fromEnv = loadControllerConfig({ dataDir });
     expect(fromEnv.mcpPort).toBe(7600);
-    expect(fromEnv.allowedProjectRoots).toEqual(['C:/from-env']);
+    expect(fromEnv.allowedProjectRoots).toEqual([absPath('/from-env')]);
 
     const fromOverride = loadControllerConfig({
       dataDir,
       mcpPort: 7700,
-      allowedProjectRoots: ['C:/from-override'],
+      allowedProjectRoots: [absPath('/from-override')],
     });
     expect(fromOverride.mcpPort).toBe(7700);
-    expect(fromOverride.allowedProjectRoots).toEqual(['C:/from-override']);
+    expect(fromOverride.allowedProjectRoots).toEqual([absPath('/from-override')]);
   });
 
   it('force rewrites controller.json defaults', () => {

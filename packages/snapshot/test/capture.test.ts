@@ -332,7 +332,9 @@ describe('captureFullSnapshot (§11, Appendix C)', () => {
           ...actual,
           open: async (...args: Parameters<typeof actual.open>) => {
             const handle = await actual.open(...args);
-            if (String(args[0]) !== sourcePath) return handle;
+            const target = String(args[0]).replace(/\\/g, '/').toLowerCase();
+            const targetExpected = sourcePath.replace(/\\/g, '/').toLowerCase();
+            if (!target.endsWith('/tracked.txt') && target !== targetExpected) return handle;
             const originalStat = handle.stat.bind(handle);
             let statCalls = 0;
             const mutableHandle = handle as unknown as {
@@ -341,7 +343,7 @@ describe('captureFullSnapshot (§11, Appendix C)', () => {
             mutableHandle.stat = async (...statArgs: Parameters<typeof handle.stat>) => {
               const result = await originalStat(...statArgs);
               statCalls += 1;
-              if (statCalls === 2) await writeFile(sourcePath, 'mutated-content');
+              if (statCalls === 2) await writeFile(String(args[0]), 'mutated-content');
               return result;
             };
             return handle;

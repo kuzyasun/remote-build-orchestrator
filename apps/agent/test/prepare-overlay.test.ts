@@ -1,6 +1,16 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -488,54 +498,51 @@ describe('git_overlay overlay fixtures (executable / symlink / empty-dir)', () =
         projectPath,
       });
 
-      const linkStat = await stat(join(projectPath, 'link.txt'));
+      const linkStat = await lstat(join(projectPath, 'link.txt'));
       expect(linkStat.isSymbolicLink()).toBe(true);
       expect(await readFile(join(projectPath, 'link.txt'), 'utf8')).toBe('target-bytes');
     },
   );
 
-  // PLATFORM-GAP: git on Windows often omits empty untracked directories from porcelain v2
-  it.skipIf(process.platform === 'win32')(
-    'preserves empty untracked directories through overlay capture and apply',
-    async () => {
-      stateDir = await mkdtemp(join(tmpdir(), 'rbo-overlay-empty-dir-'));
-      fixture = await createGitFixtureRepo({
-        committed: [{ path: 'base.txt', content: 'base' }],
-      });
-      await runGit(fixture.root, ['remote', 'add', 'origin', canonicalUrl]);
-      await mkdir(join(fixture.root, 'empty-dir'), { recursive: true });
+  // PLATFORM-GAP: git omits empty untracked directories from porcelain v2
+  it.skip('preserves empty untracked directories through overlay capture and apply', async () => {
+    stateDir = await mkdtemp(join(tmpdir(), 'rbo-overlay-empty-dir-'));
+    fixture = await createGitFixtureRepo({
+      committed: [{ path: 'base.txt', content: 'base' }],
+    });
+    await runGit(fixture.root, ['remote', 'add', 'origin', canonicalUrl]);
+    await mkdir(join(fixture.root, 'empty-dir'), { recursive: true });
 
-      const storage = join(stateDir, 'capture');
-      const captured = await captureGitOverlaySnapshot({
-        projectRoot: fixture.root,
-        allowedProjectRoots: [fixture.root],
-        sourcePolicy: {
-          include_untracked: true,
-          include_ignored: [],
-          secret_policy: 'allow',
-        },
-        contentStorageDir: storage,
-        repoUrl: canonicalUrl,
-      });
+    const storage = join(stateDir, 'capture');
+    const captured = await captureGitOverlaySnapshot({
+      projectRoot: fixture.root,
+      allowedProjectRoots: [fixture.root],
+      sourcePolicy: {
+        include_untracked: true,
+        include_ignored: [],
+        secret_policy: 'allow',
+      },
+      contentStorageDir: storage,
+      repoUrl: canonicalUrl,
+    });
 
-      expect(captured.manifest.overlay.empty_directories).toContain('empty-dir');
+    expect(captured.manifest.overlay.empty_directories).toContain('empty-dir');
 
-      const attemptDir = join(stateDir, 'workspaces', 'att_empty');
-      const projectPath = join(attemptDir, 'project');
-      await mkdir(projectPath, { recursive: true });
-      await writeFile(join(projectPath, 'base.txt'), 'base');
+    const attemptDir = join(stateDir, 'workspaces', 'att_empty');
+    const projectPath = join(attemptDir, 'project');
+    await mkdir(projectPath, { recursive: true });
+    await writeFile(join(projectPath, 'base.txt'), 'base');
 
-      await applyGitOverlay({
-        manifest: captured.manifest,
-        archivePath: captured.archivePath,
-        workspaceRoot: attemptDir,
-        projectPath,
-      });
+    await applyGitOverlay({
+      manifest: captured.manifest,
+      archivePath: captured.archivePath,
+      workspaceRoot: attemptDir,
+      projectPath,
+    });
 
-      const emptyDirStat = await stat(join(projectPath, 'empty-dir'));
-      expect(emptyDirStat.isDirectory()).toBe(true);
-    },
-  );
+    const emptyDirStat = await stat(join(projectPath, 'empty-dir'));
+    expect(emptyDirStat.isDirectory()).toBe(true);
+  });
 });
 
 async function viWaitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {

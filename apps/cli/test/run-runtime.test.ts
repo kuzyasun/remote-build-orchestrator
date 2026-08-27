@@ -418,7 +418,7 @@ describe('rbo run runtime', () => {
           return;
         }
         controller.abort();
-        // Keep the response pending: the client must stop via its abort signal, not its 15s timeout.
+        // Keep the response pending: the client must stop via its abort signal, not the wait timeout.
       }),
     );
 
@@ -430,6 +430,21 @@ describe('rbo run runtime', () => {
       ),
     ).rejects.toMatchObject<Partial<RunInterruptedError>>({ jobId: 'job_abort_request' });
   });
+
+  it('aborts the first wait when the compact input already has a job ID', async () => {
+    const controller = new AbortController();
+    const baseUrl = await listen(
+      createServer(async (req, res) => {
+        await readJson(req);
+        controller.abort();
+        // Keep the response pending: job_id is already known, so this wait must be cancellable.
+      }),
+    );
+
+    await expect(
+      runJobToTerminal(baseUrl, { job_id: 'job_known' }, { signal: controller.signal }),
+    ).rejects.toMatchObject<Partial<RunInterruptedError>>({ jobId: 'job_known' });
+  }, 5_000);
 
   it.each([
     [{ outcome: 'succeeded', exit_code: 0 }, 0],

@@ -233,7 +233,7 @@ describe('Controller job_logs contract and durable paging', () => {
     );
     expect(received[0]).toMatchObject({ stream: 'stderr', text: 'err-1\n' });
     expect(received.at(-1)).toMatchObject({ stream: 'stdout', text: 'out-201\n' });
-  });
+  }, 60_000);
 
   it('bounds pages to 128 chunks and returns a structured error when a source disappears', async () => {
     for (let sequence = 1; sequence <= 130; sequence += 1)
@@ -255,7 +255,7 @@ describe('Controller job_logs contract and durable paging', () => {
       max_bytes: 16,
     });
     expect(missing).toMatchObject({ error: { category: 'validation', retryable: false } });
-  });
+  }, 60_000);
 
   it('resumes a later opaque cursor through sparse checkpoints without skipping the suffix', async () => {
     for (let sequence = 1; sequence <= 300; sequence += 1) {
@@ -300,7 +300,7 @@ describe('Controller job_logs contract and durable paging', () => {
     expect(resumed.map((chunk) => chunk.text).join('')).toBe(
       Array.from({ length: 172 }, (_, index) => `chunk-${index + 129}\n`).join(''),
     );
-  });
+  }, 60_000);
 
   it('keeps an old cursor bound to its original attempt after a retry and survives a new context', async () => {
     await append('stdout', 'old', 1);

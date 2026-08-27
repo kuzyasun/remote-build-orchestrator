@@ -12,13 +12,22 @@ vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   const mockedExecFile = ((...args: unknown[]) => {
     const [file, gitArgs, options, callback] = args;
+    const optCwd =
+      typeof options === 'object' && options !== null
+        ? (options as { cwd?: string }).cwd
+        : undefined;
+    const targetCwd = injectedStatusFailure.cwd;
+    const isMatchingCwd = Boolean(
+      targetCwd &&
+        optCwd &&
+        (optCwd.replace(/\\/g, '/').toLowerCase() === targetCwd.replace(/\\/g, '/').toLowerCase() ||
+          optCwd.replace(/\\/g, '/').toLowerCase().endsWith('/vendor/lib')),
+    );
     const shouldFail =
       file === 'git' &&
       Array.isArray(gitArgs) &&
       gitArgs.join('\0') === 'submodule\0status\0--recursive' &&
-      typeof options === 'object' &&
-      options !== null &&
-      (options as { cwd?: string }).cwd === injectedStatusFailure.cwd;
+      isMatchingCwd;
     if (shouldFail && typeof callback === 'function') {
       const error = Object.assign(new Error('injected submodule status failure'), {
         stderr: 'injected submodule status failure',
