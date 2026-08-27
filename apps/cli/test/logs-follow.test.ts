@@ -143,6 +143,73 @@ describe('CLI job logs helpers', () => {
     );
   });
 
+  it('followJobLogsRemote reconnects after an established SSE body reset', async () => {
+    let connections = 0;
+    const printed: string[] = [];
+    const receivedHeaders: Array<string | undefined> = [];
+    const server = createServer((req, res) => {
+      if (req.url?.startsWith('/internal/v1/tools/job_get')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        const state = connections >= 2 ? 'completed' : 'running';
+        res.end(
+          JSON.stringify({
+            job: {
+              id: 'job_1',
+              state,
+              outcome: state === 'completed' ? 'succeeded' : null,
+            },
+          }),
+        );
+        return;
+      }
+      if (!req.url?.includes('/logs/stream')) {
+        res.writeHead(404).end();
+        return;
+      }
+      connections += 1;
+      receivedHeaders.push(
+        typeof req.headers['last-event-id'] === 'string' ? req.headers['last-event-id'] : undefined,
+      );
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      if (connections === 1) {
+        res.write(
+          'event: log\nid: 1\ndata: {"attempt_id":"att","sequence":1,"stream":"stdout","text":"a"}\n\n',
+          () => {
+            // Reset the established body so reader.read() rejects (unlike res.end()).
+            req.socket.destroy();
+          },
+        );
+        return;
+      }
+      res.write(
+        'event: log\nid: 2\ndata: {"attempt_id":"att","sequence":2,"stream":"stdout","text":"b"}\n\n',
+      );
+      res.write(
+        'event: done\ndata: {"attempt_id":"att","job_id":"job_1","state":"completed","outcome":"succeeded","last_sequence":2}\n\n',
+      );
+      res.end();
+    });
+
+    await new Promise<void>((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    const result = await followJobLogsRemote(`http://127.0.0.1:${port}`, 'job_1', {
+      onChunk: (_stream, text) => printed.push(text),
+      pollMs: 10,
+    });
+
+    expect(printed.join('')).toBe('ab');
+    expect(result.lastSequence).toBe(2);
+    expect(result.state).toBe('completed');
+    expect(connections).toBeGreaterThanOrEqual(2);
+    expect(receivedHeaders[1]).toBe('1');
+
+    await new Promise<void>((resolvePromise, rejectPromise) =>
+      server.close((err) => (err ? rejectPromise(err) : resolvePromise())),
+    );
+  });
+
   it('followJobLogsRemote reconnects after stream drop to catch missed tail + done', async () => {
     let connections = 0;
     const printed: string[] = [];

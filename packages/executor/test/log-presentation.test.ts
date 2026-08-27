@@ -64,6 +64,33 @@ describe('log presentation', () => {
     expect(result.toString('utf8')).not.toContain('\ufffd');
   });
 
+  it('keeps the last newline-terminated line when maxLines is 1', () => {
+    const result = presentLogTail([Buffer.from('noise\nERROR: last\n')], [], {
+      maxBytes: 1024,
+      maxLines: 1,
+      stderrPrefixComplete: true,
+      stdoutPrefixComplete: true,
+    });
+    expect(result.toString('utf8')).toBe('ERROR: last\n');
+  });
+
+  it('returns N trailing records for newline-terminated logs', () => {
+    const two = presentLogTail([Buffer.from('a\nb\nc\n')], [], {
+      maxBytes: 1024,
+      maxLines: 2,
+      stderrPrefixComplete: true,
+      stdoutPrefixComplete: true,
+    });
+    expect(two.toString('utf8')).toBe('b\nc\n');
+    const unterminated = presentLogTail([Buffer.from('a\nb\nc')], [], {
+      maxBytes: 1024,
+      maxLines: 1,
+      stderrPrefixComplete: true,
+      stdoutPrefixComplete: true,
+    });
+    expect(unterminated.toString('utf8')).toBe('c');
+  });
+
   it('strips CSI and OSC across chunk boundaries', () => {
     const a = run([
       Buffer.from('ok\x1b[31'),

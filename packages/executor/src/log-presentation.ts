@@ -341,6 +341,8 @@ function trailingLines(data: Buffer, maxLines: number): Buffer {
   let lines = 0;
   for (let index = data.length - 1; index >= 0; index -= 1) {
     if (data[index] !== 0x0a) continue;
+    // A terminating newline ends the last record; it is not an extra line.
+    if (index === data.length - 1) continue;
     lines += 1;
     if (lines >= maxLines) {
       start = index + 1;

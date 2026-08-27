@@ -357,11 +357,11 @@ export async function followJobLogsRemote(
           }
         }
       }
-    } catch (error) {
+    } catch {
       if (options.signal?.aborted) {
         break;
       }
-      throw error;
+      // Body reset/drop: fall through and reconnect with Last-Event-ID.
     }
 
     if (finished) {
