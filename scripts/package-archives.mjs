@@ -29,6 +29,12 @@ function isForbidden(p) {
   return isForbiddenPackagingPath(p);
 }
 
+/** MSVC cargo --release output is not bit-reproducible (PE timestamps and size). */
+function isNonReproducibleNativeBinary(file) {
+  const source = (file.source ?? '').replace(/\\/g, '/');
+  return source.includes('native/windows-executor/target/');
+}
+
 async function refreshManifest(os) {
   const manifestPath = join(ROOT, 'packaging', os, 'MANIFEST.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
@@ -48,6 +54,9 @@ async function refreshManifest(os) {
     }
     const sourceAbs = file.source ? join(ROOT, file.source) : null;
     if (sourceAbs && existsSync(sourceAbs)) {
+      if (isNonReproducibleNativeBinary(file)) {
+        continue;
+      }
       const buf = await readFile(sourceAbs);
       file.sha256 = sha256(buf);
       file.size_bytes = buf.length;
@@ -84,6 +93,9 @@ async function verifyOnly(os) {
       continue;
     }
     const buf = await readFile(sourceAbs);
+    if (isNonReproducibleNativeBinary(file)) {
+      continue;
+    }
     const actualHash = sha256(buf);
     if (actualHash !== file.sha256) {
       errors.push(
