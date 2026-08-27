@@ -29,7 +29,8 @@ import {
 export const DEFAULT_MCP_WAIT_SLICE_SECONDS = 50;
 
 type ShellId = ExecutionConfig['shell'];
-const CANONICAL_TARGET_OS = new Set(['macos', 'windows', 'linux']);
+type CanonicalOs = 'macos' | 'windows' | 'linux';
+const CANONICAL_TARGET_OS: ReadonlySet<CanonicalOs> = new Set(['macos', 'windows', 'linux']);
 const MAX_NO_MATCH_DIAGNOSTIC_BYTES = 512;
 const MAX_NO_MATCH_FIELD_BYTES = 16;
 const MAX_NO_MATCH_TARGET_OS = 3;
@@ -186,9 +187,9 @@ function canonicalOsForPlatform(platform: NodeJS.Platform): 'macos' | 'windows' 
   return 'linux';
 }
 
-function uniqueTargetOs(targetOs: JobRunInput['target_os']): string[] | undefined {
+function uniqueTargetOs(targetOs: JobRunInput['target_os']): CanonicalOs[] | undefined {
   if (!targetOs?.length) return undefined;
-  return [...new Set(targetOs)];
+  return [...new Set<CanonicalOs>(targetOs)];
 }
 
 function jobRunWrappingPlatform(
