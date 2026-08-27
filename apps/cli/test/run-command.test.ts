@@ -178,7 +178,7 @@ describe('rbo run HTTP helper', () => {
         JOB_SUBMIT_TIMEOUT_MS,
         5_000,
       ]);
-      expect(JOB_RUN_INITIAL_TIMEOUT_MS).toBeGreaterThan(55_000);
+      expect(JOB_RUN_INITIAL_TIMEOUT_MS).toBe(JOB_SUBMIT_TIMEOUT_MS + JOB_RUN_WAIT_TIMEOUT_MS);
       expect(JOB_RUN_WAIT_TIMEOUT_MS).toBeGreaterThan(55_000);
     } finally {
       AbortSignal.timeout = originalTimeout;

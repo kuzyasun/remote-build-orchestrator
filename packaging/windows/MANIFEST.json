@@ -28,7 +28,7 @@
     },
     {
       "path": "bin/rbo-windows-executor.exe",
-      "sha256": "e78ee7a8ff5e7b0b36e3a2e44e0e746c3c977ba68fbc02973f69af5454cab0ad",
+      "sha256": "a6408615e23241025eaf64fc7cbb46a40b82fc38e1fef917ea792f53c38aa752",
       "size_bytes": 327168,
       "source": "native/windows-executor/target/release/rbo-windows-executor.exe"
     },

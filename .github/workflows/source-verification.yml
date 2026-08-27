@@ -63,6 +63,10 @@ jobs:
       - name: Verify source
         run: pnpm verify
 
+      - name: Build Windows native executor
+        if: ${{ matrix.package-verify }}
+        run: cargo build --release --manifest-path native/windows-executor/Cargo.toml
+
       - name: Verify packaging manifests (Windows)
         if: ${{ matrix.package-verify }}
         run: pnpm package:verify
