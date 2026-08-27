@@ -13,6 +13,7 @@
  *   - pnpm-lock.yaml (workspace optionalDependency specifier)
  *   - packages/rbo-windows-executor-win32-x64/package.json
  *   - packaging/{windows,macos,linux}/MANIFEST.json (package_version + components)
+ *   - CHANGELOG.md (promotes ## [Unreleased] notes into ## [x.y.z] - YYYY-MM-DD)
  */
 import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
@@ -29,7 +30,9 @@ const CLI_PKG = join(ROOT, 'apps', 'cli', 'package.json');
 const PNPM_LOCK = join(ROOT, 'pnpm-lock.yaml');
 const EXECUTOR_PKG = join(ROOT, 'packages', 'rbo-windows-executor-win32-x64', 'package.json');
 const PACKAGING_DIR = join(ROOT, 'packaging');
+const CHANGELOG = join(ROOT, 'CHANGELOG.md');
 const OPTIONAL_DEP = '@gemslibe/rbo-windows-executor-win32-x64';
+const UNRELEASED_HEADER = '## [Unreleased]';
 
 const CONST_NAMES = ['RBO_CONTROLLER_VERSION', 'RBO_AGENT_VERSION', 'RBO_STDIO_ADAPTER_VERSION'];
 
@@ -246,6 +249,87 @@ async function writeLockfileVersion(currentVersion, next) {
   return rel(PNPM_LOCK);
 }
 
+function hasUnreleasedEntries(body) {
+  return /^\s*[-*] /m.test(body);
+}
+
+function splitUnreleased(source) {
+  const headerIdx = source.indexOf(UNRELEASED_HEADER);
+  if (headerIdx === -1) {
+    fail(`missing ${UNRELEASED_HEADER} in ${rel(CHANGELOG)}`);
+  }
+  if (headerIdx > 0 && source[headerIdx - 1] !== '\n') {
+    fail(`${UNRELEASED_HEADER} must start on its own line in ${rel(CHANGELOG)}`);
+  }
+
+  const bodyStart = headerIdx + UNRELEASED_HEADER.length;
+  const nextHeading = source.indexOf('\n## [', bodyStart);
+  if (nextHeading === -1) {
+    fail(`missing version section after Unreleased in ${rel(CHANGELOG)}`);
+  }
+
+  return {
+    prefix: source.slice(0, headerIdx),
+    body: source.slice(bodyStart, nextHeading),
+    rest: source.slice(nextHeading + 1),
+  };
+}
+
+function assertUnreleasedHasNotes(source) {
+  const { body } = splitUnreleased(source);
+  if (!hasUnreleasedEntries(body)) {
+    fail(`${rel(CHANGELOG)} Unreleased has no list entries; add user-facing notes before bumping`);
+  }
+}
+
+function updateChangelogLinks(source, currentVersion, next) {
+  const unreleasedRe = new RegExp(
+    `^(\\[Unreleased\\]: )(https://github\\.com/[^\\s]+)/compare/v${escapeRegExp(currentVersion)}(\\.\\.\\.HEAD)\\s*$`,
+    'm',
+  );
+  const match = source.match(unreleasedRe);
+  if (!match) {
+    fail(`could not find [Unreleased] compare link for v${currentVersion} in ${rel(CHANGELOG)}`);
+  }
+  const repoUrl = match[2];
+  const nextSource = source.replace(unreleasedRe, `$1${repoUrl}/compare/v${next}$3`);
+  const marker = `[Unreleased]: ${repoUrl}/compare/v${next}...HEAD`;
+  const markerIdx = nextSource.indexOf(marker);
+  if (markerIdx === -1) {
+    fail(`could not insert [${next}] release link in ${rel(CHANGELOG)}`);
+  }
+  const insertAt = markerIdx + marker.length;
+  if (!nextSource.startsWith('\n', insertAt)) {
+    fail(`could not insert [${next}] release link in ${rel(CHANGELOG)}`);
+  }
+  return `${nextSource.slice(0, insertAt)}\n[${next}]: ${repoUrl}/releases/tag/v${next}${nextSource.slice(insertAt)}`;
+}
+
+function extractPreviousChangelogVersion(rest) {
+  const match = rest.match(/^## \[(\d+\.\d+\.\d+)\]/);
+  if (!match) {
+    fail(`could not read previous version heading in ${rel(CHANGELOG)}`);
+  }
+  return match[1];
+}
+
+function promoteUnreleased(source, currentVersion, next, isoDate) {
+  assertUnreleasedHasNotes(source);
+  const { prefix, body, rest } = splitUnreleased(source);
+  const previous = extractPreviousChangelogVersion(rest);
+  if (previous !== currentVersion) {
+    fail(`${rel(CHANGELOG)} latest version section is ${previous}, expected ${currentVersion}`);
+  }
+  const notes = body.replace(/^\r?\n*/, '');
+  const promoted = `${prefix}${UNRELEASED_HEADER}\n\n## [${next}] - ${isoDate}\n\n${notes}\n${rest}`;
+  return updateChangelogLinks(promoted, currentVersion, next);
+}
+
+async function writeChangelog(contents) {
+  await writeFile(CHANGELOG, contents, 'utf8');
+  return rel(CHANGELOG);
+}
+
 /** Update package_version and every components.* string that matches currentVersion. */
 async function writeManifestVersions(path, currentVersion, next) {
   let text = await readFile(path, 'utf8');
@@ -283,6 +367,8 @@ async function main() {
     manifestFiles,
   );
   const currentVersion = assertConsistent(current);
+  const changelogSource = await readFile(CHANGELOG, 'utf8');
+  assertUnreleasedHasNotes(changelogSource);
 
   console.log(`Current product version: ${currentVersion}`);
 
@@ -291,6 +377,13 @@ async function main() {
     console.log(`No change: already at ${currentVersion}`);
     return;
   }
+
+  const changelogNext = promoteUnreleased(
+    changelogSource,
+    currentVersion,
+    next,
+    new Date().toISOString().slice(0, 10),
+  );
 
   const changed = [];
   changed.push(await writeVersionsTs(next));
@@ -301,6 +394,7 @@ async function main() {
   for (const path of manifestPaths) {
     changed.push(await writeManifestVersions(path, currentVersion, next));
   }
+  changed.push(await writeChangelog(changelogNext));
 
   console.log(`Bumped ${currentVersion} → ${next}`);
   console.log('Updated:');
@@ -313,6 +407,8 @@ async function main() {
       console.log(`  - ${file} (workspace optionalDependency specifier)`);
     } else if (file.startsWith('packaging/')) {
       console.log(`  - ${file} (package_version, components)`);
+    } else if (file === rel(CHANGELOG)) {
+      console.log(`  - ${file} (Unreleased → ${next})`);
     } else {
       console.log(`  - ${file} (version)`);
     }

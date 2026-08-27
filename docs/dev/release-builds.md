@@ -43,7 +43,7 @@ Prepare the release from the repository root on Windows x64:
 
 ```powershell
 pnpm bump-version 1.2.3
-# Move the CHANGELOG.md "Unreleased" notes into a new 1.2.3 section.
+# Promotes CHANGELOG.md Unreleased notes into a new 1.2.3 section (fails if Unreleased is empty).
 pnpm format
 cargo build --release --manifest-path native/windows-executor/Cargo.toml
 pnpm verify
@@ -52,9 +52,10 @@ pnpm package:archives
 pnpm package:verify
 ```
 
-Commit and merge those changes. Then create a GitHub Release with the exact tag `v1.2.3`. Publishing
-the release triggers the workflow, which repeats the checks, builds the Windows helper, verifies the
-package contents, and publishes the optional package before the main package.
+Commit and merge those changes. Then create a GitHub Release with the exact tag `v1.2.3` and paste
+the new CHANGELOG version section into the release body. Publishing the release triggers the
+workflow, which repeats the checks, builds the Windows helper, verifies the package contents, and
+publishes the optional package before the main package.
 
 After publish, smoke on a clean Windows x64 host:
 
@@ -188,6 +189,12 @@ left alone.
 | `packages/rbo-windows-executor-win32-x64/package.json` | `"version"` |
 | Root `package.json` | `"version"` (workspace label; not read at runtime) |
 | `packaging/{windows,macos,linux}/MANIFEST.json` | `package_version` and `components.*` |
+| `CHANGELOG.md` | Promotes `## [Unreleased]` into `## [x.y.z] - YYYY-MM-DD` and updates compare links |
+
+Write user-facing notes under `## [Unreleased]` during development (Keep a Changelog:
+Added / Changed / Fixed). `pnpm bump-version` fails if Unreleased has no list entries, then moves
+those notes into the new version section and leaves Unreleased empty. Copy that version section into
+the GitHub Release body when tagging `vX.Y.Z`.
 
 Example constants (keep the three runtime strings identical):
 
@@ -479,15 +486,15 @@ Be honest when writing release notes:
 
 ## Pre-release checklist
 
-- [ ] `pnpm bump-version` (or `pnpm bump-version x.y.z`) — lockstep sites updated
-- [ ] Move `CHANGELOG.md` notes from Unreleased into the new version section
+- [ ] `pnpm bump-version` (or `pnpm bump-version x.y.z`) — lockstep sites updated, CHANGELOG Unreleased promoted
+- [ ] Confirm `CHANGELOG.md` has a dated `x.y.z` section and an empty Unreleased heading
 - [ ] `pnpm format` then `pnpm verify` exit 0
 - [ ] `pnpm build` then `pnpm package:archives` && `pnpm package:verify`
 - [ ] Semver matches in `versions.ts`, `apps/cli/package.json` (including its `workspace:` optionalDependency),
       `packages/rbo-windows-executor-win32-x64/package.json`, and root `package.json`
 - [ ] `LICENSE` + AGPL/`README` commercial note present on both publish packages
 - [ ] Release preparation is committed and merged
-- [ ] Normal GitHub Release uses the exact tag `v<package version>`
+- [ ] Normal GitHub Release uses the exact tag `v<package version>` and the CHANGELOG version section as notes
 - [ ] `npm` environment approval granted after reviewing the workflow summary
 - [ ] `Publish npm packages` workflow exits 0
 - [ ] Registry versions match: `npm view` both packages
