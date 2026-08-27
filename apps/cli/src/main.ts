@@ -272,9 +272,10 @@ async function main(): Promise<void> {
         } else {
           process.stderr.write(
             jobId
-              ? `Cancellation already requested for job ${jobId}.\n`
-              : 'Cancellation will be requested when the Controller returns a job ID.\n',
+              ? `Forcing exit; cancellation was already requested for job ${jobId}.\n`
+              : 'Forcing exit before a job ID was available.\n',
           );
+          process.exit(130);
         }
       };
       process.on('SIGINT', onInterrupt);

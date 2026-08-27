@@ -316,6 +316,10 @@ function localHostCanExecute(
   return localHost.shells.some((shell) => normalizedShell(shell) === requiredShell);
 }
 
+function noMatchingAgentHint(request: JobRequest, waitingHint: string, failHint: string): string {
+  return request.queue_policy === 'wait' ? waitingHint : failHint;
+}
+
 /**
  * Summarize only the request and aggregate matching state. Never include individual Agent
  * capabilities: the diagnostic is exposed on a job failure and must remain compact.
@@ -331,6 +335,8 @@ export function describeNoMatchingAgent(
   const requiredShell = normalizedShell(request.execution.shell ?? 'bash');
   const diagnosticShell = truncateDiagnosticText(requiredShell);
   const targetLabel = targetOs?.join(' or ') ?? 'the requested target OS';
+  const waitingResumeHint =
+    'Queued until a matching Agent is online; call job_run again with this job_id.';
   const base = {
     category: 'no_matching_agent' as const,
     retryable: false as const,
@@ -341,10 +347,13 @@ export function describeNoMatchingAgent(
   if (agents.length === 0) {
     return {
       ...base,
-      hint:
+      hint: noMatchingAgentHint(
+        request,
+        waitingResumeHint,
         options.registeredAgentCount && options.registeredAgentCount > 0
           ? 'No registered Agent is online. Reconnect an Agent or use queue_policy="wait".'
           : 'No online Agent is available. Connect an Agent or use queue_policy="wait".',
+      ),
     };
   }
 
@@ -352,7 +361,11 @@ export function describeNoMatchingAgent(
   if (requestedOs && requestedOs.length > 0 && osMatches.length === 0) {
     return {
       ...base,
-      hint: `No online Agent matches target_os ${targetLabel}. Choose target_os and shell supported by the same Agent.`,
+      hint: noMatchingAgentHint(
+        request,
+        `Queued until an Agent matching target_os ${targetLabel} is online; call job_run again with this job_id.`,
+        `No online Agent matches target_os ${targetLabel}. Choose target_os and shell supported by the same Agent.`,
+      ),
     };
   }
 
@@ -360,20 +373,32 @@ export function describeNoMatchingAgent(
   if (shellMatches.length === 0) {
     return {
       ...base,
-      hint: `No online Agent provides ${diagnosticShell} on ${targetLabel}. Specify shell and target_os supported by the same Agent.`,
+      hint: noMatchingAgentHint(
+        request,
+        `Queued until an Agent provides ${diagnosticShell} on ${targetLabel}; call job_run again with this job_id.`,
+        `No online Agent provides ${diagnosticShell} on ${targetLabel}. Specify shell and target_os supported by the same Agent.`,
+      ),
     };
   }
 
   if (shellMatches.every(agentIsAtCapacity)) {
     return {
       ...base,
-      hint: 'All online Agents matching shell and target_os are at capacity. Use queue_policy="wait" or retry when capacity is available.',
+      hint: noMatchingAgentHint(
+        request,
+        'Queued until a matching Agent has capacity; call job_run again with this job_id.',
+        'All online Agents matching shell and target_os are at capacity. Use queue_policy="wait" or retry when capacity is available.',
+      ),
     };
   }
 
   return {
     ...base,
-    hint: 'No online Agent satisfies the requested execution requirements.',
+    hint: noMatchingAgentHint(
+      request,
+      waitingResumeHint,
+      'No online Agent satisfies the requested execution requirements.',
+    ),
   };
 }
 

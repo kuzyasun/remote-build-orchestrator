@@ -278,6 +278,7 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
   let nextOff = cursor.off;
   let truncated = false;
   const blockedStreams = new Set<'stdout' | 'stderr'>();
+  const exhaustedLookaheadStreams = new Set<'stdout' | 'stderr'>();
   let hasPendingIntervening = false;
   let remainingScan = PAGE_RAW_SCAN_CAP;
   for (let index = 0; index < Math.min(128, entries.length); index += 1) {
@@ -315,7 +316,15 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
     let consumedNextEntry: ChunkIndexEntry | undefined;
     const needed = !page.truncated ? utf8ContinuationBytesNeeded(bytes) : 0;
     if (needed > 0 && !page.data.length && page.consumedRawBytes < bytes.length) {
-      for (let lookIndex = index + 1; lookIndex < entries.length; lookIndex += 1) {
+      const lookaheadParts: Buffer[] = [];
+      const lookaheadEntries: ChunkIndexEntry[] = [];
+      let collected = 0;
+      let scannedToEnd = true;
+      for (
+        let lookIndex = index + 1;
+        lookIndex < entries.length && collected < needed;
+        lookIndex += 1
+      ) {
         const lookEntry = entries[lookIndex];
         if (lookEntry.stream !== stream) {
           hasPendingIntervening = true;
@@ -324,16 +333,31 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
           continue;
         }
         const look = await readIndexedRange(logs, lookEntry, 0);
-        const lookahead = look?.subarray(0, needed);
-        if (lookahead?.length !== needed) break;
-        page = presentLogChunks([bytes, lookahead], states[stream], {
+        if (!look?.length) {
+          scannedToEnd = false;
+          break;
+        }
+        const take = look.subarray(0, needed - collected);
+        lookaheadParts.push(take);
+        lookaheadEntries.push(lookEntry);
+        collected += take.length;
+      }
+      if (collected >= needed) {
+        page = presentLogChunks([bytes, ...lookaheadParts], states[stream], {
           maxBytes: maxBytes - returned,
           stripAnsi: true,
           rawScanCap: scanBudget,
         });
-        consumedFromNext = Math.max(0, page.consumedRawBytes - bytes.length);
-        consumedNextEntry = lookEntry;
-        break;
+        let remain = Math.max(0, page.consumedRawBytes - bytes.length);
+        for (let lookPart = 0; lookPart < lookaheadEntries.length; lookPart += 1) {
+          const used = Math.min(remain, lookaheadParts[lookPart].length);
+          remain -= used;
+          consumedNextEntry = lookaheadEntries[lookPart];
+          consumedFromNext = used;
+          if (remain === 0) break;
+        }
+      } else if (scannedToEnd) {
+        exhaustedLookaheadStreams.add(stream);
       }
     }
     remainingScan = Math.max(0, remainingScan - page.scannedRawBytes);
@@ -413,7 +437,10 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
       positions,
     },
     returned,
-    hasMore: truncated || entries.length > 128 || blockedStreams.size > 0,
+    hasMore:
+      truncated ||
+      entries.length > 128 ||
+      [...blockedStreams].some((blocked) => !exhaustedLookaheadStreams.has(blocked)),
     truncated,
   };
 }

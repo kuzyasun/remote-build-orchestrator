@@ -21,7 +21,14 @@ export class JobLifecycleNotifier {
   private closed = false;
 
   subscribe(jobId: string, listener: JobLifecycleListener): () => void {
-    if (this.closed) return () => undefined;
+    if (this.closed) {
+      try {
+        listener();
+      } catch {
+        // Shutdown must still wake waiters that subscribe after close.
+      }
+      return () => undefined;
+    }
     let listeners = this.listenersByJob.get(jobId);
     if (!listeners) {
       listeners = new Set();

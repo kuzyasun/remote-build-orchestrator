@@ -218,6 +218,18 @@ function isTerminalCancelled(result: Record<string, unknown>): boolean {
   return result.outcome === 'cancelled' || result.failure_category === 'cancelled';
 }
 
+function isCompletedJob(result: Record<string, unknown>): boolean {
+  return result.state === 'completed';
+}
+
+function cancelResponseAlreadyTerminal(result: Record<string, unknown>): boolean {
+  if (result.reason === 'already_terminal') return true;
+  const job = result.job;
+  if (!job || typeof job !== 'object') return false;
+  const record = job as Record<string, unknown>;
+  return isCompletedJob(record) || isTerminalCancelled(record);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -232,9 +244,10 @@ export async function cancelAndAwaitJob(
   const pollMs = options.pollMs ?? 250;
   const deadline = Date.now() + confirmationMs;
   try {
-    await cancelJobRemote(baseUrl, jobId, 'Interrupted by CLI', {
+    const cancelled = await cancelJobRemote(baseUrl, jobId, 'Interrupted by CLI', {
       timeoutMs: Math.max(1, Math.min(2_000, deadline - Date.now())),
     });
+    if (cancelResponseAlreadyTerminal(cancelled)) return true;
   } catch {
     options.writeStderr(
       `Could not confirm cancellation request for job ${jobId}; continuing to check.\n`,
@@ -247,7 +260,12 @@ export async function cancelAndAwaitJob(
         timeoutMs: Math.max(1, Math.min(2_000, deadline - Date.now())),
       });
       const job = status.job;
-      if (job && typeof job === 'object' && isTerminalCancelled(job as Record<string, unknown>)) {
+      if (
+        job &&
+        typeof job === 'object' &&
+        (isCompletedJob(job as Record<string, unknown>) ||
+          isTerminalCancelled(job as Record<string, unknown>))
+      ) {
         return true;
       }
     } catch {

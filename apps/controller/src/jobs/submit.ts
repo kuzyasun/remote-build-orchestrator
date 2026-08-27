@@ -49,6 +49,7 @@ import {
 import {
   UnboundJobLifecycleNotifierError,
   isBoundJobLifecycleNotifierClosed,
+  notifyJobLifecycleChanged,
   subscribeToJobLifecycle,
 } from './lifecycle-notifier.js';
 import {
@@ -319,7 +320,11 @@ export async function handleJobSubmit(
 
   try {
     leaseRenewal = setInterval(() => {
-      renewCaptureLease(ctx.db, captureLease);
+      try {
+        renewCaptureLease(ctx.db, captureLease);
+      } catch {
+        // Capture/publish fail closed if the lease expires; do not crash the timer.
+      }
     }, CAPTURE_LEASE_RENEW_INTERVAL_MS);
     leaseRenewal.unref?.();
     const captureCtx: LocalRunnerContext = {
@@ -626,8 +631,9 @@ export async function dispatchJobExecution(
   // job, so there's nowhere to record a per-attempt job_event; this is operator-facing only.
   if (decision.action === 'wait' && decision.noMatchDiagnostic) {
     ctx.db
-      .prepare(`UPDATE jobs SET result_json = ? WHERE id = ? AND state = 'queued'`)
-      .run(JSON.stringify({ no_match: decision.noMatchDiagnostic }), jobId);
+      .prepare(`UPDATE jobs SET result_json = ?, updated_at = ? WHERE id = ? AND state = 'queued'`)
+      .run(JSON.stringify({ no_match: decision.noMatchDiagnostic }), nowIso(), jobId);
+    notifyJobLifecycleChanged(ctx.db, jobId);
   }
   if (decision.reason === 'host_busy') {
     logger.info(
@@ -825,6 +831,13 @@ export async function waitForJob(
   ) {
     if (options?.onTick) {
       await options.onTick(job);
+    }
+    if (
+      options?.signal?.aborted ||
+      isBoundJobLifecycleNotifierClosed(ctx.db) ||
+      Date.now() >= deadline
+    ) {
+      break;
     }
 
     // The initial read, subscribe, and second read form one lost-wakeup-safe

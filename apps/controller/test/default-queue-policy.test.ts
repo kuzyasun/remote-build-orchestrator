@@ -144,6 +144,8 @@ describe('defaultQueuePolicy (queue jobs when no Agent has capacity)', () => {
     expect(JSON.parse(queued?.result_json ?? '{}')).toMatchObject({
       no_match: { category: 'no_matching_agent', retryable: false },
     });
+    expect(JSON.parse(queued?.result_json ?? '{}').no_match.hint).toMatch(/job_run/);
+    expect(JSON.parse(queued?.result_json ?? '{}').no_match.hint).not.toContain('queue_policy');
 
     const resumed = await handleJobRun(ctx, { job_id: jobId, wait_seconds: 0 });
     expect(resumed).toMatchObject({

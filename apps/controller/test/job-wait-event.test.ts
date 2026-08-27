@@ -174,4 +174,18 @@ describe('waitForJob event-driven lifecycle', () => {
     expect(Date.now() - startedAt).toBeLessThan(500);
     expect(notifier.listenerCount()).toBe(0);
   });
+
+  it('wakes waiters that observe close during onTick before subscribe', async () => {
+    const { db, job, notifier } = setup();
+    const startedAt = Date.now();
+    const waiting = waitForJob(makeContext(db), job.id, 2, {
+      onTick: async () => {
+        notifier.close();
+      },
+    });
+    const result = await waiting;
+    expect((result.job as { state: string }).state).toBe('running');
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(notifier.listenerCount()).toBe(0);
+  });
 });

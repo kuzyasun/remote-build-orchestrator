@@ -562,9 +562,9 @@ async function finishJobRunResponse(
     } catch {
       return {
         error: {
-          category: 'internal',
+          category: 'validation',
           message: 'Unable to read durable job logs',
-          retryable: true,
+          retryable: false,
         },
       };
     }

@@ -251,7 +251,9 @@ describe('Scheduler Engine (§19.2)', () => {
     expect(waitDecision.noMatchDiagnostic).toMatchObject({
       category: 'no_matching_agent',
       retryable: false,
+      hint: 'Queued until a matching Agent is online; call job_run again with this job_id.',
     });
+    expect(waitDecision.noMatchDiagnostic?.hint).not.toContain('queue_policy');
 
     const reqFail = makeRequest({ queue_policy: 'fail_fast', requirements: { os: ['linux'] } });
     expect(selectAgentForJob([], reqFail).action).toBe('fail_fast');

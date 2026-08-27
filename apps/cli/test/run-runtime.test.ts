@@ -451,6 +451,35 @@ describe('rbo run runtime', () => {
     expect(stderr).toEqual([]);
   });
 
+  it('treats cancel of an already completed job as confirmed immediately', async () => {
+    const requests: string[] = [];
+    const baseUrl = await listen(
+      createServer(async (req, res) => {
+        requests.push(req.url ?? '');
+        await readJson(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            job: { state: 'completed', outcome: 'succeeded', exit_code: 0 },
+            cancelled: false,
+            reason: 'already_terminal',
+          }),
+        );
+      }),
+    );
+    const stderr: string[] = [];
+
+    await expect(
+      cancelAndAwaitJob(baseUrl, 'job_already_done', {
+        confirmationMs: 1_000,
+        pollMs: 1,
+        writeStderr: (text) => stderr.push(text),
+      }),
+    ).resolves.toBe(true);
+    expect(requests).toEqual(['/internal/v1/tools/job_cancel']);
+    expect(stderr).toEqual([]);
+  });
+
   it('warns with the job ID when cancellation is not confirmed within the fixed window', async () => {
     const baseUrl = await listen(
       createServer(async (req, res) => {

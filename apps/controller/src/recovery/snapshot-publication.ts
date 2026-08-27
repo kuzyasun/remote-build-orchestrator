@@ -1,5 +1,5 @@
 import type { Dirent } from 'node:fs';
-import { readdir, rm } from 'node:fs/promises';
+import { readdir, rm, rmdir } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { createLogger } from '@rbo/shared';
 import type { ControllerDatabase } from '../storage/database.js';
@@ -159,8 +159,23 @@ export async function recoverSnapshotPublications(
 
     const remaining = await listDirectory(directoryPath);
     if (!abortedForLease && remaining?.length === 0 && directoryPath !== snapshotsRoot) {
-      await rm(directoryPath, { recursive: true, force: true });
-      removedDirectories += 1;
+      if (hasActiveCaptureLease(options.db, new Date())) {
+        logger.info('snapshot publication recovery aborted for active capture lease');
+        abortedForLease = true;
+        return;
+      }
+      try {
+        await rmdir(directoryPath);
+        removedDirectories += 1;
+      } catch (error: unknown) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return;
+        if (code === 'ENOTEMPTY' || code === 'EEXIST') {
+          abortedForLease = true;
+          return;
+        }
+        throw error;
+      }
     }
   }
   for (const directory of rootEntries) {

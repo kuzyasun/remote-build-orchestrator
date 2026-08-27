@@ -64,6 +64,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build Windows native executor
+        run: cargo build --release --manifest-path native/windows-executor/Cargo.toml
+
       - name: Verify source
         run: pnpm verify
 

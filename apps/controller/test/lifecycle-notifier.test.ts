@@ -139,7 +139,13 @@ describe('JobLifecycleNotifier', () => {
     notifier.subscribe('job-5', () => undefined);
     notifier.close();
     expect(notifier.listenerCount()).toBe(0);
-    expect(notifier.subscribe('job-4', () => undefined)).toBeTypeOf('function');
+    let closedSubscribeCalls = 0;
+    expect(
+      notifier.subscribe('job-4', () => {
+        closedSubscribeCalls += 1;
+      }),
+    ).toBeTypeOf('function');
+    expect(closedSubscribeCalls).toBe(1);
     expect(notifier.listenerCount()).toBe(0);
   });
 

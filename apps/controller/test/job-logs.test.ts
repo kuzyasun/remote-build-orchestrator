@@ -284,6 +284,44 @@ describe('Controller job_logs contract and durable paging', () => {
     expect(done.has_more).toBe(false);
   });
 
+  it('reconstructs a UTF-8 scalar split across three same-stream chunks', async () => {
+    const scalar = Buffer.from('€');
+    await append('stdout', scalar.subarray(0, 1), 1);
+    await append('stdout', scalar.subarray(1, 2), 2);
+    await append('stdout', Buffer.concat([scalar.subarray(2), Buffer.from('x')]), 3);
+    const received: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 8; page += 1) {
+      const result = await handleToolCall(ctx, 'job_logs', {
+        job_id: jobId,
+        attempt_id: attemptId,
+        mode: 'logs',
+        cursor,
+        max_bytes: 64,
+      });
+      expect(result).not.toHaveProperty('error');
+      received.push(...(result.chunks as Array<{ text: string }>).map((chunk) => chunk.text));
+      if (!result.has_more) break;
+      expect(result.next_cursor).toEqual(expect.any(String));
+      cursor = result.next_cursor as string;
+    }
+    expect(received.join('')).toBe('€x');
+  });
+
+  it('does not livelock has_more on a dangling UTF-8 lead at durable EOF', async () => {
+    await append('stdout', Buffer.from([0xe2]), 1);
+    const first = await handleToolCall(ctx, 'job_logs', {
+      job_id: jobId,
+      attempt_id: attemptId,
+      mode: 'logs',
+      max_bytes: 64,
+    });
+    expect(first).not.toHaveProperty('error');
+    expect(first.has_more).toBe(false);
+    expect(first.next_cursor).toEqual(expect.any(String));
+    expect((first.chunks as Array<{ text: string }>).map((chunk) => chunk.text).join('')).toBe('');
+  });
+
   it('pages past a quiet stream when the other stream continues beyond one page', async () => {
     await append('stderr', 'err-1\n', 1);
     for (let sequence = 2; sequence <= 201; sequence += 1) {

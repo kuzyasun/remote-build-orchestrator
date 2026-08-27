@@ -45,6 +45,7 @@ Prepare the release from the repository root on Windows x64:
 pnpm bump-version 1.2.3
 # Move the CHANGELOG.md "Unreleased" notes into a new 1.2.3 section.
 pnpm format
+cargo build --release --manifest-path native/windows-executor/Cargo.toml
 pnpm verify
 pnpm build
 pnpm package:archives
@@ -317,7 +318,7 @@ The `Publish npm packages` workflow:
 
 1. waits for approval on the `npm` GitHub environment;
 2. verifies the release tag and lockstep package versions;
-3. runs `pnpm verify`, builds all bundles, and verifies packaging manifests;
+3. builds the Windows native executor, runs `pnpm verify`, builds all bundles, and verifies packaging manifests;
 4. builds and packs the Windows x64 executor;
 5. publishes the optional package, then the main package, using short-lived OIDC credentials.
 
