@@ -315,7 +315,7 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
     let consumedFromNext = 0;
     let consumedNextEntry: ChunkIndexEntry | undefined;
     const needed = !page.truncated ? utf8ContinuationBytesNeeded(bytes) : 0;
-    if (needed > 0 && !page.data.length && page.consumedRawBytes < bytes.length) {
+    if (needed > 0 && !page.data.length && page.consumedRawBytes < bytes.length && !rangeCapped) {
       const lookaheadParts: Buffer[] = [];
       const lookaheadEntries: ChunkIndexEntry[] = [];
       let collected = 0;

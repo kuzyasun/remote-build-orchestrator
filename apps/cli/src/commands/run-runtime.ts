@@ -200,7 +200,7 @@ export async function runJobWithLifecycle(
       options.signal,
     );
   } catch (error) {
-    if (options.signal?.aborted) throw new RunInterruptedError(jobId);
+    if (options.signal?.aborted || isAbortError(error)) throw new RunInterruptedError(jobId);
     throw error;
   }
   if (!accepted) throw new ConfirmationDeclinedError(jobId);
@@ -212,6 +212,10 @@ export async function runJobWithLifecycle(
     throw error;
   }
   return runJobToTerminal(baseUrl, { job_id: jobId }, options);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
 }
 
 function isTerminalCancelled(result: Record<string, unknown>): boolean {

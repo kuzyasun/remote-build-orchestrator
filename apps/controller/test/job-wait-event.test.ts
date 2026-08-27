@@ -188,4 +188,20 @@ describe('waitForJob event-driven lifecycle', () => {
     expect(Date.now() - startedAt).toBeLessThan(500);
     expect(notifier.listenerCount()).toBe(0);
   });
+
+  it('returns a job that became terminal during onTick instead of a stale snapshot', async () => {
+    const { db, job, notifier } = setup();
+    const startedAt = Date.now();
+    const waiting = waitForJob(makeContext(db), job.id, 2, {
+      onTick: async () => {
+        transitionJobState(db, job.id, 'completed', { outcome: 'succeeded' });
+        notifier.close();
+      },
+    });
+    const result = await waiting;
+    expect((result.job as { state: string; outcome: string }).state).toBe('completed');
+    expect((result.job as { outcome: string }).outcome).toBe('succeeded');
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(notifier.listenerCount()).toBe(0);
+  });
 });

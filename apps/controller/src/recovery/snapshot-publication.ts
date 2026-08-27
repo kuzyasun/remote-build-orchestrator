@@ -170,7 +170,7 @@ export async function recoverSnapshotPublications(
       } catch (error: unknown) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code === 'ENOENT') return;
-        if (code === 'ENOTEMPTY' || code === 'EEXIST') {
+        if (code === 'ENOTEMPTY' || code === 'EEXIST' || code === 'EPERM') {
           abortedForLease = true;
           return;
         }

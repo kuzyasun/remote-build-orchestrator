@@ -39,7 +39,9 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     if (!result.skippedForActiveLease) return;
     const delay = snapshotRecoveryRetryDelayMs(db) ?? 50;
     snapshotRecoveryTimer = setTimeout(() => {
-      void recoverSnapshots();
+      void recoverSnapshots().catch((error) => {
+        logger.error('snapshot publication recovery retry failed', { error: String(error) });
+      });
     }, delay);
     snapshotRecoveryTimer.unref?.();
   };

@@ -322,6 +322,34 @@ describe('Controller job_logs contract and durable paging', () => {
     expect((first.chunks as Array<{ text: string }>).map((chunk) => chunk.text).join('')).toBe('');
   });
 
+  it('keeps has_more when a 1 MiB cap splits a UTF-8 lead after a silent prefix', async () => {
+    const oscPrefix = Buffer.concat([
+      Buffer.from('\x1b]0;'),
+      Buffer.alloc(1024 * 1024 - 6, 0x41),
+      Buffer.from('\x07'),
+    ]);
+    const scalar = Buffer.from('€');
+    await append('stdout', Buffer.concat([oscPrefix, scalar, Buffer.from('x')]), 1);
+    await append('stdout', 'TAIL', 2);
+    const received: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 8; page += 1) {
+      const result = await handleToolCall(ctx, 'job_logs', {
+        job_id: jobId,
+        attempt_id: attemptId,
+        mode: 'logs',
+        cursor,
+        max_bytes: 64,
+      });
+      expect(result).not.toHaveProperty('error');
+      received.push(...(result.chunks as Array<{ text: string }>).map((chunk) => chunk.text));
+      if (!result.has_more) break;
+      expect(result.next_cursor).toEqual(expect.any(String));
+      cursor = result.next_cursor as string;
+    }
+    expect(received.join('')).toBe('€xTAIL');
+  }, 30_000);
+
   it('pages past a quiet stream when the other stream continues beyond one page', async () => {
     await append('stderr', 'err-1\n', 1);
     for (let sequence = 2; sequence <= 201; sequence += 1) {

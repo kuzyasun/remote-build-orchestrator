@@ -70,7 +70,7 @@ describe('writeZstdTarArchiveCandidate memory hygiene', () => {
       writeZstdTarArchiveCandidate(requestedPath, [
         { path: 'missing.bin', mode: 0o644, type: 'file', contentPath: join(dir, 'missing.bin') },
       ]),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/Source path is not a regular file/);
     await expect(readFile(requestedPath)).rejects.toMatchObject({ code: 'ENOENT' });
     expect((await readdir(dir)).filter((name) => name.includes('.candidate-'))).toEqual([]);
   });

@@ -418,6 +418,43 @@ describe('rbo run runtime', () => {
     ).rejects.toMatchObject<Partial<RunInterruptedError>>({ jobId: 'job_prompt_interrupt' });
   });
 
+  it('treats readline AbortError at the confirm prompt as interrupt even when the shared signal is unset', async () => {
+    const baseUrl = await listen(
+      createServer((req, res) => {
+        expect(req.url).toBe('/internal/v1/tools/job_run');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            job_id: 'job_readline_interrupt',
+            state: 'awaiting_confirmation',
+            confirmation_token: 'short-lived-token',
+            snapshot_id: 'snp_5',
+            secret_warnings: [],
+            resume: false,
+          }),
+        );
+      }),
+    );
+
+    await expect(
+      runJobWithLifecycle(
+        baseUrl,
+        { command: 'dangerous', project_root: '/work/project', cwd: '.' },
+        {
+          io: {
+            isTTY: true,
+            writeStderr: () => undefined,
+            confirm: async () => {
+              const error = new Error('Aborted with Ctrl+C');
+              error.name = 'AbortError';
+              throw error;
+            },
+          },
+        },
+      ),
+    ).rejects.toMatchObject<Partial<RunInterruptedError>>({ jobId: 'job_readline_interrupt' });
+  });
+
   it('forwards cancellation once and observes the terminal cancelled state', async () => {
     const requests: string[] = [];
     const baseUrl = await listen(

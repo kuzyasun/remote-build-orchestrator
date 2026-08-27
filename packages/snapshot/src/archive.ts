@@ -163,6 +163,18 @@ export interface WrittenArchiveCandidateResult extends WrittenArchiveResult {
  * Write a compressed archive to a unique private candidate.
  * Publication/rename of the candidate is deliberately owned by the caller.
  */
+function sourceIdentityError(entryPath: string): Error {
+  return new Error(`Source path is not a regular file: '${entryPath}'`);
+}
+
+function rethrowContentPathIdentityError(error: unknown, entryPath: string): never {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === 'ENOENT' || code === 'ELOOP' || code === 'ENOTDIR' || code === 'EISDIR') {
+    throw sourceIdentityError(entryPath);
+  }
+  throw error;
+}
+
 export async function writeZstdTarArchiveCandidate(
   archivePath: string,
   entries: TarEntryInput[],
@@ -187,58 +199,62 @@ export async function writeZstdTarArchiveCandidate(
         if (entry.content) {
           fileSize = entry.content.length;
         } else if (entry.contentPath) {
-          const listed = await lstat(entry.contentPath);
-          if (listed.isSymbolicLink() || !listed.isFile()) {
-            throw new Error(`Source path is not a regular file: '${entry.path}'`);
-          }
-          const handle = await open(
-            entry.contentPath,
-            constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-          );
           try {
-            const before = await handle.stat({ bigint: true });
-            if (!before.isFile()) {
-              throw new Error(`Source path is not a regular file: '${entry.path}'`);
+            const listed = await lstat(entry.contentPath);
+            if (listed.isSymbolicLink() || !listed.isFile()) {
+              throw sourceIdentityError(entry.path);
             }
-            if (before.size > BigInt(Number.MAX_SAFE_INTEGER)) {
-              throw new Error(`Source file is too large to archive safely: '${entry.path}'`);
-            }
-            fileSize = Number(before.size);
-            yield writeTarHeader(entry, fileSize);
-            let streamed = 0;
-            if (fileSize > 0) {
-              for await (const chunk of createReadStream(entry.contentPath, {
-                fd: handle.fd,
-                autoClose: false,
-                start: 0,
-                end: fileSize - 1,
-              })) {
-                const bytes = chunk as Buffer;
-                streamed += bytes.length;
-                fileHash.update(bytes);
-                yield bytes;
+            const handle = await open(
+              entry.contentPath,
+              constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+            );
+            try {
+              const before = await handle.stat({ bigint: true });
+              if (!before.isFile()) {
+                throw sourceIdentityError(entry.path);
               }
+              if (before.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+                throw new Error(`Source file is too large to archive safely: '${entry.path}'`);
+              }
+              fileSize = Number(before.size);
+              yield writeTarHeader(entry, fileSize);
+              let streamed = 0;
+              if (fileSize > 0) {
+                for await (const chunk of createReadStream(entry.contentPath, {
+                  fd: handle.fd,
+                  autoClose: false,
+                  start: 0,
+                  end: fileSize - 1,
+                })) {
+                  const bytes = chunk as Buffer;
+                  streamed += bytes.length;
+                  fileHash.update(bytes);
+                  yield bytes;
+                }
+              }
+              const after = await handle.stat({ bigint: true });
+              if (
+                streamed !== fileSize ||
+                after.size !== before.size ||
+                after.mtimeNs !== before.mtimeNs ||
+                after.ctimeNs !== before.ctimeNs ||
+                after.dev !== before.dev ||
+                after.ino !== before.ino
+              ) {
+                throw new Error(`Source file changed while archiving '${entry.path}'`);
+              }
+            } finally {
+              await handle.close();
             }
-            const after = await handle.stat({ bigint: true });
-            if (
-              streamed !== fileSize ||
-              after.size !== before.size ||
-              after.mtimeNs !== before.mtimeNs ||
-              after.ctimeNs !== before.ctimeNs ||
-              after.dev !== before.dev ||
-              after.ino !== before.ino
-            ) {
-              throw new Error(`Source file changed while archiving '${entry.path}'`);
+            const remainder = fileSize % 512;
+            if (remainder !== 0) {
+              yield Buffer.alloc(512 - remainder);
             }
-          } finally {
-            await handle.close();
+            entryResults.push({ path: entry.path, size: fileSize, sha256: fileHash.digest('hex') });
+            continue;
+          } catch (error: unknown) {
+            rethrowContentPathIdentityError(error, entry.path);
           }
-          const remainder = fileSize % 512;
-          if (remainder !== 0) {
-            yield Buffer.alloc(512 - remainder);
-          }
-          entryResults.push({ path: entry.path, size: fileSize, sha256: fileHash.digest('hex') });
-          continue;
         }
       }
       yield writeTarHeader(entry, fileSize);

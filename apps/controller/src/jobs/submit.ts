@@ -832,7 +832,10 @@ export async function waitForJob(
     if (options?.onTick) {
       await options.onTick(job);
     }
+    job = getJob(ctx.db, jobId);
     if (
+      !job ||
+      isTerminalJobState(job.state) ||
       options?.signal?.aborted ||
       isBoundJobLifecycleNotifierClosed(ctx.db) ||
       Date.now() >= deadline
