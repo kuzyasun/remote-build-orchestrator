@@ -327,7 +327,12 @@ export async function readChunkIndexTail(
         if (result.bytesRead === 0) break;
         pending = buffer.subarray(0, result.bytesRead).toString('utf8') + pending;
         const lines = pending.split('\n');
-        pending = lines.shift() ?? '';
+        if (start === 0) {
+          // The first split element is a complete JSONL record, not a partial prefix.
+          pending = '';
+        } else {
+          pending = lines.shift() ?? '';
+        }
         for (let index = lines.length - 1; index >= 0 && entries.length < maxEntries; index -= 1) {
           const line = lines[index].trim();
           if (!line) continue;

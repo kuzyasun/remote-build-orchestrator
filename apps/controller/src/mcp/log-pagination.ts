@@ -238,11 +238,20 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
     knownPositions.length > 0
       ? Math.min(cursor.seq, ...knownPositions.map((p) => p.seq))
       : cursor.seq;
+  const alreadyConsumed = (entry: ChunkIndexEntry): boolean => {
+    const position = positions[entry.stream];
+    return Boolean(
+      position &&
+        (entry.sequence < position.seq ||
+          (entry.sequence === position.seq && position.off >= entry.byte_length)),
+    );
+  };
   const entries: ChunkIndexEntry[] = [];
   for await (const entry of iterChunkIndexEntriesAfter(
     logs,
     firstSequence > 0 ? firstSequence - 1 : 0,
   )) {
+    if (alreadyConsumed(entry)) continue;
     entries.push(entry);
     if (entries.length >= 129) break;
   }
@@ -361,7 +370,9 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
     }
   }
   if (!hasPendingIntervening && nextSeq === cursor.seq) {
-    const progressed = Object.values(positions).map((position) => position?.seq ?? cursor.seq);
+    const progressed = Object.values(positions)
+      .map((position) => position?.seq ?? cursor.seq)
+      .filter((seq) => seq >= cursor.seq);
     if (progressed.length > 0) nextSeq = Math.min(...progressed);
   }
   return {

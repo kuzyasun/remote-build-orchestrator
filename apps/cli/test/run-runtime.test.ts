@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   ConfirmationDeclinedError,
   type ConfirmationRequiredError,
-  RunInterruptedError,
+  type RunInterruptedError,
   cancelAndAwaitJob,
   runJobToTerminal,
   runJobWithLifecycle,
@@ -402,7 +402,7 @@ describe('rbo run runtime', () => {
         { command: 'pnpm test', project_root: '/work/project', cwd: '.' },
         { signal: controller.signal },
       ),
-    ).rejects.toBeInstanceOf(RunInterruptedError);
+    ).rejects.toMatchObject<Partial<RunInterruptedError>>({ jobId: 'job_interrupted' });
   });
 
   it('aborts an in-flight job_run resume request when Ctrl+C arrives after the job ID', async () => {

@@ -3,6 +3,8 @@ import type { JobRunInput } from './run.js';
 // Thin HTTP client for Controller job MCP tools via /internal/v1/tools/* (§23).
 
 const TOOL_REQUEST_TIMEOUT_MS = 15_000;
+/** `mcp_wait_slice_seconds` max is 55s; include snapshot-capture and HTTP headroom. */
+const BLOCKING_TOOL_REQUEST_TIMEOUT_MS = 70_000;
 
 export interface ToolCallOptions {
   timeoutMs?: number;
@@ -45,7 +47,7 @@ export function submitJobRemote(
   baseUrl: string,
   request: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  return postTool(baseUrl, 'job_submit', request);
+  return postTool(baseUrl, 'job_submit', request, { timeoutMs: BLOCKING_TOOL_REQUEST_TIMEOUT_MS });
 }
 
 /** Submit the shared compact `job_run` input without local protocol revalidation. */
@@ -54,7 +56,10 @@ export function runJobRemote(
   input: JobRunInput,
   options?: ToolCallOptions,
 ): Promise<Record<string, unknown>> {
-  return postTool(baseUrl, 'job_run', input, options);
+  return postTool(baseUrl, 'job_run', input, {
+    ...options,
+    timeoutMs: options?.timeoutMs ?? BLOCKING_TOOL_REQUEST_TIMEOUT_MS,
+  });
 }
 
 /** Confirm a previously captured destructive or hardware job. */

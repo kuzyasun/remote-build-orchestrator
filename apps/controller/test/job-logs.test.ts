@@ -194,7 +194,7 @@ describe('Controller job_logs contract and durable paging', () => {
     expect((second.chunks as Array<{ sequence: number }>).map((chunk) => chunk.sequence)).toEqual([
       2,
     ]);
-    expect(second.has_more).toBe(true);
+    expect(second.has_more).toBe(false);
     const done = await handleToolCall(ctx, 'job_logs', {
       job_id: jobId,
       mode: 'logs',
@@ -203,6 +203,36 @@ describe('Controller job_logs contract and durable paging', () => {
     });
     expect(done.chunks).toEqual([]);
     expect(done.has_more).toBe(false);
+  });
+
+  it('pages past a quiet stream when the other stream continues beyond one page', async () => {
+    await append('stderr', 'err-1\n', 1);
+    for (let sequence = 2; sequence <= 201; sequence += 1) {
+      await append('stdout', `out-${sequence}\n`, sequence);
+    }
+    const received: Array<{ sequence: number; stream: string; text: string }> = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 10; page += 1) {
+      const result = await handleToolCall(ctx, 'job_logs', {
+        job_id: jobId,
+        attempt_id: attemptId,
+        mode: 'logs',
+        cursor,
+        max_bytes: 4096,
+      });
+      expect(result).not.toHaveProperty('error');
+      const chunks = result.chunks as Array<{ sequence: number; stream: string; text: string }>;
+      received.push(...chunks);
+      if (!result.has_more) break;
+      expect(result.next_cursor).toEqual(expect.any(String));
+      expect(result.next_cursor).not.toBe(cursor);
+      cursor = result.next_cursor as string;
+    }
+    expect(received.map((chunk) => chunk.sequence)).toEqual(
+      Array.from({ length: 201 }, (_, index) => index + 1),
+    );
+    expect(received[0]).toMatchObject({ stream: 'stderr', text: 'err-1\n' });
+    expect(received.at(-1)).toMatchObject({ stream: 'stdout', text: 'out-201\n' });
   });
 
   it('bounds pages to 128 chunks and returns a structured error when a source disappears', async () => {

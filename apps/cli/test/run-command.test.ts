@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { runJobRemote } from '../src/commands/jobs.js';
+import { runJobRemote, submitJobRemote } from '../src/commands/jobs.js';
 import { parseRunCommandArgs, takeRunJsonFlag } from '../src/commands/run.js';
 
 describe('rbo run parser', () => {
@@ -136,5 +136,37 @@ describe('rbo run HTTP helper', () => {
     await new Promise<void>((resolvePromise, rejectPromise) =>
       server.close((error) => (error ? rejectPromise(error) : resolvePromise())),
     );
+  });
+
+  it('lets job_run and job_submit outlive the default MCP wait slice', async () => {
+    const timeouts: number[] = [];
+    const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+    AbortSignal.timeout = ((delay: number) => {
+      timeouts.push(delay);
+      return originalTimeout(delay);
+    }) as typeof AbortSignal.timeout;
+    const server = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ job_id: 'job_1', resume: true }));
+    });
+    await new Promise<void>((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise));
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    const baseUrl = `http://127.0.0.1:${port}`;
+    try {
+      await runJobRemote(baseUrl, {
+        command: 'pnpm test',
+        project_root: '/work/project',
+        cwd: '.',
+      });
+      await submitJobRemote(baseUrl, { command: 'pnpm test', project_root: '/work/project' });
+      expect(timeouts.length).toBe(2);
+      expect(Math.min(...timeouts)).toBeGreaterThan(50_000);
+    } finally {
+      AbortSignal.timeout = originalTimeout;
+      await new Promise<void>((resolvePromise, rejectPromise) =>
+        server.close((error) => (error ? rejectPromise(error) : resolvePromise())),
+      );
+    }
   });
 });

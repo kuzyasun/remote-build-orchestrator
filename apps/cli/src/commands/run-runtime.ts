@@ -111,7 +111,15 @@ export async function runJobToTerminal(
   options: RunToTerminalOptions = {},
 ): Promise<Record<string, unknown>> {
   interrupted(options.signal, null);
-  let result = await requestJobRun(baseUrl, initialInput, options.signal, null);
+  // Do not abort the initial wait: the Controller may already have captured and
+  // started the job, and job_id is only present on the first response.
+  let result: Record<string, unknown>;
+  try {
+    result = await requestJobRun(baseUrl, initialInput, undefined, null);
+  } catch (error) {
+    interrupted(options.signal, null);
+    throw error;
+  }
   const initialJobId = jobIdFromResult(result);
   options.onJobId?.(initialJobId);
   interrupted(options.signal, initialJobId);

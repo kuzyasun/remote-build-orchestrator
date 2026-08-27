@@ -205,4 +205,15 @@ describe('sequence-indexed log reader', () => {
     const tail = await readChunkIndexTail(logs, 3);
     expect(tail.map((entry) => entry.sequence)).toEqual([298, 299, 300]);
   });
+
+  it('includes the first complete index record when the suffix spans the whole file', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rbo-log-reader-tail-first-line-'));
+    const logs = await ensureAttemptLogs(dir);
+    const only = await appendIndexedLogChunk(logs, 'stdout', 'only', 1, 0);
+    expect(await readChunkIndexTail(logs, 8)).toEqual([only.entry]);
+
+    const second = await appendIndexedLogChunk(logs, 'stderr', 'err', 2, 0);
+    expect((await readChunkIndexTail(logs, 8)).map((entry) => entry.sequence)).toEqual([1, 2]);
+    expect(await readChunkIndexTail(logs, 1)).toEqual([second.entry]);
+  });
 });

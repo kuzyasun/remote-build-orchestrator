@@ -2,11 +2,13 @@ name: Source verification
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
     branches:
       - master
   push:
     branches:
       - master
+  workflow_dispatch:
 
 permissions:
   contents: read
