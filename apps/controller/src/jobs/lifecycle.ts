@@ -4,6 +4,7 @@ import { generateId } from '@rbo/shared';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
 import {
+  UnboundJobLifecycleNotifierError,
   assertJobLifecycleWriteAllowed,
   notifyJobLifecycleChanged,
   runJobLifecycleTransaction,
@@ -62,10 +63,7 @@ export function runLifecycleTransaction<T>(db: ControllerDatabase, operation: ()
   try {
     return runJobLifecycleTransaction(db, operation);
   } catch (error) {
-    if (
-      !(error instanceof Error) ||
-      error.message !== 'No job lifecycle notifier is bound to this database'
-    ) {
+    if (!(error instanceof UnboundJobLifecycleNotifierError)) {
       throw error;
     }
     // Without a runtime notifier there is no post-commit wakeup path, but the

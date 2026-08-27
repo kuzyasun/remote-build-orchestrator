@@ -263,7 +263,11 @@ async function main(): Promise<void> {
       const onInterrupt = () => {
         interruptCount += 1;
         if (interruptCount === 1) {
-          process.stderr.write('Interrupt received; requesting job cancellation.\n');
+          process.stderr.write(
+            jobId
+              ? 'Interrupt received; requesting job cancellation.\n'
+              : 'Interrupt received; waiting for a job ID so cancellation can be requested.\n',
+          );
           interruption.abort();
         } else {
           process.stderr.write(

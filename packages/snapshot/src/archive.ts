@@ -167,8 +167,8 @@ export async function writeZstdTarArchiveCandidate(
   archivePath: string,
   entries: TarEntryInput[],
 ): Promise<WrittenArchiveCandidateResult> {
-  const { createReadStream, createWriteStream } = await import('node:fs');
-  const { open, rm } = await import('node:fs/promises');
+  const { constants, createReadStream, createWriteStream } = await import('node:fs');
+  const { lstat, open, rm } = await import('node:fs/promises');
   const { pipeline } = await import('node:stream/promises');
   const { Transform, Readable } = await import('node:stream');
   const { createZstdCompress } = await import('node:zlib');
@@ -187,7 +187,14 @@ export async function writeZstdTarArchiveCandidate(
         if (entry.content) {
           fileSize = entry.content.length;
         } else if (entry.contentPath) {
-          const handle = await open(entry.contentPath, 'r');
+          const listed = await lstat(entry.contentPath);
+          if (listed.isSymbolicLink() || !listed.isFile()) {
+            throw new Error(`Source path is not a regular file: '${entry.path}'`);
+          }
+          const handle = await open(
+            entry.contentPath,
+            constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+          );
           try {
             const before = await handle.stat({ bigint: true });
             if (!before.isFile()) {

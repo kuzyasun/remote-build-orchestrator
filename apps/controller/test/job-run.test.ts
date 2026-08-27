@@ -164,6 +164,23 @@ describe('buildJobRunRequest', () => {
     );
 
     expect(request.execution.shell).toBe('powershell');
+    expect(request.requirements).toEqual({ os: ['windows'] });
+  });
+
+  it('pins omitted OS to the Controller and wraps a single target OS', () => {
+    const linuxDefault = buildJobRunRequest(
+      { command: 'echo hi', project_root: '/tmp/app' },
+      'linux',
+    );
+    expect(linuxDefault.execution.shell).toBe('bash');
+    expect(linuxDefault.requirements).toEqual({ os: ['linux'] });
+
+    const windowsTarget = buildJobRunRequest(
+      { command: 'Write-Output $env:HOME', project_root: '/tmp/app', target_os: ['windows'] },
+      'linux',
+    );
+    expect(windowsTarget.execution.shell).toBe('powershell');
+    expect(windowsTarget.requirements).toEqual({ os: ['windows'] });
   });
 
   it.each(['local_fallback', 'wait', 'fail_fast'] as const)(
@@ -398,6 +415,41 @@ describe('handleJobRun responses', () => {
     expect(res.no_match).toBeUndefined();
   });
 
+  it('surfaces no_match on a queued wait resume', async () => {
+    vi.mocked(submit.waitForJob).mockResolvedValue({
+      job: {
+        state: 'queued',
+        outcome: null,
+        exit_code: null,
+        result_json: JSON.stringify({
+          no_match: {
+            category: 'no_matching_agent',
+            retryable: false,
+            required_shell: 'bash',
+            target_os: ['linux'],
+            hint: 'No online Agent provides bash on linux.',
+          },
+        }),
+      },
+    });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue(undefined);
+
+    // biome-ignore lint/suspicious/noExplicitAny: partial SubmitJobContext mock
+    const res = await handleJobRun(ctx as any, rawInput);
+
+    expect(res).toMatchObject({
+      job_id: 'job-1',
+      state: 'queued',
+      resume: true,
+      no_match: {
+        category: 'no_matching_agent',
+        retryable: false,
+        required_shell: 'bash',
+        target_os: ['linux'],
+      },
+    });
+  });
+
   it.each([
     ['required_shell', { required_shell: 'x'.repeat(17) }],
     ['target_os entry', { target_os: ['linux', 'windows', 'macos', 'freebsd'] }],
@@ -544,7 +596,7 @@ describe('handleJobRun responses', () => {
 
     const res = await handleJobRun(testCtx, { job_id: 'job-1', max_output_bytes: 4 });
     expect(res).toEqual({
-      error: { category: 'internal', message: 'Unable to encode log cursor', retryable: true },
+      error: { category: 'internal', message: 'Unable to encode log cursor', retryable: false },
     });
   });
 
@@ -562,10 +614,10 @@ describe('handleJobRun responses', () => {
     });
     vi.mocked(executor.readChunkIndexTail).mockResolvedValue([
       { stream: 'stderr', byte_length: 100, sequence: 1, byte_offset: 0 },
-      { stream: 'stderr', byte_length: 100, sequence: 2, byte_offset: 100 },
+      { stream: 'stderr', byte_length: 4, sequence: 2, byte_offset: 100 },
     ]);
     vi.mocked(pagination.readIndexedRange).mockImplementation(async (_logs, entry) =>
-      entry.sequence === 2 ? Buffer.from('newest') : Buffer.from('old'),
+      entry.sequence === 2 ? Buffer.from('west') : Buffer.from('old'),
     );
     vi.mocked(executor.presentLogChunks).mockImplementation(([bytes]) => ({
       data: bytes,

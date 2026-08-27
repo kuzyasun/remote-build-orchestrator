@@ -26,6 +26,7 @@ import {
   type LogCursor as PaginationLogCursor,
   decodeCursor as decodeLogCursor,
   encodeCursor as encodeLogCursor,
+  logCursorAdvanced,
   readJobLogsPage as readLogPage,
 } from './log-pagination.js';
 
@@ -63,6 +64,8 @@ export interface ToolContext {
   maxHostCpuBusyFraction?: number;
   /** Optional progress sink for job_run (MCP notifications/progress). */
   jobRunOptions?: JobRunOptions;
+  /** Disconnect/abort of the calling HTTP request; wait returns the current job. */
+  signal?: AbortSignal;
 }
 
 export interface ToolErrorResult {
@@ -192,7 +195,11 @@ export async function handleToolCall(
           log_cursor: args.log_cursor as string | null | undefined,
           max_output_bytes: args.max_output_bytes as number | undefined,
         },
-        ctx.jobRunOptions,
+        ctx.jobRunOptions
+          ? { ...ctx.jobRunOptions, signal: ctx.jobRunOptions.signal ?? ctx.signal }
+          : ctx.signal
+            ? { signal: ctx.signal }
+            : undefined,
       );
 
     case 'job_confirm':
@@ -218,6 +225,7 @@ export async function handleToolCall(
     case 'job_wait':
       return waitForJob(runnerContext(ctx), args.job_id as string, args.wait_seconds as number, {
         includeLogTailLines: args.include_log_tail_lines as number,
+        signal: ctx.signal,
       });
 
     case 'job_logs': {
@@ -317,7 +325,7 @@ export async function handleToolCall(
           off: 0,
         };
         const nextCursor = encodeLogCursor(ctx.controllerIdentity, next);
-        const advanced = next.seq !== cursor.seq;
+        const advanced = next.seq !== cursor.seq || next.off !== cursor.off;
         if (advanced && !nextCursor)
           return cursorError('job_logs cursor cannot be represented within 512 bytes');
         return {
@@ -337,11 +345,9 @@ export async function handleToolCall(
       } catch {
         return cursorError('Unable to read durable job logs');
       }
-      const nextCursor =
-        page.chunks.length || page.next.seq !== cursor.seq || page.next.off !== cursor.off
-          ? encodeLogCursor(ctx.controllerIdentity, page.next)
-          : supplied;
-      if (page.chunks.length && !nextCursor)
+      const advanced = page.chunks.length > 0 || logCursorAdvanced(cursor, page.next);
+      const nextCursor = advanced ? encodeLogCursor(ctx.controllerIdentity, page.next) : supplied;
+      if (advanced && !nextCursor)
         return cursorError('job_logs cursor cannot be represented within 512 bytes');
       return {
         job_id: job.id,

@@ -61,6 +61,7 @@ export interface JobRunInput {
 
 export interface JobRunOptions {
   onProgress?: (update: JobRunProgressUpdate) => void | Promise<void>;
+  signal?: AbortSignal;
 }
 
 interface NoMatchDiagnosticResponse {
@@ -179,6 +180,22 @@ function directWrappingPlatform(
   return targetOs[0] === 'windows' ? 'win32' : targetOs[0] === 'macos' ? 'darwin' : 'linux';
 }
 
+function canonicalOsForPlatform(platform: NodeJS.Platform): 'macos' | 'windows' | 'linux' {
+  if (platform === 'win32') return 'windows';
+  if (platform === 'darwin') return 'macos';
+  return 'linux';
+}
+
+function jobRunWrappingPlatform(
+  input: JobRunInput,
+  controllerPlatform: NodeJS.Platform,
+): NodeJS.Platform {
+  if (input.shell === 'direct' || input.target_os?.length === 1) {
+    return directWrappingPlatform(input.target_os, controllerPlatform);
+  }
+  return controllerPlatform;
+}
+
 /** Map job_run MCP args → canonical JobRequest (Controller owns shell wrapping). */
 export function buildJobRunRequest(
   input: JobRunInput,
@@ -206,10 +223,10 @@ export function buildJobRunRequest(
     execution: wrapCommandAsExecution(
       input.command,
       timeoutSeconds,
-      input.shell === 'direct' ? directWrappingPlatform(input.target_os, platform) : platform,
+      jobRunWrappingPlatform(input, platform),
       input.shell,
     ),
-    requirements: input.target_os ? { os: input.target_os } : undefined,
+    requirements: { os: input.target_os ?? [canonicalOsForPlatform(platform)] },
     queue_policy: input.queue_policy,
     risk_level: input.risk_level ?? 'normal',
     artifacts: input.artifacts ?? [],
@@ -328,6 +345,9 @@ async function buildDiagnosticExcerpt(
         const offset = Math.max(0, e.byte_length - Math.min(1024 * 1024, budget * 2));
         const b = await readIndexedRange(logs, e, offset);
         if (!b || b.length === 0) continue;
+        // A bounded suffix can start mid CSI/OSC; without the prefix a fresh parser
+        // would leak that payload as text, so skip until this stream has a grounded state.
+        if (offset > 0 && !state) continue;
         const res = presentLogChunks([b], state, { maxBytes: 1024 * 1024, stripAnsi: true });
         state = res.state;
         if (res.data.length) {
@@ -518,7 +538,7 @@ async function finishJobRunResponse(
       nextLogCursor = encodeCursor(ctx.controllerIdentity, page.next);
       if (!nextLogCursor)
         return {
-          error: { category: 'internal', message: 'Unable to encode log cursor', retryable: true },
+          error: { category: 'internal', message: 'Unable to encode log cursor', retryable: false },
         };
       returnedBytes = page.returned;
       hasMore = page.hasMore;
@@ -543,6 +563,10 @@ async function finishJobRunResponse(
   };
   if (job.failure_category != null) out.failure_category = truncateUtf8(job.failure_category, 1024);
   if (job.failure_message != null) out.failure_message = truncateUtf8(job.failure_message, 2048);
+  if (job.state === 'queued' || job.failure_category === 'no_matching_agent') {
+    const noMatch = readNoMatchDiagnostic(job.result_json);
+    if (noMatch) out.no_match = noMatch;
+  }
   if (logChunks) out.log_chunks = logChunks;
   if (nextLogCursor) out.next_log_cursor = nextLogCursor;
   if (returnedBytes !== undefined) out.returned_bytes = returnedBytes;
@@ -636,6 +660,9 @@ export async function handleJobRun(
     }
   }
 
-  const waitResult = await waitForJob(ctx, jobId, waitBudget, { onTick });
+  const waitResult = await waitForJob(ctx, jobId, waitBudget, {
+    onTick,
+    signal: options.signal,
+  });
   return finishJobRunResponse(ctx, jobId, waitResult, rawInput);
 }

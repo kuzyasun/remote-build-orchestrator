@@ -98,16 +98,16 @@ impl Drop for JobHandle {
 
 fn create_kill_on_close_job() -> windows::core::Result<JobHandle> {
     unsafe {
-        let job = CreateJobObjectW(None, PCWSTR::null())?;
+        let job = JobHandle(CreateJobObjectW(None, PCWSTR::null())?);
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         SetInformationJobObject(
-            job,
+            job.0,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )?;
-        Ok(JobHandle(job))
+        Ok(job)
     }
 }
 

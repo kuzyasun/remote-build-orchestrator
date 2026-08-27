@@ -7,7 +7,10 @@ import {
   reserveCaptureLease,
 } from '../src/jobs/capture-lease.js';
 import { persistSnapshot } from '../src/jobs/lifecycle.js';
-import { recoverSnapshotPublications } from '../src/recovery/snapshot-publication.js';
+import {
+  recoverSnapshotPublications,
+  snapshotRecoveryRetryDelayMs,
+} from '../src/recovery/snapshot-publication.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 
 const capturedAt = new Date('2026-08-21T10:00:00.000Z');
@@ -84,6 +87,18 @@ describe('snapshot publication startup recovery', () => {
     await expect(exists(orphan.manifest)).resolves.toBe(true);
     await expect(exists(orphan.overlay)).resolves.toBe(true);
     await expect(exists(orphan.payload)).resolves.toBe(true);
+  });
+
+  it('reports when recovery should retry after the soonest live lease expires', async () => {
+    const reserved = reserveCaptureLease(
+      db,
+      { clientId: 'retry-client', clientRequestId: 'retry-request' },
+      { ownerToken: 'retry-owner', ttlMs: 10_000, now: () => capturedAt },
+    );
+    expect(reserved.acquired).toBe(true);
+    const delay = snapshotRecoveryRetryDelayMs(db, capturedAt);
+    expect(delay).toBeGreaterThanOrEqual(10_000);
+    expect(delay).toBeLessThanOrEqual(10_200);
   });
 
   it('cleans stale data once an expired lease has been reclaimed and released', async () => {

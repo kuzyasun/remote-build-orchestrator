@@ -136,11 +136,16 @@ export async function runJobToTerminal(
   if (!needsResume(result)) return result;
 
   if (options.follow) {
-    await followJobLogsRemote(baseUrl, initialJobId, {
-      onChunk: options.onChunk,
-      signal: options.signal,
-      pollMs: options.pollMs,
-    });
+    try {
+      await followJobLogsRemote(baseUrl, initialJobId, {
+        onChunk: options.onChunk,
+        signal: options.signal,
+        pollMs: options.pollMs,
+      });
+    } catch (error) {
+      interrupted(options.signal, initialJobId);
+      throw error;
+    }
     interrupted(options.signal, initialJobId);
     return requestJobRun(baseUrl, { job_id: initialJobId }, options.signal, initialJobId);
   }
@@ -249,8 +254,9 @@ export async function cancelAndAwaitJob(
     const remaining = deadline - Date.now();
     if (remaining > 0) await sleep(Math.min(pollMs, remaining));
   }
+  const seconds = Math.max(1, Math.round(confirmationMs / 1000));
   options.writeStderr(
-    `Cancellation was not confirmed within 10 seconds for job ${jobId}; it may still be stopping.\n`,
+    `Cancellation was not confirmed within ${seconds} seconds for job ${jobId}; it may still be stopping.\n`,
   );
   return false;
 }

@@ -1,5 +1,12 @@
 import type { ControllerDatabase } from '../storage/database.js';
 
+export class UnboundJobLifecycleNotifierError extends Error {
+  constructor() {
+    super('No job lifecycle notifier is bound to this database');
+    this.name = 'UnboundJobLifecycleNotifierError';
+  }
+}
+
 export type JobLifecycleListener = () => void;
 
 /**
@@ -38,7 +45,13 @@ export class JobLifecycleNotifier {
     const listeners = this.listenersByJob.get(jobId);
     if (!listeners) return;
     this.listenersByJob.delete(jobId);
-    for (const listener of listeners) listener();
+    for (const listener of listeners) {
+      try {
+        listener();
+      } catch {
+        // A waiter bug must not prevent other waiters from observing the transition.
+      }
+    }
   }
 
   /** Publish immediately outside a transaction, or queue until runTransaction commits. */
@@ -94,9 +107,23 @@ export class JobLifecycleNotifier {
     return count;
   }
 
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
   close(): void {
     this.closed = true;
+    const pending = [...this.listenersByJob.values()];
     this.listenersByJob.clear();
+    for (const listeners of pending) {
+      for (const listener of listeners) {
+        try {
+          listener();
+        } catch {
+          // Shutdown must still wake remaining waiters.
+        }
+      }
+    }
   }
 }
 
@@ -115,6 +142,10 @@ export function unbindJobLifecycleNotifier(db: ControllerDatabase): void {
   notifierByDatabase.delete(db);
 }
 
+export function isBoundJobLifecycleNotifierClosed(db: ControllerDatabase): boolean {
+  return notifierByDatabase.get(db)?.isClosed === true;
+}
+
 /**
  * Subscribe through the Controller-owned notifier. This intentionally fails
  * closed when no runtime binding exists so a waiter cannot accidentally attach
@@ -127,7 +158,7 @@ export function subscribeToJobLifecycle(
 ): () => void {
   const notifier = notifierByDatabase.get(db);
   if (!notifier) {
-    throw new Error('No job lifecycle notifier is bound to this database');
+    throw new UnboundJobLifecycleNotifierError();
   }
   return notifier.subscribe(jobId, listener);
 }
@@ -141,7 +172,7 @@ export function subscribeToJobLifecycle(
 export function runJobLifecycleTransaction<T>(db: ControllerDatabase, operation: () => T): T {
   const notifier = notifierByDatabase.get(db);
   if (!notifier) {
-    throw new Error('No job lifecycle notifier is bound to this database');
+    throw new UnboundJobLifecycleNotifierError();
   }
   return notifier.runTransaction(db, operation);
 }

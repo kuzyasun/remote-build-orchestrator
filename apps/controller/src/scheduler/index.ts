@@ -876,7 +876,7 @@ export function selectAgentForJob(
   const noMatchDiagnostic = describeNoMatchingAgent(agents, request, options);
 
   if (queuePolicy === 'wait') {
-    return { action: 'wait', reason: 'no_eligible_agent' };
+    return { action: 'wait', reason: 'no_eligible_agent', noMatchDiagnostic };
   }
 
   if (queuePolicy === 'fail_fast') {

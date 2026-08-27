@@ -46,7 +46,11 @@ import {
   renewCaptureLease,
   reserveCaptureLease,
 } from './capture-lease.js';
-import { subscribeToJobLifecycle } from './lifecycle-notifier.js';
+import {
+  UnboundJobLifecycleNotifierError,
+  isBoundJobLifecycleNotifierClosed,
+  subscribeToJobLifecycle,
+} from './lifecycle-notifier.js';
 import {
   createJob,
   createJobEvent,
@@ -146,13 +150,9 @@ function failSubmissionIfCaptureLeaseIsAuthoritative(
 }
 
 async function flushFile(path: string): Promise<void> {
-  const handle = await open(path, 'r');
+  const handle = await open(path, 'r+');
   try {
-    try {
-      await handle.sync();
-    } catch {
-      // Windows may reject fsync on a read-only handle; close still completes the guard.
-    }
+    await handle.sync();
   } finally {
     await handle.close();
   }
@@ -623,6 +623,11 @@ export async function dispatchJobExecution(
   // queue_policy=wait: leave job queued until an eligible agent has capacity, or (reason ===
   // 'host_busy') until the host cools down or an agent connects — no attempt exists yet for this
   // job, so there's nowhere to record a per-attempt job_event; this is operator-facing only.
+  if (decision.action === 'wait' && decision.noMatchDiagnostic) {
+    ctx.db
+      .prepare(`UPDATE jobs SET result_json = ? WHERE id = ? AND state = 'queued'`)
+      .run(JSON.stringify({ no_match: decision.noMatchDiagnostic }), jobId);
+  }
   if (decision.reason === 'host_busy') {
     logger.info(
       'local fallback deferred — host over CPU threshold and not the least-loaded option',
@@ -814,6 +819,7 @@ export async function waitForJob(
     job &&
     !isTerminalJobState(job.state) &&
     !options?.signal?.aborted &&
+    !isBoundJobLifecycleNotifierClosed(ctx.db) &&
     Date.now() < deadline
   ) {
     if (options?.onTick) {
@@ -855,10 +861,7 @@ export async function waitForJob(
       } catch (error) {
         // Tests and embedded callers may not bind the Controller runtime
         // notifier. The durable fallback remains safe, only less immediate.
-        if (
-          !(error instanceof Error) ||
-          error.message !== 'No job lifecycle notifier is bound to this database'
-        ) {
+        if (!(error instanceof UnboundJobLifecycleNotifierError)) {
           throw error;
         }
       }

@@ -68,6 +68,22 @@ function hasActiveCaptureLease(db: ControllerDatabase, now: Date): boolean {
   );
 }
 
+/** Delay until the soonest live capture lease expires so startup recovery can retry. */
+export function snapshotRecoveryRetryDelayMs(
+  db: ControllerDatabase,
+  now: Date = new Date(),
+): number | undefined {
+  const row = db
+    .prepare(
+      'SELECT MIN(lease_expires_at) AS until FROM snapshot_capture_leases WHERE lease_expires_at > ?',
+    )
+    .get(now.toISOString()) as { until: string | null } | undefined;
+  if (!row?.until) return undefined;
+  const until = Date.parse(row.until);
+  if (Number.isNaN(until)) return undefined;
+  return Math.max(50, until - now.getTime() + 50);
+}
+
 function isRecoverableSnapshotFile(name: string): boolean {
   return PRIVATE_CANDIDATE_NAME.test(name) || GENERATION_FINAL_NAME.test(name);
 }

@@ -382,7 +382,7 @@ describe('rbo run runtime', () => {
     ).resolves.toBe(false);
 
     expect(stderr.join('')).toContain('job_still_stopping');
-    expect(stderr.join('')).toContain('not confirmed within 10 seconds');
+    expect(stderr.join('')).toMatch(/not confirmed within .+ for job job_still_stopping/);
   });
 
   it('stops terminal waiting when interrupted after a job ID is available', async () => {
@@ -444,6 +444,35 @@ describe('rbo run runtime', () => {
     await expect(
       runJobToTerminal(baseUrl, { job_id: 'job_known' }, { signal: controller.signal }),
     ).rejects.toMatchObject<Partial<RunInterruptedError>>({ jobId: 'job_known' });
+  }, 5_000);
+
+  it('maps Ctrl+C during --follow SSE body to RunInterruptedError with the job id', async () => {
+    const controller = new AbortController();
+    const baseUrl = await listen(
+      createServer(async (req, res) => {
+        const url = req.url ?? '';
+        if (url.includes('/logs/stream')) {
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+          });
+          res.write(': connected\n\n');
+          controller.abort();
+          return;
+        }
+        await readJson(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ job_id: 'job_follow_abort', state: 'running', resume: true }));
+      }),
+    );
+
+    await expect(
+      runJobToTerminal(
+        baseUrl,
+        { command: 'pnpm test', project_root: '/work/project', cwd: '.' },
+        { follow: true, signal: controller.signal, pollMs: 20 },
+      ),
+    ).rejects.toMatchObject<Partial<RunInterruptedError>>({ jobId: 'job_follow_abort' });
   }, 5_000);
 
   it.each([

@@ -57,6 +57,7 @@ describe('waitForJob event-driven lifecycle', () => {
 
   it('closes the initial-read to subscribe race without waiting for the fallback', async () => {
     const { db, job, notifier } = setup();
+    const startedAt = Date.now();
     const result = await waitForJob(makeContext(db), job.id, 2, {
       testHooks: {
         beforeSubscribe: () => {
@@ -66,11 +67,13 @@ describe('waitForJob event-driven lifecycle', () => {
     });
 
     expect((result.job as { state: string }).state).toBe('completed');
+    expect(Date.now() - startedAt).toBeLessThan(500);
     expect(notifier.listenerCount()).toBe(0);
   });
 
   it('closes the subscribe to reread race without waiting for the fallback', async () => {
     const { db, job, notifier } = setup();
+    const startedAt = Date.now();
     const result = await waitForJob(makeContext(db), job.id, 2, {
       testHooks: {
         afterSubscribe: () => {
@@ -80,6 +83,7 @@ describe('waitForJob event-driven lifecycle', () => {
     });
 
     expect((result.job as { state: string }).state).toBe('completed');
+    expect(Date.now() - startedAt).toBeLessThan(500);
     expect(notifier.listenerCount()).toBe(0);
   });
 
@@ -153,6 +157,17 @@ describe('waitForJob event-driven lifecycle', () => {
 
     expect((result.job as { state: string }).state).toBe('running');
     expect(getJob(db, job.id)?.state).toBe('running');
+    expect(notifier.listenerCount()).toBe(0);
+  });
+
+  it('wakes waiters when the notifier closes', async () => {
+    const { db, job, notifier } = setup();
+    const waiting = waitForJob(makeContext(db), job.id, 2);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(notifier.listenerCount(job.id)).toBe(1);
+    notifier.close();
+    const result = await waiting;
+    expect((result.job as { state: string }).state).toBe('running');
     expect(notifier.listenerCount()).toBe(0);
   });
 });

@@ -166,6 +166,24 @@ function writeChunkDefault(stream: 'stdout' | 'stderr', text: string): void {
  * duplicate output. Exits after the stream emits `done`, or after a capped
  * catch-up reconnect budget once the job is already terminal.
  */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 export async function followJobLogsRemote(
   baseUrl: string,
   jobId: string,
@@ -263,7 +281,7 @@ export async function followJobLogsRemote(
       } else {
         terminalCatchUpAttempts = 0;
       }
-      await new Promise((r) => setTimeout(r, pollMs));
+      await abortableSleep(pollMs, options.signal);
       continue;
     } finally {
       clearTimeout(timeout);
@@ -289,7 +307,7 @@ export async function followJobLogsRemote(
         } else {
           terminalCatchUpAttempts = 0;
         }
-        await new Promise((r) => setTimeout(r, pollMs));
+        await abortableSleep(pollMs, options.signal);
         continue;
       }
       throw new Error(`log stream failed: HTTP ${res.status} ${text}`);
@@ -297,46 +315,53 @@ export async function followJobLogsRemote(
 
     let finished = false;
     const sequenceBefore = lastSequence;
-    for await (const block of parseSseBlocks(res.body)) {
-      if (options.signal?.aborted) {
-        finished = true;
-        break;
-      }
-      if (block.event === 'heartbeat') {
-        continue;
-      }
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(block.data) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
-      if (block.event === 'done') {
-        lastState = typeof parsed.state === 'string' ? parsed.state : lastState;
-        if (typeof parsed.last_sequence === 'number') {
-          lastSequence = Math.max(lastSequence, parsed.last_sequence);
+    try {
+      for await (const block of parseSseBlocks(res.body)) {
+        if (options.signal?.aborted) {
+          finished = true;
+          break;
         }
-        finished = true;
-        break;
-      }
-      if (block.event === 'error') {
-        // e.g. buffer_overflow — end stream so we reconnect with Last-Event-ID.
-        if (typeof parsed.last_sequence === 'number') {
-          lastSequence = Math.max(lastSequence, parsed.last_sequence);
+        if (block.event === 'heartbeat') {
+          continue;
         }
-        break;
-      }
-      if (block.event === 'log' || typeof parsed.sequence === 'number') {
-        const sequence = Number(parsed.sequence);
-        const stream = parsed.stream === 'stderr' ? 'stderr' : 'stdout';
-        const text = typeof parsed.text === 'string' ? parsed.text : '';
-        if (Number.isFinite(sequence) && sequence > lastSequence) {
-          lastSequence = sequence;
-          if (text.length > 0) {
-            onChunk(stream, text);
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(block.data) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (block.event === 'done') {
+          lastState = typeof parsed.state === 'string' ? parsed.state : lastState;
+          if (typeof parsed.last_sequence === 'number') {
+            lastSequence = Math.max(lastSequence, parsed.last_sequence);
+          }
+          finished = true;
+          break;
+        }
+        if (block.event === 'error') {
+          // e.g. buffer_overflow — end stream so we reconnect with Last-Event-ID.
+          if (typeof parsed.last_sequence === 'number') {
+            lastSequence = Math.max(lastSequence, parsed.last_sequence);
+          }
+          break;
+        }
+        if (block.event === 'log' || typeof parsed.sequence === 'number') {
+          const sequence = Number(parsed.sequence);
+          const stream = parsed.stream === 'stderr' ? 'stderr' : 'stdout';
+          const text = typeof parsed.text === 'string' ? parsed.text : '';
+          if (Number.isFinite(sequence) && sequence > lastSequence) {
+            lastSequence = sequence;
+            if (text.length > 0) {
+              onChunk(stream, text);
+            }
           }
         }
       }
+    } catch (error) {
+      if (options.signal?.aborted) {
+        break;
+      }
+      throw error;
     }
 
     if (finished) {
@@ -359,7 +384,7 @@ export async function followJobLogsRemote(
     } else {
       terminalCatchUpAttempts = 0;
     }
-    await new Promise((r) => setTimeout(r, pollMs));
+    await abortableSleep(pollMs, options.signal);
   }
 
   return { lastSequence, state: lastState };

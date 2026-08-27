@@ -93,6 +93,8 @@ describe('rbo run parser', () => {
     [['--cwd', '../outside', '--', 'pnpm test'], /stay inside --project/],
     [['--cwd', '/absolute', '--', 'pnpm test'], /relative path inside --project/],
     [['--timeout', 'NaN', '--', 'pnpm test'], /finite number/],
+    [['--timeout', '0', '--', 'pnpm test'], /between 1 and 3600/],
+    [['--timeout', '3601', '--', 'pnpm test'], /between 1 and 3600/],
   ])('rejects invalid usage: %j', (args, error) => {
     expect(() => parseRunCommandArgs(args, '/work/project')).toThrow(error);
   });

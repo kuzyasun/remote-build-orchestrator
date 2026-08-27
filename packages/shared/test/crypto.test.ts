@@ -43,6 +43,21 @@ describe('EdDSA JWT credentials (§8.1)', () => {
     expect(claims).not.toBeNull();
     expect(claims?.sub).toBe('agt_01J1234567890ABCDEFGHJKMNP');
     expect(claims?.credential_version).toBe(1);
+    expect(claims?.iat).toEqual(expect.any(Number));
+  });
+
+  it('can omit iat and typ for compact tokens', () => {
+    const keys = generateDeviceKeyPair();
+    const token = signEdDsaJwt(
+      keys.privateKeyPem,
+      { sub: 'c', aud: 'r', exp: Math.floor(Date.now() / 1000) + 3600 },
+      { includeIat: false, header: { alg: 'EdDSA' } },
+    );
+    const claims = verifyEdDsaJwt(keys.publicKeyPem, token);
+    expect(claims).toMatchObject({ sub: 'c', aud: 'r' });
+    expect(claims?.iat).toBeUndefined();
+    const header = JSON.parse(Buffer.from(token.split('.')[0] ?? '', 'base64url').toString('utf8'));
+    expect(header).toEqual({ alg: 'EdDSA' });
   });
 
   it('rejects an expired credential', () => {

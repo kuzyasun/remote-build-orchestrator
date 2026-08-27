@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -144,6 +144,28 @@ describe('writeZstdTarArchiveCandidate memory hygiene', () => {
       expect.objectContaining({ path: 'empty.bin', type: 'file', content: Buffer.alloc(0) }),
     ]);
     await rm(candidate.candidatePath, { force: true });
+  });
+
+  it('rejects a contentPath symlink instead of following it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'rbo-archive-symlink-'));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+    const sourcePath = join(dir, 'source.bin');
+    const linkPath = join(dir, 'source.link');
+    const requestedPath = join(dir, 'snapshot.tar.zst');
+    await writeFile(sourcePath, Buffer.from('secret-bytes'));
+    try {
+      await symlink(sourcePath, linkPath);
+    } catch {
+      return;
+    }
+    await expect(
+      writeZstdTarArchiveCandidate(requestedPath, [
+        { path: 'source.bin', mode: 0o644, type: 'file', contentPath: linkPath },
+      ]),
+    ).rejects.toThrow(/regular file/);
+    expect((await readdir(dir)).filter((name) => name.includes('.candidate-'))).toEqual([]);
   });
 
   it('writes a private candidate, returns no payload buffer, and hashes its on-disk bytes', async () => {

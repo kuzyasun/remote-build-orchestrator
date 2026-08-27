@@ -2,10 +2,11 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendIndexedLogChunk, ensureAttemptLogs } from '@rbo/executor';
-import { ensureControllerIdentity } from '@rbo/shared';
+import { ensureControllerIdentity, generateId } from '@rbo/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { attemptLogDir } from '../src/execution/runner.js';
 import { type ToolContext, handleToolCall, validateToolInput } from '../src/mcp/handlers.js';
+import { decodeCursor, encodeCursor } from '../src/mcp/log-pagination.js';
 import { type ControllerDatabase, migrateToLatest, openDatabase } from '../src/storage/database.js';
 
 describe('Controller job_logs contract and durable paging', () => {
@@ -101,6 +102,60 @@ describe('Controller job_logs contract and durable paging', () => {
       'outerr',
     );
   });
+
+  it('encodes production ULID ids with ANSI carry inside 512 bytes', () => {
+    const cursor = {
+      v: 1 as const,
+      job: generateId('job'),
+      attempt: generateId('att'),
+      mode: 'logs' as const,
+      seq: 12,
+      off: 64,
+      profile: 'ansi-v1' as const,
+      states: {
+        stdout: { mode: 'osc' as const, csiLength: 0, oscLength: 4000, controlLength: 4000 },
+        stderr: { mode: 'csi' as const, csiLength: 4000, oscLength: 0, controlLength: 4000 },
+      },
+      positions: {
+        stdout: { seq: 12, off: 64 },
+        stderr: { seq: 11, off: 8 },
+      },
+    };
+    const identity = ctx.controllerIdentity;
+    if (!identity) throw new Error('expected controller identity');
+    const token = encodeCursor(identity, cursor);
+    expect(token).toEqual(expect.any(String));
+    if (!token) throw new Error('expected cursor token');
+    expect(token.length).toBeLessThanOrEqual(512);
+    expect(decodeCursor(identity, token)).toEqual(cursor);
+  });
+
+  it('keeps the byte offset when a durable chunk exceeds the 1 MiB read cap', async () => {
+    const payload = Buffer.concat([Buffer.alloc(1024 * 1024 + 16, 0x61), Buffer.from('TAIL')]);
+    await append('stdout', payload, 1);
+    const first = await handleToolCall(ctx, 'job_logs', {
+      job_id: jobId,
+      attempt_id: attemptId,
+      mode: 'logs',
+      max_bytes: 1024 * 1024,
+    });
+    expect(first).not.toHaveProperty('error');
+    expect(first.has_more).toBe(true);
+    expect(first.next_cursor).toEqual(expect.any(String));
+    const firstText = (first.chunks as Array<{ text: string }>).map((chunk) => chunk.text).join('');
+    expect(firstText.includes('TAIL')).toBe(false);
+
+    const second = await handleToolCall(ctx, 'job_logs', {
+      job_id: jobId,
+      mode: 'logs',
+      cursor: first.next_cursor,
+      max_bytes: 1024 * 1024,
+    });
+    expect(second).not.toHaveProperty('error');
+    expect(
+      (second.chunks as Array<{ text: string }>).map((chunk) => chunk.text).join(''),
+    ).toContain('TAIL');
+  }, 30_000);
 
   it('resumes split UTF-8 scalars without duplication and rejects tampered or mismatched cursors', async () => {
     const scalar = Buffer.from('Ж');

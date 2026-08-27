@@ -12,6 +12,7 @@ import { createStdioProxyServer } from '../../mcp-stdio/src/proxy.js';
 import { attemptLogDir } from '../src/execution/runner.js';
 import { startControllerServer } from '../src/http/server.js';
 import type { RunningControllerServer } from '../src/http/server.js';
+import { createJob, getJob } from '../src/jobs/lifecycle.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 
@@ -213,6 +214,47 @@ describe('MCP transports', () => {
       body: '{}',
     });
     expect(res.status).toBe(404);
+  });
+
+  it('does not abort job_wait after the POST body is fully read', async () => {
+    const job = createJob(db, {
+      clientId: 'wait-body-complete',
+      clientRequestId: `wait-body-${Date.now()}`,
+      initialState: 'running',
+      request: { command: 'echo wait', project_root: '.', risk_level: 'safe' },
+    });
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${running.port}/internal/v1/tools/job_wait`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-rbo-client-id': 'test' },
+      body: JSON.stringify({ job_id: job.id, wait_seconds: 1 }),
+    });
+    const elapsed = Date.now() - startedAt;
+    const body = (await res.json()) as { job?: { state?: string; outcome?: string } };
+    expect(res.status).toBe(200);
+    expect(body.job?.state).toBe('running');
+    expect(elapsed).toBeGreaterThan(400);
+    expect(getJob(db, job.id)).toMatchObject({ state: 'running', outcome: null });
+  });
+
+  it('returns the current job on client disconnect without cancelling it', async () => {
+    const job = createJob(db, {
+      clientId: 'wait-disconnect',
+      clientRequestId: `wait-disconnect-${Date.now()}`,
+      initialState: 'running',
+      request: { command: 'echo wait', project_root: '.', risk_level: 'safe' },
+    });
+    const abort = new AbortController();
+    const pending = fetch(`http://127.0.0.1:${running.port}/internal/v1/tools/job_wait`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-rbo-client-id': 'test' },
+      body: JSON.stringify({ job_id: job.id, wait_seconds: 5 }),
+      signal: abort.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    abort.abort();
+    await expect(pending).rejects.toThrow();
+    expect(getJob(db, job.id)).toMatchObject({ state: 'running', outcome: null });
   });
 });
 

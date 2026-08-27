@@ -138,7 +138,11 @@ describe('defaultQueuePolicy (queue jobs when no Agent has capacity)', () => {
     expect(persisted).not.toBeNull();
     await dispatchJobExecution(ctx, jobId, persisted as never);
 
-    expect(getJob(db, jobId)?.state).toBe('queued');
+    const queued = getJob(db, jobId);
+    expect(queued?.state).toBe('queued');
+    expect(JSON.parse(queued?.result_json ?? '{}')).toMatchObject({
+      no_match: { category: 'no_matching_agent', retryable: false },
+    });
   });
 
   it('falls back to local_fallback when defaultQueuePolicy is unset (back-compat)', async () => {

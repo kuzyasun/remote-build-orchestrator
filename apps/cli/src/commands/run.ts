@@ -81,8 +81,8 @@ export function parseRunCommandArgs(
       case '--timeout': {
         const rawTimeout = takeOptionValue(optionArgs, index, option);
         const parsedTimeout = Number(rawTimeout);
-        if (!Number.isFinite(parsedTimeout)) {
-          throw usage('--timeout must be a finite number of seconds.');
+        if (!Number.isFinite(parsedTimeout) || parsedTimeout < 1 || parsedTimeout > 3600) {
+          throw usage('--timeout must be a finite number of seconds between 1 and 3600.');
         }
         timeoutSeconds = parsedTimeout;
         index += 1;

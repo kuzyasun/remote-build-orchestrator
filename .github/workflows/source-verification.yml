@@ -60,17 +60,18 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Verify source
-        run: pnpm verify
-
       - name: Build Windows native executor
         if: ${{ matrix.package-verify }}
         run: cargo build --release --manifest-path native/windows-executor/Cargo.toml
+
+      - name: Verify source
+        run: pnpm verify
 
       - name: Verify packaging manifests (Windows)
         if: ${{ matrix.package-verify }}
         run: |
           pnpm package:archives
+          git diff --exit-code -- packaging
           pnpm package:verify
 
       - name: Report environment-gated checks (skipped)

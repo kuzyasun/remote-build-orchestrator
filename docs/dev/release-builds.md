@@ -22,8 +22,9 @@ The source-verification path is separate from publishing: `.github/workflows/sou
 runs on pull requests and pushes to `master` on both `ubuntu-latest` and `windows-latest`. Each job
 uses the repository Node version from `.nvmrc`, installs pnpm 10.5.2, runs
 `pnpm install --frozen-lockfile`, and executes `pnpm build` followed by `pnpm verify`. The Windows
-job then runs `pnpm package:verify` against the checked-in packaging manifests; it does not regenerate
-or publish manifests. Superseded runs for the same branch or pull request are cancelled.
+job builds the native executor before `pnpm verify`, then regenerates packaging manifests with
+`pnpm package:archives`, fails if `packaging/` differs from git (`git diff --exit-code -- packaging`),
+and finally runs `pnpm package:verify`. Superseded runs for the same branch or pull request are cancelled.
 
 This fast workflow intentionally skips Docker, QEMU, and large-log tests that require a separately
 provisioned environment. Those checks remain external, environment-gated evidence and must not be

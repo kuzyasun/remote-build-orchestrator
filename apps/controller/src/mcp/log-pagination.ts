@@ -25,47 +25,126 @@ const PRESENTATION_MODES: readonly LogPresentationState['mode'][] = [
   'oscEscape',
   'discard',
 ];
+const INDEX_READ_CAP = 1024 * 1024;
+const PAGE_RAW_SCAN_CAP = 1024 * 1024;
 type CompactPresentationState = [number, number, number, number];
 type CompactStreamPosition = [number, number];
+type PackedStreamPair<T> = 0 | [T | null, T | null];
+type PackedCursor = [
+  1,
+  string,
+  string,
+  0 | 1,
+  number,
+  number,
+  PackedStreamPair<CompactPresentationState>,
+  PackedStreamPair<CompactStreamPosition>,
+];
 
-function compactCursor(
-  cursor: LogCursor,
-): Omit<LogCursor, 'states' | 'positions'> & { states?: unknown; positions?: unknown } {
+function encodeState(state: LogPresentationState | undefined): CompactPresentationState | null {
+  return state
+    ? [
+        PRESENTATION_MODES.indexOf(state.mode),
+        state.csiLength,
+        state.oscLength,
+        state.controlLength,
+      ]
+    : null;
+}
+
+function packCursor(cursor: LogCursor): PackedCursor {
   const states = cursor.states;
   const positions = cursor.positions;
-  if ((!states || (!states.stdout && !states.stderr)) && !positions) return cursor;
-  const safeStates = states ?? {};
-  const encodeState = (state: LogPresentationState | undefined): CompactPresentationState | null =>
-    state
+  const packedStates: PackedStreamPair<CompactPresentationState> =
+    states?.stdout || states?.stderr
+      ? [encodeState(states?.stdout), encodeState(states?.stderr)]
+      : 0;
+  const packedPositions: PackedStreamPair<CompactStreamPosition> =
+    positions?.stdout || positions?.stderr
       ? [
-          PRESENTATION_MODES.indexOf(state.mode),
-          state.csiLength,
-          state.oscLength,
-          state.controlLength,
+          positions.stdout ? [positions.stdout.seq, positions.stdout.off] : null,
+          positions.stderr ? [positions.stderr.seq, positions.stderr.off] : null,
         ]
-      : null;
-  return {
-    ...cursor,
-    states: [encodeState(safeStates.stdout), encodeState(safeStates.stderr)],
-    ...(positions
-      ? {
-          positions: [
-            positions.stdout ? [positions.stdout.seq, positions.stdout.off] : null,
-            positions.stderr ? [positions.stderr.seq, positions.stderr.off] : null,
-          ] as Array<CompactStreamPosition | null>,
-        }
-      : {}),
-  };
+      : 0;
+  return [
+    1,
+    cursor.job,
+    cursor.attempt,
+    cursor.mode === 'events' ? 1 : 0,
+    cursor.seq,
+    cursor.off,
+    packedStates,
+    packedPositions,
+  ];
+}
+
+export function logCursorAdvanced(from: LogCursor, to: LogCursor): boolean {
+  return (
+    to.seq !== from.seq ||
+    to.off !== from.off ||
+    JSON.stringify(to.states) !== JSON.stringify(from.states) ||
+    JSON.stringify(to.positions) !== JSON.stringify(from.positions)
+  );
 }
 
 export function encodeCursor(identity: ControllerIdentity, cursor: LogCursor): string | null {
-  const token = signEdDsaJwt(identity.signingPrivateKeyPem, {
-    sub: 'job_logs_cursor',
-    aud: 'rbo-controller',
-    exp: 4102444800,
-    cursor: compactCursor(cursor),
-  });
+  const token = signEdDsaJwt(
+    identity.signingPrivateKeyPem,
+    {
+      sub: 'c',
+      aud: 'r',
+      exp: 4102444800,
+      c: packCursor(cursor),
+    },
+    { includeIat: false, header: { alg: 'EdDSA' } },
+  );
   return token.length <= 512 ? token : null;
+}
+
+function decodePackedState(value: unknown): LogPresentationState | undefined {
+  if (!Array.isArray(value) || value.length !== 4) return undefined;
+  const mode = PRESENTATION_MODES[value[0] as number];
+  const csiLength = value[1];
+  const oscLength = value[2];
+  const controlLength = value[3];
+  if (
+    !mode ||
+    !Number.isSafeInteger(csiLength) ||
+    !Number.isSafeInteger(oscLength) ||
+    !Number.isSafeInteger(controlLength) ||
+    csiLength < 0 ||
+    csiLength > 4096 ||
+    oscLength < 0 ||
+    oscLength > 4096 ||
+    controlLength < 0 ||
+    controlLength > 4096
+  ) {
+    return undefined;
+  }
+  return { mode, csiLength, oscLength, controlLength };
+}
+
+function decodePackedPosition(value: unknown): { seq: number; off: number } | undefined {
+  if (!Array.isArray(value) || value.length !== 2) return undefined;
+  const seq = value[0];
+  const off = value[1];
+  if (!Number.isSafeInteger(seq) || !Number.isSafeInteger(off) || seq < 0 || off < 0) {
+    return undefined;
+  }
+  return { seq, off };
+}
+
+function unpackStreamPair<T>(
+  value: unknown,
+  decode: (item: unknown) => T | undefined,
+): { stdout?: T; stderr?: T } | undefined | false {
+  if (value === 0 || value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length !== 2) return false;
+  const stdout = value[0] === null ? undefined : decode(value[0]);
+  const stderr = value[1] === null ? undefined : decode(value[1]);
+  if (value[0] !== null && stdout === undefined) return false;
+  if (value[1] !== null && stderr === undefined) return false;
+  return { ...(stdout ? { stdout } : {}), ...(stderr ? { stderr } : {}) };
 }
 
 export function decodeCursor(identity: ControllerIdentity, value: string): LogCursor | null {
@@ -79,100 +158,35 @@ export function decodeCursor(identity: ControllerIdentity, value: string): LogCu
   )
     return null;
   const claims = verifyEdDsaJwt(identity.signingPublicKeyPem, value);
-  const candidate = claims?.cursor;
-  if (!claims || !candidate || typeof candidate !== 'object') return null;
-  const c = candidate as Partial<LogCursor> & { states?: unknown };
-  const statesValue = c.states;
-  const states: LogCursor['states'] = Array.isArray(statesValue)
-    ? {
-        ...(statesValue[0]
-          ? {
-              stdout: {
-                mode: PRESENTATION_MODES[statesValue[0][0] as number],
-                csiLength: statesValue[0][1] as number,
-                oscLength: statesValue[0][2] as number,
-                controlLength: statesValue[0][3] as number,
-              },
-            }
-          : {}),
-        ...(statesValue[1]
-          ? {
-              stderr: {
-                mode: PRESENTATION_MODES[statesValue[1][0] as number],
-                csiLength: statesValue[1][1] as number,
-                oscLength: statesValue[1][2] as number,
-                controlLength: statesValue[1][3] as number,
-              },
-            }
-          : {}),
-      }
-    : undefined;
-  const positionsValue = (c as { positions?: unknown }).positions;
-  const positions: LogCursor['positions'] = Array.isArray(positionsValue)
-    ? {
-        ...(positionsValue[0]
-          ? { stdout: { seq: positionsValue[0][0], off: positionsValue[0][1] } }
-          : {}),
-        ...(positionsValue[1]
-          ? { stderr: { seq: positionsValue[1][0], off: positionsValue[1][1] } }
-          : {}),
-      }
-    : undefined;
-  const allowedModes = new Set(PRESENTATION_MODES);
-  const stateValid =
-    statesValue === undefined ||
-    (typeof states === 'object' &&
-      states !== null &&
-      Object.keys(states).every((stream) => {
-        if (stream !== 'stdout' && stream !== 'stderr') return false;
-        const state = states[stream as 'stdout' | 'stderr'];
-        return (
-          typeof state === 'object' &&
-          state !== null &&
-          allowedModes.has(state.mode) &&
-          Number.isSafeInteger(state.csiLength) &&
-          Number.isSafeInteger(state.oscLength) &&
-          Number.isSafeInteger(state.controlLength) &&
-          state.csiLength >= 0 &&
-          state.csiLength <= 4096 &&
-          state.oscLength >= 0 &&
-          state.oscLength <= 4096 &&
-          state.controlLength >= 0 &&
-          state.controlLength <= 4096
-        );
-      }));
-  const positionsValid =
-    positionsValue === undefined ||
-    (Array.isArray(positionsValue) &&
-      positionsValue.length === 2 &&
-      positionsValue.every(
-        (position: unknown) =>
-          position === null ||
-          (Array.isArray(position) &&
-            position.length === 2 &&
-            Number.isSafeInteger(position[0]) &&
-            Number.isSafeInteger(position[1]) &&
-            position[0] >= 0 &&
-            position[1] >= 0),
-      ));
+  if (!claims || claims.sub !== 'c' || claims.aud !== 'r' || !Array.isArray(claims.c)) return null;
+  const packed = claims.c as unknown[];
   if (
-    c.v !== 1 ||
-    typeof c.job !== 'string' ||
-    typeof c.attempt !== 'string' ||
-    (c.mode !== 'logs' && c.mode !== 'events') ||
-    !Number.isSafeInteger(c.seq) ||
-    (c.seq ?? -1) < 0 ||
-    !Number.isSafeInteger(c.off) ||
-    (c.off ?? -1) < 0 ||
-    c.profile !== 'ansi-v1' ||
-    !stateValid ||
-    !positionsValid ||
-    claims.sub !== 'job_logs_cursor' ||
-    claims.aud !== 'rbo-controller'
+    packed.length !== 8 ||
+    packed[0] !== 1 ||
+    typeof packed[1] !== 'string' ||
+    typeof packed[2] !== 'string' ||
+    (packed[3] !== 0 && packed[3] !== 1) ||
+    !Number.isSafeInteger(packed[4]) ||
+    (packed[4] as number) < 0 ||
+    !Number.isSafeInteger(packed[5]) ||
+    (packed[5] as number) < 0
   ) {
     return null;
   }
-  return { ...c, states, positions } as LogCursor;
+  const states = unpackStreamPair(packed[6], decodePackedState);
+  const positions = unpackStreamPair(packed[7], decodePackedPosition);
+  if (states === false || positions === false) return null;
+  return {
+    v: 1,
+    job: packed[1],
+    attempt: packed[2],
+    mode: packed[3] === 1 ? 'events' : 'logs',
+    seq: packed[4] as number,
+    off: packed[5] as number,
+    profile: 'ansi-v1',
+    ...(states && Object.keys(states).length > 0 ? { states } : {}),
+    ...(positions && Object.keys(positions).length > 0 ? { positions } : {}),
+  };
 }
 
 export async function readIndexedRange(
@@ -189,7 +203,7 @@ export async function readIndexedRange(
     return undefined;
   }
   try {
-    const result = Buffer.alloc(Math.min(entry.byte_length - offset, 1024 * 1024));
+    const result = Buffer.alloc(Math.min(entry.byte_length - offset, INDEX_READ_CAP));
     let total = 0;
     while (total < result.length) {
       const read = await handle.read(
@@ -265,8 +279,9 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
   let truncated = false;
   const blockedStreams = new Set<'stdout' | 'stderr'>();
   let hasPendingIntervening = false;
+  let remainingScan = PAGE_RAW_SCAN_CAP;
   for (let index = 0; index < Math.min(128, entries.length); index += 1) {
-    if (maxBytes - returned < 4) {
+    if (maxBytes - returned < 4 || remainingScan < 1) {
       truncated = true;
       break;
     }
@@ -284,13 +299,17 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
       continue;
     }
     const startOffset = entry.sequence === position.seq ? position.off : 0;
+    const remainingBytes = entry.byte_length - startOffset;
     const bytes = await readIndexedRange(logs, entry, startOffset);
     if (!bytes) throw new Error('indexed log source is unavailable');
     if (!bytes.length) continue;
+    const rangeCapped = bytes.length < remainingBytes;
     const stream = entry.stream;
+    const scanBudget = remainingScan;
     let page = presentLogChunks([bytes], states[stream], {
       maxBytes: maxBytes - returned,
       stripAnsi: true,
+      rawScanCap: scanBudget,
     });
     let consumedFromNext = 0;
     let consumedNextEntry: ChunkIndexEntry | undefined;
@@ -310,12 +329,14 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
         page = presentLogChunks([bytes, lookahead], states[stream], {
           maxBytes: maxBytes - returned,
           stripAnsi: true,
+          rawScanCap: scanBudget,
         });
         consumedFromNext = Math.max(0, page.consumedRawBytes - bytes.length);
         consumedNextEntry = lookEntry;
         break;
       }
     }
+    remainingScan = Math.max(0, remainingScan - page.scannedRawBytes);
     states[stream] = page.state;
     if (page.data.length) {
       output.push({
@@ -355,6 +376,13 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
       }
       truncated = consumedFromNext < nextEntry.byte_length;
       if (truncated) break;
+    } else if (rangeCapped) {
+      position.seq = entry.sequence;
+      position.off = startOffset + bytes.length;
+      nextSeq = position.seq;
+      nextOff = position.off;
+      truncated = true;
+      break;
     } else {
       position.seq = entry.sequence + 1;
       position.off = 0;

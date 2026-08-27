@@ -91,9 +91,24 @@ function identityFromHeaders(
   };
 }
 
+function abortOnDisconnect(req: IncomingMessage, res: ServerResponse): AbortSignal {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+  // Do not abort on `req` close: the request stream ends after the body is read,
+  // while the handler is still waiting. Client disconnect destroys the response.
+  req.on('aborted', abort);
+  res.on('close', () => {
+    if (!res.writableEnded) abort();
+  });
+  return controller.signal;
+}
+
 function buildToolContext(
   options: ControllerServerOptions,
   clientIdentity: ToolContext['identity'],
+  signal?: AbortSignal,
 ): ToolContext {
   return {
     db: options.db,
@@ -114,6 +129,7 @@ function buildToolContext(
     defaultQueuePolicy: options.defaultQueuePolicy,
     getHostCpuBusyFraction: options.getHostCpuBusyFraction,
     maxHostCpuBusyFraction: options.maxHostCpuBusyFraction,
+    signal,
   };
 }
 
@@ -125,7 +141,9 @@ async function handleMcpRequest(
   // Stateless mode: one server/transport pair per request keeps the loopback
   // endpoint simple; job state lives in SQLite, not in MCP sessions.
   const identity = identityFromHeaders(req, 'http', 'mcp-http');
-  const mcpServer = buildMcpServer(buildToolContext(options, identity));
+  const mcpServer = buildMcpServer(
+    buildToolContext(options, identity, abortOnDisconnect(req, res)),
+  );
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -187,7 +205,7 @@ async function handleInternalToolRequest(
   const identity = identityFromHeaders(req, 'stdio', 'mcp-stdio');
   try {
     const result = await handleToolCall(
-      buildToolContext(options, identity),
+      buildToolContext(options, identity, abortOnDisconnect(req, res)),
       def.name as McpToolName,
       args,
     );

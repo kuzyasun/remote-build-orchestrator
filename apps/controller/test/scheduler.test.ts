@@ -246,7 +246,12 @@ describe('Scheduler Engine (§19.2)', () => {
 
   it('handles queue_policy fallback table correctly', () => {
     const reqWait = makeRequest({ queue_policy: 'wait', requirements: { os: ['linux'] } });
-    expect(selectAgentForJob([], reqWait).action).toBe('wait');
+    const waitDecision = selectAgentForJob([], reqWait);
+    expect(waitDecision.action).toBe('wait');
+    expect(waitDecision.noMatchDiagnostic).toMatchObject({
+      category: 'no_matching_agent',
+      retryable: false,
+    });
 
     const reqFail = makeRequest({ queue_policy: 'fail_fast', requirements: { os: ['linux'] } });
     expect(selectAgentForJob([], reqFail).action).toBe('fail_fast');

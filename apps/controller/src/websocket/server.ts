@@ -142,19 +142,29 @@ export async function startAgentPlaneServer(
   const wss = new WebSocketServer({ server: httpsServer, path: '/agent' });
   const connectedAgents = new Map<string, ConnectedAgent>();
   const inFlightDispatches = new Set<Promise<void>>();
+  const drainableWork = new Set<Promise<void>>();
   let shuttingDown = false;
 
-  const trackDispatch = (work: Promise<void>, context: string): void => {
-    inFlightDispatches.add(work);
+  const trackWork = (work: Promise<void>, context: string, drainOnClose: boolean): void => {
+    const bucket = drainOnClose ? drainableWork : inFlightDispatches;
+    bucket.add(work);
     void work.then(
       () => {
-        inFlightDispatches.delete(work);
+        bucket.delete(work);
       },
       (error) => {
-        inFlightDispatches.delete(work);
+        bucket.delete(work);
         logger.error(`${context} failed`, { error: String(error) });
       },
     );
+  };
+
+  const trackDispatch = (work: Promise<void>, context: string): void => {
+    trackWork(work, context, false);
+  };
+
+  const trackDrainable = (work: Promise<void>, context: string): void => {
+    trackWork(work, context, true);
   };
 
   const recovery = new RecoveryCoordinator({
@@ -412,7 +422,7 @@ export async function startAgentPlaneServer(
             if (!authenticated) return;
             const payload = parsePayload(SourceNeedPayloadSchema, message.payload, message.type);
             if (!payload) return;
-            trackDispatch(
+            trackDrainable(
               handleRemoteSourceNeed(remoteOpts(), authenticated.agentId, payload),
               'remote source_need handling',
             );
@@ -439,7 +449,7 @@ export async function startAgentPlaneServer(
             if (!authenticated) return;
             const payload = parsePayload(LogChunkPayloadSchema, message.payload, message.type);
             if (!payload) return;
-            trackDispatch(
+            trackDrainable(
               enqueueRemoteLogChunk(remoteOpts(), authenticated.agentId, payload),
               'remote log_chunk handling',
             );
@@ -545,7 +555,7 @@ export async function startAgentPlaneServer(
           httpsServer.close(() => resolvePromise());
         });
       });
-      await Promise.allSettled(inFlightDispatches);
+      await Promise.allSettled(drainableWork);
     },
   };
 }
