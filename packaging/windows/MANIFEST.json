@@ -16,8 +16,8 @@
   "files": [
     {
       "path": "bin/rbo.js",
-      "sha256": "79539af94fa1e05d2d58248b6f20caa0173162365a061a3d385cdf719144e5a8",
-      "size_bytes": 704777,
+      "sha256": "315b25aa0acb3c8a95e5df6650b67adf2622c7559159000dbf8260f508782be9",
+      "size_bytes": 715330,
       "source": "apps/cli/dist/rbo.js"
     },
     {
@@ -28,8 +28,8 @@
     },
     {
       "path": "bin/rbo-windows-executor.exe",
-      "sha256": "010d4d11002345c11e7e7c6f859a2a72a8ad90b774540ce4d53c2db30108652a",
-      "size_bytes": 327680,
+      "sha256": "7e3c510a9a5c779c5050176b9a93f3896440edf72d4eabf421e9fe5037809296",
+      "size_bytes": 326656,
       "source": "native/windows-executor/target/release/rbo-windows-executor.exe"
     },
     {
