@@ -78,7 +78,7 @@ jobs:
 
       - name: Verify packaging manifests
         shell: bash
-        run: pnpm package:archives && git diff --exit-code -- packaging && pnpm package:verify
+        run: pnpm package:archives && node scripts/package-archives.mjs --check-committed && pnpm package:verify
 
       - name: Publish with npm Trusted Publishing
         run: pnpm release:publish --yes

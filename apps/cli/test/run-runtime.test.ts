@@ -640,8 +640,11 @@ describe('rbo run runtime', () => {
     [{ outcome: 'failed', exit_code: 256 }, 125],
     [{ outcome: 'failed', exit_code: 'bad' }, 125],
     [{ outcome: 'timed_out', exit_code: null }, 124],
+    [{ outcome: 'timed_out', exit_code: 0 }, 124],
     [{ outcome: 'failed', exit_code: null, failure_category: 'timeout' }, 124],
     [{ outcome: 'cancelled', exit_code: null }, 130],
+    [{ outcome: 'cancelled', exit_code: 0 }, 130],
+    [{ outcome: 'cancelled', exit_code: 1 }, 130],
     [{ outcome: 'failed', exit_code: null, failure_category: 'cancelled' }, 130],
     [{ outcome: 'failed', exit_code: null }, 1],
   ])('maps terminal result %# to exit status %i', (result, expected) => {

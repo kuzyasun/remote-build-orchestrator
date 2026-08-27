@@ -70,7 +70,7 @@ jobs:
       - name: Verify packaging manifests (Windows)
         if: ${{ matrix.package-verify }}
         shell: bash
-        run: pnpm package:archives && git diff --exit-code -- packaging && pnpm package:verify
+        run: pnpm package:archives && node scripts/package-archives.mjs --check-committed && pnpm package:verify
 
       - name: Report environment-gated checks (skipped)
         run: >-

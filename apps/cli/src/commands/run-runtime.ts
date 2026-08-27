@@ -285,8 +285,15 @@ export async function cancelAndAwaitJob(
   return false;
 }
 
-/** Map terminal Controller data to the documented CLI process status. */
+/**
+ * Map terminal Controller data to the documented CLI process status.
+ * Timeout and cancellation win over a child exit_code: a cancelled process may trap
+ * SIGTERM and exit 0, or Windows taskkill may yield a nonzero code, while the job
+ * outcome remains cancelled/timed_out.
+ */
 export function terminalExitCode(result: Record<string, unknown>): number {
+  if (result.outcome === 'timed_out' || result.failure_category === 'timeout') return 124;
+  if (isTerminalCancelled(result)) return 130;
   const remoteExit = result.exit_code;
   if (
     typeof remoteExit === 'number' &&
@@ -297,8 +304,6 @@ export function terminalExitCode(result: Record<string, unknown>): number {
     return remoteExit;
   }
   if (remoteExit !== null && remoteExit !== undefined) return 125;
-  if (result.outcome === 'timed_out' || result.failure_category === 'timeout') return 124;
-  if (isTerminalCancelled(result)) return 130;
   return result.outcome === 'succeeded' ? 0 : 1;
 }
 

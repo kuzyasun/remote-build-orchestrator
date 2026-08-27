@@ -23,8 +23,11 @@ runs on pull requests and pushes to `master` on both `ubuntu-latest` and `window
 uses the repository Node version from `.nvmrc`, installs pnpm 10.5.2, runs
 `pnpm install --frozen-lockfile`, and executes `pnpm build` followed by `pnpm verify`. The Windows
 job builds the native executor before `pnpm verify`, then regenerates packaging manifests with
-`pnpm package:archives`, fails if `packaging/` differs from git (`git diff --exit-code -- packaging`),
-and finally runs `pnpm package:verify`. Superseded runs for the same branch or pull request are cancelled.
+`pnpm package:archives`, fails if reproducible packaging files drifted from git
+(`node scripts/package-archives.mjs --check-committed`, which ignores MSVC-non-reproducible
+`rbo-windows-executor.exe` sha256/size), and finally runs `pnpm package:verify` against the
+refreshed manifests (including hashing the native executable built in that run). Superseded runs
+for the same branch or pull request are cancelled.
 
 This fast workflow intentionally skips Docker, QEMU, and large-log tests that require a separately
 provisioned environment. Those checks remain external, environment-gated evidence and must not be
@@ -159,6 +162,11 @@ pnpm package:verify     # re-check manifests (forbidden paths, required files, c
 
 If `package:verify` fails with `sha256 mismatch ... manifest is stale`, re-run
 `pnpm package:archives` after source/build changes.
+
+`pnpm package:archives` records the current `rbo-windows-executor.exe` hash and size when that
+binary is present. `pnpm package:verify` then hashes that same artifact against the refreshed
+manifest. Source CI does not git-gate those MSVC-non-reproducible fields; it runs
+`node scripts/package-archives.mjs --check-committed` instead of `git diff --exit-code -- packaging`.
 
 Confirm CLI bundles after a successful build:
 
