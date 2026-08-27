@@ -133,9 +133,8 @@ export async function runJobToTerminal(
   const initialJobId = jobIdFromResult(result);
   options.onJobId?.(initialJobId);
   interrupted(options.signal, initialJobId);
-  if (!needsResume(result)) return result;
 
-  if (options.follow) {
+  if (options.follow && result.state !== 'awaiting_confirmation') {
     try {
       await followJobLogsRemote(baseUrl, initialJobId, {
         onChunk: options.onChunk,
@@ -147,8 +146,11 @@ export async function runJobToTerminal(
       throw error;
     }
     interrupted(options.signal, initialJobId);
+    if (!needsResume(result)) return result;
     return requestJobRun(baseUrl, { job_id: initialJobId }, options.signal, initialJobId);
   }
+
+  if (!needsResume(result)) return result;
 
   while (needsResume(result)) {
     interrupted(options.signal, initialJobId);

@@ -413,7 +413,7 @@ export async function readJobLogsPage(logs: AttemptLogPaths, cursor: LogCursor, 
       positions,
     },
     returned,
-    hasMore: truncated || entries.length > 128,
+    hasMore: truncated || entries.length > 128 || blockedStreams.size > 0,
     truncated,
   };
 }

@@ -123,22 +123,33 @@ export async function recoverSnapshotPublications(
 
   let removedFiles = 0;
   let removedDirectories = 0;
+  let abortedForLease = false;
   async function recoverDirectory(directoryPath: string): Promise<void> {
+    if (abortedForLease) return;
     const entries = await listDirectory(directoryPath);
     if (!entries) return;
     for (const entry of entries) {
+      if (abortedForLease) return;
       const path = join(directoryPath, entry.name);
       if (entry.isDirectory()) {
         await recoverDirectory(path);
         continue;
       }
       if (!entry.isFile() || !isRecoverableSnapshotFile(entry.name)) continue;
+      if (hasActiveCaptureLease(options.db, new Date())) {
+        logger.info('snapshot publication recovery aborted for active capture lease');
+        abortedForLease = true;
+        return;
+      }
       const resolvedPath = resolve(path);
       const generation = generationForName(entry.name);
+      const live = referencedSnapshotPaths(options.db, snapshotsRoot);
       if (
         referenced.paths.has(resolvedPath) ||
+        live.paths.has(resolvedPath) ||
         (generation !== null &&
-          referenced.generations.has(generationKey(directoryPath, generation)))
+          (referenced.generations.has(generationKey(directoryPath, generation)) ||
+            live.generations.has(generationKey(directoryPath, generation))))
       ) {
         continue;
       }
@@ -147,13 +158,18 @@ export async function recoverSnapshotPublications(
     }
 
     const remaining = await listDirectory(directoryPath);
-    if (remaining?.length === 0 && directoryPath !== snapshotsRoot) {
+    if (!abortedForLease && remaining?.length === 0 && directoryPath !== snapshotsRoot) {
       await rm(directoryPath, { recursive: true, force: true });
       removedDirectories += 1;
     }
   }
   for (const directory of rootEntries) {
+    if (abortedForLease) break;
     if (directory.isDirectory()) await recoverDirectory(join(snapshotsRoot, directory.name));
+  }
+
+  if (abortedForLease) {
+    return { skippedForActiveLease: true, removedFiles, removedDirectories };
   }
 
   logger.info('snapshot publication recovery complete', { removedFiles, removedDirectories });

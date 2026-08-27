@@ -186,12 +186,18 @@ function canonicalOsForPlatform(platform: NodeJS.Platform): 'macos' | 'windows' 
   return 'linux';
 }
 
+function uniqueTargetOs(targetOs: JobRunInput['target_os']): string[] | undefined {
+  if (!targetOs?.length) return undefined;
+  return [...new Set(targetOs)];
+}
+
 function jobRunWrappingPlatform(
   input: JobRunInput,
   controllerPlatform: NodeJS.Platform,
 ): NodeJS.Platform {
-  if (input.shell === 'direct' || input.target_os?.length === 1) {
-    return directWrappingPlatform(input.target_os, controllerPlatform);
+  const uniqueOs = uniqueTargetOs(input.target_os);
+  if (input.shell === 'direct' || uniqueOs?.length === 1) {
+    return directWrappingPlatform(uniqueOs, controllerPlatform);
   }
   return controllerPlatform;
 }
@@ -204,12 +210,18 @@ export function buildJobRunRequest(
   if (!input.command || !input.project_root) {
     throw RboError.validation('job_run requires command and project_root unless job_id is set');
   }
+  const uniqueOs = uniqueTargetOs(input.target_os);
   if (
     input.shell === 'direct' &&
-    (input.target_os?.length !== 1 || !CANONICAL_TARGET_OS.has(input.target_os[0]))
+    (uniqueOs?.length !== 1 || !CANONICAL_TARGET_OS.has(uniqueOs[0]))
   ) {
     throw RboError.validation(
       'job_run shell=direct requires exactly one canonical target_os value',
+    );
+  }
+  if (!input.shell && uniqueOs && uniqueOs.length > 1) {
+    throw RboError.validation(
+      'job_run without shell requires a unique target_os (omit target_os or pass exactly one)',
     );
   }
   const timeoutSeconds = input.timeout_seconds ?? 3600;
@@ -226,7 +238,7 @@ export function buildJobRunRequest(
       jobRunWrappingPlatform(input, platform),
       input.shell,
     ),
-    requirements: { os: input.target_os ?? [canonicalOsForPlatform(platform)] },
+    requirements: { os: uniqueOs ?? [canonicalOsForPlatform(platform)] },
     queue_policy: input.queue_policy,
     risk_level: input.risk_level ?? 'normal',
     artifacts: input.artifacts ?? [],
@@ -342,12 +354,16 @@ async function buildDiagnosticExcerpt(
     try {
       for (const e of entries) {
         // Read only the newest bounded suffix of a large durable chunk.
-        const offset = Math.max(0, e.byte_length - Math.min(1024 * 1024, budget * 2));
+        const cap = Math.min(1024 * 1024, budget * 2);
+        let offset = Math.max(0, e.byte_length - cap);
+        // A bounded suffix can start mid CSI/OSC. If the whole chunk fits in 1 MiB,
+        // parse from a grounded start instead of skipping the only remaining entry.
+        if (offset > 0 && !state) {
+          if (e.byte_length > 1024 * 1024) continue;
+          offset = 0;
+        }
         const b = await readIndexedRange(logs, e, offset);
         if (!b || b.length === 0) continue;
-        // A bounded suffix can start mid CSI/OSC; without the prefix a fresh parser
-        // would leak that payload as text, so skip until this stream has a grounded state.
-        if (offset > 0 && !state) continue;
         const res = presentLogChunks([b], state, { maxBytes: 1024 * 1024, stripAnsi: true });
         state = res.state;
         if (res.data.length) {

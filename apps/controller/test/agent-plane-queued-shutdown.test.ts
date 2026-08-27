@@ -118,13 +118,15 @@ describe('agent-plane queued dispatch shutdown', () => {
       expect((await authenticatedConnection.connectOnce()).status).toBe('authenticated');
       await sourceRequirementsRead.promise;
 
+      const closeStartedAt = Date.now();
       const closePromise = plane.close();
-      gate.resolve();
       await closePromise;
+      expect(Date.now() - closeStartedAt).toBeLessThan(500);
 
       expect(queuedDispatch.remoteStart).not.toHaveBeenCalled();
       expect(queuedDispatch.localStart).not.toHaveBeenCalled();
       expect(getJob(db, job.id)?.state).toBe('queued');
+      gate.resolve();
       db.close();
     } finally {
       authenticatedConnection?.close();

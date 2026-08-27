@@ -74,11 +74,8 @@ jobs:
         run: pnpm release:pack
 
       - name: Verify packaging manifests
-        shell: pwsh
-        run: |
-          pnpm package:archives
-          git diff --exit-code -- packaging
-          pnpm package:verify
+        shell: bash
+        run: pnpm package:archives && git diff --exit-code -- packaging && pnpm package:verify
 
       - name: Publish with npm Trusted Publishing
         run: pnpm release:publish --yes

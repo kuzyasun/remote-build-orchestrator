@@ -158,7 +158,7 @@ async function flushFile(path: string): Promise<void> {
   }
 }
 
-/** Best-effort directory durability; directory handles are unsupported on some Windows builds. */
+/** Directory durability after no-replace `link`. Windows does not consistently expose directory fsync. */
 async function flushDirectory(path: string): Promise<void> {
   try {
     const handle = await open(path, 'r');
@@ -167,8 +167,9 @@ async function flushDirectory(path: string): Promise<void> {
     } finally {
       await handle.close();
     }
-  } catch {
-    // The file publication remains atomic; Windows does not consistently expose directory fsync.
+  } catch (error) {
+    if (process.platform === 'win32') return;
+    throw error;
   }
 }
 

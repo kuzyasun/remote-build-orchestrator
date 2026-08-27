@@ -69,10 +69,8 @@ jobs:
 
       - name: Verify packaging manifests (Windows)
         if: ${{ matrix.package-verify }}
-        run: |
-          pnpm package:archives
-          git diff --exit-code -- packaging
-          pnpm package:verify
+        shell: bash
+        run: pnpm package:archives && git diff --exit-code -- packaging && pnpm package:verify
 
       - name: Report environment-gated checks (skipped)
         run: >-

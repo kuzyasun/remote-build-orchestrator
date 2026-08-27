@@ -90,6 +90,7 @@ describe('waitForJob event-driven lifecycle', () => {
   it('wakes all waiters on one committed transition without polling delay', async () => {
     const { db, job, notifier } = setup();
     const context = makeContext(db);
+    const startedAt = Date.now();
     const first = waitForJob(context, job.id, 2);
     const second = waitForJob(context, job.id, 2);
 
@@ -100,6 +101,7 @@ describe('waitForJob event-driven lifecycle', () => {
     const [firstResult, secondResult] = await Promise.all([first, second]);
     expect((firstResult.job as { state: string }).state).toBe('completed');
     expect((secondResult.job as { state: string }).state).toBe('completed');
+    expect(Date.now() - startedAt).toBeLessThan(500);
     expect(notifier.listenerCount()).toBe(0);
   });
 
@@ -162,12 +164,14 @@ describe('waitForJob event-driven lifecycle', () => {
 
   it('wakes waiters when the notifier closes', async () => {
     const { db, job, notifier } = setup();
+    const startedAt = Date.now();
     const waiting = waitForJob(makeContext(db), job.id, 2);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(notifier.listenerCount(job.id)).toBe(1);
     notifier.close();
     const result = await waiting;
     expect((result.job as { state: string }).state).toBe('running');
+    expect(Date.now() - startedAt).toBeLessThan(500);
     expect(notifier.listenerCount()).toBe(0);
   });
 });

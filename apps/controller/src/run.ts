@@ -112,9 +112,9 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     logger.info('controller shutting down');
     if (snapshotRecoveryTimer) clearTimeout(snapshotRecoveryTimer);
     hostCpuMonitor.stop();
+    lifecycleNotifier.close();
     await httpServer.close();
     await agentPlane.close();
-    lifecycleNotifier.close();
     unbindJobLifecycleNotifier(db);
     db.close();
     process.exit(0);

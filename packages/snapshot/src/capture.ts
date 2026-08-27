@@ -248,7 +248,14 @@ function throwIfSecretViolations(violations: SecretPolicyViolation[]): void {
 
 function archiveCaptureError(error: unknown): RboError {
   const message = error instanceof Error ? error.message : String(error);
-  if (message.includes('Source file changed while archiving')) {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (
+    message.includes('Source file changed while archiving') ||
+    message.includes('Source path is not a regular file') ||
+    code === 'ENOENT' ||
+    code === 'ELOOP' ||
+    code === 'ENOTDIR'
+  ) {
     return new RboError('workspace_changed', message, true, {
       reason: 'file_identity_changed',
     });

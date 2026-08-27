@@ -19,6 +19,18 @@ async function pidAlive(pid: number): Promise<boolean> {
   }
 }
 
+async function waitForPidExit(pid: number, timeoutMs: number, diagnostic: string): Promise<void> {
+  const startedAt = Date.now();
+  while (await pidAlive(pid)) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(
+        `Process ${pid} remained alive after ${Date.now() - startedAt}ms; ${diagnostic}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 describe('process containment (§15.2)', () => {
   // PLATFORM-GAP: Unix process-group kill requires POSIX setsid/SIGTERM semantics — verify on a Unix/macOS runner
   it.skipIf(process.platform === 'win32')(
@@ -335,6 +347,7 @@ exit 7
       const controlDir = join(workspace, 'control');
       const logs = await ensureAttemptLogs(join(workspace, 'logs'));
       const pidFile = join(workspace, 'grandchild.pid');
+      let grandchildPid: number | undefined;
       try {
         const script = `$ErrorActionPreference = 'Stop'
 $p = Start-Process -FilePath ping -ArgumentList '-n','120','127.0.0.1' -PassThru -WindowStyle Hidden
@@ -367,15 +380,24 @@ Wait-Process -Id $p.Id
             await new Promise((r) => setTimeout(r, 100));
           }
         }
-        const grandchildPid = Number.parseInt((await readFile(pidFile, 'utf8')).trim(), 10);
+        grandchildPid = Number.parseInt((await readFile(pidFile, 'utf8')).trim(), 10);
         expect(Number.isFinite(grandchildPid)).toBe(true);
 
         await child.kill(1);
         await child.waitForExit();
-        await new Promise((r) => setTimeout(r, 500));
+        await waitForPidExit(
+          grandchildPid,
+          5_000,
+          `backend=Windows Job Object helper (${helper.detail})`,
+        );
         expect(await pidAlive(child.pid)).toBe(false);
         expect(await pidAlive(grandchildPid)).toBe(false);
       } finally {
+        if (grandchildPid !== undefined) {
+          await execFileAsync('taskkill', ['/F', '/PID', String(grandchildPid)], {
+            windowsHide: true,
+          }).catch(() => undefined);
+        }
         await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
       }
     },

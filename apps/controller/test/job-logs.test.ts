@@ -165,9 +165,10 @@ describe('Controller job_logs contract and durable paging', () => {
       job_id: jobId,
       attempt_id: attemptId,
       mode: 'logs',
-      max_bytes: 4,
+      max_bytes: 64,
     });
     expect(first).not.toHaveProperty('error');
+    expect(first.has_more).toBe(true);
     const cursor = first.next_cursor as string;
     expect(cursor.length).toBeLessThanOrEqual(512);
     expect((first.chunks as Array<{ sequence: number }>).map((chunk) => chunk.sequence)).toEqual([
@@ -213,6 +214,29 @@ describe('Controller job_logs contract and durable paging', () => {
         })
       ).error,
     ).toBeTruthy();
+  });
+
+  it('reconstructs a split UTF-8 scalar using has_more as the only resume signal', async () => {
+    const scalar = Buffer.from('Ж');
+    await append('stdout', Buffer.concat([Buffer.from('a'), scalar.subarray(0, 1)]), 1);
+    await append('stdout', Buffer.concat([scalar.subarray(1), Buffer.from('b')]), 2);
+    const received: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 8; page += 1) {
+      const result = await handleToolCall(ctx, 'job_logs', {
+        job_id: jobId,
+        attempt_id: attemptId,
+        mode: 'logs',
+        cursor,
+        max_bytes: 64,
+      });
+      expect(result).not.toHaveProperty('error');
+      received.push(...(result.chunks as Array<{ text: string }>).map((chunk) => chunk.text));
+      if (!result.has_more) break;
+      expect(result.next_cursor).toEqual(expect.any(String));
+      cursor = result.next_cursor as string;
+    }
+    expect(received.join('')).toBe('aЖb');
   });
 
   it('does not replay or livelock a split scalar when another stream intervenes', async () => {

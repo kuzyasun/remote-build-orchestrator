@@ -159,6 +159,98 @@ describe('rbo run runtime', () => {
     });
   });
 
+  it('follows SSE even when the first job_run is already terminal', async () => {
+    const jobRunRequests: unknown[] = [];
+    const output: Array<{ stream: string; text: string }> = [];
+    const baseUrl = await listen(
+      createServer(async (req, res) => {
+        if (req.url === '/internal/v1/tools/job_run') {
+          jobRunRequests.push(await readJson(req));
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              job_id: 'job_follow_done',
+              state: 'completed',
+              outcome: 'succeeded',
+              exit_code: 0,
+            }),
+          );
+          return;
+        }
+        if (!req.url?.startsWith('/internal/v1/jobs/job_follow_done/logs/stream')) {
+          res.writeHead(404).end();
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(
+          [
+            'event: log\nid: 1\ndata: {"sequence":1,"stream":"stdout","text":"hello"}\n\n',
+            'event: done\ndata: {"state":"completed","last_sequence":1}\n\n',
+          ].join(''),
+        );
+      }),
+    );
+
+    const result = await runJobToTerminal(
+      baseUrl,
+      { command: "printf 'hello\\n'", project_root: '/work/project', cwd: '.' },
+      {
+        follow: true,
+        pollMs: 1,
+        onChunk: (stream, text) => output.push({ stream, text }),
+      },
+    );
+
+    expect(output).toEqual([{ stream: 'stdout', text: 'hello' }]);
+    expect(jobRunRequests).toEqual([
+      { command: "printf 'hello\\n'", project_root: '/work/project', cwd: '.' },
+    ]);
+    expect(result).toEqual({
+      job_id: 'job_follow_done',
+      state: 'completed',
+      outcome: 'succeeded',
+      exit_code: 0,
+    });
+  });
+
+  it('does not open SSE follow before a confirmation prompt', async () => {
+    let streamHits = 0;
+    const baseUrl = await listen(
+      createServer(async (req, res) => {
+        if (req.url?.includes('/logs/stream')) {
+          streamHits += 1;
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'No attempt found for job' } }));
+          return;
+        }
+        await readJson(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            job_id: 'job_follow_confirm',
+            state: 'awaiting_confirmation',
+            confirmation_token: 'short-lived-token',
+            snapshot_id: 'snp_1',
+            resume: false,
+          }),
+        );
+      }),
+    );
+
+    const result = await runJobToTerminal(
+      baseUrl,
+      { command: 'dangerous', project_root: '/work/project', cwd: '.' },
+      { follow: true, pollMs: 1 },
+    );
+
+    expect(streamHits).toBe(0);
+    expect(result).toMatchObject({
+      job_id: 'job_follow_confirm',
+      state: 'awaiting_confirmation',
+      resume: false,
+    });
+  });
+
   it('prints confirmation snapshot and warnings to stderr then confirms only from a TTY', async () => {
     const requests: Array<{ path: string; body: unknown }> = [];
     const baseUrl = await listen(

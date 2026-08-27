@@ -183,6 +183,21 @@ describe('buildJobRunRequest', () => {
     expect(windowsTarget.requirements).toEqual({ os: ['windows'] });
   });
 
+  it('rejects omitted shell when target_os is not a unique canonical OS', () => {
+    expect(() =>
+      buildJobRunRequest(
+        { command: 'echo hi', project_root: '/tmp/app', target_os: ['linux', 'macos'] },
+        'win32',
+      ),
+    ).toThrow(/without shell requires a unique target_os/);
+    const duplicates = buildJobRunRequest(
+      { command: 'echo hi', project_root: '/tmp/app', target_os: ['linux', 'linux'] },
+      'win32',
+    );
+    expect(duplicates.execution.shell).toBe('bash');
+    expect(duplicates.requirements).toEqual({ os: ['linux'] });
+  });
+
   it.each(['local_fallback', 'wait', 'fail_fast'] as const)(
     'maps explicit queue_policy=%s into the canonical request',
     (queue_policy) => {
@@ -632,6 +647,32 @@ describe('handleJobRun responses', () => {
     expect(pagination.readIndexedRange).toHaveBeenCalledTimes(1);
     expect(res).toMatchObject({ artifact_count: 2, artifacts_truncated: true });
     expect(JSON.stringify(res).length).toBeLessThan(1024);
+  });
+
+  it('keeps a diagnostic excerpt from a single chunk larger than twice max_output_bytes', async () => {
+    const payload = Buffer.concat([Buffer.alloc(40, 0x61), Buffer.from('SENTINEL')]);
+    const jobRow = { state: 'failed', outcome: 'failed', exit_code: 1 };
+    vi.mocked(submit.waitForJob).mockResolvedValue({ job: jobRow });
+    vi.mocked(lifecycle.getLatestAttempt).mockReturnValue({
+      id: 'att-1',
+    } as unknown as lifecycle.AttemptRow);
+    vi.mocked(submit.handleJobArtifacts).mockReturnValue({ artifacts: [] });
+    vi.mocked(executor.readChunkIndexTail).mockResolvedValue([
+      { stream: 'stderr', byte_length: payload.length, sequence: 1, byte_offset: 0 },
+    ]);
+    vi.mocked(pagination.readIndexedRange).mockImplementation(async (_logs, _entry, offset = 0) =>
+      payload.subarray(offset),
+    );
+    vi.mocked(executor.presentLogChunks).mockImplementation(([bytes]) => ({
+      data: bytes,
+      state: {} as executor.LogPresentationState,
+      consumedRawBytes: bytes.length,
+      scannedRawBytes: bytes.length,
+      truncated: false,
+    }));
+
+    const res = await handleJobRun(testCtx, { job_id: 'job-1', max_output_bytes: 8 });
+    expect(res.diagnostic_excerpt).toBe('SENTINEL');
   });
 
   it('Caps successful artifact metadata to the compact response budget', async () => {
