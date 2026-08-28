@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-28
+
 ### Added
 
 - Bounded MCP log presentation for `job_run` and `job_logs`, with a default 16 KiB `job_run` output
@@ -65,6 +67,7 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.7.0
 [0.6.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.2
 [0.6.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.0
