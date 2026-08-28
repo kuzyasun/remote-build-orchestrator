@@ -64,6 +64,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build Windows native executor
+        run: cargo build --release --manifest-path native/windows-executor/Cargo.toml
+
       - name: Verify source
         run: pnpm verify
 
@@ -74,11 +77,8 @@ jobs:
         run: pnpm release:pack
 
       - name: Verify packaging manifests
-        shell: pwsh
-        run: |
-          pnpm package:archives
-          git diff --exit-code -- packaging
-          pnpm package:verify
+        shell: bash
+        run: pnpm package:archives && node scripts/package-archives.mjs --check-committed && pnpm package:verify
 
       - name: Publish with npm Trusted Publishing
         run: pnpm release:publish --yes

@@ -50,8 +50,12 @@ async function runGit(
       encoding: encoding === 'buffer' ? undefined : encoding,
     })) as { stdout: string | Buffer; stderr: string };
   } catch (error) {
-    const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
-    const message = err.stderr?.trim() || err.message;
+    const err = error as NodeJS.ErrnoException & {
+      stdout?: string | Buffer;
+      stderr?: string | Buffer;
+    };
+    const stderr = err.stderr ? String(err.stderr).trim() : '';
+    const message = stderr || err.message;
     throw new Error(`git ${args.join(' ')} failed: ${message}`);
   }
 }

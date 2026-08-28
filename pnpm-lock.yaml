@@ -102,7 +102,7 @@ importers:
         version: 5.9.3
     optionalDependencies:
       '@gemslibe/rbo-windows-executor-win32-x64':
-        specifier: workspace:0.6.2
+        specifier: workspace:0.7.0
         version: link:../../packages/rbo-windows-executor-win32-x64
 
   apps/controller:

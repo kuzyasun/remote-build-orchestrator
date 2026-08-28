@@ -1,6 +1,6 @@
 {
   "name": "@gemslibe/rbo-windows-executor-win32-x64",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Windows x64 Job Object process-isolation helper for @gemslibe/rbo.",
   "keywords": [
     "rbo",
@@ -29,7 +29,7 @@
   "os": ["win32"],
   "cpu": ["x64"],
   "engines": {
-    "node": ">=22.14"
+    "node": ">=24.0"
   },
   "files": [
     "bin",

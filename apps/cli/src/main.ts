@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline/promises';
 import {
   RBO_CONTROLLER_VERSION,
   resolveAgentStateDir,
@@ -34,6 +35,16 @@ import {
   submitJobRemote,
 } from './commands/jobs.js';
 import {
+  RunInterruptedError,
+  cancelAndAwaitJob,
+  runJobWithLifecycle,
+  runLifecycleErrorExitCode,
+  takeRunFollowFlag,
+  terminalExitCode,
+  writeRunResult,
+} from './commands/run-runtime.js';
+import { parseRunCommandArgs, takeRunJsonFlag } from './commands/run.js';
+import {
   type ServiceAction,
   detectPlatform,
   executeServicePlan,
@@ -48,6 +59,18 @@ function defaultControllerUrl(): string {
 
 function printPlan(action: string, plan: Parameters<typeof formatDryRunPlan>[1]): void {
   console.log(formatDryRunPlan(action, plan));
+}
+
+async function confirmOnTerminal(
+  prompt: string,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  const terminal = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return /^(y|yes)$/i.test((await terminal.question(prompt, { signal })).trim());
+  } finally {
+    terminal.close();
+  }
 }
 
 const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'status', 'stop']);
@@ -227,6 +250,85 @@ async function main(): Promise<void> {
       return;
     }
 
+    case 'run': {
+      const { follow, args: withoutFollow } = takeRunFollowFlag(rest);
+      const { json, args } = takeRunJsonFlag(withoutFollow);
+      if (json && follow) {
+        throw new Error('rbo run --json cannot be combined with --follow.');
+      }
+      const { request } = parseRunCommandArgs(args);
+      const interruption = new AbortController();
+      let jobId: string | null = null;
+      let interruptCount = 0;
+      const onInterrupt = () => {
+        interruptCount += 1;
+        if (interruptCount === 1) {
+          process.stderr.write(
+            jobId
+              ? 'Interrupt received; requesting job cancellation.\n'
+              : 'Interrupt received; waiting for a job ID so cancellation can be requested.\n',
+          );
+          interruption.abort();
+        } else {
+          process.stderr.write(
+            jobId
+              ? `Forcing exit; cancellation was already requested for job ${jobId}.\n`
+              : 'Forcing exit before a job ID was available.\n',
+          );
+          process.exit(130);
+        }
+      };
+      process.on('SIGINT', onInterrupt);
+      try {
+        const result = await runJobWithLifecycle(controllerUrl, request, {
+          follow,
+          signal: interruption.signal,
+          onJobId: (id) => {
+            jobId = id;
+          },
+          io: {
+            isTTY: process.stdin.isTTY === true,
+            writeStderr: (text) => process.stderr.write(text),
+            confirm: confirmOnTerminal,
+          },
+        });
+        writeRunResult(result, {
+          json,
+          writeStdout: (text) => process.stdout.write(text),
+          writeStderr: (text) => process.stderr.write(text),
+        });
+        process.exitCode = terminalExitCode(result);
+      } catch (error) {
+        if (error instanceof RunInterruptedError) {
+          const interruptedJobId = error.jobId ?? jobId;
+          if (interruptedJobId) {
+            await cancelAndAwaitJob(controllerUrl, interruptedJobId, {
+              writeStderr: (text) => process.stderr.write(text),
+            });
+          } else {
+            process.stderr.write(
+              'No job ID was received; no cancellation request could be sent.\n',
+            );
+          }
+          process.exitCode = 130;
+          return;
+        }
+        const lifecycleExit = runLifecycleErrorExitCode(error);
+        if (lifecycleExit !== null) {
+          process.stderr.write(`${error.message}\n`);
+          process.exitCode = lifecycleExit;
+          return;
+        }
+        // A parsed request has already passed the Controller-owned protocol boundary. Remaining
+        // runtime errors are Controller, transport, or malformed-response failures.
+        process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        process.exitCode = 125;
+      } finally {
+        process.off('SIGINT', onInterrupt);
+      }
+      return;
+    }
+
     case 'logs': {
       const jobId = rest[0];
       if (!jobId) {
@@ -237,21 +339,42 @@ async function main(): Promise<void> {
         await followJobLogsRemote(controllerUrl, jobId);
         return;
       }
-      // Pull historical stdout/stderr as terminal text (not events JSON).
-      let cursor = 0;
+      // Pull historical stdout/stderr using the opaque, attempt-scoped MCP cursor.
+      let cursor: string | null = null;
       for (;;) {
         const result = await getJobLogsRemote(controllerUrl, jobId, {
-          streams: ['stdout', 'stderr'],
+          mode: 'logs',
           cursor,
           max_bytes: 65_536,
         });
-        const data = typeof result.data === 'string' ? result.data : '';
-        if (data.length > 0) {
-          process.stdout.write(data);
+        if (result.mode !== 'logs' || !Array.isArray(result.chunks)) {
+          throw new Error('Malformed job_logs response: expected mode=logs and chunks[]');
         }
-        const next = typeof result.next_cursor === 'number' ? result.next_cursor : cursor;
-        if (next <= cursor || data.length === 0) {
+        for (const chunk of result.chunks) {
+          if (
+            !chunk ||
+            typeof chunk !== 'object' ||
+            typeof (chunk as { sequence?: unknown }).sequence !== 'number' ||
+            ((chunk as { stream?: unknown }).stream !== 'stdout' &&
+              (chunk as { stream?: unknown }).stream !== 'stderr') ||
+            typeof (chunk as { text?: unknown }).text !== 'string' ||
+            typeof (chunk as { complete?: unknown }).complete !== 'boolean'
+          ) {
+            throw new Error('Malformed job_logs response: invalid log chunk');
+          }
+          const stream = (chunk as { stream: 'stdout' | 'stderr' }).stream;
+          const text = (chunk as { text: string }).text;
+          (stream === 'stderr' ? process.stderr : process.stdout).write(text);
+        }
+        const next = result.next_cursor;
+        if (next !== null && typeof next !== 'string') {
+          throw new Error('Malformed job_logs response: next_cursor must be string or null');
+        }
+        if (result.has_more !== true) {
           break;
+        }
+        if (next === cursor) {
+          throw new Error('job_logs made no cursor progress while has_more=true');
         }
         cursor = next;
       }

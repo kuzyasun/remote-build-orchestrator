@@ -6,6 +6,15 @@ import {
 } from '@rbo/shared';
 import { type ControllerConfig, ensureDataDir, loadControllerConfig } from './config.js';
 import { startControllerServer } from './http/server.js';
+import {
+  JobLifecycleNotifier,
+  bindJobLifecycleNotifier,
+  unbindJobLifecycleNotifier,
+} from './jobs/lifecycle-notifier.js';
+import {
+  recoverSnapshotPublications,
+  snapshotRecoveryRetryDelayMs,
+} from './recovery/snapshot-publication.js';
 import { migrateToLatest, openDatabase } from './storage/database.js';
 import { startAgentPlaneServer } from './websocket/server.js';
 
@@ -24,6 +33,21 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
 
   const db = openDatabase(config.databasePath);
   migrateToLatest(db);
+  let snapshotRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  const recoverSnapshots = async (): Promise<void> => {
+    const result = await recoverSnapshotPublications({ db, dataDir: config.dataDir });
+    if (!result.skippedForActiveLease) return;
+    const delay = snapshotRecoveryRetryDelayMs(db) ?? 50;
+    snapshotRecoveryTimer = setTimeout(() => {
+      void recoverSnapshots().catch((error) => {
+        logger.error('snapshot publication recovery retry failed', { error: String(error) });
+      });
+    }, delay);
+    snapshotRecoveryTimer.unref?.();
+  };
+  await recoverSnapshots();
+  const lifecycleNotifier = new JobLifecycleNotifier();
+  bindJobLifecycleNotifier(db, lifecycleNotifier);
 
   const identity = await ensureControllerIdentity(config.dataDir);
 
@@ -48,6 +72,7 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
       allowedArtifactDestinations: config.allowedArtifactDestinations,
       maxConcurrentJobs: config.localExecutor.maxConcurrentJobs,
       gitAllowlist: config.gitAllowlist,
+      snapshotCaptureLimits: config.snapshotCaptureLimits,
       allowLocalFallback: config.allowLocalFallback,
       defaultQueuePolicy: config.defaultQueuePolicy,
       getHostCpuBusyFraction,
@@ -71,6 +96,7 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     gitAllowlist: config.gitAllowlist,
     allowLocalFallback: config.allowLocalFallback,
     allowFullSnapshotFallback: config.allowFullSnapshotFallback,
+    snapshotCaptureLimits: config.snapshotCaptureLimits,
     defaultQueuePolicy: config.defaultQueuePolicy,
     getHostCpuBusyFraction,
     maxHostCpuBusyFraction: config.maxHostCpuBusyFraction,
@@ -86,9 +112,12 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
 
   const shutdown = async () => {
     logger.info('controller shutting down');
+    if (snapshotRecoveryTimer) clearTimeout(snapshotRecoveryTimer);
     hostCpuMonitor.stop();
+    lifecycleNotifier.close();
     await httpServer.close();
     await agentPlane.close();
+    unbindJobLifecycleNotifier(db);
     db.close();
     process.exit(0);
   };

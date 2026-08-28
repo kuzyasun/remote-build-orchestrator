@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { ensureAttemptLogs } from '../src/logs.js';
 import { spawnJobScript, writeJobScript } from '../src/script.js';
+import { describeWindowsExecutorResolution } from '../src/windows-executor-path.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -15,6 +16,18 @@ async function pidAlive(pid: number): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number, diagnostic: string): Promise<void> {
+  const startedAt = Date.now();
+  while (await pidAlive(pid)) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(
+        `Process ${pid} remained alive after ${Date.now() - startedAt}ms; ${diagnostic}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
 
@@ -323,4 +336,71 @@ exit 7
       await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     }
   }, 30_000);
+
+  it.skipIf(process.platform !== 'win32')(
+    'cancel kills child and grandchild on Windows via the Job Object helper',
+    async () => {
+      const helper = describeWindowsExecutorResolution();
+      expect(helper.path, helper.detail).not.toBeNull();
+
+      const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-cancel-win-'));
+      const controlDir = join(workspace, 'control');
+      const logs = await ensureAttemptLogs(join(workspace, 'logs'));
+      const pidFile = join(workspace, 'grandchild.pid');
+      let grandchildPid: number | undefined;
+      try {
+        const script = `$ErrorActionPreference = 'Stop'
+$p = Start-Process -FilePath ping -ArgumentList '-n','120','127.0.0.1' -PassThru -WindowStyle Hidden
+Set-Content -LiteralPath '${pidFile.replace(/'/g, "''")}' -Value $p.Id
+Wait-Process -Id $p.Id
+`;
+        const execution = {
+          shell: 'powershell' as const,
+          script,
+          timeout_seconds: 120,
+          cancel_grace_seconds: 2,
+        };
+        await writeJobScript(controlDir, execution);
+        const child = spawnJobScript({
+          attemptId: 'att_win_cancel',
+          controlDir,
+          workspacePath: workspace,
+          projectPath: workspace,
+          execution,
+          env: {},
+          logs,
+        });
+
+        const deadline = Date.now() + 8_000;
+        while (Date.now() < deadline) {
+          try {
+            await readFile(pidFile, 'utf8');
+            break;
+          } catch {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+        }
+        grandchildPid = Number.parseInt((await readFile(pidFile, 'utf8')).trim(), 10);
+        expect(Number.isFinite(grandchildPid)).toBe(true);
+
+        await child.kill(1);
+        await child.waitForExit();
+        await waitForPidExit(
+          grandchildPid,
+          5_000,
+          `backend=Windows Job Object helper (${helper.detail})`,
+        );
+        expect(await pidAlive(child.pid)).toBe(false);
+        expect(await pidAlive(grandchildPid)).toBe(false);
+      } finally {
+        if (grandchildPid !== undefined) {
+          await execFileAsync('taskkill', ['/F', '/PID', String(grandchildPid)], {
+            windowsHide: true,
+          }).catch(() => undefined);
+        }
+        await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      }
+    },
+    30_000,
+  );
 });

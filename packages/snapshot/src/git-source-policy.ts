@@ -82,7 +82,12 @@ export async function gitSubmoduleStatus(repoRoot: string): Promise<SubmoduleSta
     const { stdout } = await runGit(repoRoot, ['submodule', 'status', '--recursive']);
     return parseSubmoduleStatus(stdout);
   } catch {
-    return [];
+    throw new RboError(
+      'materialization',
+      'Unable to inspect submodule status. Retry the snapshot capture.',
+      true,
+      { reason: 'submodule_status_failed' },
+    );
   }
 }
 

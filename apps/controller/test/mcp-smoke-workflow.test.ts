@@ -142,31 +142,34 @@ describe('MCP smoke workflow harness', () => {
 
   it('cancels a long-running job over HTTP', async () => {
     const client = await connectHttpClient('phase8-http-cancel');
-    const request = longRunningCancelJobRequest(fixtureDir);
-    const submit = JSON.parse(
-      textOf(await client.callTool({ name: 'job_submit', arguments: request })),
-    );
-    expect(submit.job_id).toBeTruthy();
-    const cancel = JSON.parse(
-      textOf(
-        await client.callTool({
-          name: 'job_cancel',
-          arguments: { job_id: submit.job_id, reason: 'phase8-smoke' },
-        }),
-      ),
-    );
-    expect(cancel.cancel_requested).toBe(true);
-    const waited = JSON.parse(
-      textOf(
-        await client.callTool({
-          name: 'job_wait',
-          arguments: { job_id: submit.job_id, wait_seconds: 60 },
-        }),
-      ),
-    );
-    expect(waited.job.state).toBe('completed');
-    expect(waited.job.outcome).toBe('cancelled');
-    await client.close();
+    try {
+      const request = longRunningCancelJobRequest(fixtureDir);
+      const submit = JSON.parse(
+        textOf(await client.callTool({ name: 'job_submit', arguments: request })),
+      );
+      expect(submit.job_id, `job_submit response: ${JSON.stringify(submit)}`).toBeTruthy();
+      const cancel = JSON.parse(
+        textOf(
+          await client.callTool({
+            name: 'job_cancel',
+            arguments: { job_id: submit.job_id, reason: 'phase8-smoke' },
+          }),
+        ),
+      );
+      expect(cancel.cancel_requested).toBe(true);
+      const waited = JSON.parse(
+        textOf(
+          await client.callTool({
+            name: 'job_wait',
+            arguments: { job_id: submit.job_id, wait_seconds: 60 },
+          }),
+        ),
+      );
+      expect(waited.job.state).toBe('completed');
+      expect(waited.job.outcome).toBe('cancelled');
+    } finally {
+      await client.close();
+    }
   }, 120_000);
 
   it('rejects malformed job_submit input on both transports via shared Zod', async () => {

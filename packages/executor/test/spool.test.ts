@@ -148,4 +148,40 @@ describe('AttemptSpool', () => {
     expect(next.sequence).toBe(2);
     expect(await readAck(spool)).toBe(1);
   });
+
+  it('recovers after truncated index tail and preserves unindexed stream tail offsets', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-recover-tail-'));
+    await writeFile(join(spoolDir, 'stdout.log'), 'indexed-orphan');
+    await writeFile(join(spoolDir, 'stderr.log'), '');
+    await writeFile(join(spoolDir, 'events.jsonl'), '');
+    await writeFile(
+      join(spoolDir, 'chunks.jsonl'),
+      `${JSON.stringify({ sequence: 4, stream: 'stdout', byte_offset: 0, byte_length: 7 })}\n{"sequence":5,"stream":"stdout"`,
+    );
+
+    const spool = await openAttemptSpool(spoolDir);
+    expect(spool.nextSequence).toBe(5);
+    expect(spool.streamOffsets.stdout).toBe(14);
+    await appendChunk(spool, 'stdout', 'tail');
+
+    const stdout = await readFile(join(spoolDir, 'stdout.log'), 'utf8');
+    expect(stdout).toBe('indexed-orphan' + 'tail');
+    const chunks = [];
+    for await (const chunk of iterUnacked(spool, 4)) chunks.push(chunk);
+    expect(chunks).toEqual([{ sequence: 5, stream: 'stdout', bytes: 'tail' }]);
+  });
+
+  it('rejects index records whose offset plus length overflows safe integers', async () => {
+    spoolDir = await mkdtemp(join(tmpdir(), 'rbo-spool-overflow-'));
+    await writeFile(join(spoolDir, 'stdout.log'), 'x');
+    await writeFile(join(spoolDir, 'stderr.log'), '');
+    await writeFile(join(spoolDir, 'events.jsonl'), '');
+    await writeFile(
+      join(spoolDir, 'chunks.jsonl'),
+      `${JSON.stringify({ sequence: 1, stream: 'stdout', byte_offset: Number.MAX_SAFE_INTEGER, byte_length: 1 })}\n`,
+    );
+    const spool = await openAttemptSpool(spoolDir);
+    expect(spool.nextSequence).toBe(1);
+    expect(spool.streamOffsets.stdout).toBe(1);
+  });
 });

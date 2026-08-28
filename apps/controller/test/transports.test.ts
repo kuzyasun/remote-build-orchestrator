@@ -1,18 +1,28 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { appendIndexedLogChunk, ensureAttemptLogs } from '@rbo/executor';
 import { MCP_TOOL_DEFS } from '@rbo/protocol';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { ensureControllerIdentity, generateDeviceKeyPair } from '@rbo/shared';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createStdioProxyServer } from '../../mcp-stdio/src/proxy.js';
+import { attemptLogDir } from '../src/execution/runner.js';
 import { startControllerServer } from '../src/http/server.js';
 import type { RunningControllerServer } from '../src/http/server.js';
+import { createJob, getJob } from '../src/jobs/lifecycle.js';
+import type { ControllerDatabase } from '../src/storage/database.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 
 let running: RunningControllerServer;
+let db: ControllerDatabase;
 
 beforeAll(async () => {
-  const db = openDatabase(':memory:');
+  db = openDatabase(':memory:');
   migrateToLatest(db);
+  const keys = generateDeviceKeyPair();
   running = await startControllerServer({
     // These fixtures use local repos with no allowlisted remote, so overlay
     // capture is impossible; opt in to the full-snapshot path explicitly.
@@ -20,6 +30,14 @@ beforeAll(async () => {
     host: '127.0.0.1',
     port: 0,
     db,
+    identity: {
+      controllerId: 'controller_transport_test',
+      tlsCertPem: '',
+      tlsKeyPem: '',
+      signingPublicKeyPem: keys.publicKeyPem,
+      signingPrivateKeyPem: keys.privateKeyPem,
+      fingerprint: 'sha256:transport-test',
+    },
   });
 });
 
@@ -36,20 +54,20 @@ function textOf(result: unknown): string {
   return first.text;
 }
 
-async function connectHttpClient(): Promise<Client> {
+async function connectHttpClient(server = running): Promise<Client> {
   const client = new Client({ name: 'test-http-client', version: '0.0.1' });
   const transport = new StreamableHTTPClientTransport(
-    new URL(`http://127.0.0.1:${running.port}/mcp`),
+    new URL(`http://127.0.0.1:${server.port}/mcp`),
   );
   await client.connect(transport);
   return client;
 }
 
-async function connectStdioStyleClient(): Promise<Client> {
+async function connectStdioStyleClient(server = running): Promise<Client> {
   // The stdio adapter's MCP server logic, wired over an in-memory pair —
   // identical code path to `rbo mcp-stdio` minus the OS pipe.
   const proxy = createStdioProxyServer({
-    controllerUrl: `http://127.0.0.1:${running.port}`,
+    controllerUrl: `http://127.0.0.1:${server.port}`,
     clientId: 'test-stdio-client',
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -94,6 +112,61 @@ describe('MCP transports', () => {
 
     await httpClient.close();
     await stdioClient.close();
+  });
+
+  it('returns the same compact no-match job_run result over stdio and HTTP', async () => {
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO jobs (
+        id, client_id, client_request_id, state, outcome, created_at, updated_at, finished_at,
+        failure_category, failure_message, result_json, request_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'job_transport_no_match',
+      'transport-test',
+      'no-match',
+      'completed',
+      'failed',
+      now,
+      now,
+      now,
+      'no_matching_agent',
+      'No online Agent provides bash on linux. Specify shell and target_os supported by the same Agent.',
+      JSON.stringify({
+        no_match: {
+          category: 'no_matching_agent',
+          retryable: false,
+          required_shell: 'bash',
+          target_os: ['linux'],
+          hint: 'No online Agent provides bash on linux. Specify shell and target_os supported by the same Agent.',
+        },
+      }),
+      '{}',
+    );
+
+    const httpClient = await connectHttpClient();
+    const stdioClient = await connectStdioStyleClient();
+    try {
+      const call = { name: 'job_run' as const, arguments: { job_id: 'job_transport_no_match' } };
+      const viaHttp = JSON.parse(textOf(await httpClient.callTool(call)));
+      const viaStdio = JSON.parse(textOf(await stdioClient.callTool(call)));
+
+      expect(viaStdio).toEqual(viaHttp);
+      expect(viaHttp).toMatchObject({
+        state: 'completed',
+        outcome: 'failed',
+        failure_category: 'no_matching_agent',
+        no_match: {
+          category: 'no_matching_agent',
+          retryable: false,
+          required_shell: 'bash',
+          target_os: ['linux'],
+        },
+      });
+    } finally {
+      await httpClient.close();
+      await stdioClient.close();
+    }
   });
 
   it('agent_probe returns the real probe payload shape', async () => {
@@ -141,6 +214,118 @@ describe('MCP transports', () => {
       body: '{}',
     });
     expect(res.status).toBe(404);
+  });
+
+  it('does not abort job_wait after the POST body is fully read', async () => {
+    const job = createJob(db, {
+      clientId: 'wait-body-complete',
+      clientRequestId: `wait-body-${Date.now()}`,
+      initialState: 'running',
+      request: { command: 'echo wait', project_root: '.', risk_level: 'safe' },
+    });
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${running.port}/internal/v1/tools/job_wait`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-rbo-client-id': 'test' },
+      body: JSON.stringify({ job_id: job.id, wait_seconds: 1 }),
+    });
+    const elapsed = Date.now() - startedAt;
+    const body = (await res.json()) as { job?: { state?: string; outcome?: string } };
+    expect(res.status).toBe(200);
+    expect(body.job?.state).toBe('running');
+    expect(elapsed).toBeGreaterThan(400);
+    expect(getJob(db, job.id)).toMatchObject({ state: 'running', outcome: null });
+  });
+
+  it('returns the current job on client disconnect without cancelling it', async () => {
+    const job = createJob(db, {
+      clientId: 'wait-disconnect',
+      clientRequestId: `wait-disconnect-${Date.now()}`,
+      initialState: 'running',
+      request: { command: 'echo wait', project_root: '.', risk_level: 'safe' },
+    });
+    const abort = new AbortController();
+    const pending = fetch(`http://127.0.0.1:${running.port}/internal/v1/tools/job_wait`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-rbo-client-id': 'test' },
+      body: JSON.stringify({ job_id: job.id, wait_seconds: 5 }),
+      signal: abort.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    abort.abort();
+    await expect(pending).rejects.toThrow();
+    expect(getJob(db, job.id)).toMatchObject({ state: 'running', outcome: null });
+  });
+});
+
+describe('job_logs transport parity with persistent cursor identity', () => {
+  let fixtureDir: string;
+  let fixtureServer: RunningControllerServer;
+
+  beforeAll(async () => {
+    fixtureDir = await mkdtemp(join(tmpdir(), 'rbo-job-logs-transport-'));
+    const db = openDatabase(':memory:');
+    migrateToLatest(db);
+    const identity = await ensureControllerIdentity(fixtureDir);
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO jobs (id, client_id, client_request_id, state, created_at, updated_at, request_json)
+      VALUES ('job_transport_logs', 'fixture', 'transport-logs', 'running', ?, ?, '{}')`).run(
+      now,
+      now,
+    );
+    db.prepare(`INSERT INTO job_attempts (id, job_id, ordinal, lease_id, lease_epoch, state)
+      VALUES ('att_transport_logs', 'job_transport_logs', 1, 'lease-transport-logs', 1, 'running')`).run();
+    const logs = await ensureAttemptLogs(attemptLogDir(fixtureDir, 'att_transport_logs'));
+    await appendIndexedLogChunk(logs, 'stdout', 'transport-parity', 1);
+    fixtureServer = await startControllerServer({
+      host: '127.0.0.1',
+      port: 0,
+      db,
+      identity,
+      dataDir: fixtureDir,
+    });
+  });
+
+  afterAll(async () => {
+    await fixtureServer.close();
+    await rm(fixtureDir, { recursive: true, force: true });
+  });
+
+  it('returns byte-for-byte equal successful job_logs JSON through HTTP and stdio', async () => {
+    // The signed pagination cursor includes iat. Freeze only Date.now (not
+    // timers) so the two real transport requests exercise byte-for-byte parity.
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 0, 1));
+    let httpClient: Client | undefined;
+    let stdioClient: Client | undefined;
+    try {
+      httpClient = await connectHttpClient(fixtureServer);
+      stdioClient = await connectStdioStyleClient(fixtureServer);
+      const arguments_ = {
+        job_id: 'job_transport_logs',
+        attempt_id: 'att_transport_logs',
+        mode: 'logs' as const,
+        max_bytes: 64,
+      };
+      const httpText = textOf(
+        await httpClient.callTool({ name: 'job_logs', arguments: arguments_ }),
+      );
+      const stdioText = textOf(
+        await stdioClient.callTool({ name: 'job_logs', arguments: arguments_ }),
+      );
+      expect(httpText).toBe(stdioText);
+      const viaHttp = JSON.parse(httpText);
+      const viaStdio = JSON.parse(stdioText);
+      expect(viaHttp).toEqual(viaStdio);
+      expect(viaHttp).toMatchObject({
+        job_id: 'job_transport_logs',
+        attempt_id: 'att_transport_logs',
+        mode: 'logs',
+        chunks: [{ text: 'transport-parity' }],
+      });
+    } finally {
+      nowSpy.mockRestore();
+      await Promise.allSettled([httpClient?.close(), stdioClient?.close()]);
+    }
   });
 });
 

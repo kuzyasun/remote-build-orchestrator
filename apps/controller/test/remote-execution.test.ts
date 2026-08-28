@@ -281,9 +281,15 @@ describe('Remote Execution End-to-End', () => {
     expect(submitRes.job_id).toBeDefined();
     const jobId = String(submitRes.job_id);
 
-    const manifest = JSON.parse(
-      await readFile(join(tempDir, 'snapshots', jobId, 'manifest.json'), 'utf8'),
-    );
+    const snapshot = db
+      .prepare(
+        `SELECT s.manifest_path
+           FROM jobs j JOIN snapshots s ON s.id = j.snapshot_id
+          WHERE j.id = ?`,
+      )
+      .get(jobId) as { manifest_path: string };
+    expect(snapshot.manifest_path).toMatch(/\.g1$/);
+    const manifest = JSON.parse(await readFile(snapshot.manifest_path, 'utf8'));
     expect(manifest.payload.mode).toBe('git_overlay');
 
     const waitRes = await handleToolCall(ctx, 'job_wait', {

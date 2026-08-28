@@ -38,15 +38,16 @@ Commands below.
 
 For **other** projects (firmware, clients, etc.) that should call this Controller over MCP, see
 [`docs/user/getting-started.md`](docs/user/getting-started.md) §§6–8 (client snippets, `job_run`
-preferred for AI clients, paste-ready AGENTS.md guidance including **Shell vs agent OS**). Server
+preferred for AI clients, paste-ready AGENTS.md guidance including shell vs agent OS). Server
 names in clients are typically `rbo` or `user-rbo`. AI agents use pull-based `job_logs`; live follow
-is CLI `rbo logs --follow` for human operators. Consumer note: match shell/command to the live
-worker agent OS (`agents_list`); `job_run` wraps shell from Controller OS (no `shell` arg) — do not
-submit PowerShell jobs when only a Mac/Linux agent is online.
+is CLI `rbo run --follow` or `rbo logs --follow` for human operators. Consumer note: pass `job_run`
+`shell` and `target_os` that match a live worker (`agents_list`); an omitted `target_os` is pinned
+to the Controller OS — do not submit PowerShell jobs when only a Mac/Linux agent is online. Copy
+opaque log cursors; do not invent them.
 
 ## Stack Summary
 
-- **Runtime & Package Management**: Node.js ≥ 22.14 (`.nvmrc`), pnpm 10.5.2 (`packageManager` in `package.json`, pnpm workspace).
+- **Runtime & Package Management**: Node.js ≥ 24.0 (`.nvmrc`), pnpm 10.5.2 (`packageManager` in `package.json`, pnpm workspace).
 - **TypeScript & Build**: TypeScript strict mode (`tsconfig.base.json`), tsc build outputs under `dist/`.
 - **Formatting & Linting**: Biome 1.9.4 (`biome.json`, checks format, lint, import order).
 - **Testing**: Vitest 3.0.7 (`vitest.config.ts`).

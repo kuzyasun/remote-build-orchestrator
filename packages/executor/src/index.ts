@@ -6,3 +6,4 @@ export * from './windows-frames.js';
 export * from './windows-executor-path.js';
 export * from './completion.js';
 export * from './runtime-env.js';
+export * from './log-presentation.js';

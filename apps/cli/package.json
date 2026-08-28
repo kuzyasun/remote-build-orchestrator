@@ -1,6 +1,6 @@
 {
   "name": "@gemslibe/rbo",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Run isolated build, test, QEMU, and Docker jobs on local or remote workers from AI coding clients over MCP.",
   "keywords": [
     "remote-build",
@@ -46,7 +46,7 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=22.14"
+    "node": ">=24.0"
   },
   "scripts": {
     "build": "node esbuild.config.mjs",
@@ -63,7 +63,7 @@
     "zod": "^3.24.2"
   },
   "optionalDependencies": {
-    "@gemslibe/rbo-windows-executor-win32-x64": "workspace:0.6.2"
+    "@gemslibe/rbo-windows-executor-win32-x64": "workspace:0.7.0"
   },
   "devDependencies": {
     "@rbo/agent": "workspace:*",

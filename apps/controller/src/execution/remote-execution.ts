@@ -23,7 +23,7 @@ import type {
 } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
 import { RboError, createLogger, generateId, sha256File } from '@rbo/shared';
-import { captureFullSnapshot } from '@rbo/snapshot';
+import { captureFullSnapshot, discardCapturedContent } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
 import { DEFAULT_MAX_GIT_BUNDLE_BYTES } from '../config.js';
@@ -32,6 +32,10 @@ import {
   filterMissingArtifacts,
   registerArtifactExpectations,
 } from '../http/data-plane.js';
+import {
+  assertJobLifecycleWriteAllowed,
+  notifyJobLifecycleChanged,
+} from '../jobs/lifecycle-notifier.js';
 import {
   bumpLeaseEpoch,
   createJobEvent,
@@ -75,6 +79,8 @@ export interface RemoteExecutionOptions {
   /** Full base URL override (e.g. https://192.168.1.10:7411). Wins over host+port. */
   dataPlaneBaseUrl?: string;
   allowedProjectRoots?: string[];
+  /** Metadata-admission limits for on-demand full snapshot transfer fallback (§4.3). */
+  snapshotCaptureLimits?: import('@rbo/snapshot').SnapshotCaptureLimits;
   /** Max git bundle bytes; defaults to DEFAULT_MAX_GIT_BUNDLE_BYTES. */
   maxGitBundleBytes?: number;
   /**
@@ -355,15 +361,23 @@ async function ensureFullFallbackArchive(
     },
     additionalRoots: request.source.additional_roots,
     contentStorageDir: transferDir,
+    limits: opts.snapshotCaptureLimits,
   });
-  await copyFile(captured.archivePath, archivePath);
-  await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
-  return {
-    archivePath,
-    sizeBytes: captured.manifest.payload.size,
-    sha256: captured.manifest.payload.sha256,
-    manifest: captured.manifest,
-  };
+  try {
+    await copyFile(captured.archivePath, archivePath);
+    await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
+    return {
+      archivePath,
+      sizeBytes: captured.manifest.payload.size,
+      sha256: captured.manifest.payload.sha256,
+      manifest: captured.manifest,
+    };
+  } finally {
+    // `captureFullSnapshot` always writes into a private child of transferDir.
+    // The stable transfer artifacts above are the only files this fallback owns
+    // after the copy attempt, so discard the candidate on both success and error.
+    await discardCapturedContent(captured.contentStorageDir);
+  }
 }
 
 function resolveDataPlaneBaseUrl(opts: RemoteExecutionOptions): string {
@@ -870,6 +884,7 @@ export function handleRemoteLeaseReject(
     return;
   }
 
+  assertJobLifecycleWriteAllowed(opts.db);
   opts.db
     .prepare(
       `UPDATE jobs
@@ -883,6 +898,7 @@ export function handleRemoteLeaseReject(
        WHERE id = ?`,
     )
     .run(nowIso(), nowIso(), attempt.job_id);
+  notifyJobLifecycleChanged(opts.db, attempt.job_id);
 }
 
 /**
@@ -1033,11 +1049,14 @@ export function enqueueRemoteLogChunk(
   const prev = logChunkChains.get(key) ?? Promise.resolve();
   const next = prev.catch(() => undefined).then(() => handleRemoteLogChunk(opts, agentId, payload));
   logChunkChains.set(key, next);
-  void next.finally(() => {
+  const clearChain = (): void => {
     if (logChunkChains.get(key) === next) {
       logChunkChains.delete(key);
     }
-  });
+  };
+  // Do not discard a rejecting Promise produced by finally(). The caller owns
+  // error handling for `next`; this branch only performs bookkeeping.
+  void next.then(clearChain, clearChain);
   return next;
 }
 
@@ -1101,6 +1120,7 @@ export function handleRemoteJobExit(
     outcome: payload.outcome,
   });
   updateAttempt(opts.db, attempt.id, { orphaned_at: null });
+  assertJobLifecycleWriteAllowed(opts.db);
   opts.db
     .prepare(
       `UPDATE jobs SET exit_code = ?, failure_category = ?, failure_message = ?, updated_at = ?
@@ -1113,6 +1133,7 @@ export function handleRemoteJobExit(
       nowIso(),
       attempt.job_id,
     );
+  notifyJobLifecycleChanged(opts.db, attempt.job_id);
   transitionJobState(opts.db, attempt.job_id, 'collecting_artifacts');
 }
 

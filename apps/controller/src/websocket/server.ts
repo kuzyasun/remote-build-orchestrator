@@ -53,6 +53,7 @@ export interface AgentPlaneDispatchContext {
   allowedArtifactDestinations?: string[];
   maxConcurrentJobs?: number;
   gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
+  snapshotCaptureLimits?: import('@rbo/snapshot').SnapshotCaptureLimits;
   allowLocalFallback?: boolean;
   /** Controller-level queue policy used when a job does not set one explicitly. */
   defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
@@ -140,6 +141,32 @@ export async function startAgentPlaneServer(
   });
   const wss = new WebSocketServer({ server: httpsServer, path: '/agent' });
   const connectedAgents = new Map<string, ConnectedAgent>();
+  const inFlightDispatches = new Set<Promise<void>>();
+  const drainableWork = new Set<Promise<void>>();
+  let shuttingDown = false;
+
+  const trackWork = (work: Promise<void>, context: string, drainOnClose: boolean): void => {
+    const bucket = drainOnClose ? drainableWork : inFlightDispatches;
+    bucket.add(work);
+    void work.then(
+      () => {
+        bucket.delete(work);
+      },
+      (error) => {
+        bucket.delete(work);
+        logger.error(`${context} failed`, { error: String(error) });
+      },
+    );
+  };
+
+  const trackDispatch = (work: Promise<void>, context: string): void => {
+    trackWork(work, context, false);
+  };
+
+  const trackDrainable = (work: Promise<void>, context: string): void => {
+    trackWork(work, context, true);
+  };
+
   const recovery = new RecoveryCoordinator({
     db,
     connectedAgents,
@@ -159,6 +186,7 @@ export async function startAgentPlaneServer(
     controllerPublicHost: options.controllerPublicHost,
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
     allowedProjectRoots: options.dispatchContext?.allowedProjectRoots,
+    snapshotCaptureLimits: options.dispatchContext?.snapshotCaptureLimits,
     maxGitBundleBytes: options.maxGitBundleBytes,
     defaultQueuePolicy: options.dispatchContext?.defaultQueuePolicy,
   });
@@ -177,6 +205,7 @@ export async function startAgentPlaneServer(
         [],
       maxConcurrentJobs: options.dispatchContext.maxConcurrentJobs ?? 1,
       gitAllowlist: options.dispatchContext.gitAllowlist,
+      snapshotCaptureLimits: options.dispatchContext.snapshotCaptureLimits,
       clientId: 'agent-plane-dispatcher',
       controllerIdentity: identity,
       connectedAgents,
@@ -187,19 +216,25 @@ export async function startAgentPlaneServer(
       defaultQueuePolicy: options.dispatchContext.defaultQueuePolicy,
       getHostCpuBusyFraction: options.dispatchContext.getHostCpuBusyFraction,
       maxHostCpuBusyFraction: options.dispatchContext.maxHostCpuBusyFraction,
+      shouldContinueDispatch: () => !shuttingDown,
     };
   };
 
   const maybeDispatchQueued = (): void => {
+    if (shuttingDown) {
+      return;
+    }
     const ctx = buildSubmitContext();
     if (!ctx) {
       return;
     }
-    void import('../jobs/submit.js')
-      .then(({ tryDispatchQueuedJobs }) => tryDispatchQueuedJobs(ctx))
-      .catch((error) => {
-        logger.error('queued job dispatch failed', { error: String(error) });
-      });
+    const dispatch = import('../jobs/submit.js').then(({ tryDispatchQueuedJobs }) => {
+      if (shuttingDown) {
+        return;
+      }
+      return tryDispatchQueuedJobs(ctx);
+    });
+    trackDispatch(dispatch, 'queued job dispatch');
   };
 
   httpsServer.on('request', (req, res) => {
@@ -232,6 +267,9 @@ export async function startAgentPlaneServer(
     let pendingCredential: string | null = null;
 
     socket.on('message', (raw) => {
+      if (shuttingDown) {
+        return;
+      }
       let message: WireMessage;
       try {
         message = JSON.parse(String(raw)) as WireMessage;
@@ -384,7 +422,10 @@ export async function startAgentPlaneServer(
             if (!authenticated) return;
             const payload = parsePayload(SourceNeedPayloadSchema, message.payload, message.type);
             if (!payload) return;
-            void handleRemoteSourceNeed(remoteOpts(), authenticated.agentId, payload);
+            trackDrainable(
+              handleRemoteSourceNeed(remoteOpts(), authenticated.agentId, payload),
+              'remote source_need handling',
+            );
             return;
           }
 
@@ -408,7 +449,10 @@ export async function startAgentPlaneServer(
             if (!authenticated) return;
             const payload = parsePayload(LogChunkPayloadSchema, message.payload, message.type);
             if (!payload) return;
-            void enqueueRemoteLogChunk(remoteOpts(), authenticated.agentId, payload);
+            trackDrainable(
+              enqueueRemoteLogChunk(remoteOpts(), authenticated.agentId, payload),
+              'remote log_chunk handling',
+            );
             return;
           }
 
@@ -469,6 +513,9 @@ export async function startAgentPlaneServer(
     });
 
     socket.on('close', () => {
+      if (shuttingDown) {
+        return;
+      }
       if (authenticated) {
         connectedAgents.delete(authenticated.agentId);
         markAgentSeen(db, authenticated.agentId, 'offline');
@@ -496,8 +543,9 @@ export async function startAgentPlaneServer(
     server: httpsServer,
     connectedAgents,
     recovery,
-    close: () =>
-      new Promise<void>((resolvePromise) => {
+    close: async () => {
+      shuttingDown = true;
+      await new Promise<void>((resolvePromise) => {
         clearInterval(leaseSweep);
         recovery.dispose();
         for (const client of wss.clients) {
@@ -506,6 +554,8 @@ export async function startAgentPlaneServer(
         wss.close(() => {
           httpsServer.close(() => resolvePromise());
         });
-      }),
+      });
+      await Promise.allSettled(drainableWork);
+    },
   };
 }

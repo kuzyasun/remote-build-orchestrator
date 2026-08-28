@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import type { ControllerIdentity } from '@rbo/shared';
 import { ensureControllerIdentity } from '@rbo/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { handleJobRun } from '../src/jobs/job-run.js';
 import { getJob, getJobRequest } from '../src/jobs/lifecycle.js';
 import {
   type SubmitJobContext,
@@ -138,7 +139,21 @@ describe('defaultQueuePolicy (queue jobs when no Agent has capacity)', () => {
     expect(persisted).not.toBeNull();
     await dispatchJobExecution(ctx, jobId, persisted as never);
 
-    expect(getJob(db, jobId)?.state).toBe('queued');
+    const queued = getJob(db, jobId);
+    expect(queued?.state).toBe('queued');
+    expect(JSON.parse(queued?.result_json ?? '{}')).toMatchObject({
+      no_match: { category: 'no_matching_agent', retryable: false },
+    });
+    expect(JSON.parse(queued?.result_json ?? '{}').no_match.hint).toMatch(/job_run/);
+    expect(JSON.parse(queued?.result_json ?? '{}').no_match.hint).not.toContain('queue_policy');
+
+    const resumed = await handleJobRun(ctx, { job_id: jobId, wait_seconds: 0 });
+    expect(resumed).toMatchObject({
+      job_id: jobId,
+      state: 'queued',
+      resume: true,
+      no_match: { category: 'no_matching_agent', retryable: false },
+    });
   });
 
   it('falls back to local_fallback when defaultQueuePolicy is unset (back-compat)', async () => {

@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { sha256 } from '@rbo/shared';
 import { describe, expect, it } from 'vitest';
 import { decompressTarZstd, parseTarArchive } from '../src/archive.js';
 import { captureFullSnapshot } from '../src/capture.js';
@@ -332,6 +333,12 @@ describe('captureFullSnapshot scenarios (§34.1 full mode)', () => {
       const { decompressTarZstd, parseTarArchive } = await import('../src/archive.js');
       const { readFile } = await import('node:fs/promises');
       const entries = parseTarArchive(decompressTarZstd(await readFile(result.archivePath)));
+      const archived = entries.find((e) => e.path === 'vendor/vendor/dep.txt');
+      expect(archived).toBeDefined();
+      const rootManifest = result.manifest.additional_roots[0];
+      expect(rootManifest?.file_count).toBe(1);
+      expect(rootManifest?.total_size).toBe(archived?.content.length);
+      expect(rootManifest?.tree_sha256).toBe(sha256(sha256(archived?.content ?? Buffer.alloc(0))));
       expect(entries.map((e) => e.path)).toContain('vendor/vendor/dep.txt');
       // No duplicate archive entries for the additional root.
       expect(entries.filter((e) => e.path === 'vendor/vendor/dep.txt')).toHaveLength(1);

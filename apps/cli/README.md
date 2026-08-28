@@ -8,7 +8,7 @@ Remote Build Orchestrator (RBO) — global CLI, Controller, Agent, and MCP stdio
 npm install -g @gemslibe/rbo
 ```
 
-Requires Node.js ≥ 22.14. See the
+Requires Node.js ≥ 24.0. See the
 [getting-started guide](https://github.com/kuzyasun/remote-build-orchestrator/blob/main/docs/user/getting-started.md)
 for Controller/Agent setup and MCP client wiring.
 
@@ -34,6 +34,17 @@ to defaults.
 |---|---|
 | `rbo` | CLI — controller/agent lifecycle, job submit/logs/cancel, doctor |
 | `rbo-mcp-stdio` | MCP stdio proxy to the Controller's loopback HTTP endpoint |
+
+For a normal manual build or test from a project directory, use the one-command path:
+
+```bash
+rbo run --follow --shell bash --target-os linux -- "pnpm test"
+```
+
+`rbo run` accepts one target-shell command after `--`; the command is not argv-safe direct
+execution. Use `rbo submit <job-request.json>` for advanced full-JSON requests, including required
+artifact rules. See the [getting-started guide](https://github.com/kuzyasun/remote-build-orchestrator/blob/main/docs/user/getting-started.md#6-run-a-first-job)
+for shell-specific quoting, confirmation, cancellation, JSON, timeout, and queue-policy behavior.
 
 ## Windows Job Object helper
 

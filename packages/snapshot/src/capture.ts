@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { lstat } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import type { JobAdditionalRootSchema } from '@rbo/protocol';
@@ -6,14 +6,17 @@ import {
   RboError,
   assertRealPathContained,
   generateId,
-  isPathContained,
   isSafeRelativePath,
   normalizeRepositoryUrl,
   resolveRealPath,
   sha256,
 } from '@rbo/shared';
 import type { z } from 'zod';
-import { type TarEntryInput, writeZstdTarArchiveFile } from './archive.js';
+import {
+  type TarEntryInput,
+  type WrittenArchiveCandidateResult,
+  writeZstdTarArchiveCandidate,
+} from './archive.js';
 import { attachContentId } from './canonical.js';
 import {
   type GitSourceRequirements,
@@ -44,16 +47,35 @@ import {
 import type { FullSnapshotManifest, SnapshotFileEntry, SnapshotInstance } from './index.js';
 import { FullSnapshotManifestSchema, GitOverlaySnapshotManifestSchema } from './index.js';
 import type { GitOverlaySnapshotManifest } from './index.js';
+import {
+  type CapturedFile,
+  type SourcePolicyInput,
+  captureMetadataPreflightEntry,
+} from './metadata-preflight.js';
 import { computeOverlayPlan } from './overlay.js';
-import { type SecretPolicyViolation, findSecretPolicyViolations } from './secret-policy.js';
+import type { SecretPolicyViolation } from './secret-policy.js';
 
 type JobAdditionalRoot = z.infer<typeof JobAdditionalRootSchema>;
+export type { CapturedFile, SourcePolicyInput } from './metadata-preflight.js';
 
-export interface SourcePolicyInput {
-  include_untracked: boolean;
-  include_ignored: string[];
-  secret_policy: 'block' | 'warn' | 'allow';
+/**
+ * Controller-provided, capture-local resource limits. These are deliberately
+ * not part of the snapshot manifest or wire protocol: they govern admission
+ * on the Controller that is about to create temporary capture artifacts.
+ */
+export interface SnapshotCaptureLimits {
+  maxTotalSourceBytes: number;
+  maxRegularFileCount: number;
+  maxSingleFileBytes: number;
+  maxTemporarySnapshotBytes: number;
 }
+
+const CAPTURE_LIMIT_CONFIG_KEYS: Record<keyof SnapshotCaptureLimits, string> = {
+  maxTotalSourceBytes: 'max_snapshot_source_bytes',
+  maxRegularFileCount: 'max_snapshot_file_count',
+  maxSingleFileBytes: 'max_snapshot_single_file_bytes',
+  maxTemporarySnapshotBytes: 'max_snapshot_temporary_bytes',
+};
 
 export interface CaptureFullSnapshotInput {
   projectRoot: string;
@@ -63,15 +85,10 @@ export interface CaptureFullSnapshotInput {
   additionalRoots?: JobAdditionalRoot[];
   contentStorageDir: string;
   mainMount?: string;
-}
-
-export interface CapturedFile {
-  wirePath: string;
-  entry: SnapshotFileEntry;
-  content?: Buffer;
-  tarEntry: TarEntryInput;
-  secretWarnings?: Array<{ path: string; pattern: string }>;
-  secretViolations?: SecretPolicyViolation[];
+  /** Optional controller fencing generation embedded in a private archive candidate name. */
+  fencingGeneration?: number;
+  /** Controller capture limits, checked from metadata before compression. */
+  limits?: SnapshotCaptureLimits;
 }
 
 function releaseCapturedFileBuffers(files: CapturedFile[]): number {
@@ -101,6 +118,124 @@ function countRetainedContentBytes(files: CapturedFile[]): number {
   return total;
 }
 
+function assertCaptureLimit(
+  limitKey: keyof SnapshotCaptureLimits,
+  actual: number,
+  limit: number,
+  remediation: string,
+): void {
+  if (actual <= limit) return;
+  const configKey = CAPTURE_LIMIT_CONFIG_KEYS[limitKey];
+  throw new RboError(
+    'validation',
+    `Snapshot capture exceeds ${configKey}: actual ${actual} exceeds configured limit ${limit}. ${remediation}`,
+    false,
+    { limit_key: configKey, actual, limit, remediation },
+  );
+}
+
+/** Check discovered file metadata before the archive writer opens any file. */
+function assertSourceCaptureLimits(
+  files: CapturedFile[],
+  limits: SnapshotCaptureLimits | undefined,
+): void {
+  if (!limits) return;
+  const regularFiles = files.filter(
+    (file): file is CapturedFile & { entry: Extract<SnapshotFileEntry, { type: 'file' }> } =>
+      file.entry.type === 'file',
+  );
+  assertCaptureLimit(
+    'maxRegularFileCount',
+    regularFiles.length,
+    limits.maxRegularFileCount,
+    'Reduce the capture scope or raise "max_snapshot_file_count" in controller.json.',
+  );
+  let totalSourceBytes = 0;
+  for (const file of regularFiles) {
+    assertCaptureLimit(
+      'maxSingleFileBytes',
+      file.entry.size,
+      limits.maxSingleFileBytes,
+      `Exclude or split '${file.entry.path}', or explicitly raise "max_snapshot_single_file_bytes" in controller.json.`,
+    );
+    totalSourceBytes += file.entry.size;
+  }
+  assertCaptureLimit(
+    'maxTotalSourceBytes',
+    totalSourceBytes,
+    limits.maxTotalSourceBytes,
+    'Reduce the capture scope (including additional roots) or raise "max_snapshot_source_bytes" in controller.json.',
+  );
+}
+
+/**
+ * Exact uncompressed ustar byte count for the pending entries. This is a
+ * conservative, metadata-only admission estimate for the Controller's
+ * temporary snapshot budget; it avoids starting zstd when the candidate could
+ * not fit the configured working budget.
+ */
+function estimateTemporarySnapshotBytes(
+  files: CapturedFile[],
+  emptyDirectoryCount: number,
+): number {
+  const tarEntryBytes = files.reduce((total, file) => {
+    const contentBytes = file.entry.type === 'file' ? file.entry.size : 0;
+    return total + 512 + Math.ceil(contentBytes / 512) * 512;
+  }, 0);
+  return tarEntryBytes + emptyDirectoryCount * 512 + 1024;
+}
+
+function assertTemporarySnapshotLimit(
+  files: CapturedFile[],
+  emptyDirectoryCount: number,
+  limits: SnapshotCaptureLimits | undefined,
+): void {
+  if (!limits) return;
+  const estimatedBytes = estimateTemporarySnapshotBytes(files, emptyDirectoryCount);
+  assertCaptureLimit(
+    'maxTemporarySnapshotBytes',
+    estimatedBytes,
+    limits.maxTemporarySnapshotBytes,
+    'Reduce the capture scope or raise "max_snapshot_temporary_bytes" after provisioning sufficient Controller disk space.',
+  );
+}
+
+function assertWrittenTemporarySnapshotLimit(
+  actualBytes: number,
+  limits: SnapshotCaptureLimits | undefined,
+): void {
+  if (!limits) return;
+  assertCaptureLimit(
+    'maxTemporarySnapshotBytes',
+    actualBytes,
+    limits.maxTemporarySnapshotBytes,
+    'Raise "max_snapshot_temporary_bytes" only after provisioning sufficient Controller disk space.',
+  );
+}
+
+function applyArchivedFileResults(
+  files: CapturedFile[],
+  archive: WrittenArchiveCandidateResult,
+): void {
+  const byPath = new Map(archive.entries.map((entry) => [entry.path, entry]));
+  for (const file of files) {
+    if (file.entry.type !== 'file') continue;
+    const archived = byPath.get(file.tarEntry.path);
+    if (!archived) {
+      throw new RboError(
+        'materialization',
+        `Archive did not contain captured file '${file.tarEntry.path}'`,
+        false,
+      );
+    }
+    file.entry = {
+      ...file.entry,
+      size: archived.size,
+      sha256: archived.sha256,
+    };
+  }
+}
+
 function throwIfSecretViolations(violations: SecretPolicyViolation[]): void {
   if (violations.length === 0) {
     return;
@@ -109,6 +244,19 @@ function throwIfSecretViolations(violations: SecretPolicyViolation[]): void {
   throw new RboError('secret_blocked', `Secret files blocked: ${paths.join(', ')}`, false, {
     violations,
   });
+}
+
+function archiveCaptureError(error: unknown): RboError {
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    message.includes('Source file changed while archiving') ||
+    message.includes('Source path is not a regular file')
+  ) {
+    return new RboError('workspace_changed', message, true, {
+      reason: 'file_identity_changed',
+    });
+  }
+  return new RboError('materialization', message, false);
 }
 
 export interface CaptureFullSnapshotResult {
@@ -488,126 +636,6 @@ async function enumerateAdditionalRootPaths(root: JobAdditionalRoot): Promise<st
   return paths.sort();
 }
 
-async function readSymlinkTarget(absolutePath: string): Promise<string> {
-  const { readlink } = await import('node:fs/promises');
-  return readlink(absolutePath);
-}
-
-function isAbsoluteSymlinkTarget(target: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(target) || target.startsWith('/');
-}
-
-async function assertSymlinkAllowed(
-  repoRoot: string,
-  wirePath: string,
-  target: string,
-): Promise<void> {
-  if (isAbsoluteSymlinkTarget(target)) {
-    throw new RboError(
-      'materialization',
-      `Absolute symlink target is not allowed: ${wirePath}`,
-      false,
-      {
-        path: wirePath,
-        target,
-      },
-    );
-  }
-  const resolved = resolve(resolveInside(repoRoot, wirePath), '..', target);
-  try {
-    await assertRealPathContained(repoRoot, resolved);
-  } catch {
-    throw new RboError('materialization', `Symlink escapes workspace: ${wirePath}`, false, {
-      path: wirePath,
-      target,
-    });
-  }
-}
-
-async function captureFileEntry(
-  repoRoot: string,
-  wirePath: string,
-  stageModes: Map<string, string>,
-  sourcePolicy: SourcePolicyInput,
-): Promise<CapturedFile> {
-  const absolute = resolveInside(repoRoot, wirePath);
-  await assertRealPathContained(repoRoot, absolute);
-  const info = await lstat(absolute);
-
-  if (info.isSymbolicLink()) {
-    let target: string;
-    try {
-      target = await readSymlinkTarget(absolute);
-    } catch {
-      throw new RboError(
-        'materialization',
-        `Symlink unsupported on this platform: ${wirePath}`,
-        false,
-        {
-          reason: 'symlink_unsupported',
-          path: wirePath,
-        },
-      );
-    }
-    await assertSymlinkAllowed(repoRoot, wirePath, target);
-    const violations = findSecretPolicyViolations(wirePath, sourcePolicy.secret_policy);
-    const entry: SnapshotFileEntry = {
-      path: wirePath,
-      type: 'symlink',
-      mode: '120000',
-      target: normalizeWirePath(target),
-    };
-    return {
-      wirePath,
-      entry,
-      secretWarnings:
-        sourcePolicy.secret_policy === 'warn' && violations.length > 0 ? violations : undefined,
-      secretViolations:
-        sourcePolicy.secret_policy === 'block' && violations.length > 0 ? violations : undefined,
-      tarEntry: {
-        path: wirePath,
-        mode: 0o120000,
-        type: 'symlink',
-        target: normalizeWirePath(target),
-      },
-    };
-  }
-
-  if (!info.isFile()) {
-    throw new RboError('materialization', `Expected regular file: ${wirePath}`);
-  }
-
-  const content = await readFile(absolute);
-  const hash = sha256(content);
-  const violations = findSecretPolicyViolations(wirePath, sourcePolicy.secret_policy);
-
-  const gitMode = stageModes.get(wirePath);
-  const mode: '100644' | '100755' =
-    gitMode === '100755' || (info.mode & 0o111) !== 0 ? '100755' : '100644';
-  const entry: SnapshotFileEntry = {
-    path: wirePath,
-    type: 'file',
-    mode,
-    size: content.length,
-    sha256: hash,
-  };
-  return {
-    wirePath,
-    entry,
-    content,
-    secretWarnings:
-      sourcePolicy.secret_policy === 'warn' && violations.length > 0 ? violations : undefined,
-    secretViolations:
-      sourcePolicy.secret_policy === 'block' && violations.length > 0 ? violations : undefined,
-    tarEntry: {
-      path: wirePath,
-      mode: mode === '100755' ? 0o755 : 0o644,
-      type: 'file',
-      content,
-    },
-  };
-}
-
 async function findEmptyUntrackedDirectories(repoRoot: string): Promise<string[]> {
   const status = await gitStatusPorcelainV2(repoRoot);
   const emptyDirs: string[] = [];
@@ -633,6 +661,20 @@ async function findEmptyUntrackedDirectories(repoRoot: string): Promise<string[]
 
 async function cleanupContentStorage(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
+}
+
+function archivePathForGeneration(
+  contentStorageDir: string,
+  basename: string,
+  fencingGeneration: number | undefined,
+): string {
+  if (fencingGeneration === undefined) {
+    return join(contentStorageDir, basename);
+  }
+  if (!Number.isSafeInteger(fencingGeneration) || fencingGeneration < 1) {
+    throw new RboError('validation', 'fencingGeneration must be a positive safe integer', false);
+  }
+  return join(contentStorageDir, `${basename}.g${fencingGeneration}`);
 }
 
 export async function captureFullSnapshot(
@@ -661,6 +703,7 @@ export async function captureFullSnapshot(
   const stageModes = await gitLsFilesStageModes(repoRoot);
 
   const capturedFiles: CapturedFile[] = [];
+  const archivedFiles: CapturedFile[] = [];
   try {
     const caseCollisions = findCaseCollisions(wirePaths);
     if (caseCollisions.length > 0) {
@@ -695,29 +738,24 @@ export async function captureFullSnapshot(
       } catch {
         continue;
       }
-      const captured = await captureFileEntry(repoRoot, wirePath, stageModes, input.sourcePolicy);
+      const captured = await captureMetadataPreflightEntry(
+        repoRoot,
+        wirePath,
+        stageModes,
+        input.sourcePolicy,
+      );
       capturedFiles.push(captured);
+      archivedFiles.push(captured);
       if (captured.secretWarnings) {
         secretWarnings.push(...captured.secretWarnings);
       }
       if (captured.secretViolations) {
         secretBlockedViolations.push(...captured.secretViolations);
       }
-      if (captured.content) {
-        const dest = join(contentStorageDir, wirePath);
-        await mkdir(join(dest, '..'), { recursive: true });
-        await writeFile(dest, captured.content);
-        captured.tarEntry = {
-          ...captured.tarEntry,
-          content: undefined,
-          contentPath: dest,
-        };
-        captured.content = undefined;
-      }
     }
 
     const emptyDirectories = await findEmptyUntrackedDirectories(repoRoot);
-    const additionalRootsManifest = [];
+    const additionalRootCaptures: Array<{ root: JobAdditionalRoot; files: CapturedFile[] }> = [];
     const additionalTarEntries: TarEntryInput[] = [];
 
     for (const root of input.additionalRoots ?? []) {
@@ -745,8 +783,6 @@ export async function captureFullSnapshot(
           `Additional root is not under allowed project roots: ${root.source_path}`,
         );
       }
-      const additionalBase = join(contentStorageDir, 'additional');
-      await mkdir(additionalBase, { recursive: true });
       const rootPaths = await enumerateAdditionalRootPaths(root);
       const rootCaptured: CapturedFile[] = [];
       for (const relPath of rootPaths) {
@@ -758,13 +794,19 @@ export async function captureFullSnapshot(
             false,
           );
         }
-        const captured = await captureFileEntry(realSource, relPath, new Map(), input.sourcePolicy);
+        const captured = await captureMetadataPreflightEntry(
+          realSource,
+          relPath,
+          new Map(),
+          input.sourcePolicy,
+        );
         rootCaptured.push({
           ...captured,
           wirePath: mountPath,
           entry: { ...captured.entry, path: mountPath },
           tarEntry: { ...captured.tarEntry, path: mountPath },
         });
+        archivedFiles.push(rootCaptured[rootCaptured.length - 1] as CapturedFile);
         if (captured.secretWarnings) {
           secretWarnings.push(
             ...captured.secretWarnings.map((warning) => ({
@@ -781,51 +823,14 @@ export async function captureFullSnapshot(
             })),
           );
         }
-        if (captured.content) {
-          const dest = join(additionalBase, root.mount_path, relPath);
-          if (!isPathContained(additionalBase, dest)) {
-            throw new RboError(
-              'validation',
-              `additional root content path escapes snapshot storage: ${root.mount_path}`,
-              false,
-            );
-          }
-          await mkdir(join(dest, '..'), { recursive: true });
-          await writeFile(dest, captured.content);
-          const last = rootCaptured[rootCaptured.length - 1];
-          if (last) {
-            last.tarEntry = {
-              ...last.tarEntry,
-              content: undefined,
-              contentPath: dest,
-            };
-            last.content = undefined;
-          }
-          captured.content = undefined;
-        }
       }
-      const fileEntries = rootCaptured
-        .map((f) => f.entry)
-        .filter((e): e is Extract<SnapshotFileEntry, { type: 'file' }> => e.type === 'file');
-      const totalSize = fileEntries.reduce((sum, e) => sum + e.size, 0);
-      const treeHash = sha256(
-        fileEntries
-          .map((e) => e.sha256)
-          .sort()
-          .join('\n'),
-      );
-      additionalRootsManifest.push({
-        id: basename(root.mount_path),
-        mount: normalizeWirePath(root.mount_path),
-        file_count: fileEntries.length,
-        total_size: totalSize,
-        tree_sha256: treeHash,
-        mode: root.mode ?? 'read_only',
-      });
+      additionalRootCaptures.push({ root, files: rootCaptured });
       // Additional roots go only into the archive under their mount path — not into
       // source.files (and not twice into the tar via capturedFiles).
       additionalTarEntries.push(...rootCaptured.map((f) => f.tarEntry));
     }
+
+    assertSourceCaptureLimits(archivedFiles, input.limits);
 
     throwIfSecretViolations(secretBlockedViolations);
 
@@ -840,15 +845,40 @@ export async function captureFullSnapshot(
       })),
       ...additionalTarEntries,
     ];
+    assertTemporarySnapshotLimit(archivedFiles, emptyDirectories.length, input.limits);
 
-    const archivePath = join(contentStorageDir, 'full-source.tar.zst');
-    let archive: Awaited<ReturnType<typeof writeZstdTarArchiveFile>>;
+    const archivePath = archivePathForGeneration(
+      contentStorageDir,
+      'full-source.tar.zst',
+      input.fencingGeneration,
+    );
+    let archive: WrittenArchiveCandidateResult;
     try {
-      archive = await writeZstdTarArchiveFile(archivePath, tarEntries);
+      archive = await writeZstdTarArchiveCandidate(archivePath, tarEntries);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new RboError('materialization', message, false);
+      throw archiveCaptureError(error);
     }
+    assertWrittenTemporarySnapshotLimit(archive.size, input.limits);
+    await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, input.additionalRoots ?? []);
+    applyArchivedFileResults(archivedFiles, archive);
+    const additionalRootsManifest = additionalRootCaptures.map(({ root, files }) => {
+      const fileEntries = files
+        .map((f) => f.entry)
+        .filter((e): e is Extract<SnapshotFileEntry, { type: 'file' }> => e.type === 'file');
+      return {
+        id: basename(root.mount_path),
+        mount: normalizeWirePath(root.mount_path),
+        file_count: fileEntries.length,
+        total_size: fileEntries.reduce((sum, e) => sum + e.size, 0),
+        tree_sha256: sha256(
+          fileEntries
+            .map((e) => e.sha256)
+            .sort()
+            .join('\n'),
+        ),
+        mode: root.mode ?? 'read_only',
+      };
+    });
     releaseCapturedFileBuffers(capturedFiles);
 
     const manifestBody = {
@@ -891,7 +921,7 @@ export async function captureFullSnapshot(
     return {
       instance,
       manifest,
-      archivePath,
+      archivePath: archive.candidatePath,
       contentStorageDir,
       secretWarnings,
       gitSourceRequirements,
@@ -911,8 +941,12 @@ export interface CaptureGitOverlaySnapshotInput {
   additionalRoots?: JobAdditionalRoot[];
   contentStorageDir: string;
   mainMount?: string;
+  /** Optional controller fencing generation embedded in a private archive candidate name. */
+  fencingGeneration?: number;
   /** Allowlisted remote URL for the overlay manifest (any matching remote, not only origin). */
   repoUrl?: string;
+  /** Controller capture limits, checked from metadata before compression. */
+  limits?: SnapshotCaptureLimits;
 }
 
 export interface CaptureGitOverlaySnapshotResult {
@@ -982,12 +1016,7 @@ async function collectSubmodulePinsAndOverlay(
       });
     }
 
-    let childSubmodules: SubmoduleStatusEntry[] = [];
-    try {
-      childSubmodules = await gitSubmoduleStatus(subAbsRoot);
-    } catch {
-      childSubmodules = [];
-    }
+    const childSubmodules = await gitSubmoduleStatus(subAbsRoot);
     if (childSubmodules.length > 0) {
       const childRes = await collectSubmodulePinsAndOverlay(
         repoRoot,
@@ -1023,7 +1052,6 @@ export async function captureGitOverlaySnapshot(
 
   const captureId = generateId('snp');
   const contentStorageDir = join(input.contentStorageDir, captureId);
-  await mkdir(contentStorageDir, { recursive: true });
 
   const initialStatus = await gitStatusPorcelainV2(repoRoot);
   const repoInfo = await describeRepository(repoRoot);
@@ -1075,7 +1103,9 @@ export async function captureGitOverlaySnapshot(
     [],
   );
 
+  await mkdir(contentStorageDir, { recursive: true });
   const capturedFiles: CapturedFile[] = [];
+  const archivedFiles: CapturedFile[] = [];
   const secretWarnings: Array<{ path: string; pattern: string }> = [];
   const secretBlockedViolations: SecretPolicyViolation[] = [];
   try {
@@ -1101,29 +1131,19 @@ export async function captureGitOverlaySnapshot(
       if (!isSafeRelativePath(wirePath)) {
         throw new RboError('materialization', `Unsafe overlay path: ${wirePath}`);
       }
-      const captured = await captureFileEntry(
+      const captured = await captureMetadataPreflightEntry(
         repoRoot,
         wirePath,
         combinedStageModes,
         input.sourcePolicy,
       );
       capturedFiles.push(captured);
+      archivedFiles.push(captured);
       if (captured.secretWarnings) {
         secretWarnings.push(...captured.secretWarnings);
       }
       if (captured.secretViolations) {
         secretBlockedViolations.push(...captured.secretViolations);
-      }
-      if (captured.content) {
-        const dest = join(contentStorageDir, 'overlay-staging', wirePath);
-        await mkdir(join(dest, '..'), { recursive: true });
-        await writeFile(dest, captured.content);
-        captured.tarEntry = {
-          ...captured.tarEntry,
-          content: undefined,
-          contentPath: dest,
-        };
-        captured.content = undefined;
       }
     }
 
@@ -1131,14 +1151,19 @@ export async function captureGitOverlaySnapshot(
       plan.files.some((f) => f === dir || f.startsWith(`${dir}/`)),
     );
 
-    const additionalRootsManifest: CaptureFullSnapshotResult['manifest']['additional_roots'] = [];
+    const additionalRootCaptures: Array<{ root: JobAdditionalRoot; files: CapturedFile[] }> = [];
     const additionalTarEntries: TarEntryInput[] = [];
     for (const root of input.additionalRoots ?? []) {
       const realSource = await resolveRealPath(root.source_path);
       const rootPaths = await enumerateAdditionalRootPaths(root);
       const rootCaptured: CapturedFile[] = [];
       for (const relPath of rootPaths) {
-        const captured = await captureFileEntry(realSource, relPath, new Map(), input.sourcePolicy);
+        const captured = await captureMetadataPreflightEntry(
+          realSource,
+          relPath,
+          new Map(),
+          input.sourcePolicy,
+        );
         const mount = normalizeWirePath(root.mount_path);
         const archivePath = `${mount}/${relPath}`.replace(/\\/g, '/');
         rootCaptured.push({
@@ -1150,6 +1175,7 @@ export async function captureGitOverlaySnapshot(
               : { ...captured.entry, path: archivePath },
           tarEntry: { ...captured.tarEntry, path: archivePath },
         });
+        archivedFiles.push(rootCaptured[rootCaptured.length - 1] as CapturedFile);
         if (captured.secretWarnings) {
           secretWarnings.push(...captured.secretWarnings.map((w) => ({ ...w, path: archivePath })));
         }
@@ -1159,41 +1185,11 @@ export async function captureGitOverlaySnapshot(
           );
         }
       }
-      for (const f of rootCaptured) {
-        if (f.entry.type === 'file') {
-          const dest = join(contentStorageDir, 'additional-staging', f.wirePath);
-          await mkdir(join(dest, '..'), { recursive: true });
-          if (f.content) {
-            await writeFile(dest, f.content);
-            f.tarEntry = {
-              ...f.tarEntry,
-              content: undefined,
-              contentPath: dest,
-            };
-            f.content = undefined;
-          }
-        }
-      }
-      const fileEntries = rootCaptured
-        .map((f) => f.entry)
-        .filter((e): e is Extract<SnapshotFileEntry, { type: 'file' }> => e.type === 'file');
-      const totalSize = fileEntries.reduce((sum, e) => sum + e.size, 0);
-      const treeHash = sha256(
-        fileEntries
-          .map((e) => e.sha256)
-          .sort()
-          .join('\n'),
-      );
-      additionalRootsManifest.push({
-        id: basename(root.mount_path),
-        mount: normalizeWirePath(root.mount_path),
-        file_count: fileEntries.length,
-        total_size: totalSize,
-        tree_sha256: treeHash,
-        mode: root.mode ?? 'read_only',
-      });
+      additionalRootCaptures.push({ root, files: rootCaptured });
       additionalTarEntries.push(...rootCaptured.map((f) => f.tarEntry));
     }
+
+    assertSourceCaptureLimits(archivedFiles, input.limits);
 
     throwIfSecretViolations(secretBlockedViolations);
 
@@ -1269,15 +1265,100 @@ export async function captureGitOverlaySnapshot(
       })),
       ...additionalTarEntries,
     ];
+    assertTemporarySnapshotLimit(archivedFiles, emptyDirectories.length, input.limits);
 
-    const archivePath = join(contentStorageDir, 'overlay.tar.zst');
-    let archive: Awaited<ReturnType<typeof writeZstdTarArchiveFile>>;
+    const archivePath = archivePathForGeneration(
+      contentStorageDir,
+      'overlay.tar.zst',
+      input.fencingGeneration,
+    );
+    let archive: WrittenArchiveCandidateResult;
     try {
-      archive = await writeZstdTarArchiveFile(archivePath, tarEntries);
+      archive = await writeZstdTarArchiveCandidate(archivePath, tarEntries);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new RboError('materialization', message, false);
+      throw archiveCaptureError(error);
     }
+    assertWrittenTemporarySnapshotLimit(archive.size, input.limits);
+    const postArchiveStatus = await gitStatusPorcelainV2(repoRoot);
+    if (postArchiveStatus.head !== guard.head) {
+      throw new RboError('workspace_changed', 'HEAD changed during overlay capture', true, {
+        reason: 'head_changed',
+      });
+    }
+    for (const [subPath, expectedHead] of subRes.submoduleHeads) {
+      let currentHead = expectedHead;
+      try {
+        currentHead = await gitRevParseHead(resolveInside(repoRoot, subPath));
+      } catch {
+        // ignore if missing; the identity guard below will reject the capture
+      }
+      if (currentHead !== expectedHead) {
+        throw new RboError(
+          'workspace_changed',
+          `Submodule ${subPath} HEAD changed during overlay capture`,
+          true,
+          { reason: 'head_changed', path: subPath },
+        );
+      }
+    }
+    for (const wirePath of guard.wirePaths) {
+      const before = guard.identities.get(wirePath);
+      const after = await statFileIdentity(repoRoot, wirePath);
+      if (!before || !identitiesEqual(before, after)) {
+        throw new RboError('workspace_changed', 'Workspace changed during overlay capture', true, {
+          reason: 'file_identity_changed',
+          path: wirePath,
+        });
+      }
+    }
+    for (const rootGuard of guard.additionalRoots) {
+      const root = (input.additionalRoots ?? []).find(
+        (candidate) => normalizeWirePath(candidate.mount_path) === rootGuard.mount,
+      );
+      if (!root) {
+        throw new RboError(
+          'workspace_changed',
+          'Additional root disappeared during capture',
+          true,
+          {
+            reason: 'additional_root_missing',
+            mount: rootGuard.mount,
+          },
+        );
+      }
+      const realSource = await resolveRealPath(root.source_path);
+      for (const relPath of rootGuard.paths) {
+        const before = rootGuard.identities.get(relPath);
+        const after = await statFileIdentity(realSource, relPath);
+        if (!before || !identitiesEqual(before, after)) {
+          throw new RboError(
+            'workspace_changed',
+            'Additional root changed during overlay capture',
+            true,
+            { reason: 'additional_root_identity_changed', mount: rootGuard.mount, path: relPath },
+          );
+        }
+      }
+    }
+    applyArchivedFileResults(archivedFiles, archive);
+    const additionalRootsManifest = additionalRootCaptures.map(({ root, files }) => {
+      const fileEntries = files
+        .map((f) => f.entry)
+        .filter((e): e is Extract<SnapshotFileEntry, { type: 'file' }> => e.type === 'file');
+      return {
+        id: basename(root.mount_path),
+        mount: normalizeWirePath(root.mount_path),
+        file_count: fileEntries.length,
+        total_size: fileEntries.reduce((sum, e) => sum + e.size, 0),
+        tree_sha256: sha256(
+          fileEntries
+            .map((e) => e.sha256)
+            .sort()
+            .join('\n'),
+        ),
+        mode: root.mode ?? 'read_only',
+      };
+    });
     releaseCapturedFileBuffers(capturedFiles);
 
     const manifestBody = {
@@ -1323,7 +1404,7 @@ export async function captureGitOverlaySnapshot(
     return {
       instance,
       manifest,
-      archivePath,
+      archivePath: archive.candidatePath,
       contentStorageDir,
       secretWarnings,
       overlayBytes: archive.size,

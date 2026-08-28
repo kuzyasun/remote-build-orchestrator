@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   appendEvent,
@@ -20,6 +20,7 @@ import {
 } from '@rbo/shared';
 import {
   type GitSourceRequirements,
+  type SnapshotCaptureLimits,
   captureFullSnapshot,
   captureGitOverlaySnapshot,
   gitFindRoot,
@@ -50,7 +51,6 @@ import {
   getJob,
   getLatestAttempt,
   isTerminalJobState,
-  persistSnapshot,
   recordEvent,
   transitionAttemptState,
   transitionJobState,
@@ -77,6 +77,8 @@ export interface LocalRunnerContext {
    * instead of silently transferring the entire repository.
    */
   allowFullSnapshotFallback?: boolean;
+  /** Controller metadata-admission limits for temporary snapshot capture (§4.3). */
+  snapshotCaptureLimits?: SnapshotCaptureLimits;
 }
 
 const activeCancels = new Map<string, () => Promise<void>>();
@@ -297,7 +299,11 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       content_id: contentId,
     });
 
-    const warningsPath = join(dirname(snapshotRow.manifest_path), 'secret-warnings.json');
+    const generationSuffix = snapshotRow.manifest_path.match(/\.g\d+$/)?.[0] ?? '';
+    const warningsPath = join(
+      dirname(snapshotRow.manifest_path),
+      `secret-warnings.json${generationSuffix}`,
+    );
     try {
       const warnings = JSON.parse(await readFile(warningsPath, 'utf8')) as Array<{
         path: string;
@@ -604,10 +610,16 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
   }
 }
 
+/**
+ * Capture-only boundary for S-03 publication. The historical function name is
+ * retained until the submission integration is migrated; this function never
+ * persists a snapshot or mutates a job.
+ */
 export async function captureAndPersistSnapshot(
   ctx: LocalRunnerContext,
   jobId: string,
   request: JobRequest,
+  fencingGeneration: number,
 ): Promise<{
   snapshotId: string;
   contentId: string;
@@ -615,6 +627,17 @@ export async function captureAndPersistSnapshot(
   gitSourceRequirements: GitSourceRequirements;
   /** Job request with nested `project_root` mapped onto an effective `source.cwd`. */
   request: JobRequest;
+  manifestPath: string;
+  archivePath: string;
+  sizeBytes: number;
+  sha256: string;
+  repoId: string;
+  baseCommit: string | null;
+  /** Remove the private archive candidate when the publication owner aborts. */
+  cleanupCandidate: () => Promise<void>;
+  /** Private metadata candidates correlated with archivePath for S-03 publication. */
+  secretWarningsPath: string;
+  gitSourceRequirementsPath: string;
 }> {
   const storageDir = join(ctx.dataDir, 'snapshots', jobId);
   const sourcePolicy = {
@@ -656,6 +679,8 @@ export async function captureAndPersistSnapshot(
         sourcePolicy,
         additionalRoots: normalizedRequest.source.additional_roots,
         contentStorageDir: storageDir,
+        fencingGeneration,
+        limits: ctx.snapshotCaptureLimits,
         ...(overlayRemoteUrl ? { repoUrl: overlayRemoteUrl } : {}),
       })
     : await captureFullSnapshot({
@@ -665,36 +690,33 @@ export async function captureAndPersistSnapshot(
         sourcePolicy,
         additionalRoots: normalizedRequest.source.additional_roots,
         contentStorageDir: storageDir,
+        fencingGeneration,
+        limits: ctx.snapshotCaptureLimits,
       });
 
-  const manifestPath = join(storageDir, 'manifest.json');
-  await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
-  await writeFile(
-    join(storageDir, 'secret-warnings.json'),
-    JSON.stringify(captured.secretWarnings),
+  const candidateMatch = captured.archivePath.match(
+    new RegExp(`\\.g${fencingGeneration}\\.candidate-([^\\\\/]+)$`),
   );
-  await writeFile(
-    join(storageDir, 'git-source-requirements.json'),
-    JSON.stringify(captured.gitSourceRequirements),
+  if (!candidateMatch) {
+    await rm(storageDir, { recursive: true, force: true }).catch(() => undefined);
+    throw new RboError('internal', 'Snapshot capture did not return a private archive candidate');
+  }
+  const candidateSuffix = `.g${fencingGeneration}.candidate-${candidateMatch[1]}`;
+  const manifestPath = join(storageDir, `manifest.json${candidateSuffix}`);
+  const secretWarningsPath = join(storageDir, `secret-warnings.json${candidateSuffix}`);
+  const gitSourceRequirementsPath = join(
+    storageDir,
+    `git-source-requirements.json${candidateSuffix}`,
   );
-
-  persistSnapshot(ctx.db, {
-    snapshotId: captured.instance.snapshot_id,
-    contentId: captured.manifest.content_id,
-    repoId: captured.manifest.repo?.canonical_id ?? 'local',
-    baseCommit: captured.manifest.repo?.base_commit ?? null,
-    dirty: true,
-    manifestPath,
-    payloadPath: captured.archivePath,
-    sizeBytes: captured.manifest.payload.size,
-    sha256: captured.manifest.payload.sha256,
-  });
-
-  const current = getJob(ctx.db, jobId);
-  if (current) {
-    transitionJobState(ctx.db, jobId, current.state, {
-      snapshot_id: captured.instance.snapshot_id,
-    });
+  try {
+    await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
+    await writeFile(secretWarningsPath, JSON.stringify(captured.secretWarnings));
+    await writeFile(gitSourceRequirementsPath, JSON.stringify(captured.gitSourceRequirements));
+  } catch (error) {
+    // The snapshot package owns cleanup while capture is running. Once it has
+    // returned, this runner owns the private candidate until S-03 publishes it.
+    await rm(storageDir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
   }
 
   return {
@@ -703,6 +725,21 @@ export async function captureAndPersistSnapshot(
     secretWarnings: captured.secretWarnings,
     gitSourceRequirements: captured.gitSourceRequirements,
     request: normalizedRequest,
+    manifestPath,
+    archivePath: captured.archivePath,
+    sizeBytes: captured.manifest.payload.size,
+    sha256: captured.manifest.payload.sha256,
+    repoId: captured.manifest.repo?.canonical_id ?? 'local',
+    baseCommit: captured.manifest.repo?.base_commit ?? null,
+    cleanupCandidate: async () => {
+      await Promise.all(
+        [captured.archivePath, manifestPath, secretWarningsPath, gitSourceRequirementsPath].map(
+          (path) => rm(path, { force: true }),
+        ),
+      );
+    },
+    secretWarningsPath,
+    gitSourceRequirementsPath,
   };
 }
 
@@ -734,10 +771,15 @@ export async function readGitSourceRequirements(
   jobId: string,
 ): Promise<GitSourceRequirements> {
   try {
-    const raw = await readFile(
-      join(dataDir, 'snapshots', jobId, 'git-source-requirements.json'),
-      'utf8',
-    );
+    const snapshotDir = join(dataDir, 'snapshots', jobId);
+    let sidecar = 'git-source-requirements.json';
+    const generated = (await readdir(snapshotDir))
+      .filter((name) => /^git-source-requirements\.json\.g\d+$/.test(name))
+      .sort((a, b) => Number(a.match(/\.g(\d+)$/)?.[1]) - Number(b.match(/\.g(\d+)$/)?.[1]));
+    if (generated.length > 0) {
+      sidecar = generated[generated.length - 1] as string;
+    }
+    const raw = await readFile(join(snapshotDir, sidecar), 'utf8');
     const parsed = JSON.parse(raw) as Partial<GitSourceRequirements>;
     return {
       submodules: parsed.submodules === true,

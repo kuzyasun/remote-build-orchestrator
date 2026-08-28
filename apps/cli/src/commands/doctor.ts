@@ -11,7 +11,7 @@ import {
 const execFileAsync = promisify(execFile);
 
 /** Minimum Node.js version declared by `@gemslibe/rbo` engines. */
-export const REQUIRED_NODE_ENGINES = { major: 22, minor: 14 } as const;
+export const REQUIRED_NODE_ENGINES = { major: 24, minor: 0 } as const;
 
 export interface DoctorCheck {
   name: string;
@@ -31,7 +31,7 @@ export interface DoctorOptions {
   controllerUrl: string | null;
   /** Injected for unit tests of the windows-executor check. */
   windowsExecutorResolve?: ResolveWindowsExecutorOptions;
-  /** Injected Node version string (e.g. `v22.14.0`) for engines tests. */
+  /** Injected Node version string (e.g. `v24.0.0`) for engines tests. */
   nodeVersion?: string;
 }
 
@@ -139,7 +139,7 @@ async function checkControllerReachable(controllerUrl: string): Promise<DoctorCh
 }
 
 /**
- * FAIL when the running Node is below `@gemslibe/rbo` engines (`>=22.14`).
+ * FAIL when the running Node is below `@gemslibe/rbo` engines (`>=24.0`).
  */
 export function checkNodeEngines(nodeVersion: string = process.version): DoctorCheck {
   const required = `>=${REQUIRED_NODE_ENGINES.major}.${REQUIRED_NODE_ENGINES.minor}`;

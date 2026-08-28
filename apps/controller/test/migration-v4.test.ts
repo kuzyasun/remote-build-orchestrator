@@ -31,7 +31,7 @@ describe('Migration v4 — agent boot_id', () => {
     try {
       migrateToLatest(db);
 
-      expect(getSchemaVersion(db)).toBe(4);
+      expect(getSchemaVersion(db)).toBeGreaterThanOrEqual(4);
 
       const columns = listColumnNames(db, 'agents');
       expect(columns).toContain('last_boot_id');

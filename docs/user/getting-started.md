@@ -13,7 +13,7 @@ on another machine.
 
 Install these on every Controller and Agent machine:
 
-- Node.js 22.14 or newer;
+- Node.js 24.0 or newer;
 - Git;
 - the shells and build tools that jobs on that machine need.
 
@@ -115,6 +115,13 @@ can reach:
 }
 ```
 
+Snapshot capture is bounded before compression by conservative Controller defaults: 1 GiB total
+source bytes, 100,000 regular files, 256 MiB per file, and a 1.25 GiB temporary tar estimate.
+If a known large workspace needs more capacity, raise the corresponding
+`max_snapshot_source_bytes`, `max_snapshot_file_count`, `max_snapshot_single_file_bytes`, or
+`max_snapshot_temporary_bytes` value in `controller.json` only after confirming available
+Controller disk space.
+
 Start the Controller and print the fingerprint you will use when configuring Agents:
 
 ```bash
@@ -191,7 +198,56 @@ Restart the AI client after changing its MCP configuration. If the client cannot
 The simplest test is to ask your AI client to use RBO for a build or test in an allowed project.
 RBO's primary MCP tool, `job_run`, submits the command and waits for a useful result.
 
-For a manual CLI test, create `job.json`:
+For a manual CLI test, run one command from the allowed project directory. `rbo run` captures the
+current project, submits the same compact request as MCP `job_run`, waits for its terminal result,
+and streams logs with `--follow`.
+
+POSIX shell:
+
+```bash
+cd /home/you/projects/my-app
+rbo run --follow --shell bash --target-os linux --timeout 600 -- 'printf "%s\\n" "RBO is working"'
+```
+
+PowerShell:
+
+```powershell
+Set-Location C:\projects\my-app
+rbo run --follow --shell powershell --target-os windows --timeout 600 -- 'Write-Output "RBO is working"'
+```
+
+Windows `cmd.exe`:
+
+```bat
+cd /d C:\projects\my-app
+rbo run --follow --shell cmd --target-os windows --timeout 600 -- "echo RBO is working"
+```
+
+Pass exactly one target-shell command string after `--`. The local shell removes its outer quoting;
+RBO sends the remaining text unchanged to the selected target shell. This is shell text, not an
+argv-safe direct-execution interface. Use the target's shell syntax and select a compatible
+`--shell` and `--target-os`; RBO never translates command syntax between shell families.
+
+`--timeout` is the remote execution timeout. It does not impose an overall CLI wait deadline:
+the CLI continues its resume loop while the job is active, although individual Controller requests
+and SSE reconnects are bounded. Use `--queue-policy fail_fast` when a missing compatible Agent
+should fail immediately, `wait` to queue until one is available, or `local_fallback` only when
+Controller-local execution is acceptable.
+
+Use `--json` for scripts. It writes exactly one final JSON object to stdout; CLI diagnostics stay
+on stderr. The initial interface rejects `--json --follow` rather than providing a JSONL log stream.
+
+For jobs that require confirmation, RBO writes the snapshot and warnings to stderr and prompts only
+when stdin is a TTY. A non-interactive invocation refuses without a bypass, exits 125, and prints
+the job ID with instructions to confirm from a TTY-enabled client. Ctrl+C sends one cancellation
+request, waits at most 10 seconds for cancellation to be confirmed, then exits 130; if confirmation
+does not arrive, stderr identifies the job so it can still be checked.
+
+### Use `rbo submit` for advanced requests
+
+`rbo submit <job-request.json>` remains available for full request JSON that `rbo run` intentionally
+does not expose. In particular, use it when an artifact must be required rather than the optional
+rules added by repeated `rbo run --artifact <glob>`:
 
 ```json
 {
@@ -203,23 +259,46 @@ For a manual CLI test, create `job.json`:
   },
   "execution": {
     "shell": "bash",
-    "script": "echo RBO is working",
-    "timeout_seconds": 60
+    "script": "pnpm test",
+    "timeout_seconds": 600
   },
   "risk_level": "safe",
-  "artifacts": []
+  "artifacts": [{ "glob": "coverage/**", "required": true }]
 }
 ```
 
-Change `project_root` to an allowed absolute path. On Windows, use an escaped Windows path,
-`"shell": "powershell"`, and a PowerShell command.
+Submit the advanced request with `rbo submit job.json`; use `rbo logs <job-id> --follow` to inspect
+an existing job separately.
 
-Submit and inspect the job:
+### Select a remote shell and OS explicitly
 
-```bash
-rbo submit job.json
-rbo logs <job-id> --follow
+`job_run` is the compact MCP path for an AI client. When the chosen Agent differs from the
+Controller's OS, the client should name both the shell and target OS. RBO schedules that exact
+shell; it never translates command syntax between shell families.
+
+```json
+{
+  "command": "printf '%s\\n' \"$HOME\"",
+  "project_root": "/home/you/projects/my-app",
+  "shell": "bash",
+  "target_os": ["linux"],
+  "queue_policy": "fail_fast"
+}
 ```
+
+`queue_policy` is optional: use `fail_fast` when a missing compatible Agent should return an
+immediate answer, `wait` to leave the job queued for one, or `local_fallback` only when local
+execution is acceptable. An omitted shell keeps the Controller's same-platform convenience default;
+an omitted `target_os` is pinned to the Controller OS. Do not rely on those defaults for a
+cross-platform command, and do not submit PowerShell or `cmd` when only a Mac/Linux Agent is online.
+A no-match result includes a compact `no_match` object with the required shell, target OS, and an
+actionable hint. It intentionally does not expose Agent hostnames or complete capabilities.
+
+`job_run` waits up to `mcp_wait_slice_seconds` (default 50). If the job is still running, the
+response includes `resume: true` — call again with the same `job_id`. Copy `next_log_cursor` into
+the next `job_run` `log_cursor`, and copy `job_logs` `next_cursor` into `cursor`; do not invent
+cursors. Presented log text is ANSI-stripped and bounded (`job_run` defaults to 16 KiB);
+`has_more` means more remains on disk. Durable raw logs are unchanged.
 
 The AI client can also retrieve declared artifacts. RBO never writes job output into your live
 checkout unless the client explicitly materializes an artifact into an allowed destination.
@@ -233,9 +312,16 @@ short rule like this to the target project's `AGENTS.md` or equivalent:
 ## Remote builds with RBO
 
 Prefer the RBO MCP tools for builds, tests, and long-running commands when a compatible Agent is
-available. Use `agents_list` to check the target OS and tools, then use `job_run`. Match the command
-and shell to the Agent OS. Read the returned outcome, exit code, and log tail; request artifacts
-only when a file is needed locally. Ask before falling back to the live local checkout.
+available. Use `job_run` with explicit `shell` and `target_os` that a live Agent provides; RBO does
+not translate command syntax between shell families. An omitted `target_os` is pinned to the
+Controller OS — do not submit PowerShell or `cmd` when only a Mac/Linux Agent is online.
+
+If `job_run` returns `resume: true`, call it again with the same `job_id`. Copy `next_log_cursor`
+into `log_cursor`, and copy `job_logs` `next_cursor` into `cursor`; do not invent cursors. Default
+`job_run` log text is 16 KiB and ANSI-stripped; when `has_more` is true, page with `job_logs`.
+Read the outcome, exit code, and log tail; request artifacts only when a file is needed locally.
+A compact `no_match` result is actionable in normal cases, so do not call `agents_list` solely to
+diagnose it. Ask before falling back to the live local checkout.
 ```
 
 For destructive or hardware-risk work, the client must present RBO's confirmation request before

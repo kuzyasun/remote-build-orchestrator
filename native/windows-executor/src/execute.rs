@@ -25,8 +25,9 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOW,
 };
 
 use crate::{ExecutionRequest, ExecutionResponse, PROTOCOL_VERSION};
@@ -98,16 +99,16 @@ impl Drop for JobHandle {
 
 fn create_kill_on_close_job() -> windows::core::Result<JobHandle> {
     unsafe {
-        let job = CreateJobObjectW(None, PCWSTR::null())?;
+        let job = JobHandle(CreateJobObjectW(None, PCWSTR::null())?);
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         SetInformationJobObject(
-            job,
+            job.0,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )?;
-        Ok(JobHandle(job))
+        Ok(job)
     }
 }
 
@@ -310,6 +311,7 @@ pub fn execute_request(request: ExecutionRequest, cancel: Arc<AtomicBool>) -> Ex
 
     unsafe {
         if AssignProcessToJobObject(job.0, process_info.hProcess).is_err() {
+            let _ = TerminateProcess(process_info.hProcess, 1);
             let _ = TerminateJobObject(job.0, 1);
             let _ = CloseHandle(process_info.hProcess);
             let _ = CloseHandle(process_info.hThread);

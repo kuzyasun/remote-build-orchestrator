@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { type QueuePolicy, QueuePolicySchema } from '@rbo/protocol';
 import { type GitUrlAllowlist, resolveControllerDataDir } from '@rbo/shared';
+import type { SnapshotCaptureLimits } from '@rbo/snapshot';
 import { z } from 'zod';
 
 export interface LocalExecutorConfig {
@@ -40,6 +41,8 @@ export interface ControllerConfig {
   allowFullSnapshotFallback: boolean;
   /** Max git bundle bytes for local-only base commits (Phase 5). Default 512 MiB. */
   maxGitBundleBytes: number;
+  /** Metadata-admission limits for Controller snapshot capture (§4.3). */
+  snapshotCaptureLimits: SnapshotCaptureLimits;
   /**
    * Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md): CPU busy-fraction
    * [0,1] above which the host is excluded from local-fallback consideration (unless it's still
@@ -56,6 +59,14 @@ export interface ControllerConfig {
 
 /** Default max git bundle size when RBO_MAX_GIT_BUNDLE_BYTES is unset (512 MiB). */
 export const DEFAULT_MAX_GIT_BUNDLE_BYTES = 512 * 1024 * 1024;
+
+/** Conservative capture defaults: 1 GiB source, 100k files, 256 MiB/file, 1.25 GiB temp tar. */
+export const DEFAULT_SNAPSHOT_CAPTURE_LIMITS: SnapshotCaptureLimits = {
+  maxTotalSourceBytes: 1024 * 1024 * 1024,
+  maxRegularFileCount: 100_000,
+  maxSingleFileBytes: 256 * 1024 * 1024,
+  maxTemporarySnapshotBytes: 1280 * 1024 * 1024,
+};
 
 /** Default Git schemes when RBO_GIT_ALLOWLIST_SCHEMES is unset. */
 export const DEFAULT_GIT_ALLOWLIST_SCHEMES = ['https', 'ssh'] as const;
@@ -99,6 +110,10 @@ export const ControllerConfigFileSchema = z
     allow_local_fallback: z.boolean().optional(),
     allow_full_snapshot_fallback: z.boolean().optional(),
     max_git_bundle_bytes: z.number().int().positive().optional(),
+    max_snapshot_source_bytes: z.number().int().positive().optional(),
+    max_snapshot_file_count: z.number().int().positive().optional(),
+    max_snapshot_single_file_bytes: z.number().int().positive().optional(),
+    max_snapshot_temporary_bytes: z.number().int().positive().optional(),
     local_fallback_max_host_cpu_percent: z.number().min(0).max(100).optional(),
     default_queue_policy: QueuePolicySchema.optional(),
   })
@@ -142,6 +157,14 @@ export function parseEnvInt(key: string, raw: string | undefined): number {
   const n = parseEnvNumber(key, raw);
   if (!Number.isInteger(n)) {
     throw new Error(`Invalid ${key}=${JSON.stringify(raw)}: expected an integer`);
+  }
+  return n;
+}
+
+function parsePositiveEnvInt(key: string, raw: string | undefined): number {
+  const n = parseEnvInt(key, raw);
+  if (n <= 0) {
+    throw new Error(`Invalid ${key}=${JSON.stringify(raw)}: expected a positive integer`);
   }
   return n;
 }
@@ -245,6 +268,10 @@ export function defaultControllerConfigFile(): ControllerConfigFile {
     allow_local_fallback: true,
     allow_full_snapshot_fallback: false,
     max_git_bundle_bytes: DEFAULT_MAX_GIT_BUNDLE_BYTES,
+    max_snapshot_source_bytes: DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxTotalSourceBytes,
+    max_snapshot_file_count: DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxRegularFileCount,
+    max_snapshot_single_file_bytes: DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxSingleFileBytes,
+    max_snapshot_temporary_bytes: DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxTemporarySnapshotBytes,
     local_fallback_max_host_cpu_percent: 80,
     default_queue_policy: 'wait',
   };
@@ -388,6 +415,49 @@ export function loadControllerConfig(
     file?.allow_full_snapshot_fallback ??
     false;
 
+  const snapshotCaptureLimits: SnapshotCaptureLimits = {
+    maxTotalSourceBytes:
+      fieldOverrides.snapshotCaptureLimits?.maxTotalSourceBytes ??
+      (envSet('RBO_MAX_SNAPSHOT_SOURCE_BYTES')
+        ? parsePositiveEnvInt(
+            'RBO_MAX_SNAPSHOT_SOURCE_BYTES',
+            process.env.RBO_MAX_SNAPSHOT_SOURCE_BYTES,
+          )
+        : undefined) ??
+      file?.max_snapshot_source_bytes ??
+      DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxTotalSourceBytes,
+    maxRegularFileCount:
+      fieldOverrides.snapshotCaptureLimits?.maxRegularFileCount ??
+      (envSet('RBO_MAX_SNAPSHOT_FILE_COUNT')
+        ? parsePositiveEnvInt(
+            'RBO_MAX_SNAPSHOT_FILE_COUNT',
+            process.env.RBO_MAX_SNAPSHOT_FILE_COUNT,
+          )
+        : undefined) ??
+      file?.max_snapshot_file_count ??
+      DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxRegularFileCount,
+    maxSingleFileBytes:
+      fieldOverrides.snapshotCaptureLimits?.maxSingleFileBytes ??
+      (envSet('RBO_MAX_SNAPSHOT_SINGLE_FILE_BYTES')
+        ? parsePositiveEnvInt(
+            'RBO_MAX_SNAPSHOT_SINGLE_FILE_BYTES',
+            process.env.RBO_MAX_SNAPSHOT_SINGLE_FILE_BYTES,
+          )
+        : undefined) ??
+      file?.max_snapshot_single_file_bytes ??
+      DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxSingleFileBytes,
+    maxTemporarySnapshotBytes:
+      fieldOverrides.snapshotCaptureLimits?.maxTemporarySnapshotBytes ??
+      (envSet('RBO_MAX_SNAPSHOT_TEMPORARY_BYTES')
+        ? parsePositiveEnvInt(
+            'RBO_MAX_SNAPSHOT_TEMPORARY_BYTES',
+            process.env.RBO_MAX_SNAPSHOT_TEMPORARY_BYTES,
+          )
+        : undefined) ??
+      file?.max_snapshot_temporary_bytes ??
+      DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxTemporarySnapshotBytes,
+  };
+
   const maxHostCpuBusyFraction =
     fieldOverrides.maxHostCpuBusyFraction ??
     (envSet('RBO_LOCAL_FALLBACK_MAX_HOST_CPU_PERCENT')
@@ -455,6 +525,7 @@ export function loadControllerConfig(
         : undefined) ??
       file?.max_git_bundle_bytes ??
       DEFAULT_MAX_GIT_BUNDLE_BYTES,
+    snapshotCaptureLimits,
     maxHostCpuBusyFraction,
     defaultQueuePolicy,
   };

@@ -1,0 +1,78 @@
+name: Source verification
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - master
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-verification-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Source verification (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            os: ubuntu-latest
+            shell: bash
+            package-verify: false
+          - platform: Windows
+            os: windows-latest
+            shell: pwsh
+            package-verify: true
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Install pnpm
+        run: npm install --global pnpm@10.5.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Build Windows native executor
+        if: ${{ matrix.package-verify }}
+        run: cargo build --release --manifest-path native/windows-executor/Cargo.toml
+
+      - name: Verify source
+        run: pnpm verify
+
+      - name: Verify packaging manifests (Windows)
+        if: ${{ matrix.package-verify }}
+        shell: bash
+        run: pnpm package:archives && node scripts/package-archives.mjs --check-committed && pnpm package:verify
+
+      - name: Report environment-gated checks (skipped)
+        run: >-
+          echo "Skipped in fast source CI: Docker, QEMU, and large-log/environment-gated tests;
+          run those external checks separately when their environment is available."

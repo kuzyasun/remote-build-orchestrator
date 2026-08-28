@@ -7,6 +7,7 @@ import { waitForCompletion } from '../src/completion.js';
 import { ensureAttemptLogs } from '../src/logs.js';
 import { buildReservedRboEnv } from '../src/runtime-env.js';
 import { runCleanupScript, spawnJobScript, writeJobScript } from '../src/script.js';
+import { describeWindowsExecutorResolution } from '../src/windows-executor-path.js';
 
 /** Test-only fake-workload script (not a real QEMU binary). */
 const FAKE_WORKLOAD_JS = `#!/usr/bin/env node
@@ -94,6 +95,33 @@ async function pidAlive(pid: number): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function waitForPidExit(
+  pid: number,
+  timeoutMs: number,
+  diagnostic: string,
+): Promise<{ waitedMs: number }> {
+  const startedAt = Date.now();
+  while (await pidAlive(pid)) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(
+        `Process ${pid} remained alive after ${Date.now() - startedAt}ms; ${diagnostic}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return { waitedMs: Date.now() - startedAt };
+}
+
+function cancellationBackendDiagnostic(): string {
+  if (process.platform !== 'win32') {
+    return `backend=POSIX process group (${process.platform}/${process.arch})`;
+  }
+  const resolution = describeWindowsExecutorResolution();
+  return resolution.path
+    ? `backend=Windows Job Object helper (${resolution.detail})`
+    : `backend=Windows taskkill fallback (${resolution.reason}: ${resolution.detail})`;
 }
 
 async function createHarness(input: {
@@ -333,12 +361,17 @@ describe('fake-workload completion policies (QEMU-style)', () => {
 
     await harness.child.kill(1);
     await harness.child.waitForExit();
-    await new Promise((r) => setTimeout(r, 800));
 
     expect(await pidAlive(harness.child.pid)).toBe(false);
-    // On Windows, ManagedChildProcess uses taskkill /T. On Unix, process-group kill.
-    // PLATFORM-GAP: if a host fails tree-kill for this fake-workload, skip rather than soft-pass.
-    expect(await pidAlive(grandchildPid)).toBe(false);
+    // Job Object / taskkill teardown can complete just after the wrapper's exit event.
+    // Poll a bounded interval instead of assuming the fixed 800ms delay is sufficient.
+    await expect(
+      waitForPidExit(
+        grandchildPid,
+        5_000,
+        `wrapper_pid=${harness.child.pid}; ${cancellationBackendDiagnostic()}`,
+      ),
+    ).resolves.toBeDefined();
   }, 45_000);
 
   it('log match succeeds without trailing newline in the success chunk', async () => {

@@ -71,6 +71,17 @@ describe('allowLocalFallback config (§2.3)', () => {
     });
     transitionJobState(db, job.id, 'queued', { snapshot_id: snapshotId });
 
+    db.prepare(
+      `INSERT INTO agents (id, display_name, hostname, state, capabilities_json, paired_at)
+       VALUES (?, ?, ?, 'offline', ?, ?)`,
+    ).run(
+      'agt_offline',
+      'offline-agent',
+      'C:/private/agent-hostname',
+      JSON.stringify({ execution: { shells: ['powershell'] } }),
+      new Date().toISOString(),
+    );
+
     const keys = generateDeviceKeyPair();
     const identity: ControllerIdentity = {
       controllerId: 'controller_fallback_test',
@@ -99,6 +110,71 @@ describe('allowLocalFallback config (§2.3)', () => {
     expect(updated?.state).toBe('completed');
     expect(updated?.outcome).toBe('failed');
     expect(updated?.failure_category).toBe('no_matching_agent');
+    expect(updated?.failure_message).toBe(
+      'No registered Agent is online. Reconnect an Agent or use queue_policy="wait".',
+    );
+    expect(updated?.failure_message).not.toContain('private/agent-hostname');
+    expect(updated?.result_json).not.toContain('private/agent-hostname');
+    expect(JSON.parse(updated?.result_json ?? '{}')).toEqual({
+      no_match: {
+        category: 'no_matching_agent',
+        retryable: false,
+        required_shell: 'bash',
+        target_os: ['linux'],
+        hint: 'No registered Agent is online. Reconnect an Agent or use queue_policy="wait".',
+      },
+    });
+    db.close();
+  });
+
+  it('dispatchJobExecution rejects a shell and target OS incompatible with the Controller host', async () => {
+    const db = openDatabase(':memory:');
+    migrateToLatest(db);
+
+    const controllerIsWindows = process.platform === 'win32';
+    const request = makeRequest({
+      execution: controllerIsWindows
+        ? { shell: 'bash', script: 'echo test' }
+        : { shell: 'powershell', script: 'Write-Output test' },
+      requirements: { os: [controllerIsWindows ? 'linux' : 'windows'] },
+      queue_policy: 'local_fallback',
+    });
+    const job = createJob(db, {
+      clientId: 'client',
+      clientRequestId: request.client_request_id,
+      request,
+      initialState: 'queued',
+    });
+    const keys = generateDeviceKeyPair();
+    const identity: ControllerIdentity = {
+      controllerId: 'controller_host_capability_test',
+      tlsCertPem: '',
+      tlsKeyPem: '',
+      signingPublicKeyPem: keys.publicKeyPem,
+      signingPrivateKeyPem: keys.privateKeyPem,
+      fingerprint: 'sha256:test',
+    };
+
+    await dispatchJobExecution(
+      {
+        clientId: 'client',
+        controllerIdentity: identity,
+        db,
+        dataDir: '/tmp/rbo-host-capability',
+        allowedProjectRoots: ['/tmp'],
+        allowedArtifactDestinations: [],
+        allowLocalFallback: true,
+      },
+      job.id,
+      request,
+    );
+
+    expect(getJob(db, job.id)).toMatchObject({
+      state: 'completed',
+      outcome: 'failed',
+      failure_category: 'no_matching_agent',
+    });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM job_attempts').get()).toEqual({ count: 0 });
     db.close();
   });
 });

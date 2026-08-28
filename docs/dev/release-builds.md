@@ -18,6 +18,26 @@ The primary release path is `.github/workflows/publish-npm.yml`. Publishing a no
 GitHub Release runs verification and builds on a GitHub-hosted Windows runner, then publishes both
 packages through npm Trusted Publishing. No long-lived npm write token is stored in GitHub.
 
+The source-verification path is separate from publishing: `.github/workflows/source-verification.yml`
+runs on pull requests and pushes to `master` on both `ubuntu-latest` and `windows-latest`. Each job
+uses the repository Node version from `.nvmrc`, installs pnpm 10.5.2, runs
+`pnpm install --frozen-lockfile`, and executes `pnpm build` followed by `pnpm verify`. The Windows
+job builds the native executor before `pnpm verify`, then regenerates packaging manifests with
+`pnpm package:archives`, fails if reproducible packaging files drifted from git
+(`node scripts/package-archives.mjs --check-committed`, which ignores MSVC-non-reproducible
+`rbo-windows-executor.exe` sha256/size), and finally runs `pnpm package:verify` against the
+refreshed manifests (including hashing the native executable built in that run). Superseded runs
+for the same branch or pull request are cancelled.
+
+This fast workflow intentionally skips Docker, QEMU, and large-log tests that require a separately
+provisioned environment. Those checks remain external, environment-gated evidence and must not be
+reported as covered by the hosted source-verification jobs.
+
+After confirming the workflow on a test pull request, a repository operator should configure branch
+protection or rulesets to require the appropriate `Source verification (Linux)` and
+`Source verification (Windows)` checks. GitHub settings are an operator action; this repository
+workflow does not change them.
+
 ---
 
 ## Quick release
@@ -26,17 +46,19 @@ Prepare the release from the repository root on Windows x64:
 
 ```powershell
 pnpm bump-version 1.2.3
-# Move the CHANGELOG.md "Unreleased" notes into a new 1.2.3 section.
+# Promotes CHANGELOG.md Unreleased notes into a new 1.2.3 section (fails if Unreleased is empty).
 pnpm format
+cargo build --release --manifest-path native/windows-executor/Cargo.toml
 pnpm verify
 pnpm build
 pnpm package:archives
 pnpm package:verify
 ```
 
-Commit and merge those changes. Then create a GitHub Release with the exact tag `v1.2.3`. Publishing
-the release triggers the workflow, which repeats the checks, builds the Windows helper, verifies the
-package contents, and publishes the optional package before the main package.
+Commit and merge those changes. Then create a GitHub Release with the exact tag `v1.2.3` and paste
+the new CHANGELOG version section into the release body. Publishing the release triggers the
+workflow, which repeats the checks, builds the Windows helper, verifies the package contents, and
+publishes the optional package before the main package.
 
 After publish, smoke on a clean Windows x64 host:
 
@@ -54,14 +76,14 @@ Then follow [`docs/user/getting-started.md`](../user/getting-started.md) (init �
 
 | Tool | Requirement |
 | --- | --- |
-| Node.js | ≥ 22.14 (see `.nvmrc`) |
+| Node.js | ≥ 24.0 (see `.nvmrc`) |
 | pnpm | 10.5.2 (pinned via `"packageManager"` in root `package.json`) |
 | Git | on `PATH` |
 | Rust | 1.93.0 (`rust-toolchain.toml`) — **required on the Windows x64 host that packs/publishes the optional package** |
 | npm | Trusted Publisher configured for both `@gemslibe` packages |
 
 ```powershell
-node -v          # v22.14.x or newer
+node -v          # v24.0.x or newer
 pnpm -v          # 10.5.2
 ```
 
@@ -141,6 +163,11 @@ pnpm package:verify     # re-check manifests (forbidden paths, required files, c
 If `package:verify` fails with `sha256 mismatch ... manifest is stale`, re-run
 `pnpm package:archives` after source/build changes.
 
+`pnpm package:archives` records the current `rbo-windows-executor.exe` hash and size when that
+binary is present. `pnpm package:verify` then hashes that same artifact against the refreshed
+manifest. Source CI does not git-gate those MSVC-non-reproducible fields; it runs
+`node scripts/package-archives.mjs --check-committed` instead of `git diff --exit-code -- packaging`.
+
 Confirm CLI bundles after a successful build:
 
 ```powershell
@@ -170,6 +197,12 @@ left alone.
 | `packages/rbo-windows-executor-win32-x64/package.json` | `"version"` |
 | Root `package.json` | `"version"` (workspace label; not read at runtime) |
 | `packaging/{windows,macos,linux}/MANIFEST.json` | `package_version` and `components.*` |
+| `CHANGELOG.md` | Promotes `## [Unreleased]` into `## [x.y.z] - YYYY-MM-DD` and updates compare links |
+
+Write user-facing notes under `## [Unreleased]` during development (Keep a Changelog:
+Added / Changed / Fixed). `pnpm bump-version` fails if Unreleased has no list entries, then moves
+those notes into the new version section and leaves Unreleased empty. Copy that version section into
+the GitHub Release body when tagging `vX.Y.Z`.
 
 Example constants (keep the three runtime strings identical):
 
@@ -300,7 +333,7 @@ The `Publish npm packages` workflow:
 
 1. waits for approval on the `npm` GitHub environment;
 2. verifies the release tag and lockstep package versions;
-3. runs `pnpm verify`, builds all bundles, and verifies packaging manifests;
+3. builds the Windows native executor, runs `pnpm verify`, builds all bundles, and verifies packaging manifests;
 4. builds and packs the Windows x64 executor;
 5. publishes the optional package, then the main package, using short-lived OIDC credentials.
 
@@ -339,7 +372,7 @@ npm publish --access public .\apps\cli\gemslibe-rbo-0.1.0.tgz
 
 On a **clean Windows x64** machine (no monorepo checkout required):
 
-1. Node.js ≥ 22.14 installed.
+1. Node.js ≥ 24.0 installed.
 2. `npm install -g @gemslibe/rbo`
 3. Confirm bins: `rbo --help`, `rbo-mcp-stdio` on `PATH`.
 4. Follow [`docs/user/getting-started.md`](../user/getting-started.md):
@@ -351,6 +384,27 @@ On a **clean Windows x64** machine (no monorepo checkout required):
    successful global install usually means the optional package failed to download or was skipped.
 
 Treat the release as incomplete until this smoke path passes.
+
+### Cross-platform shell-selection smoke (E-XP, operator-gated)
+
+The automated tests use fake Agent capability reports and verify MCP stdio/Streamable HTTP parity.
+They do **not** demonstrate a real cross-platform execution. Before declaring release readiness,
+an operator must run this smoke using the exact final release artifact and record the result:
+
+1. Record the package version or final source identity, Controller OS, Agent OS, Agent version, and
+   MCP client/transport used.
+2. Pair a real Agent whose OS family differs from the Controller. For example, use a Windows
+   Controller and Linux Agent with `shell: "bash"`, `target_os: ["linux"]`, and a harmless Bash
+   command, or the inverse with a Windows PowerShell Agent.
+3. Submit through `job_run`, wait or resume until terminal state, and retain the request, job ID,
+   terminal result, and relevant durable log excerpt. The command must succeed on the remote Agent;
+   a simulated test or a no-match response is not E-XP evidence.
+4. Confirm that the persisted request kept the exact requested shell and target OS and that the
+   command was not rewritten for the Controller's shell family.
+
+If the required mixed-OS Controller/Agent pair or release artifact is unavailable, record E-XP as
+`operator_required` with the missing precondition. Do not infer a pass from local tests, packaging,
+or fake capability fixtures.
 
 ---
 
@@ -411,7 +465,7 @@ Archives are the air-gap fallback; **npm remains the primary** distribution chan
 | Publish workflow rejects the tag | The release tag does not equal `v<package version>` | Correct the version commit or recreate the release with the matching tag |
 | `release:publish` refuses without confirmation | Missing safety gate | `$env:RELEASE_CONFIRM=1; pnpm release:publish` or `pnpm release:publish --yes` |
 | Manual `npm publish` returns 403 | Not logged in, missing `gemslibe` org rights, or interactive publishing is disabled | Prefer the trusted workflow; use the manual recovery path only with explicit npm access |
-| `engines` / install warnings | Node &lt; 22.14 | Upgrade Node; `rbo doctor` also surfaces mismatches |
+| `engines` / install warnings | Node &lt; 24.0 | Upgrade Node; `rbo doctor` also surfaces mismatches |
 | Optional package skipped | Non-Windows or non-x64 host (`os`/`cpu` in package.json) | Expected; `rbo doctor` WARNs. Only win32-x64 gets the helper automatically |
 | `windows_executor` WARN on win32-x64 after `npm install -g` | Optional package not published yet, wrong semver pin, or network/registry failure | Publish optional package first at matching semver; reinstall; check `npm ls -g @gemslibe/rbo-windows-executor-win32-x64` |
 | Main pack missing `dist/*.js` | Forgot `pnpm build` before pack | `pnpm build` or `pnpm --filter @gemslibe/rbo build` |
@@ -440,15 +494,15 @@ Be honest when writing release notes:
 
 ## Pre-release checklist
 
-- [ ] `pnpm bump-version` (or `pnpm bump-version x.y.z`) — lockstep sites updated
-- [ ] Move `CHANGELOG.md` notes from Unreleased into the new version section
+- [ ] `pnpm bump-version` (or `pnpm bump-version x.y.z`) — lockstep sites updated, CHANGELOG Unreleased promoted
+- [ ] Confirm `CHANGELOG.md` has a dated `x.y.z` section and an empty Unreleased heading
 - [ ] `pnpm format` then `pnpm verify` exit 0
 - [ ] `pnpm build` then `pnpm package:archives` && `pnpm package:verify`
 - [ ] Semver matches in `versions.ts`, `apps/cli/package.json` (including its `workspace:` optionalDependency),
       `packages/rbo-windows-executor-win32-x64/package.json`, and root `package.json`
 - [ ] `LICENSE` + AGPL/`README` commercial note present on both publish packages
 - [ ] Release preparation is committed and merged
-- [ ] Normal GitHub Release uses the exact tag `v<package version>`
+- [ ] Normal GitHub Release uses the exact tag `v<package version>` and the CHANGELOG version section as notes
 - [ ] `npm` environment approval granted after reviewing the workflow summary
 - [ ] `Publish npm packages` workflow exits 0
 - [ ] Registry versions match: `npm view` both packages

@@ -1,6 +1,7 @@
 import type { AgentCapabilityReport, JobRequest } from '@rbo/protocol';
 import { describe, expect, it } from 'vitest';
 import {
+  type LocalHostExecutionCapability,
   SCHEDULER_SCORE_BUILD_CACHE_HIT,
   SCHEDULER_SCORE_CONFIGURED_PRIORITY_MULTIPLIER,
   SCHEDULER_SCORE_CPU_LOAD_PENALTY,
@@ -62,6 +63,15 @@ function makeRequest(overrides: Partial<JobRequest> = {}): JobRequest {
     ...overrides,
   };
 }
+
+const WINDOWS_LOCAL_HOST: LocalHostExecutionCapability = {
+  os: 'windows',
+  shells: ['powershell', 'cmd', 'direct'],
+};
+const LINUX_LOCAL_HOST: LocalHostExecutionCapability = {
+  os: 'linux',
+  shells: ['bash', 'sh', 'direct'],
+};
 
 describe('Scheduler Engine (§19.2)', () => {
   it('selects candidate matching OS, Arch, and capabilities', () => {
@@ -236,7 +246,14 @@ describe('Scheduler Engine (§19.2)', () => {
 
   it('handles queue_policy fallback table correctly', () => {
     const reqWait = makeRequest({ queue_policy: 'wait', requirements: { os: ['linux'] } });
-    expect(selectAgentForJob([], reqWait).action).toBe('wait');
+    const waitDecision = selectAgentForJob([], reqWait);
+    expect(waitDecision.action).toBe('wait');
+    expect(waitDecision.noMatchDiagnostic).toMatchObject({
+      category: 'no_matching_agent',
+      retryable: false,
+      hint: 'Queued until a matching Agent is online; call job_run again with this job_id.',
+    });
+    expect(waitDecision.noMatchDiagnostic?.hint).not.toContain('queue_policy');
 
     const reqFail = makeRequest({ queue_policy: 'fail_fast', requirements: { os: ['linux'] } });
     expect(selectAgentForJob([], reqFail).action).toBe('fail_fast');
@@ -251,6 +268,270 @@ describe('Scheduler Engine (§19.2)', () => {
     expect(selectAgentForJob([], reqFallback, { allowLocalFallback: false }).action).toBe(
       'fail_fast',
     );
+  });
+
+  it.each([
+    [
+      'Windows Controller with an explicit bash/Linux request',
+      WINDOWS_LOCAL_HOST,
+      { shell: 'bash' as const, script: 'echo test' },
+      ['linux'],
+    ],
+    [
+      'Linux Controller with an explicit PowerShell/Windows request',
+      LINUX_LOCAL_HOST,
+      { shell: 'powershell' as const, script: 'Write-Output test' },
+      ['windows'],
+    ],
+    [
+      'Windows Controller direct execution targeting Linux',
+      WINDOWS_LOCAL_HOST,
+      { shell: 'direct' as const, script: './build' },
+      ['linux'],
+    ],
+  ])('fails local_fallback for %s', (_label, localHostExecution, execution, os) => {
+    const decision = selectAgentForJob(
+      [],
+      makeRequest({
+        execution,
+        requirements: { os },
+        queue_policy: 'local_fallback',
+      }),
+      { allowLocalFallback: true, localHostExecution },
+    );
+
+    expect(decision.action).toBe('fail_fast');
+    expect(decision.noMatchDiagnostic).toMatchObject({
+      category: 'no_matching_agent',
+      required_shell: execution.shell,
+      target_os: os,
+    });
+  });
+
+  it.each([
+    [
+      WINDOWS_LOCAL_HOST,
+      { shell: 'powershell' as const, script: 'Write-Output test' },
+      ['windows'],
+    ],
+    [LINUX_LOCAL_HOST, { shell: 'bash' as const, script: 'echo test' }, ['linux']],
+    [WINDOWS_LOCAL_HOST, { shell: 'direct' as const, script: 'build.cmd' }, ['windows']],
+  ])('allows matching native local execution', (localHostExecution, execution, os) => {
+    expect(
+      selectAgentForJob(
+        [],
+        makeRequest({ execution, requirements: { os }, queue_policy: 'local_fallback' }),
+        { allowLocalFallback: true, localHostExecution },
+      ),
+    ).toEqual({ action: 'local_fallback' });
+  });
+
+  it('allows the omitted shell default when it matches the injected Linux host', () => {
+    expect(
+      selectAgentForJob(
+        [],
+        makeRequest({ requirements: { os: ['linux'] }, queue_policy: 'local_fallback' }),
+        { allowLocalFallback: true, localHostExecution: LINUX_LOCAL_HOST },
+      ),
+    ).toEqual({ action: 'local_fallback' });
+  });
+
+  it.each([
+    [
+      'Bash/Linux requested by a Windows Controller',
+      'agt_linux_bash',
+      {
+        os: { family: 'linux', version: '6', arch: 'x64' },
+        execution: {
+          max_jobs: 1,
+          shells: ['bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      { shell: 'bash' as const, script: 'printf "$HOME"' },
+      ['linux'],
+    ],
+    [
+      'PowerShell/Windows requested by a Linux Controller',
+      'agt_windows_powershell',
+      {
+        os: { family: 'windows', version: '11', arch: 'x64' },
+        execution: {
+          max_jobs: 1,
+          shells: ['powershell'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      { shell: 'powershell' as const, script: 'Write-Output $env:HOME' },
+      ['windows'],
+    ],
+    [
+      'Bash explicitly available on non-default Windows',
+      'agt_windows_bash',
+      {
+        os: { family: 'windows', version: '11', arch: 'x64' },
+        execution: {
+          max_jobs: 1,
+          shells: ['bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      { shell: 'bash' as const, script: 'echo "$HOME"' },
+      ['windows'],
+    ],
+  ] as const)(
+    'selects a fake capability report for %s without translating the requested shell',
+    (_label, agentId, capabilities, execution, os) => {
+      const request = makeRequest({
+        execution,
+        requirements: { os },
+        queue_policy: 'fail_fast',
+      });
+      const decision = selectAgentForJob([makeAgent(agentId, capabilities)], request);
+
+      expect(decision.action).toBe('remote');
+      expect(decision.selectedAgent?.agentId).toBe(agentId);
+      expect(request.execution).toEqual(execution);
+    },
+  );
+
+  it('returns an actionable no-match for the Windows omitted-shell default against fake Linux Agents', () => {
+    const request = makeRequest({
+      execution: { shell: 'powershell', script: 'Write-Output $env:HOME' },
+      queue_policy: 'fail_fast',
+    });
+    const linuxBashOnly = makeAgent('agt_linux_bash', {
+      os: { family: 'linux', version: '6', arch: 'x64' },
+      execution: {
+        max_jobs: 1,
+        shells: ['bash'],
+        supports_tty: false,
+        supports_process_tree_kill: true,
+      },
+    });
+
+    const decision = selectAgentForJob([linuxBashOnly], request);
+
+    expect(decision.action).toBe('fail_fast');
+    expect(decision.noMatchDiagnostic).toMatchObject({
+      category: 'no_matching_agent',
+      required_shell: 'powershell',
+    });
+    expect(decision.noMatchDiagnostic?.hint).toContain('Specify shell and target_os');
+  });
+
+  it('returns a bounded, request-scoped diagnostic for an explicit shell and OS conflict', () => {
+    const windowsPowerShellOnly = makeAgent('agt_windows', {
+      hostname: 'C:/private/controller/host-path-must-not-leak',
+      os: { family: 'windows', version: '10', arch: 'x64' },
+      execution: {
+        max_jobs: 1,
+        shells: ['powershell'],
+        supports_tty: false,
+        supports_process_tree_kill: true,
+      },
+    });
+    const request = makeRequest({
+      execution: { shell: 'bash', script: 'echo test' },
+      requirements: { os: ['windows'] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([windowsPowerShellOnly], request);
+
+    expect(decision).toMatchObject({
+      action: 'fail_fast',
+      noMatchDiagnostic: {
+        category: 'no_matching_agent',
+        retryable: false,
+        required_shell: 'bash',
+        target_os: ['windows'],
+      },
+    });
+    expect(decision.noMatchDiagnostic?.hint).toContain('bash on windows');
+    expect(
+      Buffer.byteLength(JSON.stringify(decision.noMatchDiagnostic), 'utf8'),
+    ).toBeLessThanOrEqual(512);
+    expect(JSON.stringify(decision.noMatchDiagnostic)).not.toContain('private/controller');
+  });
+
+  it('reports a capacity-only remote mismatch without changing fail_fast selection', () => {
+    const busyBashLinux = makeAgent(
+      'agt_busy',
+      {
+        os: { family: 'linux', version: '6', arch: 'x64' },
+        execution: {
+          max_jobs: 1,
+          shells: ['bash'],
+          supports_tty: false,
+          supports_process_tree_kill: true,
+        },
+      },
+      1,
+    );
+    const request = makeRequest({
+      execution: { shell: 'bash', script: 'echo test' },
+      requirements: { os: ['linux'] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([busyBashLinux], request, { allowLocalFallback: true });
+
+    expect(decision.action).toBe('fail_fast');
+    expect(decision.noMatchDiagnostic?.hint).toContain('at capacity');
+  });
+
+  it('identifies an offline registered Agent without exposing its capabilities', () => {
+    const request = makeRequest({
+      execution: { shell: 'powershell', script: 'Write-Output test' },
+      requirements: { os: ['windows'] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([], request, { registeredAgentCount: 1 });
+
+    expect(decision.noMatchDiagnostic).toEqual({
+      category: 'no_matching_agent',
+      retryable: false,
+      required_shell: 'powershell',
+      target_os: ['windows'],
+      hint: 'No registered Agent is online. Reconnect an Agent or use queue_policy="wait".',
+    });
+  });
+
+  it('preserves the legacy bash default in an actionable OS mismatch diagnostic', () => {
+    const windowsAgent = makeAgent('agt_windows', {
+      os: { family: 'windows', version: '10', arch: 'x64' },
+    });
+    const request = makeRequest({
+      requirements: { os: ['linux'] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([windowsAgent], request);
+
+    expect(decision.noMatchDiagnostic).toMatchObject({
+      required_shell: 'bash',
+      target_os: ['linux'],
+    });
+    expect(decision.noMatchDiagnostic?.hint).toContain('target_os linux');
+  });
+
+  it('bounds diagnostic serialization for oversized programmatic target requirements', () => {
+    const request = makeRequest({
+      execution: { shell: 'bash', script: 'echo test' },
+      requirements: { os: ['界'.repeat(100), '測'.repeat(100), '試'.repeat(100)] },
+      queue_policy: 'fail_fast',
+    });
+
+    const decision = selectAgentForJob([makeAgent('agt_windows')], request);
+
+    expect(
+      Buffer.byteLength(JSON.stringify(decision.noMatchDiagnostic), 'utf8'),
+    ).toBeLessThanOrEqual(512);
   });
 
   it('supports mocked macOS capability selection as scheduler unit coverage', () => {

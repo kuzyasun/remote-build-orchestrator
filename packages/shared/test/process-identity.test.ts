@@ -25,13 +25,11 @@ describe('process identity', () => {
       return;
     }
     expect(startMs).toBeLessThanOrEqual(Date.now());
+    expect(processStartTimeMs(process.pid)).toBe(startMs);
 
     const identity = processIdentityFromPid(process.pid);
-    expect(identity).toMatch(/^pid:\d+:start:\d+$/);
-    if (!identity) {
-      return;
-    }
-    expect(parseProcessIdentity(identity)).toEqual({
+    expect(identity).toBe(`pid:${process.pid}:start:${startMs}`);
+    expect(parseProcessIdentity(identity ?? '')).toEqual({
       pid: process.pid,
       startMs,
     });

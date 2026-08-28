@@ -16,5 +16,9 @@
   "reconcile_deadline_seconds": 120,
   "allow_local_fallback": true,
   "max_git_bundle_bytes": 536870912,
+  "max_snapshot_source_bytes": 1073741824,
+  "max_snapshot_file_count": 100000,
+  "max_snapshot_single_file_bytes": 268435456,
+  "max_snapshot_temporary_bytes": 1342177280,
   "local_fallback_max_host_cpu_percent": 80
 }

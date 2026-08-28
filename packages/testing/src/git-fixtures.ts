@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -78,6 +78,9 @@ async function writeFixtureFile(repoRoot: string, file: GitFixtureFileSpec): Pro
   }
 
   await writeFile(absolute, file.content ?? '', 'utf8');
+  if (file.mode === '100755') {
+    await chmod(absolute, 0o755);
+  }
   await runGit(repoRoot, ['add', '--', file.path]);
   if (file.mode === '100755') {
     await runGit(repoRoot, ['update-index', '--chmod=+x', '--', file.path]);
@@ -100,6 +103,9 @@ export async function createGitFixtureRepo(spec: GitFixtureRepoSpec = {}): Promi
     const absolute = join(root, file.path);
     await mkdir(dirname(absolute), { recursive: true });
     await writeFile(absolute, file.content ?? '', 'utf8');
+    if (file.mode === '100755') {
+      await chmod(absolute, 0o755);
+    }
     await runGit(root, ['add', '--', file.path]);
     if (file.mode === '100755') {
       await runGit(root, ['update-index', '--chmod=+x', '--', file.path]);
@@ -116,6 +122,9 @@ export async function createGitFixtureRepo(spec: GitFixtureRepoSpec = {}): Promi
       const absolute = join(root, file.path);
       await mkdir(dirname(absolute), { recursive: true });
       await writeFile(absolute, file.content ?? '', 'utf8');
+      if (file.mode === '100755') {
+        await chmod(absolute, 0o755);
+      }
       await runGit(root, ['add', '--', file.path]);
       if (file.mode === '100755') {
         await runGit(root, ['update-index', '--chmod=+x', '--', file.path]);
@@ -127,12 +136,18 @@ export async function createGitFixtureRepo(spec: GitFixtureRepoSpec = {}): Promi
     const absolute = join(root, file.path);
     await mkdir(dirname(absolute), { recursive: true });
     await writeFile(absolute, file.content ?? '', 'utf8');
+    if (file.mode === '100755') {
+      await chmod(absolute, 0o755);
+    }
   }
 
   for (const file of spec.untracked ?? []) {
     const absolute = join(root, file.path);
     await mkdir(dirname(absolute), { recursive: true });
     await writeFile(absolute, file.content ?? '', 'utf8');
+    if (file.mode === '100755') {
+      await chmod(absolute, 0o755);
+    }
   }
 
   for (const path of spec.deleted ?? []) {

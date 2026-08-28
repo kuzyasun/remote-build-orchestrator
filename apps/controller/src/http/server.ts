@@ -44,6 +44,8 @@ export interface ControllerServerOptions {
   allowLocalFallback?: boolean;
   /** Opt in to full working-tree snapshot when overlay capture is impossible. Default false. */
   allowFullSnapshotFallback?: boolean;
+  /** Metadata-admission limits for Controller snapshot capture (§4.3). */
+  snapshotCaptureLimits?: import('@rbo/snapshot').SnapshotCaptureLimits;
   /** Controller-level queue policy used when a job does not set one explicitly. */
   defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
   /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
@@ -89,9 +91,24 @@ function identityFromHeaders(
   };
 }
 
+function abortOnDisconnect(req: IncomingMessage, res: ServerResponse): AbortSignal {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+  // Do not abort on `req` close: the request stream ends after the body is read,
+  // while the handler is still waiting. Client disconnect destroys the response.
+  req.on('aborted', abort);
+  res.on('close', () => {
+    if (!res.writableEnded) abort();
+  });
+  return controller.signal;
+}
+
 function buildToolContext(
   options: ControllerServerOptions,
   clientIdentity: ToolContext['identity'],
+  signal?: AbortSignal,
 ): ToolContext {
   return {
     db: options.db,
@@ -108,9 +125,11 @@ function buildToolContext(
     gitAllowlist: options.gitAllowlist,
     allowLocalFallback: options.allowLocalFallback,
     allowFullSnapshotFallback: options.allowFullSnapshotFallback,
+    snapshotCaptureLimits: options.snapshotCaptureLimits,
     defaultQueuePolicy: options.defaultQueuePolicy,
     getHostCpuBusyFraction: options.getHostCpuBusyFraction,
     maxHostCpuBusyFraction: options.maxHostCpuBusyFraction,
+    signal,
   };
 }
 
@@ -122,7 +141,9 @@ async function handleMcpRequest(
   // Stateless mode: one server/transport pair per request keeps the loopback
   // endpoint simple; job state lives in SQLite, not in MCP sessions.
   const identity = identityFromHeaders(req, 'http', 'mcp-http');
-  const mcpServer = buildMcpServer(buildToolContext(options, identity));
+  const mcpServer = buildMcpServer(
+    buildToolContext(options, identity, abortOnDisconnect(req, res)),
+  );
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -184,7 +205,7 @@ async function handleInternalToolRequest(
   const identity = identityFromHeaders(req, 'stdio', 'mcp-stdio');
   try {
     const result = await handleToolCall(
-      buildToolContext(options, identity),
+      buildToolContext(options, identity, abortOnDisconnect(req, res)),
       def.name as McpToolName,
       args,
     );

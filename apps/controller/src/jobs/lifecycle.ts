@@ -3,6 +3,13 @@ import { JobEventSchema } from '@rbo/protocol';
 import { generateId } from '@rbo/shared';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
+import {
+  UnboundJobLifecycleNotifierError,
+  assertJobLifecycleWriteAllowed,
+  notifyJobLifecycleChanged,
+  runJobLifecycleTransaction,
+  runUnboundJobLifecycleTransaction,
+} from './lifecycle-notifier.js';
 
 export interface JobRow {
   id: string;
@@ -21,6 +28,7 @@ export interface JobRow {
   exit_code: number | null;
   failure_category: string | null;
   failure_message: string | null;
+  result_json: string | null;
 }
 
 export interface AttemptRow {
@@ -44,6 +52,25 @@ export interface AttemptRow {
 /** Phase 6 attempt states/outcomes — no SQLite CHECK on state; callers use these literals. */
 export const ATTEMPT_STATE_ORPHANED = 'orphaned' as const;
 export const ATTEMPT_OUTCOME_LOST = 'lost' as const;
+
+/**
+ * Use the runtime-owned transaction when available. Unit/programmatic callers
+ * may not bind a notifier; still run their operation in an SQLite transaction
+ * so rollback semantics remain identical while production lifecycle writes keep
+ * their post-commit notification behavior.
+ */
+export function runLifecycleTransaction<T>(db: ControllerDatabase, operation: () => T): T {
+  try {
+    return runJobLifecycleTransaction(db, operation);
+  } catch (error) {
+    if (!(error instanceof UnboundJobLifecycleNotifierError)) {
+      throw error;
+    }
+    // Without a runtime notifier there is no post-commit wakeup path, but the
+    // lifecycle operation still needs the same rollback boundary.
+    return runUnboundJobLifecycleTransaction(db, operation);
+  }
+}
 
 export interface SnapshotRow {
   id: string;
@@ -99,7 +126,7 @@ export function getJob(db: ControllerDatabase, jobId: string): JobRow | null {
     .prepare(
       `SELECT id, client_id, client_request_id, name, state, outcome, created_at, updated_at,
               queued_at, started_at, finished_at, agent_id, snapshot_id, exit_code,
-              failure_category, failure_message
+              failure_category, failure_message, result_json
        FROM jobs WHERE id = ?`,
     )
     .get(jobId);
@@ -132,6 +159,7 @@ export function transitionJobState(
     result_json: string;
   }> = {},
 ): JobRow {
+  assertJobLifecycleWriteAllowed(db);
   const sets = ['state = ?', 'updated_at = ?'];
   const values: unknown[] = [state, nowIso()];
   for (const [key, value] of Object.entries(fields)) {
@@ -144,6 +172,7 @@ export function transitionJobState(
   if (!row) {
     throw new Error(`Job not found after transition: ${jobId}`);
   }
+  notifyJobLifecycleChanged(db, jobId);
   return row;
 }
 

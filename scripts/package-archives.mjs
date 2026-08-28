@@ -2,9 +2,16 @@
 /**
  * Build/verify Phase 8 packaging manifests.
  * Usage:
- *   node scripts/package-archives.mjs          # refresh checksums from sources if present
- *   node scripts/package-archives.mjs --verify # validate manifests only
+ *   node scripts/package-archives.mjs                 # refresh checksums from sources if present
+ *   node scripts/package-archives.mjs --verify        # validate manifests against built sources
+ *   node scripts/package-archives.mjs --check-committed
+ *     # compare refreshed manifests to git, ignoring MSVC-non-reproducible native checksums
+ *
+ * MSVC cargo --release is not bit-reproducible (PE timestamps, often size). Refresh still
+ * records the current artifact so --verify can hash it; --check-committed keeps source CI
+ * from git-gating those unstable sha256/size_bytes fields.
  */
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -27,6 +34,12 @@ function sha256(buf) {
 
 function isForbidden(p) {
   return isForbiddenPackagingPath(p);
+}
+
+/** MSVC cargo --release output is not bit-reproducible (PE timestamps and size). */
+function isNonReproducibleNativeBinary(file) {
+  const source = (file.source ?? '').replace(/\\/g, '/');
+  return source.includes('native/windows-executor/target/');
 }
 
 async function refreshManifest(os) {
@@ -105,8 +118,57 @@ async function verifyOnly(os) {
   );
 }
 
+function readCommittedManifest(os) {
+  const rel = `packaging/${os}/MANIFEST.json`;
+  const text = execFileSync('git', ['show', `HEAD:${rel}`], {
+    cwd: ROOT,
+    encoding: 'utf8',
+  });
+  return JSON.parse(text);
+}
+
+/** Drop fields that MSVC rebuilds change so git can still gate JS/config checksums. */
+function normalizeForCommitGate(manifest) {
+  const clone = structuredClone(manifest);
+  for (const file of clone.files ?? []) {
+    if (isNonReproducibleNativeBinary(file)) {
+      file.sha256 = '<non-reproducible>';
+      file.size_bytes = 0;
+    }
+  }
+  return clone;
+}
+
+async function checkCommitted() {
+  const errors = [];
+  for (const os of OSES) {
+    const current = JSON.parse(
+      await readFile(join(ROOT, 'packaging', os, 'MANIFEST.json'), 'utf8'),
+    );
+    const committed = readCommittedManifest(os);
+    if (
+      JSON.stringify(normalizeForCommitGate(committed)) !==
+      JSON.stringify(normalizeForCommitGate(current))
+    ) {
+      errors.push(
+        `${os}: packaging drifted from git beyond non-reproducible native checksums — run \`pnpm package:archives\` and commit reproducible file hashes`,
+      );
+    }
+  }
+  if (errors.length) throw new Error(errors.join('\n'));
+  console.log('OK committed packaging (native executor checksums excluded from git gate)');
+}
+
 async function main() {
   const verify = process.argv.includes('--verify');
+  const checkCommittedFlag = process.argv.includes('--check-committed');
+  if (verify && checkCommittedFlag) {
+    throw new Error('use --verify or --check-committed, not both');
+  }
+  if (checkCommittedFlag) {
+    await checkCommitted();
+    return;
+  }
   for (const os of OSES) {
     if (verify) {
       await verifyOnly(os);

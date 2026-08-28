@@ -67,13 +67,25 @@ function linuxProcessStartMs(pid: number): number | null {
   if (!Number.isFinite(starttime)) {
     return null;
   }
-  const uptimeSec = Number(readFileSync('/proc/uptime', 'utf8').split(' ')[0]);
-  if (!Number.isFinite(uptimeSec)) {
+  const btimeSec = linuxBtimeSec();
+  if (btimeSec === null) {
     return null;
   }
+  // USER_HZ is 100 for /proc. btime + starttime jiffies is stable across
+  // reads; Date.now()-uptime drifted by 1ms and broke exact identity matches.
   const hz = 100;
-  const elapsedMs = uptimeSec * 1000 - (starttime * 1000) / hz;
-  return Date.now() - elapsedMs;
+  return btimeSec * 1000 + (starttime * 1000) / hz;
+}
+
+function linuxBtimeSec(): number | null {
+  const stat = readFileSync('/proc/stat', 'utf8');
+  for (const line of stat.split('\n')) {
+    if (line.startsWith('btime ')) {
+      const value = Number(line.slice(6).trim());
+      return Number.isFinite(value) ? value : null;
+    }
+  }
+  return null;
 }
 
 function windowsProcessStartMs(pid: number): number | null {

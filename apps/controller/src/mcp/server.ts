@@ -34,6 +34,7 @@ export function buildMcpServer(ctx: ToolContext): McpServer {
                       },
                     });
                   },
+                  signal: ctx.signal,
                 },
               }
             : ctx;

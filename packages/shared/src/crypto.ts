@@ -66,9 +66,21 @@ function base64UrlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
 }
 
-export function signEdDsaJwt(privateKeyPem: string, claims: JwtClaims): string {
-  const header = base64UrlJson({ alg: 'EdDSA', typ: 'JWT' });
-  const payload = base64UrlJson({ iat: Math.floor(Date.now() / 1000), ...claims });
+export interface SignEdDsaJwtOptions {
+  /** Default true. Compact log cursors omit iat to stay within 512 bytes. */
+  includeIat?: boolean;
+  header?: { alg: 'EdDSA'; typ?: 'JWT' };
+}
+
+export function signEdDsaJwt(
+  privateKeyPem: string,
+  claims: JwtClaims,
+  options?: SignEdDsaJwtOptions,
+): string {
+  const header = base64UrlJson(options?.header ?? { alg: 'EdDSA', typ: 'JWT' });
+  const payload = base64UrlJson(
+    options?.includeIat === false ? claims : { iat: Math.floor(Date.now() / 1000), ...claims },
+  );
   const signingInput = `${header}.${payload}`;
   const signature = cryptoSign(null, Buffer.from(signingInput, 'utf8'), privateKeyPem).toString(
     'base64url',
