@@ -67,11 +67,11 @@ jobs:
       - name: Build Windows native executor
         run: cargo build --release --manifest-path native/windows-executor/Cargo.toml
 
-      - name: Verify source
-        run: pnpm verify
-
       - name: Build release
         run: pnpm build
+
+      - name: Verify source
+        run: pnpm verify
 
       - name: Pack release
         run: pnpm release:pack
