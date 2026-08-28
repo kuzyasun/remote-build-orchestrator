@@ -33,11 +33,12 @@ Commands below.
 
 For **other** projects (firmware, clients, etc.) that should call this Controller over MCP, see
 [`docs/user/getting-started.md`](docs/user/getting-started.md) §§6–8 (client snippets, `job_run`
-preferred for AI clients, paste-ready AGENTS.md guidance including **Shell vs agent OS**). Server
+preferred for AI clients, paste-ready AGENTS.md guidance including shell vs agent OS). Server
 names in clients are typically `rbo` or `user-rbo`. AI agents use pull-based `job_logs`; live follow
-is CLI `rbo logs --follow` for human operators. Consumer note: match shell/command to the live
-worker agent OS (`agents_list`); `job_run` wraps shell from Controller OS (no `shell` arg) — do not
-submit PowerShell jobs when only a Mac/Linux agent is online.
+is CLI `rbo run --follow` or `rbo logs --follow` for human operators. Consumer note: pass `job_run`
+`shell` and `target_os` that match a live worker (`agents_list`); an omitted `target_os` is pinned
+to the Controller OS — do not submit PowerShell jobs when only a Mac/Linux agent is online. Copy
+opaque log cursors; do not invent them.
 
 ## Stack Summary
 

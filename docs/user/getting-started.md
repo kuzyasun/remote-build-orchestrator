@@ -289,9 +289,16 @@ shell; it never translates command syntax between shell families.
 `queue_policy` is optional: use `fail_fast` when a missing compatible Agent should return an
 immediate answer, `wait` to leave the job queued for one, or `local_fallback` only when local
 execution is acceptable. An omitted shell keeps the Controller's same-platform convenience default;
-do not rely on it for a cross-platform command. A no-match result includes a compact `no_match`
-object with the required shell, target OS, and an actionable hint. It intentionally does not expose
-Agent hostnames or complete capabilities.
+an omitted `target_os` is pinned to the Controller OS. Do not rely on those defaults for a
+cross-platform command, and do not submit PowerShell or `cmd` when only a Mac/Linux Agent is online.
+A no-match result includes a compact `no_match` object with the required shell, target OS, and an
+actionable hint. It intentionally does not expose Agent hostnames or complete capabilities.
+
+`job_run` waits up to `mcp_wait_slice_seconds` (default 50). If the job is still running, the
+response includes `resume: true` — call again with the same `job_id`. Copy `next_log_cursor` into
+the next `job_run` `log_cursor`, and copy `job_logs` `next_cursor` into `cursor`; do not invent
+cursors. Presented log text is ANSI-stripped and bounded (`job_run` defaults to 16 KiB);
+`has_more` means more remains on disk. Durable raw logs are unchanged.
 
 The AI client can also retrieve declared artifacts. RBO never writes job output into your live
 checkout unless the client explicitly materializes an artifact into an allowed destination.
@@ -305,11 +312,16 @@ short rule like this to the target project's `AGENTS.md` or equivalent:
 ## Remote builds with RBO
 
 Prefer the RBO MCP tools for builds, tests, and long-running commands when a compatible Agent is
-available. Use `job_run` with explicit `shell` and `target_os` for cross-platform work; RBO does not
-translate command syntax between shell families. Read the returned outcome, exit code, and log tail;
-request artifacts only when a file is needed locally. A compact `no_match` result is actionable in
-normal cases, so do not call `agents_list` solely to diagnose it. Ask before falling back to the live
-local checkout.
+available. Use `job_run` with explicit `shell` and `target_os` that a live Agent provides; RBO does
+not translate command syntax between shell families. An omitted `target_os` is pinned to the
+Controller OS — do not submit PowerShell or `cmd` when only a Mac/Linux Agent is online.
+
+If `job_run` returns `resume: true`, call it again with the same `job_id`. Copy `next_log_cursor`
+into `log_cursor`, and copy `job_logs` `next_cursor` into `cursor`; do not invent cursors. Default
+`job_run` log text is 16 KiB and ANSI-stripped; when `has_more` is true, page with `job_logs`.
+Read the outcome, exit code, and log tail; request artifacts only when a file is needed locally.
+A compact `no_match` result is actionable in normal cases, so do not call `agents_list` solely to
+diagnose it. Ask before falling back to the live local checkout.
 ```
 
 For destructive or hardware-risk work, the client must present RBO's confirmation request before
