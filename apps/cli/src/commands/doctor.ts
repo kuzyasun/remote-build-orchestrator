@@ -123,18 +123,154 @@ async function checkShellExecutables(): Promise<DoctorCheck> {
   };
 }
 
-async function checkControllerReachable(controllerUrl: string): Promise<DoctorCheck> {
+/** Health probe budget used by `controller_reachable` and its timeout wording. */
+export const CONTROLLER_HEALTH_TIMEOUT_MS = 2000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * Walk `cause` and AggregateError `errors` so undici's wrapper `TypeError: fetch failed`
+ * is not the only string operator-facing checks can print.
+ */
+function flattenErrorChain(error: unknown): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [error];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!isRecord(current) || seen.has(current)) {
+      continue;
+    }
+    seen.add(current);
+    out.push(current);
+    if ('cause' in current) {
+      stack.push(current.cause);
+    }
+    if (Array.isArray(current.errors)) {
+      for (let i = current.errors.length - 1; i >= 0; i -= 1) {
+        stack.push(current.errors[i]);
+      }
+    }
+  }
+  return out;
+}
+
+function errorCode(entry: Record<string, unknown>): string | undefined {
+  return typeof entry.code === 'string' && entry.code.length > 0 ? entry.code : undefined;
+}
+
+function isAbortTimeout(entry: Record<string, unknown>): boolean {
+  const name = typeof entry.name === 'string' ? entry.name : '';
+  const message = typeof entry.message === 'string' ? entry.message : '';
+  return (
+    name === 'TimeoutError' ||
+    entry.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    (name === 'AbortError' && /timeout/i.test(message))
+  );
+}
+
+function formatSystemError(entry: Record<string, unknown>): string {
+  const code = errorCode(entry);
+  const syscall = typeof entry.syscall === 'string' ? entry.syscall : undefined;
+  const address = typeof entry.address === 'string' ? entry.address : undefined;
+  const port = typeof entry.port === 'number' ? entry.port : undefined;
+  const host = address !== undefined && port !== undefined ? `${address}:${port}` : address;
+  const parts = [syscall, code, host].filter((part): part is string => Boolean(part));
+  if (parts.length > 0) {
+    return parts.join(' ');
+  }
+  const message = typeof entry.message === 'string' ? entry.message.trim() : '';
+  if (code && message && message !== 'fetch failed') {
+    return `${code}: ${message}`;
+  }
+  if (code) {
+    return code;
+  }
+  return message;
+}
+
+/**
+ * Prefer the underlying system / undici error over Node's generic `fetch failed`.
+ */
+export function describeNetworkError(error: unknown): string {
+  const chain = flattenErrorChain(error);
+  if (chain.some((entry) => isAbortTimeout(entry))) {
+    return `timed out after ${CONTROLLER_HEALTH_TIMEOUT_MS / 1000}s`;
+  }
+
+  const withCode = [...chain].reverse().find((entry) => errorCode(entry));
+  if (withCode) {
+    return formatSystemError(withCode);
+  }
+
+  for (const entry of [...chain].reverse()) {
+    const message = typeof entry.message === 'string' ? entry.message.trim() : '';
+    if (message && message !== 'fetch failed') {
+      return message;
+    }
+  }
+
+  return String(error);
+}
+
+function parsedPort(controllerUrl: string): string | null {
   try {
-    const res = await fetch(`${controllerUrl.replace(/\/+$/, '')}/internal/v1/health`, {
-      signal: AbortSignal.timeout(2000),
+    const port = new URL(controllerUrl).port;
+    return port.length > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+function reachabilityHint(controllerUrl: string, cause: string): string | null {
+  if (/ECONNREFUSED/.test(cause)) {
+    return 'Controller HTTP is not listening; start it with `rbo controller start --daemon`';
+  }
+  if (/ENOTFOUND|EAI_AGAIN/.test(cause)) {
+    return 'hostname did not resolve';
+  }
+  if (/CERT|UNABLE_TO_VERIFY|ERR_TLS|ERR_SSL/.test(cause)) {
+    return 'TLS certificate could not be verified';
+  }
+  if (/ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|timed out/.test(cause)) {
+    const port = parsedPort(controllerUrl);
+    if (port === '7410') {
+      return 'port 7410 is CLI/MCP and is usually loopback-only; Agents use :7411. Set RBO_CONTROLLER_URL_HTTP to reach a remote Controller, or run doctor on the Controller host';
+    }
+    return 'host unreachable, firewall dropped the packet, or the Controller is not bound on this address';
+  }
+  return null;
+}
+
+/** Operator-facing detail for a failed Controller HTTP health probe. */
+export function describeControllerReachabilityFailure(
+  error: unknown,
+  controllerUrl: string,
+): string {
+  const cause = describeNetworkError(error);
+  const hint = reachabilityHint(controllerUrl, cause);
+  return hint ? `${controllerUrl}: ${cause}. ${hint}` : `${controllerUrl}: ${cause}`;
+}
+
+async function checkControllerReachable(controllerUrl: string): Promise<DoctorCheck> {
+  const base = controllerUrl.replace(/\/+$/, '');
+  try {
+    const res = await fetch(`${base}/internal/v1/health`, {
+      signal: AbortSignal.timeout(CONTROLLER_HEALTH_TIMEOUT_MS),
     });
     return {
       name: 'controller_reachable',
       ok: res.ok,
-      detail: res.ok ? controllerUrl : `HTTP ${res.status}`,
+      detail: res.ok ? controllerUrl : `${controllerUrl} returned HTTP ${res.status}`,
     };
   } catch (error) {
-    return { name: 'controller_reachable', ok: false, detail: String(error) };
+    return {
+      name: 'controller_reachable',
+      ok: false,
+      detail: describeControllerReachabilityFailure(error, controllerUrl),
+    };
   }
 }
 

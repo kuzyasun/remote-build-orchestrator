@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   checkNodeEngines,
   checkWindowsExecutor,
+  describeControllerReachabilityFailure,
+  describeNetworkError,
   doctorStatusTag,
   formatDoctorCheckLine,
   runDoctor,
@@ -85,6 +87,10 @@ describe('rbo doctor (§33)', () => {
     const reachable = report.checks.find((c) => c.name === 'controller_reachable');
     expect(reachable?.ok).toBe(false);
     expect(report.ok).toBe(false);
+    expect(reachable?.detail).toContain('http://127.0.0.1:1');
+    expect(reachable?.detail).not.toMatch(/TypeError: fetch failed/);
+    // Node/undici may reject port 1 as `bad port` instead of connecting.
+    expect(reachable?.detail).toMatch(/bad port|ECONNREFUSED|ECONNRESET|timed out/i);
   }, 15_000);
 
   it('warns for windows_executor when helper is missing (non-Windows)', async () => {
@@ -139,6 +145,104 @@ describe('rbo doctor (§33)', () => {
     expect(check.ok).toBe(true);
     expect(check.warn).toBeUndefined();
     expect(check.detail).toBe(path);
+  });
+});
+
+function systemError(init: {
+  code: string;
+  syscall?: string;
+  address?: string;
+  port?: number;
+  message?: string;
+}): NodeJS.ErrnoException {
+  const error = new Error(
+    init.message ?? `${init.syscall ?? 'connect'} ${init.code} ${init.address ?? ''}`,
+  ) as NodeJS.ErrnoException;
+  error.code = init.code;
+  error.syscall = init.syscall;
+  error.address = init.address;
+  error.port = init.port;
+  return error;
+}
+
+function fetchFailed(cause: unknown): TypeError {
+  const error = new TypeError('fetch failed');
+  error.cause = cause;
+  return error;
+}
+
+describe('controller reachability error details', () => {
+  it('unwraps undici TypeError: fetch failed to the system cause', () => {
+    const wrapped = fetchFailed(
+      systemError({
+        code: 'ECONNREFUSED',
+        syscall: 'connect',
+        address: '127.0.0.1',
+        port: 7410,
+      }),
+    );
+    expect(describeNetworkError(wrapped)).toBe('connect ECONNREFUSED 127.0.0.1:7410');
+    expect(describeControllerReachabilityFailure(wrapped, 'http://127.0.0.1:7410')).toMatch(
+      /^http:\/\/127\.0\.0\.1:7410: connect ECONNREFUSED 127\.0\.0\.1:7410\. Controller HTTP is not listening/,
+    );
+    expect(describeControllerReachabilityFailure(wrapped, 'http://127.0.0.1:7410')).not.toContain(
+      'TypeError: fetch failed',
+    );
+  });
+
+  it('walks AggregateError.errors used by dual-stack connect', () => {
+    const wrapped = fetchFailed(
+      new AggregateError(
+        [
+          systemError({ code: 'ECONNREFUSED', syscall: 'connect', address: '::1', port: 7410 }),
+          systemError({
+            code: 'ECONNREFUSED',
+            syscall: 'connect',
+            address: '127.0.0.1',
+            port: 7410,
+          }),
+        ],
+        'fetch failed',
+      ),
+    );
+    expect(describeNetworkError(wrapped)).toMatch(/ECONNREFUSED/);
+  });
+
+  it('reports probe timeout instead of AbortError name', () => {
+    const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+    expect(describeNetworkError(timeout)).toBe('timed out after 2s');
+    expect(describeControllerReachabilityFailure(timeout, 'http://192.168.0.102:7410')).toContain(
+      'port 7410 is CLI/MCP',
+    );
+  });
+
+  it('hints that remote :7410 timeouts are often loopback-only HTTP', () => {
+    const wrapped = fetchFailed(
+      systemError({
+        code: 'ETIMEDOUT',
+        syscall: 'connect',
+        address: '192.168.0.102',
+        port: 7410,
+      }),
+    );
+    const detail = describeControllerReachabilityFailure(wrapped, 'http://192.168.0.102:7410');
+    expect(detail).toContain('connect ETIMEDOUT 192.168.0.102:7410');
+    expect(detail).toContain('RBO_CONTROLLER_URL_HTTP');
+    expect(detail).toContain(':7411');
+  });
+
+  it('reports ENOTFOUND without the fetch-failed wrapper', () => {
+    const wrapped = fetchFailed(
+      systemError({
+        code: 'ENOTFOUND',
+        syscall: 'getaddrinfo',
+        address: 'no-such-controller.local',
+        message: 'getaddrinfo ENOTFOUND no-such-controller.local',
+      }),
+    );
+    expect(
+      describeControllerReachabilityFailure(wrapped, 'http://no-such-controller.local:7410'),
+    ).toMatch(/ENOTFOUND.*hostname did not resolve/s);
   });
 });
 
