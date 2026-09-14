@@ -13,6 +13,10 @@ import {
 
 const logger = createLogger('agent.recovery');
 
+function hasProcessIdentity(identity: string | null | undefined): identity is string {
+  return typeof identity === 'string' && identity.trim().length > 0;
+}
+
 export interface AgentRecoveryHooks {
   /** Kill process tree for an attempt (if still held in-process). */
   terminateAttempt: (attemptId: string) => Promise<void>;
@@ -94,14 +98,14 @@ export class AgentRecoveryCoordinator {
   }
 
   async emitRecoveryReport(meta: AttemptMetadata): Promise<void> {
-    if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
+    if (!hasProcessIdentity(meta.process_identity)) {
+      // recovery_report.process_identity is required (min 1). Pre-spawn leftovers
+      // (prepare_source failed, cancelled, or disconnect before job_started) cannot
+      // be fenced — drop them once so reconnect does not warn forever.
+      await this.discardUnfencedLeftover(meta);
       return;
     }
-    if (!meta.process_identity) {
-      // Cannot fence without process identity — report as orphaned with placeholder.
-      logger.warn('skipping recovery_report without process_identity', {
-        attemptId: meta.attempt_id,
-      });
+    if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
       return;
     }
 
@@ -228,6 +232,26 @@ export class AgentRecoveryCoordinator {
    */
   async cleanupVerifiedOrphan(attemptId: string): Promise<void> {
     await this.invokeCleanupAttemptResources(attemptId);
+  }
+
+  /**
+   * Local-only cleanup for attempts that never got a process identity.
+   * Mirrors terminate_stale disk hygiene without sending an invalid recovery_report.
+   */
+  private async discardUnfencedLeftover(meta: AttemptMetadata): Promise<void> {
+    logger.info('discarding leftover attempt without process_identity', {
+      attemptId: meta.attempt_id,
+      status: meta.status,
+    });
+    this.rejectedAttempts.add(meta.attempt_id);
+    await this.hooks.terminateAttempt(meta.attempt_id);
+    await this.invokeCleanupAttemptResources(meta.attempt_id);
+    writeAttemptMetadata(this.stateDir, {
+      ...meta,
+      status: 'terminal',
+      updated_at: new Date().toISOString(),
+    });
+    await removeAttemptMetadata(this.stateDir, meta.attempt_id).catch(() => undefined);
   }
 
   private async invokeCleanupAttemptResources(attemptId: string): Promise<void> {

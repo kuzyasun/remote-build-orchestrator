@@ -61,9 +61,11 @@ import { cleanupDockerResourcesForAttempt } from '../docker/cleanup.js';
 import { SpoolSender } from '../logs/spool-sender.js';
 import {
   type AttemptArtifactManifestItem,
+  type AttemptExitRecord,
   type AttemptMetadata,
   processIdentityFromPid,
   readAttemptMetadata,
+  removeAttemptMetadata,
   writeAttemptMetadata,
 } from '../recovery/attempt-metadata.js';
 import type { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
@@ -627,12 +629,33 @@ export class AgentJobExecutor {
     });
   }
 
+  /** Mark on-disk metadata terminal then remove it so recovery does not rescan it. */
+  private persistTerminalMetadata(attemptId: string, lastExit: AttemptExitRecord): void {
+    const existing = readAttemptMetadata(this.config.stateDir, attemptId);
+    if (!existing) {
+      return;
+    }
+    writeAttemptMetadata(this.config.stateDir, {
+      ...existing,
+      status: 'terminal',
+      last_exit: lastExit,
+      updated_at: new Date().toISOString(),
+    });
+    void removeAttemptMetadata(this.config.stateDir, attemptId).catch(() => undefined);
+  }
+
   private sendCancelledTerminal(
     attemptId: string,
     leaseId: string,
     leaseEpoch: number,
     message: string,
   ): void {
+    this.persistTerminalMetadata(attemptId, {
+      exit_code: null,
+      outcome: 'cancelled',
+      failure_category: 'cancelled',
+      failure_message: message,
+    });
     const exitPayload: JobExitPayload = {
       attempt_id: attemptId,
       lease_id: leaseId,
@@ -674,6 +697,12 @@ export class AgentJobExecutor {
     failureCategory: NonNullable<JobExitPayload['failure_category']>,
     failureMessage: string,
   ): void {
+    this.persistTerminalMetadata(attemptId, {
+      exit_code: 1,
+      outcome: 'failed',
+      failure_category: failureCategory,
+      failure_message: failureMessage,
+    });
     const exitPayload: JobExitPayload = {
       attempt_id: attemptId,
       lease_id: leaseId,
