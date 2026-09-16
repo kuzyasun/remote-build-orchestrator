@@ -73,9 +73,11 @@ Your local shell strips one level of quotes before invoking `rbo`. RBO transmits
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Job succeeded. |
-| `1` | Job failed (command exited non-zero or execution error). |
-| `125` | Job requires confirmation (destructive or hardware risk) and terminal is non-interactive. |
+| `0` | Job succeeded with remote exit code 0. |
+| `1`–`255` | Remote command exit code propagated directly when available (e.g. test or build failure). |
+| `1` | Job failed due to an execution error, infrastructure failure, declined confirmation, or unspecified error. |
+| `124` | Job timed out (`duration_seconds` elapsed or timeout policy triggered). |
+| `125` | Job requires confirmation in a non-interactive terminal, or remote exit code was malformed. |
 | `130` | Cancelled by user (Ctrl+C). |
 
 #### Interactive confirmation

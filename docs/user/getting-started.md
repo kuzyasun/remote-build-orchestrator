@@ -247,7 +247,8 @@ Add this rule to your project's `AGENTS.md`:
 ## Remote builds
 Use RBO MCP tools for builds and tests. Always specify `shell` and
 `target_os` matching a live Agent (`agents_list`). If `job_run` returns
-`resume: true`, call again with the same `job_id` and `next_log_cursor`.
+`resume: true`, call again with the same `job_id` and pass the returned
+`next_log_cursor` under `log_cursor`.
 ```
 
 The complete template is in [AI client configuration](client-integration/README.md).

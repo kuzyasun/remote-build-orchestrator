@@ -58,7 +58,7 @@ npm install -g @gemslibe/rbo
    rbo controller init
    rbo controller start --daemon
    ```
-   *Note: For remote workers across a LAN, data-plane transfers automatically use the connecting network interface. If using custom hostnames, VPNs, or reverse proxies, set `controller_public_host` in `~/.rbo/controller.json`.*
+   *Note: For remote workers across a LAN, data-plane transfers automatically use the connecting network interface. If using custom hostnames or VPNs on the same port, set `controller_public_host`. If using a reverse proxy with port translation (e.g. port 443), set `data_plane_base_url` (e.g. `https://proxy.example/`) in `~/.rbo/controller.json` or `RBO_DATA_PLANE_BASE_URL`.*
 2. **Worker Agent machine**: auto-discover Controller and start:
    ```bash
    rbo agent init             # scans LAN via mDNS, select your Controller [1]
