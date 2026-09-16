@@ -187,16 +187,16 @@ binaries or unbounded node_modules folders. These limits can be adjusted in `con
 
 ```json
 {
-  "max_snapshot_source_bytes": 524288000,
-  "max_snapshot_file_count": 50000,
-  "max_snapshot_single_file_bytes": 52428800,
-  "max_git_bundle_bytes": 524288000,
+  "max_snapshot_source_bytes": 1073741824,
+  "max_snapshot_file_count": 100000,
+  "max_snapshot_single_file_bytes": 268435456,
+  "max_git_bundle_bytes": 536870912,
   "allow_full_snapshot_fallback": false
 }
 ```
 
-- **`max_snapshot_source_bytes`**: Maximum total uncompressed source bytes across all files (default: 500 MiB).
-- **`max_snapshot_file_count`**: Maximum number of regular files included in a snapshot (default: 50,000).
-- **`max_snapshot_single_file_bytes`**: Maximum size of any individual uncommitted file (default: 50 MiB).
-- **`max_git_bundle_bytes`**: Maximum Git bundle transfer size when seeding missing commits to an Agent (default: 500 MiB).
+- **`max_snapshot_source_bytes`**: Maximum total uncompressed source bytes across all files (default: 1 GiB / 1,073,741,824 bytes).
+- **`max_snapshot_file_count`**: Maximum number of regular files included in a snapshot (default: 100,000).
+- **`max_snapshot_single_file_bytes`**: Maximum size of any individual uncommitted file (default: 256 MiB / 268,435,456 bytes).
+- **`max_git_bundle_bytes`**: Maximum Git bundle transfer size when seeding missing commits to an Agent (default: 512 MiB / 536,870,912 bytes).
 - **`allow_full_snapshot_fallback`**: When `false` (default), jobs fail fast if Git overlay capture is unavailable (e.g. non-allowlisted remotes or missing upstream). Set to `true` to permit uploading full working trees when overlay fails.

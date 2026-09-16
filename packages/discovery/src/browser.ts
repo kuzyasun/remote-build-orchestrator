@@ -1,6 +1,10 @@
 import { Bonjour, type Service } from 'bonjour-service';
 import { suppressMdnsErrors } from './advertiser.js';
-import { RBO_MDNS_BROWSE_TIMEOUT_MS, RBO_MDNS_SERVICE_TYPE } from './constants.js';
+import {
+  RBO_MDNS_BROWSE_TIMEOUT_MS,
+  RBO_MDNS_SERVICE_TYPE,
+  RBO_MDNS_TXT_VERSION,
+} from './constants.js';
 
 /** A controller discovered via mDNS/DNS-SD on the local network. */
 export interface DiscoveredController {
@@ -55,8 +59,8 @@ export function serviceToController(service: Service): DiscoveredController | nu
   const fingerprint = txtValue(txt, 'fingerprint').trim();
   const version = txtValue(txt, 'version').trim();
 
-  // Skip services missing required TXT fields.
-  if (!controllerId || !fingerprint) {
+  // Skip services missing required TXT fields or with incompatible protocol version.
+  if (!controllerId || !fingerprint || version !== RBO_MDNS_TXT_VERSION) {
     return null;
   }
 

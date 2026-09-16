@@ -117,6 +117,7 @@ describe('serviceToController and txtValue unit tests', () => {
       txt: {
         controller_id: 'controller_ref_123',
         fingerprint: 'sha256:ref123',
+        version: '1',
       },
     };
     const ctrl = serviceToController(mockService as unknown as Service);
@@ -170,7 +171,7 @@ describe('serviceToController and txtValue unit tests', () => {
     const base = {
       name: 'test',
       host: 'test.local',
-      txt: { controller_id: 'c1', fingerprint: 'f1' },
+      txt: { controller_id: 'c1', fingerprint: 'f1', version: '1' },
     };
     expect(serviceToController({ ...base, port: 0 } as unknown as Service)).toBeNull();
     expect(serviceToController({ ...base, port: -1 } as unknown as Service)).toBeNull();
@@ -178,5 +179,38 @@ describe('serviceToController and txtValue unit tests', () => {
     expect(
       serviceToController({ ...base, port: '7411' as unknown as number } as unknown as Service),
     ).toBeNull();
+  });
+
+  it('rejects services with missing or unsupported protocol versions', async () => {
+    const { serviceToController } = await import('../browser.js');
+    const base = {
+      name: 'test-ver',
+      host: 'test.local',
+      port: 7411,
+      txt: { controller_id: 'c1', fingerprint: 'f1' },
+    };
+    // Missing version
+    expect(serviceToController(base as unknown as Service)).toBeNull();
+    // Unsupported future version
+    expect(
+      serviceToController({
+        ...base,
+        txt: { ...base.txt, version: '2' },
+      } as unknown as Service),
+    ).toBeNull();
+    // Empty version
+    expect(
+      serviceToController({
+        ...base,
+        txt: { ...base.txt, version: '' },
+      } as unknown as Service),
+    ).toBeNull();
+    // Valid version
+    expect(
+      serviceToController({
+        ...base,
+        txt: { ...base.txt, version: '1' },
+      } as unknown as Service),
+    ).not.toBeNull();
   });
 });
