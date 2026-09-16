@@ -31,6 +31,7 @@ export interface PromptPairingOptions {
   isTTY?: boolean;
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
+  signal?: AbortSignal;
 }
 
 async function postAdmin<T>(baseUrl: string, action: string, body: unknown): Promise<T> {
@@ -114,13 +115,29 @@ export async function promptPendingPairingSelection(
   console.error(formatPendingPairingsList(pending));
 
   const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  if (options.signal) {
+    if (options.signal.aborted) {
+      ac.abort();
+    } else {
+      options.signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+
   const rl = createInterface({
     input: options.input ?? process.stdin,
     output: options.output ?? process.stderr,
   });
-  rl.on('SIGINT', () => {
-    ac.abort();
-  });
+  rl.on('SIGINT', onAbort);
+
+  const onSigint = () => ac.abort();
+  const customInput =
+    options.input && options.input !== process.stdin
+      ? (options.input as NodeJS.EventEmitter)
+      : null;
+  if (customInput) {
+    customInput.on('SIGINT', onSigint);
+  }
 
   try {
     const max = pending.length;
@@ -130,8 +147,12 @@ export async function promptPendingPairingSelection(
       signal: ac.signal,
     });
     const trimmed = answer.trim() || (defaultChoice ?? '');
+    if (!/^\d+$/.test(trimmed)) {
+      console.error('Invalid selection — cancelled.');
+      return null;
+    }
     const num = Number.parseInt(trimmed, 10);
-    if (Number.isNaN(num) || num < 0 || num > max) {
+    if (num < 0 || num > max) {
       console.error('Invalid selection — cancelled.');
       return null;
     }
@@ -139,10 +160,23 @@ export async function promptPendingPairingSelection(
       return null;
     }
     return pending[num - 1];
-  } catch {
+  } catch (error) {
+    if (
+      ac.signal.aborted ||
+      options.signal?.aborted ||
+      (error instanceof Error && error.name === 'AbortError')
+    ) {
+      throw new Error(`Pairing ${actionLabel} cancelled by operator`);
+    }
     return null;
   } finally {
     rl.close();
+    if (options.signal) {
+      options.signal.removeEventListener('abort', onAbort);
+    }
+    if (customInput) {
+      customInput.off('SIGINT', onSigint);
+    }
   }
 }
 

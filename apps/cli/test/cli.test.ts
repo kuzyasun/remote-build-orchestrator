@@ -208,6 +208,21 @@ describe('mDNS CLI formatting (§7.2)', () => {
       const best = selectBestAddress([], 'ctrl.local');
       expect(best).toBe('ctrl.local');
     });
+
+    it('prefers routable IPv4 responderAddress over 192.168.x.x host-only interface', () => {
+      const best = selectBestAddress(['192.168.56.1', '10.0.0.42'], 'ctrl.local', '10.0.0.42');
+      expect(best).toBe('10.0.0.42');
+    });
+
+    it('ignores link-local IPv6 responderAddress and uses routable address from list', () => {
+      const best = selectBestAddress(['10.0.0.42'], 'ctrl.local', 'fe80::1234');
+      expect(best).toBe('10.0.0.42');
+    });
+
+    it('ignores loopback responderAddress and uses routable address from list', () => {
+      const best = selectBestAddress(['10.0.0.42'], 'ctrl.local', '127.0.0.1');
+      expect(best).toBe('10.0.0.42');
+    });
   });
 
   describe('runDiscover', () => {

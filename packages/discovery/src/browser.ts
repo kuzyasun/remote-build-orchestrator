@@ -18,6 +18,8 @@ export interface DiscoveredController {
   fingerprint: string;
   /** Protocol version from TXT record. */
   version: string;
+  /** Resolved IP address of the UDP responder that delivered the advertisement. */
+  responderAddress?: string;
 }
 
 export interface DiscoverOptions {
@@ -76,6 +78,7 @@ export function serviceToController(service: Service): DiscoveredController | nu
     controllerId,
     fingerprint,
     version,
+    responderAddress: refererAddr,
   };
 }
 

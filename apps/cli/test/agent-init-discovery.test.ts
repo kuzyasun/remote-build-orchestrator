@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable, Writable } from 'node:stream';
 import type { DiscoveredController } from '@rbo/discovery';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runAgentInit } from '../src/commands/agent.js';
@@ -90,5 +91,80 @@ describe('runAgentInit with mDNS discovery', () => {
     };
     expect(config.controller_url).toBe('');
     expect(mockDiscover).toHaveBeenCalled();
+  });
+
+  it('selects controller interactively when operator enters option 1', async () => {
+    mockDiscover.mockResolvedValue(mockControllers);
+
+    const stateDir = tempDir();
+    const input = Readable.from(['1\n']);
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    const result = await runAgentInit({ stateDir, input, output, isTTY: true });
+
+    expect(result.configWritten).toBe(true);
+    expect(result.discovered).toBe(true);
+    expect(result.controllerName).toBe('discovered-ctrl');
+
+    const config = JSON.parse(readFileSync(join(stateDir, 'agent.json'), 'utf8')) as {
+      controller_url: string;
+      controller_fingerprint: string;
+    };
+    expect(config.controller_url).toBe('wss://192.168.1.88:7411/agent');
+    expect(config.controller_fingerprint).toBe('sha256:discovered12345');
+  });
+
+  it('writes empty default config when operator selects 0 (Skip)', async () => {
+    mockDiscover.mockResolvedValue(mockControllers);
+
+    const stateDir = tempDir();
+    const input = Readable.from(['0\n']);
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    const result = await runAgentInit({ stateDir, input, output, isTTY: true });
+
+    expect(result.configWritten).toBe(true);
+    expect(result.discovered).toBeUndefined();
+
+    const config = JSON.parse(readFileSync(join(stateDir, 'agent.json'), 'utf8')) as {
+      controller_url: string;
+      controller_fingerprint: string;
+    };
+    expect(config.controller_url).toBe('');
+    expect(config.controller_fingerprint).toBe('');
+  });
+
+  it('aborts without writing agent.json when selection is interrupted via signal / Ctrl+C', async () => {
+    mockDiscover.mockResolvedValue(mockControllers);
+
+    const stateDir = tempDir();
+    const ac = new AbortController();
+    ac.abort();
+
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    await expect(
+      runAgentInit({
+        stateDir,
+        output,
+        isTTY: true,
+        signal: ac.signal,
+      }),
+    ).rejects.toThrow('Controller selection cancelled by operator');
+
+    // Crucial guarantee: agent.json was NOT written to disk
+    expect(existsSync(join(stateDir, 'agent.json'))).toBe(false);
   });
 });

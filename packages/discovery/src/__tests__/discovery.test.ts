@@ -106,6 +106,24 @@ describe('serviceToController and txtValue unit tests', () => {
     expect(ctrl?.name).toBe('ctrl-alpha');
   });
 
+  it('captures responderAddress from service.referer.address', async () => {
+    const { serviceToController } = await import('../browser.js');
+    const mockService = {
+      name: 'ctrl-referer',
+      host: 'referer.local',
+      port: 7411,
+      addresses: ['192.168.56.1', '10.0.0.25'],
+      referer: { address: '10.0.0.25' },
+      txt: {
+        controller_id: 'controller_ref_123',
+        fingerprint: 'sha256:ref123',
+      },
+    };
+    const ctrl = serviceToController(mockService as unknown as Service);
+    expect(ctrl).not.toBeNull();
+    expect(ctrl?.responderAddress).toBe('10.0.0.25');
+  });
+
   it('handles case-insensitive TXT keys and Buffer values (RFC 6763 §6.4)', async () => {
     const { serviceToController } = await import('../browser.js');
     const mockService = {

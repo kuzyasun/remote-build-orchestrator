@@ -227,5 +227,22 @@ describe('CLI agent admin commands (§33)', () => {
       });
       expect(result).toBeNull();
     });
+
+    it('throws when selection is aborted via signal / SIGINT', async () => {
+      const ac = new AbortController();
+      ac.abort();
+      const output = new Writable({
+        write(_chunk, _encoding, callback) {
+          callback();
+        },
+      });
+      await expect(
+        promptPendingPairingSelection(baseUrl, 'approve', {
+          isTTY: true,
+          output,
+          signal: ac.signal,
+        }),
+      ).rejects.toThrow('Pairing approve cancelled by operator');
+    });
   });
 });

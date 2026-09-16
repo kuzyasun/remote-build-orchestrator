@@ -18,6 +18,14 @@ export interface AgentInitOptions {
   force?: boolean;
   /** Skip mDNS discovery (for programmatic / test use). */
   skipDiscovery?: boolean;
+  /** Custom input stream for testing interactive selection. */
+  input?: NodeJS.ReadableStream;
+  /** Custom output stream for testing interactive selection. */
+  output?: NodeJS.WritableStream;
+  /** TTY override for testing interactive selection. */
+  isTTY?: boolean;
+  /** Optional cancellation signal. */
+  signal?: AbortSignal;
 }
 
 export interface AgentInitResult {
@@ -42,20 +50,38 @@ export function isAgentInitialized(stateDir: string): boolean {
 
 /**
  * Select the best routable IP address from discovered addresses.
- * Prioritizes private LAN IPv4 (192.168.x.x, 10.x.x.x, 172.16-31.x.x),
+ * Prioritizes the responder address that actually delivered the advertisement packet
+ * (when routable IPv4), then private LAN IPv4 (192.168.x.x, 10.x.x.x, 172.16-31.x.x),
  * avoids APIPA (169.254.x.x) and loopback, and handles IPv6 cleanly.
  */
-export function selectBestAddress(addresses: string[], fallbackHost: string): string {
-  if (!addresses || addresses.length === 0) {
-    return fallbackHost;
-  }
+export function selectBestAddress(
+  addresses: string[],
+  fallbackHost: string,
+  responderAddress?: string,
+): string {
+  const normalizedResponder = responderAddress?.replace(/^::ffff:/i, '');
 
-  // Filter out loopback and link-local (APIPA)
+  // Filter out loopback and link-local (APIPA / fe80)
   const isLoopbackOrLinkLocal = (a: string) =>
-    a === '127.0.0.1' ||
+    a.startsWith('127.') ||
     a === '::1' ||
     a.startsWith('169.254.') ||
     a.toLowerCase().startsWith('fe80:');
+
+  // If the packet's responder IP is a routable IPv4 address, prefer it above
+  // all else: it came over the physical interface that delivered the mDNS packet.
+  // (IPv6 link-local responder fe80:... is excluded because it requires an unscoped zone index).
+  if (
+    normalizedResponder &&
+    !isLoopbackOrLinkLocal(normalizedResponder) &&
+    !normalizedResponder.includes(':')
+  ) {
+    return normalizedResponder;
+  }
+
+  if (!addresses || addresses.length === 0) {
+    return fallbackHost;
+  }
 
   const routable = addresses.filter((a) => !isLoopbackOrLinkLocal(a));
   if (routable.length === 0) {
@@ -91,7 +117,7 @@ export function formatControllerList(controllers: DiscoveredController[]): strin
   const lines: string[] = [];
   for (let i = 0; i < controllers.length; i++) {
     const c = controllers[i];
-    const rawAddr = selectBestAddress(c.addresses, c.host);
+    const rawAddr = selectBestAddress(c.addresses, c.host, c.responderAddress);
     const displayAddr =
       rawAddr.includes(':') && !rawAddr.startsWith('[') ? `[${rawAddr}]` : rawAddr;
     lines.push(`  ${i + 1}) ${c.name} (${displayAddr}:${c.port})`);
@@ -101,17 +127,33 @@ export function formatControllerList(controllers: DiscoveredController[]): strin
   return lines.join('\n');
 }
 
+export interface PromptControllerOptions {
+  input?: NodeJS.ReadableStream;
+  output?: NodeJS.WritableStream;
+  isTTY?: boolean;
+  signal?: AbortSignal;
+}
+
 /**
  * Prompt the user to select a controller from the discovered list.
  * Returns the selected controller, or `null` if skipped / non-TTY.
+ * Throws if cancelled/aborted (e.g. SIGINT) so initialization aborts without writing config.
  */
-async function promptControllerSelection(
+export async function promptControllerSelection(
   controllers: DiscoveredController[],
+  options: PromptControllerOptions = {},
 ): Promise<DiscoveredController | null> {
   console.error(`\nFound ${controllers.length} controller(s):`);
   console.error(formatControllerList(controllers));
+  console.error(
+    '\nWarning: On an untrusted or shared network, verify the fingerprint matches `rbo controller fingerprint` on the Controller before connecting.',
+  );
 
-  if (!process.stdin.isTTY) {
+  const isTTY =
+    options.isTTY ??
+    Boolean((options.input as { isTTY?: boolean } | undefined)?.isTTY ?? process.stdin.isTTY);
+
+  if (!isTTY) {
     console.error(
       '\nNon-interactive terminal detected. Edit agent.json manually or set RBO_CONTROLLER_URL.',
     );
@@ -119,17 +161,42 @@ async function promptControllerSelection(
   }
 
   const ac = new AbortController();
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  rl.on('SIGINT', () => {
-    ac.abort();
+  const onAbort = () => ac.abort();
+  if (options.signal) {
+    if (options.signal.aborted) {
+      ac.abort();
+    } else {
+      options.signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+
+  const rl = createInterface({
+    input: options.input ?? process.stdin,
+    output: options.output ?? process.stderr,
   });
+  rl.on('SIGINT', onAbort);
+
+  const onSigint = () => ac.abort();
+  const customInput =
+    options.input && options.input !== process.stdin
+      ? (options.input as NodeJS.EventEmitter)
+      : null;
+  if (customInput) {
+    customInput.on('SIGINT', onSigint);
+  }
+
   try {
     const max = controllers.length;
     const answer = await rl.question(`\nSelect controller [1-${max}, 0 to skip]: `, {
       signal: ac.signal,
     });
-    const num = Number.parseInt(answer.trim(), 10);
-    if (Number.isNaN(num) || num < 0 || num > max) {
+    const trimmed = answer.trim();
+    if (!/^\d+$/.test(trimmed)) {
+      console.error('Invalid selection — skipping.');
+      return null;
+    }
+    const num = Number.parseInt(trimmed, 10);
+    if (num < 0 || num > max) {
       console.error('Invalid selection — skipping.');
       return null;
     }
@@ -137,10 +204,23 @@ async function promptControllerSelection(
       return null;
     }
     return controllers[num - 1];
-  } catch {
+  } catch (error) {
+    if (
+      ac.signal.aborted ||
+      options.signal?.aborted ||
+      (error instanceof Error && error.name === 'AbortError')
+    ) {
+      throw new Error('Controller selection cancelled by operator');
+    }
     return null;
   } finally {
     rl.close();
+    if (options.signal) {
+      options.signal.removeEventListener('abort', onAbort);
+    }
+    if (customInput) {
+      customInput.off('SIGINT', onSigint);
+    }
   }
 }
 
@@ -184,16 +264,25 @@ export async function runAgentInit(options: AgentInitOptions = {}): Promise<Agen
 
   if (!options.skipDiscovery) {
     console.error('Scanning for RBO controllers on local network...');
-    const controllers = await discoverControllers();
+    const controllers = await discoverControllers({ signal: options.signal });
 
     if (controllers.length === 0) {
       console.error(
         'No controllers found on local network. Edit agent.json manually or set RBO_CONTROLLER_URL.',
       );
     } else {
-      selectedController = await promptControllerSelection(controllers);
+      selectedController = await promptControllerSelection(controllers, {
+        input: options.input,
+        output: options.output,
+        isTTY: options.isTTY,
+        signal: options.signal,
+      });
       if (selectedController) {
-        const rawAddr = selectBestAddress(selectedController.addresses, selectedController.host);
+        const rawAddr = selectBestAddress(
+          selectedController.addresses,
+          selectedController.host,
+          selectedController.responderAddress,
+        );
         const hostPart =
           rawAddr.includes(':') && !rawAddr.startsWith('[') ? `[${rawAddr}]` : rawAddr;
         discovery = {

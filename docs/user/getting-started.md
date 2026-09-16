@@ -158,6 +158,9 @@ Run `rbo agent start` to connect and begin pairing.
 Selecting your Controller automatically configures `controller_url` and pins `controller_fingerprint`
 in `agent.json` — no manual IP lookup or fingerprint copying required.
 
+> [!WARNING]
+> On untrusted or shared networks, verify that the displayed fingerprint matches `rbo controller fingerprint` on your Controller before connecting, or use manual setup (`rbo agent init --skip-discovery`).
+
 Start the Agent:
 
 ```bash

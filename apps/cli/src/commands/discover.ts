@@ -11,7 +11,7 @@ export function formatTable(controllers: DiscoveredController[]): string {
   }
 
   const formattedRows = controllers.map((c) => {
-    const addr = selectBestAddress(c.addresses, c.host);
+    const addr = selectBestAddress(c.addresses, c.host, c.responderAddress);
     const hostPart = addr.includes(':') && !addr.startsWith('[') ? `[${addr}]` : addr;
     return {
       name: c.name,
