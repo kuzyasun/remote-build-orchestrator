@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { RBO_MDNS_DEFAULT_DISPLAY_NAME } from '@rbo/discovery';
+import { RBO_MDNS_DEFAULT_DISPLAY_NAME, validateMdnsDisplayName } from '@rbo/discovery';
 import { type QueuePolicy, QueuePolicySchema } from '@rbo/protocol';
 import { type GitUrlAllowlist, resolveControllerDataDir } from '@rbo/shared';
 import type { SnapshotCaptureLimits } from '@rbo/snapshot';
@@ -122,7 +122,22 @@ export const ControllerConfigFileSchema = z
     local_fallback_max_host_cpu_percent: z.number().min(0).max(100).optional(),
     default_queue_policy: QueuePolicySchema.optional(),
     mdns_enabled: z.boolean().optional(),
-    mdns_display_name: z.string().min(1).max(63).optional(),
+    mdns_display_name: z
+      .string()
+      .trim()
+      .min(1, 'mDNS display name cannot be empty')
+      .refine(
+        (val) => Buffer.byteLength(val, 'utf8') <= 63,
+        (val) => ({
+          message: `mDNS display name exceeds 63 bytes (RFC 6763 §4.1.1, got ${Buffer.byteLength(val, 'utf8')} bytes)`,
+        }),
+      )
+      .refine(
+        // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control character rejection
+        (val) => !/[\x00-\x1f\x7f-\x9f]/.test(val),
+        'mDNS display name cannot contain control characters',
+      )
+      .optional(),
   })
   .strict();
 
@@ -547,12 +562,17 @@ export function loadControllerConfig(
       file?.mdns_enabled ??
       true,
     mdnsDisplayName:
-      fieldOverrides.mdnsDisplayName ??
-      (envSet('RBO_MDNS_DISPLAY_NAME') &&
-      (process.env.RBO_MDNS_DISPLAY_NAME?.trim().length ?? 0) > 0
-        ? process.env.RBO_MDNS_DISPLAY_NAME?.trim()
+      (fieldOverrides.mdnsDisplayName !== undefined
+        ? validateMdnsDisplayName(fieldOverrides.mdnsDisplayName, 'fieldOverrides.mdnsDisplayName')
         : undefined) ??
-      file?.mdns_display_name ??
+      (envSet('RBO_MDNS_DISPLAY_NAME') &&
+      typeof process.env.RBO_MDNS_DISPLAY_NAME === 'string' &&
+      process.env.RBO_MDNS_DISPLAY_NAME.trim().length > 0
+        ? validateMdnsDisplayName(process.env.RBO_MDNS_DISPLAY_NAME, 'RBO_MDNS_DISPLAY_NAME')
+        : undefined) ??
+      (file?.mdns_display_name !== undefined
+        ? validateMdnsDisplayName(file.mdns_display_name, 'file.mdns_display_name')
+        : undefined) ??
       RBO_MDNS_DEFAULT_DISPLAY_NAME,
   };
 }

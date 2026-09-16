@@ -2,6 +2,7 @@ export {
   ControllerAdvertiser,
   type AdvertiserOptions,
   suppressMdnsErrors,
+  validateMdnsDisplayName,
 } from './advertiser.js';
 export {
   discoverControllers,

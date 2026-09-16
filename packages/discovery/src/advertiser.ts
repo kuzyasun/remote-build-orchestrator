@@ -39,6 +39,34 @@ export function suppressMdnsErrors(bonjour: Bonjour): void {
 }
 
 /**
+ * Validate a DNS-SD service instance name (RFC 6763 §4.1.1).
+ *
+ * Rules:
+ * - Must be non-empty after trim.
+ * - Must be at most 63 bytes in UTF-8 (DNS label limit).
+ * - Must not contain control characters (0x00-0x1F, 0x7F-0x9F).
+ */
+export function validateMdnsDisplayName(name: string, label = 'mDNS display name'): string {
+  const trimmed = typeof name === 'string' ? name.trim() : '';
+  if (!trimmed) {
+    throw new Error(`Invalid ${label}: cannot be empty`);
+  }
+  const byteLength = Buffer.byteLength(trimmed, 'utf8');
+  if (byteLength > 63) {
+    throw new Error(
+      `Invalid ${label}: exceeds 63 bytes (RFC 6763 §4.1.1, got ${byteLength} bytes): ${JSON.stringify(trimmed)}`,
+    );
+  }
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control character rejection
+  if (/[\x00-\x1f\x7f-\x9f]/.test(trimmed)) {
+    throw new Error(
+      `Invalid ${label}: cannot contain control characters: ${JSON.stringify(trimmed)}`,
+    );
+  }
+  return trimmed;
+}
+
+/**
  * Advertises the Controller on the local network via mDNS/DNS-SD (§7.2).
  *
  * Publishes a `_rbo-controller._tcp` service with TXT records containing
@@ -58,13 +86,18 @@ export class ControllerAdvertiser {
       return;
     }
 
+    const name = validateMdnsDisplayName(
+      options.displayName ?? RBO_MDNS_DEFAULT_DISPLAY_NAME,
+      'displayName',
+    );
+
     this.bonjour = new Bonjour(undefined, () => {
       // Suppress unhandled mDNS UDP socket query errors.
     });
     suppressMdnsErrors(this.bonjour);
 
     this.bonjour.publish({
-      name: options.displayName ?? RBO_MDNS_DEFAULT_DISPLAY_NAME,
+      name,
       type: RBO_MDNS_SERVICE_TYPE,
       port: options.port,
       txt: {

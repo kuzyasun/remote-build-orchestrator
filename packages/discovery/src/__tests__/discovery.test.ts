@@ -77,10 +77,69 @@ describe('mDNS discovery', () => {
     advertiser.start(opts);
   });
 
+  it('advertiser.start validates displayName and rejects invalid values', () => {
+    const fresh = new ControllerAdvertiser();
+    expect(() =>
+      fresh.start({
+        port: 17414,
+        controllerId: 'c1',
+        fingerprint: 'f1',
+        displayName: 'a'.repeat(64),
+      }),
+    ).toThrow(/exceeds 63 bytes/);
+
+    expect(() =>
+      fresh.start({
+        port: 17414,
+        controllerId: 'c1',
+        fingerprint: 'f1',
+        displayName: 'bad\nname',
+      }),
+    ).toThrow(/control characters/);
+
+    expect(() =>
+      fresh.start({
+        port: 17414,
+        controllerId: 'c1',
+        fingerprint: 'f1',
+        displayName: '   ',
+      }),
+    ).toThrow(/cannot be empty/);
+  });
+
   it('stop is safe when not started and handles concurrent stops', async () => {
     const fresh = new ControllerAdvertiser();
     await expect(fresh.stop()).resolves.toBeUndefined();
     await expect(Promise.all([fresh.stop(), fresh.stop()])).resolves.toBeDefined();
+  });
+});
+
+describe('validateMdnsDisplayName', () => {
+  it('accepts valid DNS-SD service instance names', async () => {
+    const { validateMdnsDisplayName } = await import('../advertiser.js');
+    expect(validateMdnsDisplayName('rbo-controller')).toBe('rbo-controller');
+    expect(validateMdnsDisplayName('  my-ctrl-123  ')).toBe('my-ctrl-123');
+    expect(validateMdnsDisplayName('контролер')).toBe('контролер');
+  });
+
+  it('rejects empty or whitespace-only names', async () => {
+    const { validateMdnsDisplayName } = await import('../advertiser.js');
+    expect(() => validateMdnsDisplayName('')).toThrow(/cannot be empty/);
+    expect(() => validateMdnsDisplayName('   ')).toThrow(/cannot be empty/);
+  });
+
+  it('rejects names exceeding 63 UTF-8 bytes (RFC 6763 §4.1.1)', async () => {
+    const { validateMdnsDisplayName } = await import('../advertiser.js');
+    expect(() => validateMdnsDisplayName('a'.repeat(64))).toThrow(/exceeds 63 bytes/);
+    expect(() => validateMdnsDisplayName('я'.repeat(32))).toThrow(/exceeds 63 bytes/);
+  });
+
+  it('rejects names containing control characters', async () => {
+    const { validateMdnsDisplayName } = await import('../advertiser.js');
+    expect(() => validateMdnsDisplayName('ctrl\x00name')).toThrow(/control characters/);
+    expect(() => validateMdnsDisplayName('ctrl\nname')).toThrow(/control characters/);
+    expect(() => validateMdnsDisplayName('ctrl\x1b[31mname')).toThrow(/control characters/);
+    expect(() => validateMdnsDisplayName('ctrl\x7fname')).toThrow(/control characters/);
   });
 });
 

@@ -331,4 +331,30 @@ describe('mDNS discovery config (§7.2)', () => {
     writeFileSync(path, JSON.stringify({ mdns_display_name: 'a'.repeat(64) }), 'utf8');
     expect(() => readControllerConfigFile(path)).toThrow();
   });
+
+  it('rejects mdns_display_name in controller.json containing control characters', () => {
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(path, JSON.stringify({ mdns_display_name: 'ctrl\ninjection' }), 'utf8');
+    expect(() => readControllerConfigFile(path)).toThrow();
+  });
+
+  it('rejects RBO_MDNS_DISPLAY_NAME from environment exceeding 63 bytes', () => {
+    process.env.RBO_MDNS_DISPLAY_NAME = 'a'.repeat(64);
+    expect(() => loadControllerConfig({ configPath: null })).toThrow(/exceeds 63 bytes/);
+  });
+
+  it('rejects RBO_MDNS_DISPLAY_NAME from environment containing control characters', () => {
+    process.env.RBO_MDNS_DISPLAY_NAME = 'evil\x1b[31mname';
+    expect(() => loadControllerConfig({ configPath: null })).toThrow(/control characters/);
+  });
+
+  it('rejects programmatic mdnsDisplayName override exceeding 63 bytes or with control characters', () => {
+    expect(() =>
+      loadControllerConfig({ configPath: null, mdnsDisplayName: 'a'.repeat(64) }),
+    ).toThrow(/exceeds 63 bytes/);
+    expect(() => loadControllerConfig({ configPath: null, mdnsDisplayName: 'bad\rname' })).toThrow(
+      /control characters/,
+    );
+  });
 });
