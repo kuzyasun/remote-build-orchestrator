@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { RBO_MDNS_DEFAULT_DISPLAY_NAME } from '@rbo/discovery';
 import { type QueuePolicy, QueuePolicySchema } from '@rbo/protocol';
 import { type GitUrlAllowlist, resolveControllerDataDir } from '@rbo/shared';
 import type { SnapshotCaptureLimits } from '@rbo/snapshot';
@@ -55,6 +56,10 @@ export interface ControllerConfig {
    * capacity; `local_fallback` runs them on the Controller host; `fail_fast` fails immediately.
    */
   defaultQueuePolicy: QueuePolicy;
+  /** Advertise this controller via mDNS/DNS-SD for agent auto-discovery (§7.2). Default true. */
+  mdnsEnabled: boolean;
+  /** mDNS instance display name. Default: `'rbo-controller'`. */
+  mdnsDisplayName: string;
 }
 
 /** Default max git bundle size when RBO_MAX_GIT_BUNDLE_BYTES is unset (512 MiB). */
@@ -116,6 +121,8 @@ export const ControllerConfigFileSchema = z
     max_snapshot_temporary_bytes: z.number().int().positive().optional(),
     local_fallback_max_host_cpu_percent: z.number().min(0).max(100).optional(),
     default_queue_policy: QueuePolicySchema.optional(),
+    mdns_enabled: z.boolean().optional(),
+    mdns_display_name: z.string().min(1).max(63).optional(),
   })
   .strict();
 
@@ -274,6 +281,8 @@ export function defaultControllerConfigFile(): ControllerConfigFile {
     max_snapshot_temporary_bytes: DEFAULT_SNAPSHOT_CAPTURE_LIMITS.maxTemporarySnapshotBytes,
     local_fallback_max_host_cpu_percent: 80,
     default_queue_policy: 'wait',
+    mdns_enabled: true,
+    mdns_display_name: RBO_MDNS_DEFAULT_DISPLAY_NAME,
   };
 }
 
@@ -528,6 +537,23 @@ export function loadControllerConfig(
     snapshotCaptureLimits,
     maxHostCpuBusyFraction,
     defaultQueuePolicy,
+    mdnsEnabled:
+      fieldOverrides.mdnsEnabled ??
+      (envSet('RBO_MDNS_ENABLED')
+        ? !['false', '0', 'no', 'off', ''].includes(
+            (process.env.RBO_MDNS_ENABLED ?? '').trim().toLowerCase(),
+          )
+        : undefined) ??
+      file?.mdns_enabled ??
+      true,
+    mdnsDisplayName:
+      fieldOverrides.mdnsDisplayName ??
+      (envSet('RBO_MDNS_DISPLAY_NAME') &&
+      (process.env.RBO_MDNS_DISPLAY_NAME?.trim().length ?? 0) > 0
+        ? process.env.RBO_MDNS_DISPLAY_NAME?.trim()
+        : undefined) ??
+      file?.mdns_display_name ??
+      RBO_MDNS_DEFAULT_DISPLAY_NAME,
   };
 }
 

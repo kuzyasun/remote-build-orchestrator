@@ -1,8 +1,10 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { formatControllerList, selectBestAddress } from '../src/commands/agent.js';
 import { runControllerFingerprint, runControllerInit } from '../src/commands/controller.js';
+import { formatTable, runDiscover } from '../src/commands/discover.js';
 import { formatCliHelp } from '../src/commands/help.js';
 import { detectPlatform, renderServiceInstallPlan } from '../src/commands/service.js';
 
@@ -22,6 +24,10 @@ describe('rbo --help', () => {
     expect(help).toMatch(/^rbo CLI v/);
     expect(help).toContain('controller start');
     expect(help).toContain('agent stop-process');
+    expect(help).toContain('agent reject [<pairing-request-id>]');
+    expect(help).toContain('agent approve [<pairing-request-id>]');
+    expect(help).toContain('agent init [--force] [--skip-discovery]');
+    expect(help).toContain('discover');
     expect(help).toContain('doctor');
     expect(help).toContain('--replace');
     expect(help).toContain('run [options] -- <shell-command-string>');
@@ -115,5 +121,106 @@ describe('rbo agent install plan (§33)', () => {
 
   it('detects the current platform', () => {
     expect(['win32', 'darwin', 'linux']).toContain(detectPlatform(process.platform));
+  });
+});
+
+describe('mDNS CLI formatting (§7.2)', () => {
+  const dummyControllers = [
+    {
+      name: 'ctrl-alpha',
+      host: 'alpha.local',
+      addresses: ['192.168.1.10', 'fe80::1'],
+      port: 7411,
+      controllerId: 'controller_01JALPHA',
+      fingerprint: 'sha256:1122334455667788',
+      version: '1',
+    },
+    {
+      name: 'ctrl-beta',
+      host: 'beta.local',
+      addresses: ['192.168.1.20'],
+      port: 7411,
+      controllerId: 'controller_01JBETA',
+      fingerprint: 'sha256:aabbccddeeff0011',
+      version: '1',
+    },
+  ];
+
+  it('formatControllerList renders numbered entries and skip option', () => {
+    const text = formatControllerList(dummyControllers);
+    expect(text).toContain('1) ctrl-alpha (192.168.1.10:7411)');
+    expect(text).toContain('controller_01JALPHA  fingerprint: sha256:1122334455667788');
+    expect(text).toContain('2) ctrl-beta (192.168.1.20:7411)');
+    expect(text).toContain('controller_01JBETA  fingerprint: sha256:aabbccddeeff0011');
+    expect(text).toContain('0) Skip — configure manually later');
+  });
+
+  it('formatTable renders column headers and formatted rows without truncating fingerprints or IPv6', () => {
+    const table = formatTable(dummyControllers);
+    expect(table).toContain('Name');
+    expect(table).toContain('Address');
+    expect(table).toContain('Port');
+    expect(table).toContain('Controller ID');
+    expect(table).toContain('Fingerprint');
+    expect(table).toContain('ctrl-alpha');
+    expect(table).toContain('192.168.1.10');
+    expect(table).toContain('7411');
+    expect(table).toContain('controller_01JALPHA');
+    expect(table).toContain('sha256:1122334455667788');
+
+    const ipv6Controller = [
+      {
+        name: 'ctrl-ipv6',
+        host: 'ipv6.local',
+        addresses: ['fe80::1ff:fe23:4567:890a'],
+        port: 7411,
+        controllerId: 'controller_01JIPV6TEST',
+        fingerprint: 'sha256:998877665544332211',
+        version: '1',
+      },
+    ];
+    const ipv6Table = formatTable(ipv6Controller);
+    expect(ipv6Table).toContain('ipv6.local');
+  });
+
+  describe('selectBestAddress', () => {
+    it('prefers 192.168.x.x LAN over docker bridge 172.17.0.1', () => {
+      const best = selectBestAddress(['172.17.0.1', '192.168.1.50'], 'fallback.local');
+      expect(best).toBe('192.168.1.50');
+    });
+
+    it('prefers 10.x.x.x LAN over APIPA 169.254.x.x', () => {
+      const best = selectBestAddress(['169.254.10.20', '10.0.0.15'], 'fallback.local');
+      expect(best).toBe('10.0.0.15');
+    });
+
+    it('filters out loopback and link-local IPv6', () => {
+      const best = selectBestAddress(['127.0.0.1', 'fe80::1', '192.168.1.2'], 'fallback.local');
+      expect(best).toBe('192.168.1.2');
+    });
+
+    it('falls back to fallbackHost when all addresses are link-local or loopback', () => {
+      const best = selectBestAddress(['169.254.1.2', 'fe80::1', '127.0.0.1'], 'myhost.local');
+      expect(best).toBe('myhost.local');
+    });
+
+    it('falls back to fallbackHost when addresses array is empty', () => {
+      const best = selectBestAddress([], 'ctrl.local');
+      expect(best).toBe('ctrl.local');
+    });
+  });
+
+  describe('runDiscover', () => {
+    it('outputs JSON when json option is true', async () => {
+      const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const results = await runDiscover({ json: true });
+        expect(consoleLogSpy).toHaveBeenCalled();
+        const jsonOutput = consoleLogSpy.mock.calls[0]?.[0];
+        expect(() => JSON.parse(jsonOutput)).not.toThrow();
+      } finally {
+        consoleLogSpy.mockRestore();
+      }
+    });
   });
 });

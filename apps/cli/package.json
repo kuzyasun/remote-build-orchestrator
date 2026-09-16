@@ -68,6 +68,7 @@
   "devDependencies": {
     "@rbo/agent": "workspace:*",
     "@rbo/controller": "workspace:*",
+    "@rbo/discovery": "workspace:*",
     "@rbo/executor": "workspace:*",
     "@rbo/protocol": "workspace:*",
     "@rbo/shared": "workspace:*",

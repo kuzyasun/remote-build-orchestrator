@@ -15,16 +15,18 @@ Commands:
   controller stop [--data-dir <dir>]
   controller restore <staging-dir> [--data-dir <dir>]
 
-  agent init [--force] [--state-dir <dir>]
+  agent init [--force] [--skip-discovery] [--state-dir <dir>]
   agent start [--daemon] [--replace] [--state-dir <dir>]
   agent stop-process [--state-dir <dir>]
-  agent approve <pairing-request-id>
+  agent approve [<pairing-request-id>]
+  agent reject [<pairing-request-id>]
   agent revoke <agent-id>
   agent probe <agent-id>
   agent install|status|stop|uninstall [--execute]
       (OS service plans; process stop is stop-process)
 
   agents
+  discover [--json]
   doctor [--data-dir <dir>]
   submit <job-request.json>
   run [options] -- <shell-command-string>

@@ -1,3 +1,4 @@
+import { ControllerAdvertiser } from '@rbo/discovery';
 import {
   HostCpuMonitor,
   RBO_CONTROLLER_VERSION,
@@ -110,11 +111,28 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     database: config.databasePath,
   });
 
+  const advertiser = new ControllerAdvertiser();
+  if (config.mdnsEnabled) {
+    advertiser.start({
+      port: agentPlane.port,
+      controllerId: identity.controllerId,
+      fingerprint: identity.fingerprint,
+      displayName: config.mdnsDisplayName,
+    });
+    logger.info('mDNS advertisement started', {
+      type: '_rbo-controller._tcp',
+      displayName: config.mdnsDisplayName,
+    });
+  } else {
+    logger.info('mDNS advertisement disabled');
+  }
+
   const shutdown = async () => {
     logger.info('controller shutting down');
     if (snapshotRecoveryTimer) clearTimeout(snapshotRecoveryTimer);
     hostCpuMonitor.stop();
     lifecycleNotifier.close();
+    await advertiser.stop();
     await httpServer.close();
     await agentPlane.close();
     unbindJobLifecycleNotifier(db);

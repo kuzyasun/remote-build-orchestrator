@@ -498,7 +498,7 @@ Agent control і data endpoints доступні:
 
 ### 7.2. Discovery
 
-#### MVP
+#### Explicit URL (fallback)
 
 Agent config містить explicit Controller URL:
 
@@ -508,7 +508,7 @@ controller:
     - wss://kpc:7411/agent
 ```
 
-#### Наступна фаза
+#### mDNS/DNS-SD (default)
 
 Controller рекламує:
 
@@ -516,7 +516,7 @@ Controller рекламує:
 _rbo-controller._tcp.local
 ```
 
-Через mDNS/DNS-SD.
+Через mDNS/DNS-SD (пакет `bonjour-service`, `packages/discovery/`).
 
 TXT records:
 
@@ -525,7 +525,12 @@ version=1
 tls=1
 pairing=required
 controller_id=<uuid>
+fingerprint=<sha256:hex>
 ```
+
+`rbo agent init` автоматично сканує мережу і пропонує обрати контролер.
+`rbo discover` дозволяє вручну переглянути доступні контролери.
+Вимкнути: `mdns_enabled: false` в `controller.json` або `RBO_MDNS_ENABLED=false`.
 
 mDNS використовується лише для discovery. Authentication все одно обов'язкова.
 
