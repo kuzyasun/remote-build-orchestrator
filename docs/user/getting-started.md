@@ -230,7 +230,7 @@ rbo run --follow -- 'echo "RBO is working"'
 PowerShell:
 
 ```powershell
-rbo run --follow --shell powershell -- 'Write-Output "RBO is working"'
+rbo run --follow --shell powershell --target-os windows -- 'Write-Output "RBO is working"'
 ```
 
 Pass one command string after `--`. Use `--shell` and `--target-os` when the Agent runs a different
