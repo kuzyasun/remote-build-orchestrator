@@ -63,19 +63,18 @@ export function selectBestAddress(
 
   // Filter out loopback and link-local (APIPA / fe80)
   const isLoopbackOrLinkLocal = (a: string) =>
+    a === '0.0.0.0' ||
+    a === '::' ||
     a.startsWith('127.') ||
     a === '::1' ||
     a.startsWith('169.254.') ||
     a.toLowerCase().startsWith('fe80:');
 
-  // If the packet's responder IP is a routable IPv4 address, prefer it above
-  // all else: it came over the physical interface that delivered the mDNS packet.
-  // (IPv6 link-local responder fe80:... is excluded because it requires an unscoped zone index).
-  if (
-    normalizedResponder &&
-    !isLoopbackOrLinkLocal(normalizedResponder) &&
-    !normalizedResponder.includes(':')
-  ) {
+  // If the packet's responder IP is a routable address (IPv4 or non-link-local IPv6),
+  // prefer it above all else: it came over the physical interface that delivered the mDNS packet.
+  // Loopback (127.*, ::1) and link-local (169.254.*, fe80:*) are excluded because
+  // fe80 requires a zone index not provided by mDNS referer.
+  if (normalizedResponder && !isLoopbackOrLinkLocal(normalizedResponder)) {
     return normalizedResponder;
   }
 
@@ -110,6 +109,17 @@ export function selectBestAddress(
   return routable[0] ?? fallbackHost;
 }
 
+/** Strip or escape ANSI control sequences and control characters for terminal safety. */
+export function sanitizeTerminalOutput(str: string): string {
+  if (typeof str !== 'string') return '';
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional terminal CSI escape sequence sanitization
+  const noCsi = str.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional terminal OSC escape sequence sanitization
+  const noAnsi = noCsi.replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)?/g, '');
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional terminal control character replacement
+  return noAnsi.replace(/[\x00-\x1f\x7f-\x9f]/g, '?');
+}
+
 /**
  * Format the interactive controller selection list. Returns lines to print.
  */
@@ -118,10 +128,14 @@ export function formatControllerList(controllers: DiscoveredController[]): strin
   for (let i = 0; i < controllers.length; i++) {
     const c = controllers[i];
     const rawAddr = selectBestAddress(c.addresses, c.host, c.responderAddress);
+    const safeAddr = sanitizeTerminalOutput(rawAddr);
     const displayAddr =
-      rawAddr.includes(':') && !rawAddr.startsWith('[') ? `[${rawAddr}]` : rawAddr;
-    lines.push(`  ${i + 1}) ${c.name} (${displayAddr}:${c.port})`);
-    lines.push(`     ${c.controllerId}  fingerprint: ${c.fingerprint}`);
+      safeAddr.includes(':') && !safeAddr.startsWith('[') ? `[${safeAddr}]` : safeAddr;
+    const safeName = sanitizeTerminalOutput(c.name);
+    const safeId = sanitizeTerminalOutput(c.controllerId);
+    const safeFp = sanitizeTerminalOutput(c.fingerprint);
+    lines.push(`  ${i + 1}) ${safeName} (${displayAddr}:${c.port})`);
+    lines.push(`     ${safeId}  fingerprint: ${safeFp}`);
   }
   lines.push('  0) Skip — configure manually later');
   return lines.join('\n');
@@ -136,8 +150,8 @@ export interface PromptControllerOptions {
 
 /**
  * Prompt the user to select a controller from the discovered list.
- * Returns the selected controller, or `null` if skipped / non-TTY.
- * Throws if cancelled/aborted (e.g. SIGINT) so initialization aborts without writing config.
+ * Returns the selected controller, or `null` if explicitly skipped (0) or non-TTY.
+ * Throws if cancelled/aborted (e.g. SIGINT or uncorrected invalid input) so initialization aborts without writing config.
  */
 export async function promptControllerSelection(
   controllers: DiscoveredController[],
@@ -187,32 +201,45 @@ export async function promptControllerSelection(
 
   try {
     const max = controllers.length;
-    const answer = await rl.question(`\nSelect controller [1-${max}, 0 to skip]: `, {
-      signal: ac.signal,
-    });
-    const trimmed = answer.trim();
-    if (!/^\d+$/.test(trimmed)) {
-      console.error('Invalid selection — skipping.');
-      return null;
+    const maxRetries = 10;
+    let attempts = 0;
+    while (!ac.signal.aborted && attempts < maxRetries) {
+      attempts += 1;
+      const answer = await rl.question(`\nSelect controller [1-${max}, 0 to skip]: `, {
+        signal: ac.signal,
+      });
+      const trimmed = answer.trim();
+      if (!/^\d+$/.test(trimmed)) {
+        console.error(
+          `Invalid selection "${sanitizeTerminalOutput(trimmed)}". Enter a number from 1 to ${max}, or 0 to skip.`,
+        );
+        continue;
+      }
+      const num = Number.parseInt(trimmed, 10);
+      if (num < 0 || num > max) {
+        console.error(
+          `Selection ${num} is out of range. Enter a number from 1 to ${max}, or 0 to skip.`,
+        );
+        continue;
+      }
+      if (num === 0) {
+        return null;
+      }
+      return controllers[num - 1];
     }
-    const num = Number.parseInt(trimmed, 10);
-    if (num < 0 || num > max) {
-      console.error('Invalid selection — skipping.');
-      return null;
-    }
-    if (num === 0) {
-      return null;
-    }
-    return controllers[num - 1];
+    throw new Error('Invalid selection — aborted without writing configuration.');
   } catch (error) {
     if (
       ac.signal.aborted ||
       options.signal?.aborted ||
-      (error instanceof Error && error.name === 'AbortError')
+      (error instanceof Error && (error.name === 'AbortError' || error.message === 'SIGINT'))
     ) {
       throw new Error('Controller selection cancelled by operator');
     }
-    return null;
+    if (error instanceof Error && error.message.includes('readline was closed')) {
+      throw new Error('Invalid selection — aborted without writing configuration.');
+    }
+    throw error;
   } finally {
     rl.close();
     if (options.signal) {

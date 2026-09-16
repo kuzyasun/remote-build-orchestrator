@@ -2,7 +2,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { formatControllerList, selectBestAddress } from '../src/commands/agent.js';
+import {
+  formatControllerList,
+  sanitizeTerminalOutput,
+  selectBestAddress,
+} from '../src/commands/agent.js';
 import { runControllerFingerprint, runControllerInit } from '../src/commands/controller.js';
 import { formatTable, runDiscover } from '../src/commands/discover.js';
 import { formatCliHelp } from '../src/commands/help.js';
@@ -183,6 +187,49 @@ describe('mDNS CLI formatting (§7.2)', () => {
     expect(ipv6Table).toContain('ipv6.local');
   });
 
+  it('formatControllerList and formatTable sanitize control characters and ANSI escape codes', () => {
+    const maliciousController = [
+      {
+        name: 'ctrl\x1b[2K\x1b[1A\rInjected Name',
+        host: 'ctrl.local',
+        addresses: ['192.168.1.10'],
+        port: 7411,
+        controllerId: 'controller_\x1b[31mEVIL\x1b[0m',
+        fingerprint: 'sha256:\nfake_fingerprint',
+        version: '1',
+      },
+    ];
+    const listOutput = formatControllerList(maliciousController);
+    expect(listOutput).not.toContain('\x1b');
+    expect(listOutput).not.toContain('\r');
+    expect(listOutput).not.toContain('\nfake_fingerprint');
+    expect(listOutput).toContain('Injected Name');
+    expect(listOutput).toContain('controller_EVIL');
+    expect(listOutput).toContain('sha256:?fake_fingerprint');
+
+    const tableOutput = formatTable(maliciousController);
+    expect(tableOutput).not.toContain('\x1b');
+    expect(tableOutput).not.toContain('\r');
+    expect(tableOutput).not.toContain('\nfake_fingerprint');
+  });
+
+  describe('sanitizeTerminalOutput', () => {
+    it('strips ANSI color, style, and cursor sequences', () => {
+      expect(sanitizeTerminalOutput('\x1b[31mRed\x1b[0m')).toBe('Red');
+      expect(sanitizeTerminalOutput('\x1b[1;32mBold Green\x1b[m')).toBe('Bold Green');
+      expect(sanitizeTerminalOutput('\x1b[2K\x1b[?25hCursor')).toBe('Cursor');
+    });
+
+    it('replaces newlines, carriage returns, tabs, and control codes with ?', () => {
+      expect(sanitizeTerminalOutput('hello\nworld\r\x07')).toBe('hello?world??');
+      expect(sanitizeTerminalOutput('tab\there')).toBe('tab?here');
+    });
+
+    it('returns empty string for non-string input', () => {
+      expect(sanitizeTerminalOutput(undefined as unknown as string)).toBe('');
+    });
+  });
+
   describe('selectBestAddress', () => {
     it('prefers 192.168.x.x LAN over docker bridge 172.17.0.1', () => {
       const best = selectBestAddress(['172.17.0.1', '192.168.1.50'], 'fallback.local');
@@ -222,6 +269,21 @@ describe('mDNS CLI formatting (§7.2)', () => {
     it('ignores loopback responderAddress and uses routable address from list', () => {
       const best = selectBestAddress(['10.0.0.42'], 'ctrl.local', '127.0.0.1');
       expect(best).toBe('10.0.0.42');
+    });
+
+    it('prefers routable global IPv6 responderAddress over IPv4 addresses', () => {
+      const best = selectBestAddress(['10.0.0.42'], 'ctrl.local', '2001:db8::1');
+      expect(best).toBe('2001:db8::1');
+    });
+
+    it('prefers routable ULA IPv6 responderAddress over 192.168.x.x addresses', () => {
+      const best = selectBestAddress(['192.168.1.100'], 'ctrl.local', 'fd00::1234');
+      expect(best).toBe('fd00::1234');
+    });
+
+    it('filters out unspecified 0.0.0.0 and :: addresses', () => {
+      const best = selectBestAddress(['0.0.0.0', '::', '192.168.1.50'], 'fallback.local');
+      expect(best).toBe('192.168.1.50');
     });
   });
 

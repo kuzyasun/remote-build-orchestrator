@@ -1,5 +1,5 @@
 import { type DiscoveredController, discoverControllers } from '@rbo/discovery';
-import { selectBestAddress } from './agent.js';
+import { sanitizeTerminalOutput, selectBestAddress } from './agent.js';
 
 export interface DiscoverOptions {
   json?: boolean;
@@ -11,14 +11,16 @@ export function formatTable(controllers: DiscoveredController[]): string {
   }
 
   const formattedRows = controllers.map((c) => {
-    const addr = selectBestAddress(c.addresses, c.host, c.responderAddress);
-    const hostPart = addr.includes(':') && !addr.startsWith('[') ? `[${addr}]` : addr;
+    const rawAddr = selectBestAddress(c.addresses, c.host, c.responderAddress);
+    const safeAddr = sanitizeTerminalOutput(rawAddr);
+    const hostPart =
+      safeAddr.includes(':') && !safeAddr.startsWith('[') ? `[${safeAddr}]` : safeAddr;
     return {
-      name: c.name,
+      name: sanitizeTerminalOutput(c.name),
       address: hostPart,
       port: String(c.port),
-      id: c.controllerId,
-      fingerprint: c.fingerprint,
+      id: sanitizeTerminalOutput(c.controllerId),
+      fingerprint: sanitizeTerminalOutput(c.fingerprint),
     };
   });
 

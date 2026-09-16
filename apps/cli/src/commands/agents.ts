@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline/promises';
+import { sanitizeTerminalOutput } from './agent.js';
 
 // Thin HTTP client for the Controller's local admin API (§33, Phase 2).
 // The CLI never touches the database or security modules directly — it talks
@@ -77,9 +78,12 @@ export function formatPendingPairingsList(requests: PendingPairingSummary[]): st
   const lines: string[] = [];
   for (let i = 0; i < requests.length; i++) {
     const req = requests[i];
-    const hostInfo = req.hostname ? ` (hostname: ${req.hostname})` : '';
-    lines.push(`  ${i + 1}) ${req.display_name}${hostInfo}`);
-    lines.push(`     ID: ${req.id}  code: ${req.one_time_code}`);
+    const safeName = sanitizeTerminalOutput(req.display_name);
+    const hostInfo = req.hostname ? ` (hostname: ${sanitizeTerminalOutput(req.hostname)})` : '';
+    const safeId = sanitizeTerminalOutput(req.id);
+    const safeCode = sanitizeTerminalOutput(req.one_time_code);
+    lines.push(`  ${i + 1}) ${safeName}${hostInfo}`);
+    lines.push(`     ID: ${safeId}  code: ${safeCode}`);
   }
   lines.push('  0) Cancel');
   return lines.join('\n');

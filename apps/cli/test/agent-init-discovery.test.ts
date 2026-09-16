@@ -167,4 +167,58 @@ describe('runAgentInit with mDNS discovery', () => {
     // Crucial guarantee: agent.json was NOT written to disk
     expect(existsSync(join(stateDir, 'agent.json'))).toBe(false);
   });
+
+  it('retries on invalid or out-of-range selection and succeeds once valid option is entered', async () => {
+    mockDiscover.mockResolvedValue(mockControllers);
+
+    const stateDir = tempDir();
+    async function* multiInput() {
+      yield 'invalid\n';
+      yield '99\n';
+      yield '1\n';
+    }
+    const input = Readable.from(multiInput());
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    const result = await runAgentInit({ stateDir, input, output, isTTY: true });
+
+    expect(result.configWritten).toBe(true);
+    expect(result.discovered).toBe(true);
+    expect(result.controllerName).toBe('discovered-ctrl');
+
+    const config = JSON.parse(readFileSync(join(stateDir, 'agent.json'), 'utf8')) as {
+      controller_url: string;
+      controller_fingerprint: string;
+    };
+    expect(config.controller_url).toBe('wss://192.168.1.88:7411/agent');
+    expect(config.controller_fingerprint).toBe('sha256:discovered12345');
+  });
+
+  it('aborts without writing agent.json when selection is invalid and stream ends', async () => {
+    mockDiscover.mockResolvedValue(mockControllers);
+
+    const stateDir = tempDir();
+    const input = Readable.from(['invalid\n']);
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    await expect(
+      runAgentInit({
+        stateDir,
+        input,
+        output,
+        isTTY: true,
+      }),
+    ).rejects.toThrow('Invalid selection — aborted without writing configuration.');
+
+    // Crucial guarantee: agent.json was NOT written to disk
+    expect(existsSync(join(stateDir, 'agent.json'))).toBe(false);
+  });
 });

@@ -55,12 +55,28 @@ export function txtValue(txt: Record<string, unknown> | undefined, key: string):
  */
 export function serviceToController(service: Service): DiscoveredController | null {
   const txt = (service.txt ?? {}) as Record<string, unknown>;
-  const controllerId = txtValue(txt, 'controller_id').trim();
-  const fingerprint = txtValue(txt, 'fingerprint').trim();
-  const version = txtValue(txt, 'version').trim();
+  const rawControllerId = txtValue(txt, 'controller_id');
+  const rawFingerprint = txtValue(txt, 'fingerprint');
+  const rawVersion = txtValue(txt, 'version');
+  const controllerId = rawControllerId.trim();
+  const fingerprint = rawFingerprint.trim();
+  const version = rawVersion.trim();
 
-  // Skip services missing required TXT fields or with incompatible protocol version.
-  if (!controllerId || !fingerprint || version !== RBO_MDNS_TXT_VERSION) {
+  // Control characters regex (including ESC, newlines, tabs, and C1 controls)
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional mDNS control character rejection
+  const hasControlChars = (s: string) => /[\x00-\x1f\x7f-\x9f]/.test(s);
+
+  // Skip services missing required TXT fields, with incompatible protocol version,
+  // or containing control characters in identity/fingerprint/name/host fields.
+  if (
+    !controllerId ||
+    !fingerprint ||
+    version !== RBO_MDNS_TXT_VERSION ||
+    hasControlChars(rawControllerId) ||
+    hasControlChars(rawFingerprint) ||
+    hasControlChars(service.name ?? '') ||
+    hasControlChars(service.host ?? '')
+  ) {
     return null;
   }
 
@@ -68,8 +84,13 @@ export function serviceToController(service: Service): DiscoveredController | nu
     return null;
   }
 
-  const addresses = [...(service.addresses ?? [])];
-  const refererAddr = (service as unknown as { referer?: { address?: string } }).referer?.address;
+  const rawAddresses = Array.isArray(service.addresses) ? service.addresses : [];
+  const addresses = rawAddresses.filter(
+    (a): a is string => typeof a === 'string' && a.length > 0 && !hasControlChars(a),
+  );
+  const refererRaw = (service as unknown as { referer?: { address?: string } }).referer?.address;
+  const refererAddr =
+    typeof refererRaw === 'string' && !hasControlChars(refererRaw) ? refererRaw : undefined;
   if (refererAddr && !addresses.includes(refererAddr)) {
     addresses.push(refererAddr);
   }

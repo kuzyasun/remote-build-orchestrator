@@ -213,4 +213,61 @@ describe('serviceToController and txtValue unit tests', () => {
       } as unknown as Service),
     ).not.toBeNull();
   });
+
+  it('rejects services containing control characters in identity, fingerprint, name, or host', async () => {
+    const { serviceToController } = await import('../browser.js');
+    const validBase = {
+      name: 'ctrl-valid',
+      host: 'valid.local',
+      port: 7411,
+      addresses: ['192.168.1.50'],
+      txt: { controller_id: 'controller_123', fingerprint: 'sha256:abc', version: '1' },
+    };
+
+    // Control character / ANSI injection in controller_id
+    expect(
+      serviceToController({
+        ...validBase,
+        txt: { ...validBase.txt, controller_id: 'ctrl\x1b[31minjection\x1b[0m' },
+      } as unknown as Service),
+    ).toBeNull();
+    expect(
+      serviceToController({
+        ...validBase,
+        txt: { ...validBase.txt, controller_id: 'ctrl\ninjection' },
+      } as unknown as Service),
+    ).toBeNull();
+
+    // Control character in fingerprint
+    expect(
+      serviceToController({
+        ...validBase,
+        txt: { ...validBase.txt, fingerprint: 'sha256:abc\r\n' },
+      } as unknown as Service),
+    ).toBeNull();
+
+    // Control character in service name
+    expect(
+      serviceToController({
+        ...validBase,
+        name: 'ctrl\x00evil',
+      } as unknown as Service),
+    ).toBeNull();
+
+    // Control character in service host
+    expect(
+      serviceToController({
+        ...validBase,
+        host: 'host\x7fevil.local',
+      } as unknown as Service),
+    ).toBeNull();
+
+    // Malicious entries in addresses are filtered out
+    const withBadAddresses = serviceToController({
+      ...validBase,
+      addresses: ['192.168.1.50', 'bad\x1b[2Kaddress', '10.0.0.1'],
+    } as unknown as Service);
+    expect(withBadAddresses).not.toBeNull();
+    expect(withBadAddresses?.addresses).toEqual(['192.168.1.50', '10.0.0.1']);
+  });
 });
