@@ -500,7 +500,7 @@ Agent control і data endpoints доступні:
 
 #### Explicit URL (fallback)
 
-Agent config містить explicit Controller URL:
+Agent config contains an explicit Controller URL:
 
 ```yaml
 controller:
@@ -510,13 +510,13 @@ controller:
 
 #### mDNS/DNS-SD (default)
 
-Controller рекламує:
+Controller advertises:
 
 ```text
 _rbo-controller._tcp.local
 ```
 
-Через mDNS/DNS-SD (пакет `bonjour-service`, `packages/discovery/`).
+Via mDNS/DNS-SD (`bonjour-service` package, `packages/discovery/`).
 
 TXT records:
 
@@ -528,11 +528,11 @@ controller_id=<uuid>
 fingerprint=<sha256:hex>
 ```
 
-`rbo agent init` автоматично сканує мережу і пропонує обрати контролер.
-`rbo discover` дозволяє вручну переглянути доступні контролери.
-Вимкнути: `mdns_enabled: false` в `controller.json` або `RBO_MDNS_ENABLED=false`.
+`rbo agent init` automatically scans the network and prompts to select a controller.
+`rbo discover` allows inspecting available controllers manually.
+Disable: `mdns_enabled: false` in `controller.json` or `RBO_MDNS_ENABLED=false`.
 
-mDNS використовується лише для discovery. Authentication все одно обов'язкова.
+mDNS is used solely for discovery. Authentication is still mandatory.
 
 ---
 

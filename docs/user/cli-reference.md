@@ -43,7 +43,7 @@ rbo run [options] -- <shell-command-string>
 | `--project <path>` | Path to project root (default: current working directory). Must be inside `allowed_project_roots`. |
 | `--cwd <relative-path>` | Working directory inside the project root (default: `.`). |
 | `--shell <shell>` | Target shell: `bash`, `zsh`, `sh`, `powershell`, `pwsh`, `cmd`, or `direct`. Default: Controller host default shell. |
-| `--target-os <os>` | Repeatable OS filter: `linux`, `darwin`, or `win32`. Default: Controller host OS. |
+| `--target-os <os>` | Repeatable OS filter: `linux`, `macos`, or `windows`. Default: Controller host OS. |
 | `--timeout <seconds>` | Remote execution timeout in seconds (default: Controller config). |
 | `--risk <level>` | Declared risk level: `safe`, `normal`, `destructive`, or `hardware`. Default: `normal`. |
 | `--artifact <glob>` | Repeatable optional artifact glob pattern to collect upon job completion. |
