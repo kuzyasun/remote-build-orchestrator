@@ -51,11 +51,11 @@ export function parseRunCommandArgs(
 
   let projectOption: string | undefined;
   let cwdOption: string | undefined;
-  let shell: string | undefined;
+  let shell: JobRunInput['shell'];
   let timeoutSeconds: number | undefined;
-  let riskLevel: string | undefined;
-  let queuePolicy: string | undefined;
-  const targetOs: string[] = [];
+  let riskLevel: JobRunInput['risk_level'];
+  let queuePolicy: JobRunInput['queue_policy'];
+  const targetOs: NonNullable<JobRunInput['target_os']> = [];
   const artifacts: Array<{ glob: string; required: false }> = [];
 
   const optionArgs = args.slice(0, separator);
@@ -71,11 +71,15 @@ export function parseRunCommandArgs(
         index += 1;
         break;
       case '--shell':
-        shell = takeOptionValue(optionArgs, index, option);
+        shell = takeOptionValue(optionArgs, index, option) as JobRunInput['shell'];
         index += 1;
         break;
       case '--target-os':
-        targetOs.push(takeOptionValue(optionArgs, index, option));
+        targetOs.push(
+          takeOptionValue(optionArgs, index, option) as NonNullable<
+            JobRunInput['target_os']
+          >[number],
+        );
         index += 1;
         break;
       case '--timeout': {
@@ -89,7 +93,7 @@ export function parseRunCommandArgs(
         break;
       }
       case '--risk':
-        riskLevel = takeOptionValue(optionArgs, index, option);
+        riskLevel = takeOptionValue(optionArgs, index, option) as JobRunInput['risk_level'];
         index += 1;
         break;
       case '--artifact':
@@ -97,7 +101,7 @@ export function parseRunCommandArgs(
         index += 1;
         break;
       case '--queue-policy':
-        queuePolicy = takeOptionValue(optionArgs, index, option);
+        queuePolicy = takeOptionValue(optionArgs, index, option) as JobRunInput['queue_policy'];
         index += 1;
         break;
       default:

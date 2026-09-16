@@ -16,6 +16,26 @@ export function parseForceFlag(args: string[]): { force: boolean; rest: string[]
 }
 
 /**
+ * Boolean `--skip-discovery` (or `--no-discovery`) flag for agent init.
+ * Remaining tokens returned as `rest`.
+ */
+export function parseSkipDiscoveryFlag(args: string[]): {
+  skipDiscovery: boolean;
+  rest: string[];
+} {
+  const rest: string[] = [];
+  let skipDiscovery = false;
+  for (const arg of args) {
+    if (arg === '--skip-discovery' || arg === '--no-discovery') {
+      skipDiscovery = true;
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { skipDiscovery, rest };
+}
+
+/**
  * Boolean `--replace` flag for start (restart an already-running Controller/Agent).
  * Remaining tokens returned as `rest`.
  */

@@ -52,7 +52,7 @@ describe('isAgentInitialized / runAgentInit', () => {
 
   it('runAgentInit creates a complete agent.json config', async () => {
     const stateDir = await tempDir('rbo-cli-agent-init-');
-    const result = await runAgentInit({ stateDir });
+    const result = await runAgentInit({ stateDir, skipDiscovery: true });
     expect(existsSync(join(stateDir, 'agent.json'))).toBe(true);
     const config = JSON.parse(await readFile(join(stateDir, 'agent.json'), 'utf8')) as {
       initialized_at: string;
@@ -73,30 +73,37 @@ describe('isAgentInitialized / runAgentInit', () => {
 
   it('runAgentInit is idempotent', async () => {
     const stateDir = await tempDir('rbo-cli-agent-reinit-');
-    const first = await runAgentInit({ stateDir });
-    const second = await runAgentInit({ stateDir });
+    const first = await runAgentInit({ stateDir, skipDiscovery: true });
+    const second = await runAgentInit({ stateDir, skipDiscovery: true });
     expect(second.initialized_at).toBe(first.initialized_at);
     expect(second.configWritten).toBe(false);
   });
 
   it('runAgentInit does not overwrite an existing agent.json', async () => {
     const stateDir = await tempDir('rbo-cli-agent-config-keep-');
-    await runAgentInit({ stateDir });
+    await runAgentInit({ stateDir, skipDiscovery: true });
     const configPath = join(stateDir, 'agent.json');
     await writeFile(
       configPath,
       JSON.stringify({
         schema_version: 1,
         initialized_at: '2020-01-01T00:00:00.000Z',
-        controller_url: 'wss://kept.example:7411/agent',
-        controller_fingerprint: `sha256:${'e'.repeat(64)}`,
+        controller_url: 'wss://existing.test:7411/agent',
         display_name: 'kept',
+        max_jobs: 1,
       }),
       'utf8',
     );
-    await runAgentInit({ stateDir });
+    await runAgentInit({ stateDir, skipDiscovery: true });
     const kept = JSON.parse(await readFile(configPath, 'utf8')) as { display_name: string };
     expect(kept.display_name).toBe('kept');
+  });
+
+  it('runAgentInit honors skipDiscovery: true to bypass mDNS scanning', async () => {
+    const stateDir = await tempDir('rbo-cli-agent-skip-disc-');
+    const result = await runAgentInit({ stateDir, skipDiscovery: true });
+    expect(result.configWritten).toBe(true);
+    expect(result.discovered).toBeUndefined();
   });
 });
 

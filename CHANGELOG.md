@@ -7,6 +7,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-16
+
+### Added
+
+- Zero-configuration mDNS/DNS-SD discovery (`@rbo/discovery`, §7.2) for automatic Controller advertisement and Agent discovery on local networks.
+- Controller automatic mDNS advertisement on start, with graceful goodbye packets on shutdown (`mdns_enabled`, `mdns_display_name`).
+- Interactive Controller selection during `rbo agent init` and standalone `rbo discover [--json]` command for scanning LAN controllers.
+- Interactive Agent pairing approval and rejection (`rbo agent approve` / `rbo agent reject`) on the Controller without needing to copy 26-character pairing IDs.
+- Standalone CLI reference guide (`docs/user/cli-reference.md`) covering all commands, options, and shell execution semantics.
+
+### Changed
+
+- Made zero-configuration mDNS discovery the primary default onboarding path in `README.md` and `docs/user/getting-started.md`.
+- Streamlined `docs/user/getting-started.md` and moved manual network configuration to a dedicated fallback section for routed subnets and headless CI.
+- Updated `rbo agent approve` and `rbo agent reject` usage to support optional `[<pairing-request-id>]` argument with TTY prompt fallback.
+
 ## [0.7.0] - 2026-08-28
 
 ### Added
@@ -67,7 +83,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.7.0
 [0.6.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.2
 [0.6.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.0

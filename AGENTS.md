@@ -18,6 +18,7 @@
 - `packages/executor/`: Shared platform execution adapters (Unix/Windows process lifecycle, artifacts, logs) used by both Controller-local and Agent-remote execution.
 - `packages/shared/`: Shared errors, ID generators, hashing utilities, path/packaging helpers, crypto, controller identity, and logger.
 - `packages/testing/`: Shared test fixtures and harness helpers.
+- `packages/discovery/`: mDNS/DNS-SD controller advertisement and agent auto-discovery (§7.2).
 - `native/windows-executor/`: Rust Job Object process isolation helper for Windows (§15.2).
 - `packaging/`: Per-OS packaging manifests and config templates (see `docs/dev/release-builds.md`).
 - `docs/dev/release-builds.md`: How to build a release and publish `@gemslibe/rbo` to npm.
