@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-16
+
 ### Added
 
 - Zero-configuration mDNS/DNS-SD discovery (`@rbo/discovery`, §7.2) for automatic Controller advertisement and Agent discovery on local networks.
@@ -81,7 +83,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.7.0
 [0.6.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.2
 [0.6.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.0
