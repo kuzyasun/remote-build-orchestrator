@@ -454,6 +454,38 @@ describe('doctor mDNS port binding diagnostics', () => {
     expect(check.warn).toBeUndefined();
     expect(check.detail).toContain('UDP 5353 is available');
   });
+
+  it('reports OK (interface-pinned) when specific-IP binding belongs to controller PID', async () => {
+    const controllerOwnUdp = `
+  UDP    0.0.0.0:5353           *:*                                    54332
+  UDP    192.168.0.102:5353     *:*                                    42012
+`;
+    const check = await checkMdnsPort({
+      platform: 'win32',
+      netstatUdpOutput: controllerOwnUdp,
+      controllerPid: 42012,
+    });
+    expect(check.ok).toBe(true);
+    expect(check.warn).toBeUndefined();
+    expect(check.detail).toContain('interface-pinned');
+    expect(check.detail).toContain('192.168.0.102:5353');
+  });
+
+  it('still warns when specific-IP binding belongs to a different process even with controllerPid', async () => {
+    const mixedUdp = `
+  UDP    0.0.0.0:5353           *:*                                    54332
+  UDP    192.168.0.102:5353     *:*                                    46296
+`;
+    const check = await checkMdnsPort({
+      platform: 'win32',
+      netstatUdpOutput: mixedUdp,
+      controllerPid: 42012,
+      resolveProcessName: async (pid) => (pid === 46296 ? 'Zoom.exe' : undefined),
+    });
+    expect(check.ok).toBe(true);
+    expect(check.warn).toBe(true);
+    expect(check.detail).toContain('Zoom.exe');
+  });
 });
 
 describe('doctor Windows Firewall diagnostics', () => {

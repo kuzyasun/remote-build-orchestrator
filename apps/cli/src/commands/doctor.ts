@@ -933,6 +933,8 @@ export interface CheckMdnsPortOptions {
   ssUdpOutput?: string;
   lsofUdpOutput?: string;
   resolveProcessName?: ProcessNameResolver;
+  /** Known Controller PID — its own specific-IP mDNS binding is not a conflict. */
+  controllerPid?: number | null;
 }
 
 export async function checkMdnsPort(options: CheckMdnsPortOptions = {}): Promise<DoctorCheck> {
@@ -998,7 +1000,11 @@ export async function checkMdnsPort(options: CheckMdnsPortOptions = {}): Promise
   const isWildcard = (host: string) =>
     host === '0.0.0.0' || host === '*' || host === '::' || host === '[::]';
 
-  const conflicting = mdnsBindings.find((b) => !isWildcard(b.host));
+  const controllerPid = options.controllerPid ?? null;
+
+  const conflicting = mdnsBindings.find(
+    (b) => !isWildcard(b.host) && (controllerPid === null || b.pid !== controllerPid),
+  );
   if (conflicting) {
     const resolveName = options.resolveProcessName ?? defaultProcessNameResolver;
     const name = (await resolveName(conflicting.pid)) ?? `PID ${conflicting.pid}`;
@@ -1007,6 +1013,18 @@ export async function checkMdnsPort(options: CheckMdnsPortOptions = {}): Promise
       ok: true,
       warn: true,
       detail: `process "${name}" (PID ${conflicting.pid}) is bound to ${conflicting.host}:5353; specific-IP UDP bindings can intercept mDNS discovery packets for 0.0.0.0:5353 (close ${name} to restore auto-discovery)`,
+    };
+  }
+
+  // Controller's own specific-IP binding is intentional (interface pinning)
+  const ownBinding = mdnsBindings.find(
+    (b) => !isWildcard(b.host) && controllerPid !== null && b.pid === controllerPid,
+  );
+  if (ownBinding) {
+    return {
+      name: 'mdns_port',
+      ok: true,
+      detail: `Controller mDNS bound to ${ownBinding.host}:5353 (interface-pinned, ${mdnsBindings.length} listener${mdnsBindings.length === 1 ? '' : 's'})`,
     };
   }
 
@@ -1184,6 +1202,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
       ssUdpOutput: options.ssUdpOutput,
       lsofUdpOutput: options.lsofUdpOutput,
       resolveProcessName: options.processNameResolver,
+      controllerPid: options.controllerPid,
     }),
     checkFirewall({
       platform: options.platform,
