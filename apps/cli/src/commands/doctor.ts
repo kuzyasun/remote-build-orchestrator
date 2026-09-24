@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify, styleText } from 'node:util';
 import {
@@ -7,6 +7,8 @@ import {
   type WindowsExecutorResolveResult,
   describeWindowsExecutorResolution,
 } from '@rbo/executor';
+import { resolveControllerDataDir } from '@rbo/shared';
+import { controllerPidPath, isProcessAlive } from './daemon.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -33,6 +35,38 @@ export interface DoctorOptions {
   windowsExecutorResolve?: ResolveWindowsExecutorOptions;
   /** Injected Node version string (e.g. `v24.0.0`) for engines tests. */
   nodeVersion?: string;
+  /** Injected platform for cross-platform tests (defaults to process.platform). */
+  platform?: NodeJS.Platform;
+  /** Injected controller PID for testing controller_ports. */
+  controllerPid?: number | null;
+  /** Injected TCP netstat output for testing controller_ports. */
+  netstatTcpOutput?: string;
+  /** Injected UDP netstat output for testing mdns_port. */
+  netstatUdpOutput?: string;
+  /** Injected ss TCP output for testing Linux. */
+  ssTcpOutput?: string;
+  /** Injected ss UDP output for testing Linux. */
+  ssUdpOutput?: string;
+  /** Injected lsof TCP output for testing macOS/Linux. */
+  lsofTcpOutput?: string;
+  /** Injected lsof UDP output for testing macOS/Linux. */
+  lsofUdpOutput?: string;
+  /** Injected process name resolver for testing. */
+  processNameResolver?: ProcessNameResolver;
+  /** Injected node binary path for testing firewall rules. */
+  nodePath?: string;
+  /** Injected Windows firewall state output for testing. */
+  firewallStateOutput?: string;
+  /** Injected Windows firewall rules output for testing. */
+  firewallRulesOutput?: string;
+  /** Injected Linux ufw output for testing. */
+  linuxUfwOutput?: string | null;
+  /** Injected Linux firewalld state output for testing. */
+  linuxFirewalldStateOutput?: string | null;
+  /** Injected Linux firewalld ports output for testing. */
+  linuxFirewalldPortsOutput?: string | null;
+  /** Injected macOS firewall output for testing. */
+  macFirewallOutput?: string | null;
 }
 
 /** Status tag printed by `rbo doctor` (fixed width for column alignment). */
@@ -326,16 +360,852 @@ export function checkWindowsExecutor(
   };
 }
 
+export interface TcpPortBinding {
+  host: string;
+  port: number;
+  state: string;
+  pid: number;
+}
+
+export function parseNetstatTcp(output: string): TcpPortBinding[] {
+  const bindings: TcpPortBinding[] = [];
+  const lines = output.split('\n');
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.toUpperCase().startsWith('TCP')) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 5) continue;
+    const localAddr = parts[1];
+    const state = parts[3];
+    const pid = Number.parseInt(parts[4], 10);
+    if (Number.isNaN(pid)) continue;
+    const lastColon = localAddr.lastIndexOf(':');
+    if (lastColon === -1) continue;
+    const host = localAddr.slice(0, lastColon);
+    const port = Number.parseInt(localAddr.slice(lastColon + 1), 10);
+    if (Number.isNaN(port)) continue;
+    bindings.push({ host, port, state, pid });
+  }
+  return bindings;
+}
+
+export interface UdpPortBinding {
+  host: string;
+  port: number;
+  pid: number;
+}
+
+export function parseNetstatUdp(output: string): UdpPortBinding[] {
+  const bindings: UdpPortBinding[] = [];
+  const lines = output.split('\n');
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.toUpperCase().startsWith('UDP')) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 4) continue;
+    const localAddr = parts[1];
+    const pid = Number.parseInt(parts[3], 10);
+    if (Number.isNaN(pid)) continue;
+    const lastColon = localAddr.lastIndexOf(':');
+    if (lastColon === -1) continue;
+    const host = localAddr.slice(0, lastColon);
+    const port = Number.parseInt(localAddr.slice(lastColon + 1), 10);
+    if (Number.isNaN(port)) continue;
+    bindings.push({ host, port, pid });
+  }
+  return bindings;
+}
+
+export function parseSsTcp(output: string): TcpPortBinding[] {
+  const bindings: TcpPortBinding[] = [];
+  const lines = output.split('\n');
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || !/LISTEN/i.test(line)) continue;
+    const pidMatch = line.match(/pid=(\d+)/i);
+    const pid = pidMatch ? Number.parseInt(pidMatch[1], 10) : 0;
+    const parts = line.split(/\s+/);
+    const addrPart = parts.find((p) => p.includes(':') && !p.startsWith('users:'));
+    if (!addrPart) continue;
+    const lastColon = addrPart.lastIndexOf(':');
+    if (lastColon === -1) continue;
+    const host = addrPart.slice(0, lastColon);
+    const port = Number.parseInt(addrPart.slice(lastColon + 1), 10);
+    if (Number.isNaN(port)) continue;
+    bindings.push({ host, port, state: 'LISTENING', pid });
+  }
+  return bindings;
+}
+
+export function parseSsUdp(output: string): UdpPortBinding[] {
+  const bindings: UdpPortBinding[] = [];
+  const lines = output.split('\n');
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const pidMatch = line.match(/pid=(\d+)/i);
+    const pid = pidMatch ? Number.parseInt(pidMatch[1], 10) : 0;
+    const parts = line.split(/\s+/);
+    const addrPart = parts.find((p) => p.includes(':') && !p.startsWith('users:'));
+    if (!addrPart) continue;
+    const lastColon = addrPart.lastIndexOf(':');
+    if (lastColon === -1) continue;
+    const host = addrPart.slice(0, lastColon);
+    const port = Number.parseInt(addrPart.slice(lastColon + 1), 10);
+    if (Number.isNaN(port)) continue;
+    bindings.push({ host, port, pid });
+  }
+  return bindings;
+}
+
+export function parseLsofTcp(output: string): TcpPortBinding[] {
+  const bindings: TcpPortBinding[] = [];
+  const lines = output.split('\n');
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('COMMAND')) continue;
+    const parts = line.split(/\s+/);
+    const tcpIdx = parts.findIndex((p) => p.toUpperCase() === 'TCP');
+    if (tcpIdx === -1 || parts.length <= tcpIdx + 1) continue;
+    const pidIdx = parts.findIndex((p, idx) => idx > 0 && idx < tcpIdx && /^\d+$/.test(p));
+    const pid = pidIdx !== -1 ? Number.parseInt(parts[pidIdx], 10) : 0;
+    const addr = parts[tcpIdx + 1];
+    const lastColon = addr.lastIndexOf(':');
+    if (lastColon === -1) continue;
+    const host = addr.slice(0, lastColon);
+    const port = Number.parseInt(addr.slice(lastColon + 1), 10);
+    if (Number.isNaN(port)) continue;
+    const state =
+      parts
+        .slice(tcpIdx + 2)
+        .join(' ')
+        .replace(/[()]/g, '') || 'LISTENING';
+    bindings.push({ host, port, state, pid });
+  }
+  return bindings;
+}
+
+export function parseLsofUdp(output: string): UdpPortBinding[] {
+  const bindings: UdpPortBinding[] = [];
+  const lines = output.split('\n');
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('COMMAND')) continue;
+    const parts = line.split(/\s+/);
+    const udpIdx = parts.findIndex((p) => p.toUpperCase() === 'UDP');
+    if (udpIdx === -1 || parts.length <= udpIdx + 1) continue;
+    const pidIdx = parts.findIndex((p, idx) => idx > 0 && idx < udpIdx && /^\d+$/.test(p));
+    const pid = pidIdx !== -1 ? Number.parseInt(parts[pidIdx], 10) : 0;
+    const addr = parts[udpIdx + 1];
+    const lastColon = addr.lastIndexOf(':');
+    if (lastColon === -1) continue;
+    const host = addr.slice(0, lastColon);
+    const port = Number.parseInt(addr.slice(lastColon + 1), 10);
+    if (Number.isNaN(port)) continue;
+    bindings.push({ host, port, pid });
+  }
+  return bindings;
+}
+
+export interface InboundFirewallRule {
+  name: string;
+  enabled: boolean;
+  action: 'Allow' | 'Block';
+  program?: string;
+  protocol?: string;
+  localPort?: string;
+}
+
+export function parseWindowsFirewallRules(output: string): InboundFirewallRule[] {
+  const rules: InboundFirewallRule[] = [];
+  const blocks = output.split(/(?=Rule Name:\s*)/i);
+  for (const block of blocks) {
+    const nameMatch = block.match(/Rule Name:\s*([^\r\n]+)/i);
+    if (!nameMatch) continue;
+    const name = nameMatch[1].trim();
+
+    const enabledMatch = block.match(/Enabled:\s*([^\r\n]+)/i);
+    const enabled = enabledMatch ? /yes/i.test(enabledMatch[1].trim()) : false;
+
+    const actionMatch = block.match(/Action:\s*([^\r\n]+)/i);
+    const action = actionMatch && /allow/i.test(actionMatch[1].trim()) ? 'Allow' : 'Block';
+
+    const programMatch = block.match(/Program:\s*([^\r\n]+)/i);
+    const program = programMatch ? programMatch[1].trim() : undefined;
+
+    const protocolMatch = block.match(/Protocol:\s*([^\r\n]+)/i);
+    const protocol = protocolMatch ? protocolMatch[1].trim() : undefined;
+
+    const portMatch = block.match(/LocalPort:\s*([^\r\n]+)/i);
+    const localPort = portMatch ? portMatch[1].trim() : undefined;
+
+    rules.push({ name, enabled, action, program, protocol, localPort });
+  }
+  return rules;
+}
+
+export function isWindowsFirewallActive(showAllProfilesOutput: string): boolean {
+  return /State\s+ON/i.test(showAllProfilesOutput);
+}
+
+export function matchesPort(localPortStr: string | undefined, targetPort: number): boolean {
+  if (!localPortStr) return false;
+  const lower = localPortStr.toLowerCase().trim();
+  if (lower === 'any') return true;
+  const parts = lower.split(',').map((p) => p.trim());
+  for (const part of parts) {
+    if (part === String(targetPort)) return true;
+    const rangeMatch = part.match(/^(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      const min = Number.parseInt(rangeMatch[1], 10);
+      const max = Number.parseInt(rangeMatch[2], 10);
+      if (targetPort >= min && targetPort <= max) return true;
+    }
+  }
+  return false;
+}
+
+export interface FirewallCheckResult {
+  nodeAllowed: boolean;
+  port7411Allowed: boolean;
+  port5353Allowed: boolean;
+}
+
+export function evaluateWindowsFirewall(
+  rules: InboundFirewallRule[],
+  nodeExecutablePath: string,
+): FirewallCheckResult {
+  const normNode = nodeExecutablePath.toLowerCase().replace(/\\/g, '/');
+  let nodeAllowed = false;
+  let port7411Allowed = false;
+  let port5353Allowed = false;
+
+  for (const rule of rules) {
+    if (!rule.enabled || rule.action !== 'Allow') continue;
+
+    const normProg = rule.program ? rule.program.toLowerCase().replace(/\\/g, '/') : undefined;
+    const isProgramRule = Boolean(normProg && normProg !== 'any');
+    const matchesNode = normProg === normNode;
+
+    // If the rule specifies a different program, it does not allow traffic for node.exe
+    if (isProgramRule && !matchesNode) {
+      continue;
+    }
+
+    const proto = (rule.protocol ?? '').toUpperCase();
+    const isTcpOrAny = proto === 'TCP' || proto === 'ANY' || proto === '';
+
+    if (matchesNode && isTcpOrAny) {
+      // If rule allows node.exe without restricting to specific non-7411 ports
+      if (!rule.localPort || matchesPort(rule.localPort, 7411)) {
+        nodeAllowed = true;
+      }
+    }
+
+    if (proto === 'TCP' || proto === 'ANY') {
+      if (matchesPort(rule.localPort, 7411)) {
+        port7411Allowed = true;
+      }
+    }
+
+    if (proto === 'UDP' || proto === 'ANY') {
+      if (matchesPort(rule.localPort, 5353)) {
+        port5353Allowed = true;
+      }
+    }
+  }
+
+  return { nodeAllowed, port7411Allowed, port5353Allowed };
+}
+
+export interface FirewallDiagnosis {
+  ok: boolean;
+  warn?: boolean;
+  detail: string;
+}
+
+export function evaluateLinuxFirewall(
+  ufwStatus?: string | null,
+  firewalldState?: string | null,
+  firewalldPorts?: string | null,
+): FirewallDiagnosis {
+  if (ufwStatus && /Status:\s*active/i.test(ufwStatus)) {
+    if (/\b7411(?:\/tcp)?\b.*ALLOW/i.test(ufwStatus)) {
+      return {
+        ok: true,
+        detail: 'inbound TCP 7411 is allowed in ufw',
+      };
+    }
+    return {
+      ok: true,
+      warn: true,
+      detail:
+        'ufw is active but port 7411/tcp is not allowed; remote agents may not be able to connect. Run: sudo ufw allow 7411/tcp',
+    };
+  }
+
+  if (firewalldState && /^running$/i.test(firewalldState.trim())) {
+    if (firewalldPorts && /\b7411\/tcp\b/i.test(firewalldPorts)) {
+      return {
+        ok: true,
+        detail: 'inbound TCP 7411 is allowed in firewalld',
+      };
+    }
+    return {
+      ok: true,
+      warn: true,
+      detail:
+        'firewalld is active but port 7411/tcp is not allowed; remote agents may not be able to connect. Run: sudo firewall-cmd --add-port=7411/tcp --permanent && sudo firewall-cmd --reload',
+    };
+  }
+
+  return {
+    ok: true,
+    detail: 'no active firewall blocking ports detected (ufw/firewalld inactive or not installed)',
+  };
+}
+
+export function evaluateMacFirewall(socketfilterfwOutput?: string | null): FirewallDiagnosis {
+  if (socketfilterfwOutput === null || socketfilterfwOutput === undefined) {
+    return {
+      ok: true,
+      warn: true,
+      detail: 'unable to query macOS Application Firewall (socketfilterfw unavailable or failed)',
+    };
+  }
+  if (/State\s*=\s*0|disabled/i.test(socketfilterfwOutput)) {
+    return {
+      ok: true,
+      detail: 'macOS Application Firewall is disabled',
+    };
+  }
+  if (/State\s*=\s*1|enabled/i.test(socketfilterfwOutput)) {
+    return {
+      ok: true,
+      warn: true,
+      detail:
+        'macOS Application Firewall is enabled; ensure incoming connections are allowed for Node.js in System Settings > Network > Firewall',
+    };
+  }
+  return {
+    ok: true,
+    detail: 'macOS Application Firewall is inactive',
+  };
+}
+
+export type ProcessNameResolver = (pid: number) => Promise<string | undefined>;
+
+export async function defaultProcessNameResolver(pid: number): Promise<string | undefined> {
+  if (pid <= 0) return undefined;
+  if (process.platform === 'win32') {
+    try {
+      const { stdout } = await execFileAsync(
+        'tasklist',
+        ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
+        { timeout: 3000 },
+      );
+      const match = stdout.trim().match(/^"([^"]+)"/);
+      if (match?.[1] && !match[1].startsWith('INFO:')) {
+        return match[1];
+      }
+    } catch {
+      // Ignore tasklist failure
+    }
+  } else {
+    try {
+      if (existsSync(`/proc/${pid}/comm`)) {
+        return readFileSync(`/proc/${pid}/comm`, 'utf8').trim();
+      }
+    } catch {
+      // Ignore /proc failure
+    }
+    try {
+      const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'comm='], {
+        timeout: 3000,
+      });
+      const name = stdout.trim();
+      if (name) {
+        const lastSlash = name.lastIndexOf('/');
+        return lastSlash !== -1 ? name.slice(lastSlash + 1) : name;
+      }
+    } catch {
+      // Ignore ps failure
+    }
+  }
+  return undefined;
+}
+
+function readLiveControllerPid(dataDir: string): number | null {
+  const dirs = [dataDir];
+  try {
+    const defaultDataDir = resolveControllerDataDir();
+    if (defaultDataDir !== dataDir) {
+      dirs.push(defaultDataDir);
+    }
+  } catch {
+    // Ignore error resolving default data dir
+  }
+
+  for (const dir of dirs) {
+    try {
+      const pidFile = controllerPidPath(dir);
+      if (existsSync(pidFile)) {
+        const raw = readFileSync(pidFile, 'utf8').trim();
+        const pid = Number.parseInt(raw, 10);
+        if (isProcessAlive(pid)) {
+          return pid;
+        }
+      }
+    } catch {
+      // Continue to next dir
+    }
+  }
+  return null;
+}
+
+export interface CheckControllerPortsOptions {
+  dataDir: string;
+  platform?: NodeJS.Platform;
+  controllerPid?: number | null;
+  netstatTcpOutput?: string;
+  ssTcpOutput?: string;
+  lsofTcpOutput?: string;
+  resolveProcessName?: ProcessNameResolver;
+}
+
+export async function checkControllerPorts(
+  options: CheckControllerPortsOptions,
+): Promise<DoctorCheck> {
+  const platform = options.platform ?? process.platform;
+  const controllerPid =
+    options.controllerPid !== undefined
+      ? options.controllerPid
+      : readLiveControllerPid(options.dataDir);
+
+  let bindings: TcpPortBinding[] | undefined;
+  if (options.netstatTcpOutput !== undefined) {
+    bindings = parseNetstatTcp(options.netstatTcpOutput);
+  } else if (options.ssTcpOutput !== undefined) {
+    bindings = parseSsTcp(options.ssTcpOutput);
+  } else if (options.lsofTcpOutput !== undefined) {
+    bindings = parseLsofTcp(options.lsofTcpOutput);
+  } else if (platform === 'win32') {
+    try {
+      const res = await execFileAsync('netstat', ['-ano', '-p', 'tcp'], { timeout: 5000 });
+      bindings = parseNetstatTcp(res.stdout);
+    } catch {
+      // netstat unavailable
+    }
+  } else if (platform === 'linux') {
+    try {
+      const res = await execFileAsync('ss', ['-H', '-tlpn'], { timeout: 5000 });
+      bindings = parseSsTcp(res.stdout);
+    } catch {
+      // ss failed, try lsof
+    }
+    if (!bindings) {
+      try {
+        const res = await execFileAsync('lsof', ['-iTCP:7410,7411', '-sTCP:LISTEN', '-n', '-P'], {
+          timeout: 5000,
+        });
+        bindings = parseLsofTcp(res.stdout);
+      } catch {
+        // lsof failed
+      }
+    }
+  } else {
+    // macOS or other Unix
+    try {
+      const res = await execFileAsync('lsof', ['-iTCP:7410,7411', '-sTCP:LISTEN', '-n', '-P'], {
+        timeout: 5000,
+      });
+      bindings = parseLsofTcp(res.stdout);
+    } catch {
+      // lsof failed
+    }
+  }
+
+  if (bindings === undefined) {
+    return {
+      name: 'controller_ports',
+      ok: true,
+      detail: 'port check skipped (ss/lsof/netstat unavailable on this platform)',
+    };
+  }
+
+  const listening = bindings.filter((b) => b.state.toUpperCase() === 'LISTENING');
+  const p7410 = listening.find((b) => b.port === 7410);
+  const p7411 = listening.find((b) => b.port === 7411);
+
+  const resolveName = options.resolveProcessName ?? defaultProcessNameResolver;
+
+  // Case 1: Controller is running (controllerPid is known and alive)
+  if (controllerPid) {
+    const p7411Conflicting =
+      p7411 && (p7411.pid !== 0 ? p7411.pid !== controllerPid : p7410?.pid === controllerPid);
+    if (p7411Conflicting) {
+      const name =
+        p7411.pid === 0
+          ? 'another user or system process'
+          : ((await resolveName(p7411.pid)) ?? `PID ${p7411.pid}`);
+      const pidDesc = p7411.pid === 0 ? 'unprivileged socket' : `PID ${p7411.pid}`;
+      return {
+        name: 'controller_ports',
+        ok: false,
+        detail: `port 7411 is occupied by "${name}" (${pidDesc}) instead of Controller (PID ${controllerPid})`,
+      };
+    }
+
+    const p7410Conflicting =
+      p7410 && (p7410.pid !== 0 ? p7410.pid !== controllerPid : p7411?.pid === controllerPid);
+    if (p7410Conflicting) {
+      const name =
+        p7410.pid === 0
+          ? 'another user or system process'
+          : ((await resolveName(p7410.pid)) ?? `PID ${p7410.pid}`);
+      const pidDesc = p7410.pid === 0 ? 'unprivileged socket' : `PID ${p7410.pid}`;
+      return {
+        name: 'controller_ports',
+        ok: false,
+        detail: `port 7410 is occupied by "${name}" (${pidDesc}) instead of Controller (PID ${controllerPid})`,
+      };
+    }
+    if (p7410 && p7411) {
+      return {
+        name: 'controller_ports',
+        ok: true,
+        detail: `Controller listening on TCP 7410 (HTTP) and 7411 (agent plane) (PID ${controllerPid})`,
+      };
+    }
+    if (p7410 && !p7411) {
+      return {
+        name: 'controller_ports',
+        ok: true,
+        warn: true,
+        detail: `Controller (PID ${controllerPid}) is listening on TCP 7410, but agent plane (7411) is not active`,
+      };
+    }
+    return {
+      name: 'controller_ports',
+      ok: true,
+      warn: true,
+      detail: `Controller process is alive (PID ${controllerPid}), but ports 7410 and 7411 are not yet listening`,
+    };
+  }
+
+  // Case 2: controllerPid not explicitly known, but both ports are listening by same process (e.g. foreground controller)
+  if (p7410 && p7411 && p7410.pid === p7411.pid && p7410.pid !== 0) {
+    return {
+      name: 'controller_ports',
+      ok: true,
+      detail: `Controller listening on TCP 7410 (HTTP) and 7411 (agent plane) (PID ${p7410.pid})`,
+    };
+  }
+
+  // Case 3: Controller is NOT running
+  if (p7411) {
+    const name = (await resolveName(p7411.pid)) ?? `PID ${p7411.pid}`;
+    return {
+      name: 'controller_ports',
+      ok: false,
+      detail: `port 7411 is occupied by "${name}" (PID ${p7411.pid}); Controller will fail to bind`,
+    };
+  }
+  if (p7410) {
+    const name = (await resolveName(p7410.pid)) ?? `PID ${p7410.pid}`;
+    return {
+      name: 'controller_ports',
+      ok: false,
+      detail: `port 7410 is occupied by "${name}" (PID ${p7410.pid}); Controller will fail to bind`,
+    };
+  }
+
+  return {
+    name: 'controller_ports',
+    ok: true,
+    detail: 'ports 7410 and 7411 are available',
+  };
+}
+
+export interface CheckMdnsPortOptions {
+  platform?: NodeJS.Platform;
+  netstatUdpOutput?: string;
+  ssUdpOutput?: string;
+  lsofUdpOutput?: string;
+  resolveProcessName?: ProcessNameResolver;
+}
+
+export async function checkMdnsPort(options: CheckMdnsPortOptions = {}): Promise<DoctorCheck> {
+  const platform = options.platform ?? process.platform;
+  let bindings: UdpPortBinding[] | undefined;
+
+  if (options.netstatUdpOutput !== undefined) {
+    bindings = parseNetstatUdp(options.netstatUdpOutput);
+  } else if (options.ssUdpOutput !== undefined) {
+    bindings = parseSsUdp(options.ssUdpOutput);
+  } else if (options.lsofUdpOutput !== undefined) {
+    bindings = parseLsofUdp(options.lsofUdpOutput);
+  } else if (platform === 'win32') {
+    try {
+      const res = await execFileAsync('netstat', ['-ano', '-p', 'udp'], { timeout: 5000 });
+      bindings = parseNetstatUdp(res.stdout);
+    } catch {
+      // netstat unavailable
+    }
+  } else if (platform === 'linux') {
+    try {
+      const res = await execFileAsync('ss', ['-H', '-ulpn'], { timeout: 5000 });
+      bindings = parseSsUdp(res.stdout);
+    } catch {
+      // ss failed, try lsof
+    }
+    if (!bindings) {
+      try {
+        const res = await execFileAsync('lsof', ['-iUDP:5353', '-n', '-P'], { timeout: 5000 });
+        bindings = parseLsofUdp(res.stdout);
+      } catch {
+        // lsof failed
+      }
+    }
+  } else {
+    // macOS or other Unix
+    try {
+      const res = await execFileAsync('lsof', ['-iUDP:5353', '-n', '-P'], { timeout: 5000 });
+      bindings = parseLsofUdp(res.stdout);
+    } catch {
+      // lsof failed
+    }
+  }
+
+  if (bindings === undefined) {
+    return {
+      name: 'mdns_port',
+      ok: true,
+      detail: 'mDNS port check skipped (ss/lsof/netstat unavailable on this platform)',
+    };
+  }
+
+  const mdnsBindings = bindings.filter((b) => b.port === 5353);
+
+  if (mdnsBindings.length === 0) {
+    return {
+      name: 'mdns_port',
+      ok: true,
+      detail: 'UDP 5353 is available for discovery',
+    };
+  }
+
+  const isWildcard = (host: string) =>
+    host === '0.0.0.0' || host === '*' || host === '::' || host === '[::]';
+
+  const conflicting = mdnsBindings.find((b) => !isWildcard(b.host));
+  if (conflicting) {
+    const resolveName = options.resolveProcessName ?? defaultProcessNameResolver;
+    const name = (await resolveName(conflicting.pid)) ?? `PID ${conflicting.pid}`;
+    return {
+      name: 'mdns_port',
+      ok: true,
+      warn: true,
+      detail: `process "${name}" (PID ${conflicting.pid}) is bound to ${conflicting.host}:5353; specific-IP UDP bindings can intercept mDNS discovery packets for 0.0.0.0:5353 (close ${name} to restore auto-discovery)`,
+    };
+  }
+
+  return {
+    name: 'mdns_port',
+    ok: true,
+    detail: `UDP 5353 shared across wildcard (0.0.0.0) without conflicting specific-IP bindings (${mdnsBindings.length} listener${mdnsBindings.length === 1 ? '' : 's'})`,
+  };
+}
+
+export interface CheckFirewallOptions {
+  platform?: NodeJS.Platform;
+  nodePath?: string;
+  firewallStateOutput?: string;
+  firewallRulesOutput?: string;
+  linuxUfwOutput?: string | null;
+  linuxFirewalldStateOutput?: string | null;
+  linuxFirewalldPortsOutput?: string | null;
+  macFirewallOutput?: string | null;
+}
+
+export async function checkFirewall(options: CheckFirewallOptions = {}): Promise<DoctorCheck> {
+  const platform = options.platform ?? process.platform;
+  const nodePath = options.nodePath ?? process.execPath;
+
+  if (platform === 'win32') {
+    let stateOutput = options.firewallStateOutput;
+    let rulesOutput = options.firewallRulesOutput;
+
+    if (stateOutput === undefined || rulesOutput === undefined) {
+      try {
+        const [stateRes, rulesRes] = await Promise.all([
+          execFileAsync('netsh', ['advfirewall', 'show', 'allprofiles', 'state'], {
+            timeout: 5000,
+          }),
+          execFileAsync(
+            'netsh',
+            ['advfirewall', 'firewall', 'show', 'rule', 'name=all', 'dir=in', 'verbose'],
+            { timeout: 5000, maxBuffer: 10 * 1024 * 1024 },
+          ),
+        ]);
+        stateOutput = stateRes.stdout;
+        rulesOutput = rulesRes.stdout;
+      } catch (error) {
+        return {
+          name: 'firewall',
+          ok: true,
+          warn: true,
+          detail: `unable to query Windows Firewall: ${String(error)}`,
+        };
+      }
+    }
+
+    if (!isWindowsFirewallActive(stateOutput)) {
+      return {
+        name: 'firewall',
+        ok: true,
+        detail: 'Windows Defender Firewall is disabled',
+      };
+    }
+
+    const rules = parseWindowsFirewallRules(rulesOutput);
+    const evalResult = evaluateWindowsFirewall(rules, nodePath);
+
+    if (evalResult.nodeAllowed) {
+      return {
+        name: 'firewall',
+        ok: true,
+        detail: `inbound traffic allowed for "${nodePath}" in Windows Defender Firewall`,
+      };
+    }
+
+    if (evalResult.port7411Allowed) {
+      return {
+        name: 'firewall',
+        ok: true,
+        detail: 'inbound TCP 7411 is allowed in Windows Defender Firewall',
+      };
+    }
+
+    return {
+      name: 'firewall',
+      ok: true,
+      warn: true,
+      detail: `inbound TCP 7411 or "${nodePath}" not allowed in Windows Defender Firewall; remote agents may not be able to connect. Run: New-NetFirewallRule -DisplayName "RBO Controller" -Direction Inbound -Program "${nodePath}" -Action Allow`,
+    };
+  }
+
+  if (platform === 'linux') {
+    let ufwOut = options.linuxUfwOutput;
+    let fwCmdState = options.linuxFirewalldStateOutput;
+    let fwCmdPorts = options.linuxFirewalldPortsOutput;
+
+    if (ufwOut === undefined && fwCmdState === undefined) {
+      try {
+        const res = await execFileAsync('ufw', ['status'], { timeout: 3000 });
+        ufwOut = res.stdout;
+      } catch {
+        ufwOut = null;
+      }
+      if (!ufwOut || !/Status:\s*active/i.test(ufwOut)) {
+        try {
+          const stateRes = await execFileAsync('firewall-cmd', ['--state'], { timeout: 3000 });
+          fwCmdState = stateRes.stdout.trim();
+          if (/^running$/i.test(fwCmdState)) {
+            const portsRes = await execFileAsync('firewall-cmd', ['--list-ports'], {
+              timeout: 3000,
+            });
+            fwCmdPorts = portsRes.stdout.trim();
+          }
+        } catch {
+          fwCmdState = null;
+          fwCmdPorts = null;
+        }
+      }
+    }
+
+    const diagnosis = evaluateLinuxFirewall(ufwOut, fwCmdState, fwCmdPorts);
+    return {
+      name: 'firewall',
+      ok: diagnosis.ok,
+      warn: diagnosis.warn,
+      detail: diagnosis.detail,
+    };
+  }
+
+  if (platform === 'darwin') {
+    let macOut = options.macFirewallOutput;
+    if (macOut === undefined) {
+      try {
+        const res = await execFileAsync(
+          '/usr/libexec/ApplicationFirewall/socketfilterfw',
+          ['--getglobalstate'],
+          { timeout: 3000 },
+        );
+        macOut = res.stdout;
+      } catch {
+        macOut = null;
+      }
+    }
+
+    const diagnosis = evaluateMacFirewall(macOut);
+    return {
+      name: 'firewall',
+      ok: diagnosis.ok,
+      warn: diagnosis.warn,
+      detail: diagnosis.detail,
+    };
+  }
+
+  return {
+    name: 'firewall',
+    ok: true,
+    detail: `${platform} firewall check skipped`,
+  };
+}
+
 // `rbo doctor` (§33): git, controller port reachability, data dir permissions
 // and shell executables run locally; database/compression/TLS/snapshot checks
 // arrive with their respective phases (§35).
 export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
+  const [controllerPorts, mdnsPort, firewall] = await Promise.all([
+    checkControllerPorts({
+      dataDir: options.dataDir,
+      platform: options.platform,
+      controllerPid: options.controllerPid,
+      netstatTcpOutput: options.netstatTcpOutput,
+      ssTcpOutput: options.ssTcpOutput,
+      lsofTcpOutput: options.lsofTcpOutput,
+      resolveProcessName: options.processNameResolver,
+    }),
+    checkMdnsPort({
+      platform: options.platform,
+      netstatUdpOutput: options.netstatUdpOutput,
+      ssUdpOutput: options.ssUdpOutput,
+      lsofUdpOutput: options.lsofUdpOutput,
+      resolveProcessName: options.processNameResolver,
+    }),
+    checkFirewall({
+      platform: options.platform,
+      nodePath: options.nodePath,
+      firewallStateOutput: options.firewallStateOutput,
+      firewallRulesOutput: options.firewallRulesOutput,
+      linuxUfwOutput: options.linuxUfwOutput,
+      linuxFirewalldStateOutput: options.linuxFirewalldStateOutput,
+      linuxFirewalldPortsOutput: options.linuxFirewalldPortsOutput,
+      macFirewallOutput: options.macFirewallOutput,
+    }),
+  ]);
+
   const checks: DoctorCheck[] = [
     checkNodeEngines(options.nodeVersion),
     await checkGit(),
     checkDataDirWritable(options.dataDir),
     await checkShellExecutables(),
     checkWindowsExecutor(undefined, options.windowsExecutorResolve),
+    controllerPorts,
+    mdnsPort,
+    firewall,
   ];
 
   if (options.controllerUrl) {

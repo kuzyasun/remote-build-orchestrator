@@ -7,6 +7,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-24
+
+### Added
+
+- Cross-platform network and port diagnostics in `rbo doctor`:
+  - `controller_ports`: TCP 7410 (HTTP) and 7411 (Agent Plane WebSocket) availability and active process inspection across Windows (`netstat`), Linux (`ss`, `lsof`), and macOS (`lsof`).
+  - `mdns_port`: UDP 5353 collision detection that warns when non-wildcard interface bindings (e.g. Zoom) intercept incoming mDNS discovery packets on the local host.
+  - `firewall`: Cross-platform firewall status checks with actionable remediation commands for Windows Defender Firewall (`New-NetFirewallRule`), Linux `ufw` and `firewalld`, and macOS Application Firewall (`socketfilterfw`).
+- Local development guide (`docs/dev/local-development.md`) covering building from source, packaging with `pnpm pack`, and global installation workflows.
+- Dedicated firewall troubleshooting guide (`docs/user/troubleshooting.md`) and getting-started reference covering inbound rules for Node.js (`nvm4w`), Agent plane (TCP 7411), and mDNS discovery (UDP 5353) across Windows, Linux, and macOS.
+
+### Changed
+
+- `scripts/bump-version.mjs`: Dynamically synchronizes all 12 monorepo workspace packages (`apps/*`, `packages/*`), `native/windows-executor/Cargo.toml`, `Cargo.lock`, runtime constants, lockfile, packaging manifests, and `CHANGELOG.md` in lockstep.
+- `scripts/release-pack.mjs`: Added cross-platform packaging support for non-Windows hosts, and automated CLI bundle rebuilding before packaging.
+- Synchronized package versions across all `@rbo/*` workspace packages and `Cargo.toml` to lockstep product version `0.8.0`.
+- Added `"private": true` to all 9 internal workspace packages (`@rbo/*`) to protect against unintended npm registry publication.
+
+### Fixed
+
+- Windows Defender Firewall evaluation in `rbo doctor` now requires TCP or ANY protocol before marking `node.exe` inbound traffic allowed, preventing false positives from mDNS UDP rules.
+- Linux Controller port conflict detection now properly flags foreign occupied sockets on port 7411 when unprivileged `ss` reports PID 0.
+- macOS Application Firewall query failure handling now reports an advisory warning rather than falsely diagnosing the firewall as disabled when `socketfilterfw` is unavailable.
+- `lsof` socket parser now dynamically locates PID tokens to support command names containing whitespace.
+- Cleaned up dependency graph: moved `@rbo/testing` from `dependencies` to `devDependencies` in `apps/agent` and added missing runtime `ws` dependency in `apps/controller`.
+
 ## [0.8.0] - 2026-09-16
 
 ### Added
@@ -83,7 +109,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.0
 [0.8.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.7.0
 [0.6.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.2

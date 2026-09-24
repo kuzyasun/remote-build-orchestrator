@@ -1,7 +1,7 @@
 {
   "name": "rbo-monorepo",
   "private": true,
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Remote Build Orchestrator for running isolated build, test, QEMU, and Docker jobs on local or remote workers.",
   "license": "AGPL-3.0-only",
   "author": {
@@ -17,7 +17,7 @@
   },
   "homepage": "https://github.com/kuzyasun/remote-build-orchestrator#readme",
   "type": "module",
-  "packageManager": "pnpm@10.5.2",
+  "packageManager": "pnpm@12.6.0",
   "engines": {
     "node": ">=24.0.0"
   },

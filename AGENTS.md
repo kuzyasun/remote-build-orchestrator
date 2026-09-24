@@ -105,6 +105,11 @@ Always execute commands from the repo root or use `--filter` for targeted operat
   pnpm package:archives
   pnpm package:verify
   ```
+- **Local packaging & installation** (see `docs/dev/local-development.md`):
+  ```bash
+  pnpm release:pack                    # builds Windows helper + packs .tgz archives via pnpm pack
+  npm install -g ./apps/cli/gemslibe-rbo-<version>.tgz  # install locally (Windows helper first on win32-x64)
+  ```
 
 ## Working Rules & Efficiency
 

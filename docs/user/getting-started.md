@@ -26,9 +26,10 @@ The default ports are:
 | --- | --- | --- |
 | `7410` | AI clients and the `rbo` CLI | Controller machine only |
 | `7411` | Agent connections | reachable from Agent machines |
+| `5353` (UDP) | mDNS discovery advertisement | local network multicast |
 
 Keep port `7410` on loopback unless you deliberately secure and expose it. Allow Agents to reach
-port `7411` through the host firewall.
+port `7411` and `5353` through the host firewall (see [Firewall troubleshooting](troubleshooting.md#firewall-blocks-agent-connections-or-mdns-discovery)).
 
 ## 2. Install RBO
 

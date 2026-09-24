@@ -78,6 +78,7 @@ Run commands from repo root or with `--filter`:
 - Typechecking: `pnpm typecheck`
 - Rust verification: `pnpm rust:verify` (`cargo fmt --check` + `cargo test`)
 - Packaging manifests (after build): `pnpm package:archives` / `pnpm package:verify`
+- Local packaging & installation: `pnpm release:pack` → `npm install -g ./apps/cli/gemslibe-rbo-<version>.tgz` (see `docs/dev/local-development.md`)
 
 ## Working Rules & Efficiency
 

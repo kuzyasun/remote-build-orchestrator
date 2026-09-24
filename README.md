@@ -93,6 +93,7 @@ Start with the document that matches your goal:
 | Diagnose a problem | [Troubleshooting](docs/user/troubleshooting.md) |
 | Operate, update, back up, or remove RBO | [Operator runbook](docs/user/runbook.md) |
 | Understand the codebase | [Architecture](docs/dev/architecture.md) |
+| Compile, pack, and install locally | [Local development](docs/dev/local-development.md) |
 | Build or publish a release | [Release guide](docs/dev/release-builds.md) |
 | Review release changes | [Changelog](CHANGELOG.md) |
 | Report a vulnerability | [Security policy](SECURITY.md) |
