@@ -1186,11 +1186,16 @@ export async function checkFirewall(options: CheckFirewallOptions = {}): Promise
 // and shell executables run locally; database/compression/TLS/snapshot checks
 // arrive with their respective phases (§35).
 export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
+  const controllerPid =
+    options.controllerPid !== undefined
+      ? options.controllerPid
+      : readLiveControllerPid(options.dataDir);
+
   const [controllerPorts, mdnsPort, firewall] = await Promise.all([
     checkControllerPorts({
       dataDir: options.dataDir,
       platform: options.platform,
-      controllerPid: options.controllerPid,
+      controllerPid,
       netstatTcpOutput: options.netstatTcpOutput,
       ssTcpOutput: options.ssTcpOutput,
       lsofTcpOutput: options.lsofTcpOutput,
@@ -1202,7 +1207,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
       ssUdpOutput: options.ssUdpOutput,
       lsofUdpOutput: options.lsofUdpOutput,
       resolveProcessName: options.processNameResolver,
-      controllerPid: options.controllerPid,
+      controllerPid,
     }),
     checkFirewall({
       platform: options.platform,
