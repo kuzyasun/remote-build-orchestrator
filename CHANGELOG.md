@@ -11,6 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Native macOS mDNS discovery adapter in `@rbo/discovery` using `/usr/bin/dns-sd` IPC with `mDNSResponder`, resolving UDP 5353 port binding conflicts on macOS while maintaining cross-platform `bonjour-service` support on Windows and Linux.
 - Cross-platform network and port diagnostics in `rbo doctor`:
   - `controller_ports`: TCP 7410 (HTTP) and 7411 (Agent Plane WebSocket) availability and active process inspection across Windows (`netstat`), Linux (`ss`, `lsof`), and macOS (`lsof`).
   - `mdns_port`: UDP 5353 collision detection that warns when non-wildcard interface bindings (e.g. Zoom) intercept incoming mDNS discovery packets on the local host.

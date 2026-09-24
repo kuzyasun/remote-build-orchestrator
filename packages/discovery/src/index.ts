@@ -17,3 +17,12 @@ export {
   RBO_MDNS_SERVICE_TYPE,
   RBO_MDNS_TXT_VERSION,
 } from './constants.js';
+export {
+  parseDnsSdBrowseLine,
+  parseDnsSdResolveOutput,
+  parseDnsSdGetAddrInfoLine,
+  createDiscoveredControllerFromDnsSd,
+  discoverControllersViaDnsSd,
+  resolveHostAddresses,
+  type DnsSdResolvedService,
+} from './dnssd.js';

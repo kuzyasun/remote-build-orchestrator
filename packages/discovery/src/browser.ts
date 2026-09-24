@@ -107,38 +107,27 @@ export function serviceToController(service: Service): DiscoveredController | nu
   };
 }
 
+import { discoverControllersViaDnsSd } from './dnssd.js';
+
 /**
- * Browse the local network for RBO controllers via mDNS/DNS-SD (§7.2).
- *
- * Returns after `timeoutMs` (or upon signal abort) with all controllers discovered.
- * Listens to 'up', 'txt-update', and 'srv-update' events to handle multi-packet
- * mDNS responses, and deduplicates by `controllerId`.
+ * Internal browse helper using bonjour-service.
  */
-export async function discoverControllers(
-  options?: DiscoverOptions,
-): Promise<DiscoveredController[]> {
-  const timeoutMs = options?.timeoutMs ?? RBO_MDNS_BROWSE_TIMEOUT_MS;
-  const signal = options?.signal;
+function discoverViaBonjour(
+  options: DiscoverOptions | undefined,
+  timeoutMs: number,
+  onController: (ctrl: DiscoveredController) => void,
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
 
-  if (signal?.aborted) {
-    return [];
-  }
-
-  const bonjour = new Bonjour(undefined, () => {
-    // Suppress unhandled mDNS UDP socket errors during browse.
-  });
-  suppressMdnsErrors(bonjour);
-
-  return new Promise<DiscoveredController[]>((resolve) => {
-    const seen = new Map<string, DiscoveredController>();
-
-    const processService = (service: Service | null | undefined) => {
-      if (!service) return;
-      const controller = serviceToController(service);
-      if (controller) {
-        seen.set(controller.controllerId, controller);
-      }
-    };
+    const bonjour = new Bonjour(undefined, () => {
+      // Suppress unhandled mDNS UDP socket errors during browse.
+    });
+    suppressMdnsErrors(bonjour);
 
     interface BonjourBrowser {
       on(event: string, listener: (service: Service, ...rest: unknown[]) => void): this;
@@ -160,7 +149,8 @@ export async function discoverControllers(
       // Collect all services from browser cache before closing
       if (browser && Array.isArray(browser.services)) {
         for (const s of browser.services) {
-          processService(s);
+          const ctrl = serviceToController(s);
+          if (ctrl) onController(ctrl);
         }
       }
 
@@ -174,9 +164,7 @@ export async function discoverControllers(
       } catch {
         // Ignore destroy errors.
       }
-
-      const results = [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
-      resolve(results);
+      resolve();
     };
 
     if (signal) {
@@ -185,16 +173,65 @@ export async function discoverControllers(
     }
 
     try {
-      const b = bonjour.find({ type: RBO_MDNS_SERVICE_TYPE }, processService);
+      const b = bonjour.find({ type: RBO_MDNS_SERVICE_TYPE }, (s) => {
+        const ctrl = serviceToController(s);
+        if (ctrl) onController(ctrl);
+      });
       browser = b as unknown as BonjourBrowser;
-      browser.on('txt-update', (service: Service) => processService(service));
-      browser.on('srv-update', (service: Service) => processService(service));
+      browser.on('txt-update', (service: Service) => {
+        const ctrl = serviceToController(service);
+        if (ctrl) onController(ctrl);
+      });
+      browser.on('srv-update', (service: Service) => {
+        const ctrl = serviceToController(service);
+        if (ctrl) onController(ctrl);
+      });
     } catch {
-      // Return empty immediately if multicast interface fails to bind.
+      // Return immediately if multicast interface fails to bind.
       cleanup();
       return;
     }
 
     timer = setTimeout(cleanup, timeoutMs);
   });
+}
+
+/**
+ * Browse the local network for RBO controllers via mDNS/DNS-SD (§7.2).
+ *
+ * Returns after `timeoutMs` (or upon signal abort) with all controllers discovered.
+ * Runs `bonjour-service` across platforms, and on macOS (`darwin`) concurrently runs
+ * native `/usr/bin/dns-sd` via IPC with `mDNSResponder`, avoiding UDP 5353 port
+ * binding conflicts. Deduplicates controllers by `controllerId`.
+ */
+export async function discoverControllers(
+  options?: DiscoverOptions,
+): Promise<DiscoveredController[]> {
+  const timeoutMs = options?.timeoutMs ?? RBO_MDNS_BROWSE_TIMEOUT_MS;
+  const signal = options?.signal;
+
+  if (signal?.aborted) {
+    return [];
+  }
+
+  const seen = new Map<string, DiscoveredController>();
+  const onController = (ctrl: DiscoveredController) => {
+    if (ctrl && !seen.has(ctrl.controllerId)) {
+      seen.set(ctrl.controllerId, ctrl);
+    }
+  };
+
+  const tasks: Promise<unknown>[] = [discoverViaBonjour(options, timeoutMs, onController)];
+
+  if (process.platform === 'darwin') {
+    tasks.push(
+      discoverControllersViaDnsSd(options, onController).catch(() => {
+        // Suppress native discovery errors; bonjour-service runs in parallel
+      }),
+    );
+  }
+
+  await Promise.all(tasks);
+
+  return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
