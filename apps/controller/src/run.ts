@@ -113,15 +113,21 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
 
   const advertiser = new ControllerAdvertiser();
   if (config.mdnsEnabled) {
+    const mdnsIface =
+      config.controllerPublicHost && !config.controllerPublicHost.startsWith('127.')
+        ? config.controllerPublicHost
+        : undefined;
     advertiser.start({
       port: agentPlane.port,
       controllerId: identity.controllerId,
       fingerprint: identity.fingerprint,
       displayName: config.mdnsDisplayName,
+      interface: mdnsIface,
     });
     logger.info('mDNS advertisement started', {
       type: '_rbo-controller._tcp',
       displayName: config.mdnsDisplayName,
+      interface: mdnsIface ?? 'auto',
     });
   } else {
     logger.info('mDNS advertisement disabled');

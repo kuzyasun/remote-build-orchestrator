@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import {
   RBO_CONTROLLER_VERSION,
@@ -130,7 +131,7 @@ async function main(): Promise<void> {
           dataDir,
           daemon,
           replace,
-          cliScriptPath: process.argv[1],
+          cliScriptPath: resolve(process.argv[1]),
         });
         if (result === null) {
           return;
@@ -216,7 +217,7 @@ async function main(): Promise<void> {
           stateDir,
           daemon,
           replace,
-          cliScriptPath: process.argv[1],
+          cliScriptPath: resolve(process.argv[1]),
         });
         if (result === null) {
           return;

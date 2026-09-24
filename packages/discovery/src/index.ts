@@ -1,6 +1,7 @@
 export {
   ControllerAdvertiser,
   type AdvertiserOptions,
+  getPreferredMdnsInterface,
   suppressMdnsErrors,
   validateMdnsDisplayName,
 } from './advertiser.js';

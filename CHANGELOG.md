@@ -28,6 +28,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- **mDNS probe self-cancellation**: Disabled `bonjour-service` name probing (`probe: false`) which caused the Controller to silently cancel its own mDNS advertisement when LAN caches or `mDNSResponder` responded to the probe query after a restart.
+- **mDNS advertisement on wrong interface**: Added `getPreferredMdnsInterface()` to bind multicast to physical LAN adapters (Wi-Fi, Ethernet) instead of virtual adapters (WSL `vEthernet`, Hyper-V, Docker) that have higher link speed metrics on Windows.
+- Daemon script path resolution (`resolve(process.argv[1])`) in `rbo controller start --daemon` and `rbo agent start --daemon` to ensure detached child processes use absolute paths.
 - Windows Defender Firewall evaluation in `rbo doctor` now requires TCP or ANY protocol before marking `node.exe` inbound traffic allowed, preventing false positives from mDNS UDP rules.
 - Linux Controller port conflict detection now properly flags foreign occupied sockets on port 7411 when unprivileged `ss` reports PID 0.
 - macOS Application Firewall query failure handling now reports an advisory warning rather than falsely diagnosing the firewall as disabled when `socketfilterfw` is unavailable.
