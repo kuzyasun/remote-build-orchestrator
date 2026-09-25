@@ -166,6 +166,23 @@ describe('createDiscoveredControllerFromDnsSd', () => {
     });
   });
 
+  it('does not use an unspecified address as the responder', () => {
+    const resolved = {
+      host: 'KPC',
+      port: 7411,
+      txt: {
+        version: '1',
+        controller_id: 'ctrl_001',
+        fingerprint: 'sha256:112233',
+      },
+    };
+    const ctrl = createDiscoveredControllerFromDnsSd('rbo-controller', resolved, [
+      '0.0.0.0',
+      '192.168.0.102',
+    ]);
+    expect(ctrl?.responderAddress).toBe('192.168.0.102');
+  });
+
   it('rejects missing or wrong version', () => {
     const resolved = {
       host: 'my-pc.local',

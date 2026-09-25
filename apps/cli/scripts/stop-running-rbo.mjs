@@ -275,7 +275,13 @@ export async function stopPid(pid, options = {}) {
   try {
     process.kill(pid, 'SIGKILL');
   } catch {
-    // gone
+    return;
+  }
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await sleepMs(100);
+    if (!alive(pid)) {
+      return;
+    }
   }
 }
 

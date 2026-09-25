@@ -196,11 +196,12 @@ rbo controller restore <staging-dir> [--data-dir <dir>]
 rbo agent init [--force] [--skip-discovery] [--state-dir <dir>]
 rbo agent start [--daemon] [--replace] [--state-dir <dir>]
 rbo agent stop-process [--state-dir <dir>]
+rbo agent status [--state-dir <dir>]
 rbo agent approve [<pairing-request-id>]
 rbo agent reject [<pairing-request-id>]
 rbo agent revoke <agent-id>
 rbo agent probe <agent-id>
-rbo agent install|status|stop|uninstall [--execute]
+rbo agent install|stop|uninstall [--execute]
 ```
 
 | Command | Description |
@@ -208,11 +209,12 @@ rbo agent install|status|stop|uninstall [--execute]
 | `init` | Initializes Agent configuration (`agent.json`). Scans LAN via mDNS unless `--skip-discovery` is passed. |
 | `start` | Starts Agent worker process. Use `--daemon` for detached background execution, `--replace` to restart. |
 | `stop-process` | Stops a running foreground or daemon Agent process. |
+| `status` | Shows whether the local Agent process is running, whether it is connected to its configured controller, and whether a pairing credential is stored. |
 | `approve [<id>]` | Approves a pending agent pairing request on the Controller (interactive menu if `<id>` omitted). |
 | `reject [<id>]` | Rejects a pending agent pairing request (interactive menu if `<id>` omitted). |
 | `revoke <id>` | Revokes credentials and authorization for an existing Agent. |
 | `probe <id>` | Queries an active Agent for hardware capabilities, shells, and installed tools. |
-| `install\|status...` | Generates or executes OS service plans (systemd, launchd, Windows Service). |
+| `install\|stop\|uninstall` | Generates or executes OS service plans (systemd, launchd, Windows Service). |
 
 ---
 

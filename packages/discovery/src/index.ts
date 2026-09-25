@@ -6,6 +6,15 @@ export {
   validateMdnsDisplayName,
 } from './advertiser.js';
 export {
+  hostLookupCandidates,
+  isIpAddress,
+  isIpv4Address,
+  isIpv6Address,
+  isRoutableIpAddress,
+  normalizeMdnsHost,
+} from './address.js';
+export {
+  chooseDiscoveredController,
   discoverControllers,
   type DiscoveredController,
   type DiscoverOptions,

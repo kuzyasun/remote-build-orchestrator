@@ -33,3 +33,8 @@ export function resolveAgentStateDir(options?: RboLayoutOptions): string {
   }
   return join(resolveControllerDataDir(options), 'agent');
 }
+
+/** Live connection snapshot written by the agent process and read by `rbo agent status`. */
+export function agentRuntimeStatusPath(stateDir: string): string {
+  return join(stateDir, 'run', 'agent-status.json');
+}

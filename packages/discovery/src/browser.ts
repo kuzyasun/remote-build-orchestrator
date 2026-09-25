@@ -1,4 +1,5 @@
 import { Bonjour, type Service } from 'bonjour-service';
+import { isRoutableIpAddress } from './address.js';
 import { suppressMdnsErrors } from './advertiser.js';
 import {
   RBO_MDNS_BROWSE_TIMEOUT_MS,
@@ -24,6 +25,30 @@ export interface DiscoveredController {
   version: string;
   /** Resolved IP address of the UDP responder that delivered the advertisement. */
   responderAddress?: string;
+}
+
+/** Keep the record that has more routable IP addresses. The first sighting often has only a hostname. */
+export function chooseDiscoveredController(
+  current: DiscoveredController | undefined,
+  incoming: DiscoveredController,
+): DiscoveredController {
+  if (!current) {
+    return incoming;
+  }
+  const incomingIps = routableAddressCount(incoming);
+  const currentIps = routableAddressCount(current);
+  if (incomingIps > currentIps) {
+    return incoming;
+  }
+  return current;
+}
+
+function routableAddressCount(ctrl: DiscoveredController): number {
+  const values = [...ctrl.addresses];
+  if (ctrl.responderAddress) {
+    values.push(ctrl.responderAddress);
+  }
+  return values.filter((value) => isRoutableIpAddress(value)).length;
 }
 
 export interface DiscoverOptions {
@@ -216,9 +241,10 @@ export async function discoverControllers(
 
   const seen = new Map<string, DiscoveredController>();
   const onController = (ctrl: DiscoveredController) => {
-    if (ctrl && !seen.has(ctrl.controllerId)) {
-      seen.set(ctrl.controllerId, ctrl);
+    if (!ctrl) {
+      return;
     }
+    seen.set(ctrl.controllerId, chooseDiscoveredController(seen.get(ctrl.controllerId), ctrl));
   };
 
   const tasks: Promise<unknown>[] = [discoverViaBonjour(options, timeoutMs, onController)];

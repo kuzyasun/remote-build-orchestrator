@@ -6,6 +6,7 @@ import {
   resolveAgentStateDir,
   resolveControllerDataDir,
 } from '@rbo/shared';
+import { runAgentStatus } from './commands/agent-status.js';
 import { runAgentInit, runAgentStart, runAgentStopProcess } from './commands/agent.js';
 import {
   approveAgentRemote,
@@ -78,7 +79,7 @@ async function confirmOnTerminal(
   }
 }
 
-const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'status', 'stop']);
+const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'stop']);
 
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
@@ -230,6 +231,10 @@ async function main(): Promise<void> {
       if (sub === 'stop-process') {
         const result = await runAgentStopProcess({ stateDir });
         console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      if (sub === 'status') {
+        console.log(await runAgentStatus({ stateDir }));
         return;
       }
       if (SERVICE_ACTIONS.has(sub as ServiceAction)) {

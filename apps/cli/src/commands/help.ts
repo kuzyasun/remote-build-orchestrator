@@ -22,7 +22,8 @@ Commands:
   agent reject [<pairing-request-id>]
   agent revoke <agent-id>
   agent probe <agent-id>
-  agent install|status|stop|uninstall [--execute]
+  agent status [--state-dir <dir>]
+  agent install|stop|uninstall [--execute]
       (OS service plans; process stop is stop-process)
 
   agents

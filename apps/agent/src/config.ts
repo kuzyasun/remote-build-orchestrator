@@ -71,6 +71,11 @@ export const AGENT_CONFIG_FILENAME = 'agent.json';
 /** Schema version written into `agent.json` by `rbo agent init`. */
 export const AGENT_CONFIG_SCHEMA_VERSION = 1;
 
+export {
+  clearStoredAgentCredential,
+  controllerTargetChanged,
+} from './stored-state.js';
+
 const RiskLevelSchema = z.enum(['safe', 'normal', 'destructive', 'hardware']);
 
 const GitAllowlistFileSchema = z.object({

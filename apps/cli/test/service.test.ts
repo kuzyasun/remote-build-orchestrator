@@ -19,10 +19,11 @@ describe('rbo agent service CLI (§2.9)', () => {
 
   it('prints a dry-run plan without --execute', () => {
     const plan = renderServiceActionPlan('linux', 'status');
-    const output = formatDryRunPlan('agent status', plan);
+    const output = formatDryRunPlan('agent install', plan);
     expect(output).toContain('dry run');
     expect(output).toContain('best-effort');
     expect(output).toContain('systemctl status rbo-agent');
+    expect(output).not.toMatch(/rbo-agent\.exe/);
     expect(hasExecuteFlag(['--execute'])).toBe(true);
     expect(hasExecuteFlag([])).toBe(false);
   });

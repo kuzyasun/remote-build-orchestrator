@@ -1,5 +1,6 @@
-// OS service lifecycle plans for `rbo agent install|status|stop|uninstall`
-// (§33, §35 Phase 2). Process start is `rbo agent start` (not OS service).
+// OS service lifecycle plans for `rbo agent install|stop|uninstall`
+// (§33, §35 Phase 2). `rbo agent status` reports the local agent, not the
+// service manager. Process start is `rbo agent start` (not OS service).
 // the CLI's install/uninstall handlers execute them when `--execute` is passed.
 // Kept as pure data here so plans are unit-testable without touching the real
 // service manager.
@@ -255,8 +256,7 @@ export function hasExecuteFlag(args: string[]): boolean {
 export function formatDryRunPlan(action: string, plan: ServiceInstallPlan): string {
   const lines = [
     `# ${action} (dry run — pass --execute to run these commands)`,
-    '# Prefer `rbo agent start --daemon` for day-to-day use; OS service install is best-effort',
-    '# and expects node + bundled rbo.js (not a Program Files rbo-agent.exe).',
+    '# Prefer `rbo agent start --daemon` for day-to-day use; OS service install is best-effort.',
   ];
   for (const command of plan.commands) {
     lines.push(command);

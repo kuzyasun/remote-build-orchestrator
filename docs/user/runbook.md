@@ -26,11 +26,14 @@ rbo controller start --daemon
 rbo controller stop
 
 rbo agent start --daemon
+rbo agent status
 rbo agent stop-process
 ```
 
-Omit `--daemon` to run a process in the current terminal. `rbo agent stop` belongs to the optional
-OS-service workflow; use `stop-process` for a foreground or daemon process.
+`rbo agent status` reports the local process, its controller URL, whether a pairing
+credential is stored, and whether the process is connected. Omit `--daemon` to run a process in
+the current terminal. `rbo agent stop` belongs to the optional OS-service workflow; use
+`stop-process` for a foreground or daemon process.
 
 ## Pair
 
@@ -136,7 +139,6 @@ Service integration is best-effort and prints a plan by default:
 ```bash
 rbo agent install
 rbo agent install --execute
-rbo agent status
 rbo agent stop --execute
 rbo agent uninstall --execute
 ```

@@ -28,6 +28,7 @@ describe('rbo --help', () => {
     expect(help).toMatch(/^rbo CLI v/);
     expect(help).toContain('controller start');
     expect(help).toContain('agent stop-process');
+    expect(help).toContain('agent status [--state-dir <dir>]');
     expect(help).toContain('agent reject [<pairing-request-id>]');
     expect(help).toContain('agent approve [<pairing-request-id>]');
     expect(help).toContain('agent init [--force] [--skip-discovery]');
@@ -284,6 +285,14 @@ describe('mDNS CLI formatting (§7.2)', () => {
     it('filters out unspecified 0.0.0.0 and :: addresses', () => {
       const best = selectBestAddress(['0.0.0.0', '::', '192.168.1.50'], 'fallback.local');
       expect(best).toBe('192.168.1.50');
+    });
+
+    it('does not treat a bare hostname as an IPv4 address', () => {
+      expect(selectBestAddress(['KPC', '192.168.1.9'], 'KPC')).toBe('192.168.1.9');
+      expect(selectBestAddress(['KPC'], 'KPC', 'KPC')).toBe('KPC.local');
+      expect(selectBestAddress([], 'KPC')).toBe('KPC.local');
+      expect(selectBestAddress([], 'ctrl.local')).toBe('ctrl.local');
+      expect(selectBestAddress(['0.0.0.0'], 'KPC', '0.0.0.0')).toBe('KPC.local');
     });
   });
 

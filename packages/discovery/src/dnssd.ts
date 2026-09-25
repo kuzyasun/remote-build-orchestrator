@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import dns from 'node:dns';
+import { hostLookupCandidates, isRoutableIpAddress } from './address.js';
 import type { DiscoverOptions, DiscoveredController } from './browser.js';
 import { RBO_MDNS_SERVICE_TYPE, RBO_MDNS_TXT_VERSION } from './constants.js';
 
@@ -156,7 +157,7 @@ export function createDiscoveredControllerFromDnsSd(
     controllerId,
     fingerprint,
     version,
-    responderAddress: addresses[0],
+    responderAddress: addresses.find((address) => isRoutableIpAddress(address)),
   };
 }
 
@@ -164,10 +165,8 @@ export function createDiscoveredControllerFromDnsSd(
  * Resolve IP addresses for a hostname using libc getaddrinfo (which queries mDNSResponder
  * on macOS for `.local` hostnames) and falls back to `dns-sd -G v4`.
  */
-export async function resolveHostAddresses(host: string, timeoutMs = 2_000): Promise<string[]> {
+async function lookupHost(host: string, timeoutMs: number): Promise<string[]> {
   const addresses: string[] = [];
-
-  // 1. Try standard Node.js dns.lookup (uses macOS libc getaddrinfo for .local)
   try {
     const lookupPromise = dns.promises.lookup(host, { all: true });
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -180,26 +179,50 @@ export async function resolveHostAddresses(host: string, timeoutMs = 2_000): Pro
     if (timer) clearTimeout(timer);
 
     for (const entry of entries) {
-      if (entry.address && !addresses.includes(entry.address)) {
+      if (
+        entry.address &&
+        entry.address !== '0.0.0.0' &&
+        entry.address !== '::' &&
+        !addresses.includes(entry.address)
+      ) {
         addresses.push(entry.address);
       }
     }
   } catch {
-    // Ignore and proceed to dns-sd -G fallback
+    // Ignore and proceed to the next candidate or dns-sd -G fallback
   }
+  return addresses;
+}
 
-  if (addresses.length > 0) {
-    return addresses;
-  }
+export async function resolveHostAddresses(host: string, timeoutMs = 2_000): Promise<string[]> {
+  const addresses: string[] = [];
+  const candidates = hostLookupCandidates(host);
 
-  // 2. Fallback: run dns-sd -G v4 <host>
-  try {
-    const ip = await resolveHostViaDnsSdGetAddrInfo(host, timeoutMs);
-    if (ip && !addresses.includes(ip)) {
-      addresses.push(ip);
+  // 1. Try standard Node.js dns.lookup (uses macOS libc getaddrinfo for .local)
+  for (const candidate of candidates) {
+    for (const address of await lookupHost(candidate, timeoutMs)) {
+      if (!addresses.includes(address)) {
+        addresses.push(address);
+      }
     }
-  } catch {
-    // Ignore
+    if (addresses.length > 0) {
+      return addresses;
+    }
+  }
+
+  // 2. Fallback: run dns-sd -G v4. Bare names are tried as name.local too.
+  for (const candidate of candidates) {
+    try {
+      const ip = await resolveHostViaDnsSdGetAddrInfo(candidate, timeoutMs);
+      if (ip && ip !== '0.0.0.0' && !addresses.includes(ip)) {
+        addresses.push(ip);
+      }
+    } catch {
+      // Ignore
+    }
+    if (addresses.length > 0) {
+      return addresses;
+    }
   }
 
   return addresses;

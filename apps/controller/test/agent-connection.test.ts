@@ -98,7 +98,7 @@ describe('Agent pairing over TLS WebSocket', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('a revoked agent cannot authenticate again', async () => {
+  it('a revoked agent drops its credential and requests pairing again', async () => {
     const dir = newAgentDir();
     const conn = agentConnection(dir);
     await conn.connectOnce(); // pairing request
@@ -114,7 +114,8 @@ describe('Agent pairing over TLS WebSocket', () => {
 
     const conn2 = agentConnection(dir);
     const denied = await conn2.connectOnce();
-    expect(denied.status).toBe('rejected');
+    expect(denied.status).toBe('pairing_pending');
+    expect(conn2.hasStoredCredential()).toBe(false);
     conn2.close();
     rmSync(dir, { recursive: true, force: true });
   });

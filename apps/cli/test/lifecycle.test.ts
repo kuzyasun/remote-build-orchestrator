@@ -79,6 +79,38 @@ describe('isAgentInitialized / runAgentInit', () => {
     expect(second.configWritten).toBe(false);
   });
 
+  it('runAgentInit --force clears a credential when the controller target changes', async () => {
+    const stateDir = await tempDir('rbo-cli-agent-rebind-');
+    await runAgentInit({ stateDir, skipDiscovery: true });
+    await writeFile(
+      join(stateDir, 'agent.json'),
+      JSON.stringify({
+        schema_version: 1,
+        controller_url: 'wss://old-controller:7411/agent',
+        controller_fingerprint: 'sha256:aa',
+      }),
+    );
+    await writeFile(
+      join(stateDir, 'agent-state.json'),
+      JSON.stringify({
+        devicePublicKeyPem: '-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----',
+        devicePrivateKeyPem: '-----BEGIN PRIVATE KEY-----\nsecret-key\n-----END PRIVATE KEY-----',
+        credential: 'secret-credential',
+        agentId: 'agt_old',
+      }),
+    );
+    const result = await runAgentInit({ stateDir, force: true, skipDiscovery: true });
+    expect(result.credentialCleared).toBe(true);
+    const state = JSON.parse(await readFile(join(stateDir, 'agent-state.json'), 'utf8')) as {
+      credential?: string;
+      agentId?: string;
+      devicePrivateKeyPem: string;
+    };
+    expect(state.credential).toBeUndefined();
+    expect(state.agentId).toBeUndefined();
+    expect(state.devicePrivateKeyPem).toContain('PRIVATE KEY');
+  });
+
   it('runAgentInit does not overwrite an existing agent.json', async () => {
     const stateDir = await tempDir('rbo-cli-agent-config-keep-');
     await runAgentInit({ stateDir, skipDiscovery: true });

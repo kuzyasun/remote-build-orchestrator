@@ -4,10 +4,17 @@ import { createInterface } from 'node:readline/promises';
 import {
   AGENT_CONFIG_FILENAME,
   type AgentDiscoveryResult,
+  clearStoredAgentCredential,
+  controllerTargetChanged,
   writeDefaultAgentConfigFile,
 } from '@rbo/agent/config';
 import { runAgent } from '@rbo/agent/run';
-import { type DiscoveredController, discoverControllers } from '@rbo/discovery';
+import {
+  type DiscoveredController,
+  discoverControllers,
+  isRoutableIpAddress,
+  normalizeMdnsHost,
+} from '@rbo/discovery';
 import { resolveAgentStateDir } from '@rbo/shared';
 import { agentLogPath, agentPidPath, spawnDetachedDaemon } from './daemon.js';
 import { ensureNotRunningOrReplace, stopRoleForCli } from './process-lifecycle.js';
@@ -42,6 +49,8 @@ export interface AgentInitResult {
   controllerName?: string;
   /** Present when an existing agent.json was left untouched. */
   hint?: string;
+  /** True when a controller change dropped the stored pairing credential. */
+  credentialCleared?: boolean;
 }
 
 export function isAgentInitialized(stateDir: string): boolean {
@@ -51,8 +60,9 @@ export function isAgentInitialized(stateDir: string): boolean {
 /**
  * Select the best routable IP address from discovered addresses.
  * Prioritizes the responder address that actually delivered the advertisement packet
- * (when routable IPv4), then private LAN IPv4 (192.168.x.x, 10.x.x.x, 172.16-31.x.x),
+ * (when it is a routable IP), then private LAN IPv4 (192.168.x.x, 10.x.x.x, 172.16-31.x.x),
  * avoids APIPA (169.254.x.x) and loopback, and handles IPv6 cleanly.
+ * Hostnames are not treated as addresses. A bare fallback name becomes `name.local`.
  */
 export function selectBestAddress(
   addresses: string[],
@@ -61,31 +71,12 @@ export function selectBestAddress(
 ): string {
   const normalizedResponder = responderAddress?.replace(/^::ffff:/i, '');
 
-  // Filter out loopback and link-local (APIPA / fe80)
-  const isLoopbackOrLinkLocal = (a: string) =>
-    a === '0.0.0.0' ||
-    a === '::' ||
-    a.startsWith('127.') ||
-    a === '::1' ||
-    a.startsWith('169.254.') ||
-    a.toLowerCase().startsWith('fe80:');
-
-  // If the packet's responder IP is a routable address (IPv4 or non-link-local IPv6),
-  // prefer it above all else: it came over the physical interface that delivered the mDNS packet.
-  // Loopback (127.*, ::1) and link-local (169.254.*, fe80:*) are excluded because
-  // fe80 requires a zone index not provided by mDNS referer.
-  if (normalizedResponder && !isLoopbackOrLinkLocal(normalizedResponder)) {
+  // Prefer the packet's responder IP: it came over the interface that delivered mDNS.
+  if (normalizedResponder && isRoutableIpAddress(normalizedResponder)) {
     return normalizedResponder;
   }
 
-  if (!addresses || addresses.length === 0) {
-    return fallbackHost;
-  }
-
-  const routable = addresses.filter((a) => !isLoopbackOrLinkLocal(a));
-  if (routable.length === 0) {
-    return fallbackHost;
-  }
+  const routable = (addresses ?? []).filter((address) => isRoutableIpAddress(address));
 
   // 1. Home / Office LAN (192.168.x.x)
   const lan192 = routable.find((a) => a.startsWith('192.168.'));
@@ -101,12 +92,12 @@ export function selectBestAddress(
   if (nonDocker172) return nonDocker172;
   if (lan172.length > 0) return lan172[0];
 
-  // 4. Any IPv4 address
+  // 4. Any other routable IPv4, then IPv6.
   const anyIpv4 = routable.find((a) => !a.includes(':'));
   if (anyIpv4) return anyIpv4;
+  if (routable[0]) return routable[0];
 
-  // 5. Any routable IPv6 or fallback
-  return routable[0] ?? fallbackHost;
+  return normalizeMdnsHost(fallbackHost);
 }
 
 /** Strip or escape ANSI control sequences and control characters for terminal safety. */
@@ -257,17 +248,27 @@ export async function runAgentInit(options: AgentInitOptions = {}): Promise<Agen
 
   let existingInitializedAt: string | undefined;
   let existingSchemaVersion = 1;
+  let previousControllerUrl: string | undefined;
+  let previousFingerprint: string | undefined;
   if (existsSync(configPath)) {
     try {
       const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as {
         initialized_at?: string;
         schema_version?: number;
+        controller_url?: string;
+        controller_fingerprint?: string;
       };
       if (typeof parsed.initialized_at === 'string') {
         existingInitializedAt = parsed.initialized_at;
       }
       if (typeof parsed.schema_version === 'number') {
         existingSchemaVersion = parsed.schema_version;
+      }
+      if (typeof parsed.controller_url === 'string') {
+        previousControllerUrl = parsed.controller_url;
+      }
+      if (typeof parsed.controller_fingerprint === 'string') {
+        previousFingerprint = parsed.controller_fingerprint;
       }
     } catch {
       // Use defaults if unparseable
@@ -327,6 +328,25 @@ export async function runAgentInit(options: AgentInitOptions = {}): Promise<Agen
     discovery,
   });
 
+  let credentialCleared = false;
+  if (result.written) {
+    const nextUrl = discovery?.controllerUrl ?? '';
+    const nextFingerprint = discovery?.controllerFingerprint ?? '';
+    if (
+      controllerTargetChanged(
+        { controllerUrl: previousControllerUrl, fingerprint: previousFingerprint },
+        { controllerUrl: nextUrl, fingerprint: nextFingerprint },
+      )
+    ) {
+      credentialCleared = clearStoredAgentCredential(stateDir);
+      if (credentialCleared) {
+        console.error(
+          'Controller target changed; cleared the stored credential so this agent can pair again.',
+        );
+      }
+    }
+  }
+
   if (selectedController && discovery) {
     console.error(
       `\nConfigured controller: ${selectedController.name} (${discovery.controllerUrl})`,
@@ -342,6 +362,7 @@ export async function runAgentInit(options: AgentInitOptions = {}): Promise<Agen
     configWritten: result.written,
     discovered: selectedController ? true : undefined,
     controllerName: selectedController?.name,
+    ...(credentialCleared ? { credentialCleared: true } : {}),
   };
 }
 

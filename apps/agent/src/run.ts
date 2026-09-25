@@ -2,6 +2,7 @@ import { RBO_AGENT_VERSION, createLogger, generateId } from '@rbo/shared';
 import { probeCapabilities } from './capabilities/probe.js';
 import { type AgentConfig, ensureStateDir, loadAgentConfig } from './config.js';
 import { AgentConnection } from './connection/client.js';
+import { type AgentRuntimeConnection, writeAgentRuntimeStatus } from './runtime-status.js';
 
 const logger = createLogger('agent.main');
 
@@ -68,6 +69,21 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
     logger.error('unhandledRejection', { error: String(reason) });
   });
 
+  const reportStatus = (status: {
+    connection: AgentRuntimeConnection;
+    agent_id?: string;
+    detail?: string;
+  }) => {
+    try {
+      writeAgentRuntimeStatus(config.stateDir, {
+        ...status,
+        controller_url: config.controllerUrl,
+      });
+    } catch (error) {
+      logger.warn('failed to write runtime status', { error: String(error) });
+    }
+  };
+
   const connection = new AgentConnection({
     controllerUrl: config.controllerUrl,
     expectedFingerprint: config.controllerFingerprint,
@@ -87,31 +103,46 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
   });
 
   while (!stopped) {
+    reportStatus({ connection: 'connecting' });
     try {
       const result = await connection.connectOnce();
       attempt = 0;
 
       if (result.status === 'authenticated') {
         logger.info('agent authenticated', { agentId: result.agentId });
+        reportStatus({ connection: 'authenticated', agent_id: result.agentId });
         // Heartbeats run inside AgentConnection; wait until disconnect or stop.
         await Promise.race([connection.waitUntilDisconnected(), waitUntil(() => stopped)]);
+        if (!stopped) {
+          reportStatus({ connection: 'disconnected', agent_id: result.agentId });
+        }
       } else if (result.status === 'pairing_pending') {
         logger.info('pairing request pending operator approval');
+        reportStatus({ connection: 'pairing_pending' });
+        await sleep(RECONNECT_BASE_DELAY_MS);
+      } else if (result.status === 'incompatible_protocol') {
+        logger.warn('connection did not authenticate', { status: result.status });
+        reportStatus({ connection: 'incompatible_protocol' });
         await sleep(RECONNECT_BASE_DELAY_MS);
       } else {
         logger.warn('connection did not authenticate', { status: result.status });
+        reportStatus({ connection: 'rejected', detail: result.status });
         await sleep(RECONNECT_BASE_DELAY_MS);
       }
     } catch (error) {
       attempt += 1;
       const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
+      const detail = error instanceof Error ? error.message : String(error);
       logger.error('connection failed, retrying', { error: String(error), retry_in_ms: delay });
+      reportStatus({ connection: 'error', detail });
       await sleep(delay);
     } finally {
       // Park attempt for reconnect; kill only when the agent process is stopping.
       connection.close({ killProcess: stopped });
     }
   }
+
+  reportStatus({ connection: 'stopped' });
 
   clearInterval(freeDiskTimer);
   connection.close({ killProcess: true });
