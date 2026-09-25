@@ -517,8 +517,13 @@ export async function startAgentPlaneServer(
               message.type,
             );
             if (!payload) return;
-            handleRemoteCleanupComplete(remoteOpts(), authenticated.agentId, payload);
-            maybeDispatchQueued();
+            const agentId = authenticated.agentId;
+            trackDrainable(
+              handleRemoteCleanupComplete(remoteOpts(), agentId, payload).finally(() => {
+                maybeDispatchQueued();
+              }),
+              'remote cleanup_complete handling',
+            );
             return;
           }
 

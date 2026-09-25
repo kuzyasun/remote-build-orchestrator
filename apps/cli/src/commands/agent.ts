@@ -277,6 +277,9 @@ export async function runAgentInit(options: AgentInitOptions = {}): Promise<Agen
 
   // Guard: if config exists and --force is not specified, do not overwrite or scan.
   if (existsSync(configPath) && !options.force) {
+    console.error(
+      'Agent already initialized. Run `rbo agent start` to connect, or `rbo agent init --force` to reconfigure.',
+    );
     return {
       stateDir,
       initialized_at: existingInitializedAt ?? new Date().toISOString(),
@@ -351,7 +354,11 @@ export async function runAgentInit(options: AgentInitOptions = {}): Promise<Agen
     console.error(
       `\nConfigured controller: ${selectedController.name} (${discovery.controllerUrl})`,
     );
-    console.error('Run `rbo agent start` to connect and begin pairing.');
+  }
+
+  // Always print a clear next-step hint
+  if (result.written) {
+    console.error('\nNext step: run `rbo agent start` to connect to the Controller.');
   }
 
   return {
