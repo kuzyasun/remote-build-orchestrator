@@ -26,9 +26,10 @@ The default ports are:
 | --- | --- | --- |
 | `7410` | AI clients and the `rbo` CLI | Controller machine only |
 | `7411` | Agent connections | reachable from Agent machines |
+| `5353` (UDP) | mDNS discovery advertisement | local network multicast |
 
 Keep port `7410` on loopback unless you deliberately secure and expose it. Allow Agents to reach
-port `7411` through the host firewall.
+port `7411` and `5353` through the host firewall (see [Firewall troubleshooting](troubleshooting.md#firewall-blocks-agent-connections-or-mdns-discovery)).
 
 ## 2. Install RBO
 
@@ -115,40 +116,81 @@ can reach:
 }
 ```
 
-Snapshot capture is bounded before compression by conservative Controller defaults: 1 GiB total
-source bytes, 100,000 regular files, 256 MiB per file, and a 1.25 GiB temporary tar estimate.
-If a known large workspace needs more capacity, raise the corresponding
-`max_snapshot_source_bytes`, `max_snapshot_file_count`, `max_snapshot_single_file_bytes`, or
-`max_snapshot_temporary_bytes` value in `controller.json` only after confirming available
-Controller disk space.
-
-Start the Controller and print the fingerprint you will use when configuring Agents:
+Start the Controller:
 
 ```bash
 rbo controller start --daemon
-rbo controller fingerprint
 rbo doctor
 ```
 
-Use `rbo controller start` without `--daemon` when you want logs in the current terminal.
+The Controller starts the agent plane and automatically advertises itself on the local network via
+mDNS (`_rbo-controller._tcp`). Use `rbo controller start` without `--daemon` when you want logs in
+the current terminal.
 
 ## 4. Set up and pair an Agent
 
 Run these steps on each worker machine.
 
-Initialize its configuration:
+### Auto-discovery setup (default)
+
+Initialize the Agent:
 
 ```bash
 rbo agent init
 ```
 
-Edit `~/.rbo/agent/agent.json` (on Windows,
+`rbo agent init` automatically scans the local network via mDNS, discovers your Controller, and
+prompts you to select it:
+
+```
+Scanning for RBO controllers on local network...
+
+Found 1 controller(s):
+  1) rbo-controller (192.168.1.50:7411)
+     controller_01JXYZ...  fingerprint: sha256:abcd1234...
+  0) Skip — configure manually later
+
+Select controller [1, 0 to skip]: 1
+
+Configured controller: rbo-controller (wss://192.168.1.50:7411/agent)
+Run `rbo agent start` to connect and begin pairing.
+```
+
+Selecting your Controller automatically configures `controller_url` and pins `controller_fingerprint`
+in `agent.json` — no manual IP lookup or fingerprint copying required.
+
+> [!WARNING]
+> On untrusted or shared networks, verify that the displayed fingerprint matches `rbo controller fingerprint` on your Controller before connecting, or use manual setup (`rbo agent init --skip-discovery`).
+
+Start the Agent:
+
+```bash
+rbo agent start --daemon
+```
+
+Back on the Controller machine, approve the pending pairing request:
+
+```bash
+rbo agent approve          # prompts to select from pending requests (or pass <id> directly)
+rbo agents                 # confirms the worker is connected
+```
+
+If multiple workers are pairing, `rbo agent approve` presents an interactive numbered menu displaying each worker's display name, hostname, ID, and one-time code. If only one worker is waiting, pressing Enter accepts the default `[1]`.
+
+To reject an unrecognized request instead: `rbo agent reject` (or `rbo agent reject <pairing-request-id>`).
+
+You can also run `rbo discover` on any machine at any time to scan for active Controllers.
+
+### Manual fallback (routed networks or headless CI)
+
+If the worker is on a different subnet where mDNS multicast is not forwarded, skip discovery with
+`rbo agent init --skip-discovery` and edit `~/.rbo/agent/agent.json` (on Windows,
 `%USERPROFILE%\.rbo\agent\agent.json`):
 
 ```json
 {
   "controller_url": "wss://build-controller.local:7411/agent",
-  "controller_fingerprint": "<output of rbo controller fingerprint>",
+  "controller_fingerprint": "<output of rbo controller fingerprint on Controller>",
   "display_name": "workstation-1",
   "max_jobs": 1,
   "repo_cache_dir": "/home/you/.rbo/repositories"
@@ -158,22 +200,6 @@ Edit `~/.rbo/agent/agent.json` (on Windows,
 Use the Controller's reachable host in `controller_url`. Keep the generated fingerprint exact:
 it protects the Agent from connecting to the wrong Controller. `repo_cache_dir` is optional but
 recommended because it avoids cloning the same repository for every job.
-
-Start the Agent:
-
-```bash
-rbo agent start --daemon
-```
-
-Back on the Controller machine, approve the pending request:
-
-```bash
-rbo agents
-rbo agent approve <pairing-request-id>
-rbo agents
-```
-
-The second `rbo agents` should show the worker and its detected OS, shells, tools, and capacity.
 
 ## 5. Connect an AI client
 
@@ -195,157 +221,48 @@ Restart the AI client after changing its MCP configuration. If the client cannot
 
 ## 6. Run a first job
 
-The simplest test is to ask your AI client to use RBO for a build or test in an allowed project.
-RBO's primary MCP tool, `job_run`, submits the command and waits for a useful result.
-
-For a manual CLI test, run one command from the allowed project directory. `rbo run` captures the
-current project, submits the same compact request as MCP `job_run`, waits for its terminal result,
-and streams logs with `--follow`.
-
-POSIX shell:
+From your project directory:
 
 ```bash
 cd /home/you/projects/my-app
-rbo run --follow --shell bash --target-os linux --timeout 600 -- 'printf "%s\\n" "RBO is working"'
+rbo run --follow -- 'echo "RBO is working"'
 ```
 
 PowerShell:
 
 ```powershell
-Set-Location C:\projects\my-app
-rbo run --follow --shell powershell --target-os windows --timeout 600 -- 'Write-Output "RBO is working"'
+rbo run --follow --shell powershell --target-os windows -- 'Write-Output "RBO is working"'
 ```
 
-Windows `cmd.exe`:
+Pass one command string after `--`. Use `--shell` and `--target-os` when the Agent runs a different
+OS than the Controller.
 
-```bat
-cd /d C:\projects\my-app
-rbo run --follow --shell cmd --target-os windows --timeout 600 -- "echo RBO is working"
-```
+For a full request with required artifacts, use `rbo submit job.json`. See the
+[CLI reference](cli-reference.md) for all options and flags.
 
-Pass exactly one target-shell command string after `--`. The local shell removes its outer quoting;
-RBO sends the remaining text unchanged to the selected target shell. This is shell text, not an
-argv-safe direct-execution interface. Use the target's shell syntax and select a compatible
-`--shell` and `--target-os`; RBO never translates command syntax between shell families.
+## 7. Guide your AI assistant
 
-`--timeout` is the remote execution timeout. It does not impose an overall CLI wait deadline:
-the CLI continues its resume loop while the job is active, although individual Controller requests
-and SSE reconnects are bounded. Use `--queue-policy fail_fast` when a missing compatible Agent
-should fail immediately, `wait` to queue until one is available, or `local_fallback` only when
-Controller-local execution is acceptable.
-
-Use `--json` for scripts. It writes exactly one final JSON object to stdout; CLI diagnostics stay
-on stderr. The initial interface rejects `--json --follow` rather than providing a JSONL log stream.
-
-For jobs that require confirmation, RBO writes the snapshot and warnings to stderr and prompts only
-when stdin is a TTY. A non-interactive invocation refuses without a bypass, exits 125, and prints
-the job ID with instructions to confirm from a TTY-enabled client. Ctrl+C sends one cancellation
-request, waits at most 10 seconds for cancellation to be confirmed, then exits 130; if confirmation
-does not arrive, stderr identifies the job so it can still be checked.
-
-### Use `rbo submit` for advanced requests
-
-`rbo submit <job-request.json>` remains available for full request JSON that `rbo run` intentionally
-does not expose. In particular, use it when an artifact must be required rather than the optional
-rules added by repeated `rbo run --artifact <glob>`:
-
-```json
-{
-  "client_request_id": "first-job-1",
-  "name": "first-rbo-job",
-  "source": {
-    "project_root": "/home/you/projects/my-app",
-    "cwd": "."
-  },
-  "execution": {
-    "shell": "bash",
-    "script": "pnpm test",
-    "timeout_seconds": 600
-  },
-  "risk_level": "safe",
-  "artifacts": [{ "glob": "coverage/**", "required": true }]
-}
-```
-
-Submit the advanced request with `rbo submit job.json`; use `rbo logs <job-id> --follow` to inspect
-an existing job separately.
-
-### Select a remote shell and OS explicitly
-
-`job_run` is the compact MCP path for an AI client. When the chosen Agent differs from the
-Controller's OS, the client should name both the shell and target OS. RBO schedules that exact
-shell; it never translates command syntax between shell families.
-
-```json
-{
-  "command": "printf '%s\\n' \"$HOME\"",
-  "project_root": "/home/you/projects/my-app",
-  "shell": "bash",
-  "target_os": ["linux"],
-  "queue_policy": "fail_fast"
-}
-```
-
-`queue_policy` is optional: use `fail_fast` when a missing compatible Agent should return an
-immediate answer, `wait` to leave the job queued for one, or `local_fallback` only when local
-execution is acceptable. An omitted shell keeps the Controller's same-platform convenience default;
-an omitted `target_os` is pinned to the Controller OS. Do not rely on those defaults for a
-cross-platform command, and do not submit PowerShell or `cmd` when only a Mac/Linux Agent is online.
-A no-match result includes a compact `no_match` object with the required shell, target OS, and an
-actionable hint. It intentionally does not expose Agent hostnames or complete capabilities.
-
-`job_run` waits up to `mcp_wait_slice_seconds` (default 50). If the job is still running, the
-response includes `resume: true` — call again with the same `job_id`. Copy `next_log_cursor` into
-the next `job_run` `log_cursor`, and copy `job_logs` `next_cursor` into `cursor`; do not invent
-cursors. Presented log text is ANSI-stripped and bounded (`job_run` defaults to 16 KiB);
-`has_more` means more remains on disk. Durable raw logs are unchanged.
-
-The AI client can also retrieve declared artifacts. RBO never writes job output into your live
-checkout unless the client explicitly materializes an artifact into an allowed destination.
-
-## 7. Make your AI assistant prefer RBO
-
-Connecting MCP exposes the tools, but project guidance tells an assistant when to use them. Add a
-short rule like this to the target project's `AGENTS.md` or equivalent:
+Add this rule to your project's `AGENTS.md`:
 
 ```markdown
-## Remote builds with RBO
-
-Prefer the RBO MCP tools for builds, tests, and long-running commands when a compatible Agent is
-available. Use `job_run` with explicit `shell` and `target_os` that a live Agent provides; RBO does
-not translate command syntax between shell families. An omitted `target_os` is pinned to the
-Controller OS — do not submit PowerShell or `cmd` when only a Mac/Linux Agent is online.
-
-If `job_run` returns `resume: true`, call it again with the same `job_id`. Copy `next_log_cursor`
-into `log_cursor`, and copy `job_logs` `next_cursor` into `cursor`; do not invent cursors. Default
-`job_run` log text is 16 KiB and ANSI-stripped; when `has_more` is true, page with `job_logs`.
-Read the outcome, exit code, and log tail; request artifacts only when a file is needed locally.
-A compact `no_match` result is actionable in normal cases, so do not call `agents_list` solely to
-diagnose it. Ask before falling back to the live local checkout.
+## Remote builds
+Use RBO MCP tools for builds and tests. Always specify `shell` and
+`target_os` matching a live Agent (`agents_list`). If `job_run` returns
+`resume: true`, call again with the same `job_id` and pass the returned
+`next_log_cursor` under `log_cursor`.
 ```
 
-For destructive or hardware-risk work, the client must present RBO's confirmation request before
-the job can run.
+The complete template is in [AI client configuration](client-integration/README.md).
 
-## 8. Source transfer in one minute
+## 8. How source transfer works
 
-RBO normally transfers a **Git overlay**: the Agent obtains the base commit from the Git remote,
-then RBO sends only your local changes. This keeps repeated jobs fast.
-
-For this to work:
-
-- the project needs a Git commit and a fetchable remote;
-- the remote host must appear in `git_allowlist.hosts` on both Controller and Agent;
-- the Agent needs access to the remote;
-- submodules must be initialized and clean;
-- Git LFS objects must be pushed and available to the Agent.
-
-RBO does not silently upload the entire tree when overlay capture fails:
-`allow_full_snapshot_fallback` is `false` by default. The error explains what must be fixed. Enable
-full snapshots only when you understand the cost, especially for repositories with large files.
+RBO sends only your uncommitted changes over a Git base commit (**overlay**). This requires a
+fetchable Git remote in `git_allowlist.hosts`. If overlay capture fails, the job fails by default —
+enable `allow_full_snapshot_fallback` in `controller.json` to upload the full tree instead.
 
 ## Next steps
 
+- Explore the [CLI reference](cli-reference.md) for command syntax, flags, and exit codes.
 - Run [`rbo doctor`](troubleshooting.md) first when something does not work.
 - Use the [operator runbook](runbook.md) for updates, recovery, backup, and removal.
 - Read [backup and restore](backup-restore.md) before moving Controller state.

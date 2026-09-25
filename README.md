@@ -51,26 +51,35 @@ Install the CLI on each machine that will run a Controller or Agent:
 npm install -g @gemslibe/rbo
 ```
 
-Then:
+### Zero-config setup
 
-1. initialize and start the Controller;
-2. initialize an Agent and pair it with the Controller;
-3. connect your AI client's MCP configuration;
-4. run `rbo doctor`, then submit a first job.
+1. **Controller machine**: initialize and start (advertises on LAN via mDNS by default):
+   ```bash
+   rbo controller init
+   rbo controller start --daemon
+   ```
+   *Note: For remote workers across a LAN, data-plane transfers automatically use the connecting network interface. If using custom hostnames or VPNs on the same port, set `controller_public_host`. If using a reverse proxy with port translation (e.g. port 443), set `data_plane_base_url` (e.g. `https://proxy.example/`) in `~/.rbo/controller.json` or `RBO_DATA_PLANE_BASE_URL`.*
+2. **Worker Agent machine**: auto-discover Controller and start:
+   ```bash
+   rbo agent init             # scans LAN via mDNS, select your Controller [1]
+   rbo agent start --daemon
+   ```
+3. **Controller machine**: approve the worker pairing:
+   ```bash
+   rbo agent approve          # interactive menu (or `rbo agent approve <id>`)
+   ```
+4. **AI client**: connect MCP proxy (`rbo-mcp-stdio`) and submit builds.
 
-The [getting-started guide](docs/user/getting-started.md) provides the commands and the small set
-of configuration values required for each step. If the npm package is not available for your
-environment, the same guide also explains how to install a local build.
+The [getting-started guide](docs/user/getting-started.md) walks through project configuration and client snippets.
 
-Once configured, the AI client normally drives RBO for you. The CLI remains useful for diagnostics
-and manual jobs:
+Once configured, the AI client normally drives RBO for you. The CLI remains useful for operations:
 
 ```bash
-rbo agents                 # show workers and pending pairing requests
-rbo submit job.json        # submit a job manually
-rbo logs <job-id> --follow # follow its logs
-rbo cancel <job-id>        # cancel it
-rbo doctor                 # check the local setup
+rbo discover                 # scan LAN for active Controllers via mDNS
+rbo agents                   # show workers and pending pairing requests
+rbo agent approve            # approve a worker (interactive menu or pass <id>)
+rbo run --follow -- 'cmd'    # run a job on an available worker
+rbo doctor                   # check local setup and connectivity
 ```
 
 ## Documentation
@@ -84,6 +93,7 @@ Start with the document that matches your goal:
 | Diagnose a problem | [Troubleshooting](docs/user/troubleshooting.md) |
 | Operate, update, back up, or remove RBO | [Operator runbook](docs/user/runbook.md) |
 | Understand the codebase | [Architecture](docs/dev/architecture.md) |
+| Compile, pack, and install locally | [Local development](docs/dev/local-development.md) |
 | Build or publish a release | [Release guide](docs/dev/release-builds.md) |
 | Review release changes | [Changelog](CHANGELOG.md) |
 | Report a vulnerability | [Security policy](SECURITY.md) |

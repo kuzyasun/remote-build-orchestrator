@@ -8,7 +8,12 @@ const buildOptions = {
   format: 'esm',
   packages: 'bundle',
   external: EXTERNALS,
-  banner: { js: '#!/usr/bin/env node' },
+  banner: {
+    js: `#!/usr/bin/env node
+import * as __node_module from 'node:module';
+const require = __node_module.createRequire(import.meta.url);
+`,
+  },
   logLevel: 'info',
 };
 

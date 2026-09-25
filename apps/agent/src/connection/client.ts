@@ -276,6 +276,23 @@ export class AgentConnection {
             return;
           }
 
+          // A credential from another controller (or a revoked one) is rejected
+          // and would otherwise retry forever without ever creating a pairing request.
+          if (state.credential) {
+            state.credential = undefined;
+            state.agentId = undefined;
+            this.saveState({
+              devicePublicKeyPem: state.devicePublicKeyPem,
+              devicePrivateKeyPem: state.devicePrivateKeyPem,
+            });
+            this.send(socket, 'pairing_request', {
+              device_public_key: state.devicePublicKeyPem,
+              display_name: this.options.displayName,
+              hostname: hostname(),
+            });
+            return;
+          }
+
           finish({ status: 'rejected' });
         }
 

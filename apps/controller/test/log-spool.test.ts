@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { ensureAttemptLogs, readLogsFromCursor } from '@rbo/executor';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { WebSocket } from 'ws';
-import { enqueueRemoteLogChunk, handleRemoteLogChunk } from '../src/execution/remote-execution.js';
+import {
+  enqueueRemoteLogChunk,
+  handleRemoteCleanupComplete,
+  handleRemoteJobExit,
+  handleRemoteLogChunk,
+} from '../src/execution/remote-execution.js';
 import { attemptLogDir } from '../src/execution/runner.js';
 import { createJob, getAttempt, transitionJobState } from '../src/jobs/lifecycle.js';
 import { migrateToLatest, nowIso, openDatabase } from '../src/storage/database.js';
@@ -209,6 +214,72 @@ describe('Controller idempotent log_chunk + log_ack', () => {
     const logDir = attemptLogDir(dataDir, attemptId);
     expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('onetwothree');
     expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(3);
+
+    db.close();
+  });
+
+  it('persists every queued log chunk before cleanup_complete marks the attempt terminal', async () => {
+    const { db, opts, socket, attemptId, leaseId } = await setup();
+
+    const chunk = (sequence: number, bytes: string) =>
+      enqueueRemoteLogChunk(opts, 'agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        stream: 'stdout',
+        sequence,
+        bytes,
+      });
+
+    // Same shape as the WS plane: log frames are in flight, then job_exit and
+    // cleanup_complete run without awaiting ingest.
+    const pending = [chunk(1, 'one\n'), chunk(2, 'two\n'), chunk(3, 'three\n')];
+
+    handleRemoteJobExit(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      exit_code: 0,
+      outcome: 'succeeded',
+    });
+
+    await handleRemoteCleanupComplete(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      exit_code: 0,
+      timed_out: false,
+    });
+
+    // Assert before the original chunk promises are observed again. Accepting
+    // log_chunk after `completed` would otherwise let a no-op drain pass.
+    expect(getAttempt(db, attemptId)?.state).toBe('completed');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(3);
+    const logDir = attemptLogDir(dataDir, attemptId);
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('one\ntwo\nthree\n');
+
+    const logs = await ensureAttemptLogs(logDir);
+    const page = await readLogsFromCursor(logs, 0, 10_000, ['stdout']);
+    expect(page.data).toBe('one\ntwo\nthree\n');
+    expect(page.nextCursor).toBe(Buffer.byteLength('one\ntwo\nthree\n'));
+
+    const acks = socket.sent.filter((frame) => frame.type === 'log_ack');
+    expect(acks.map((frame) => (frame.payload as { sequence: number }).sequence)).toEqual([
+      1, 2, 3,
+    ]);
+    await Promise.all(pending);
+
+    // A contiguous frame that arrives after the terminal transition is still durable.
+    await handleRemoteLogChunk(opts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      stream: 'stdout',
+      sequence: 4,
+      bytes: 'four\n',
+    });
+    expect(await readFile(join(logDir, 'stdout.log'), 'utf8')).toBe('one\ntwo\nthree\nfour\n');
+    expect(getAttempt(db, attemptId)?.log_acked_sequence).toBe(4);
 
     db.close();
   });

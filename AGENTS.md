@@ -18,6 +18,7 @@
 - `packages/executor/`: Shared platform execution adapters (Unix/Windows process lifecycle, artifacts, logs) used by both Controller-local and Agent-remote execution.
 - `packages/shared/`: Shared errors, ID generators, hashing utilities, path/packaging helpers, crypto, controller identity, and logger.
 - `packages/testing/`: Shared test fixtures and harness helpers.
+- `packages/discovery/`: mDNS/DNS-SD controller advertisement and agent auto-discovery (§7.2).
 - `native/windows-executor/`: Rust Job Object process isolation helper for Windows (§15.2).
 - `packaging/`: Per-OS packaging manifests and config templates (see `docs/dev/release-builds.md`).
 - `docs/dev/release-builds.md`: How to build a release and publish `@gemslibe/rbo` to npm.
@@ -103,6 +104,11 @@ Always execute commands from the repo root or use `--filter` for targeted operat
   ```bash
   pnpm package:archives
   pnpm package:verify
+  ```
+- **Local packaging & installation** (see `docs/dev/local-development.md`):
+  ```bash
+  pnpm release:pack                    # builds Windows helper + packs .tgz archives via pnpm pack
+  npm install -g ./apps/cli/gemslibe-rbo-<version>.tgz  # install locally (Windows helper first on win32-x64)
   ```
 
 ## Working Rules & Efficiency

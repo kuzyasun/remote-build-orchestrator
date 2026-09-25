@@ -186,15 +186,15 @@ pnpm bump-version          # interactive: prints current, asks for new x.y.z
 pnpm bump-version 1.2.3    # non-interactive override
 ```
 
-That runs `scripts/bump-version.mjs`. Internal `@rbo/*` workspace packages are not published and are
-left alone.
+That runs `scripts/bump-version.mjs`. It bumps all workspace packages across `apps/` and `packages/`, the native executor `Cargo.toml`/`Cargo.lock`, runtime constants, manifests, lockfile, and CHANGELOG.
 
 | Location | Field(s) |
 | --- | --- |
 | `packages/shared/src/versions.ts` | `RBO_CONTROLLER_VERSION`, `RBO_AGENT_VERSION`, `RBO_STDIO_ADAPTER_VERSION` |
 | `apps/cli/package.json` | `"version"` **and** the matching `workspace:` optionalDependency |
+| All other `apps/*/package.json` and `packages/*/package.json` | `"version"` |
 | `pnpm-lock.yaml` | Matching workspace optionalDependency specifier |
-| `packages/rbo-windows-executor-win32-x64/package.json` | `"version"` |
+| `native/windows-executor/Cargo.toml` and `Cargo.lock` | `version` |
 | Root `package.json` | `"version"` (workspace label; not read at runtime) |
 | `packaging/{windows,macos,linux}/MANIFEST.json` | `package_version` and `components.*` |
 | `CHANGELOG.md` | Promotes `## [Unreleased]` into `## [x.y.z] - YYYY-MM-DD` and updates compare links |
@@ -249,8 +249,8 @@ What it does:
 Success: tarballs under the package directories, e.g.
 
 ```text
-packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-0.1.0.tgz
-apps\cli\gemslibe-rbo-0.1.0.tgz
+packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-<version>.tgz
+apps\cli\gemslibe-rbo-<version>.tgz
 ```
 
 #### Manual pack (one piece at a time)
@@ -309,12 +309,12 @@ Controller/Agent processes before global reinstall (see `docs/user/getting-start
 
 #### Dry-run smoke from local tarballs
 
-Prefer optional package published (or its `.tgz` installed) before installing the main `.tgz`:
+Prefer optional package published (or its `.tgz` installed) before installing the main `.tgz` (see also [`docs/dev/local-development.md`](local-development.md)):
 
 ```powershell
 # Optional local dry-run of both on Windows x64:
-npm install -g .\packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-0.1.0.tgz
-npm install -g .\apps\cli\gemslibe-rbo-0.1.0.tgz
+npm install -g .\packages\rbo-windows-executor-win32-x64\gemslibe-rbo-windows-executor-win32-x64-<version>.tgz
+npm install -g .\apps\cli\gemslibe-rbo-<version>.tgz
 rbo --help
 rbo doctor
 npm uninstall -g @gemslibe/rbo

@@ -315,7 +315,7 @@ describe('remote cancel + lease_reject rematch', () => {
     db.close();
   });
 
-  it('cleanup_complete keeps cancelled exit_code null instead of adopting cleanup script exit 0', () => {
+  it('cleanup_complete keeps cancelled exit_code null instead of adopting cleanup script exit 0', async () => {
     const db = openDatabase(':memory:');
     migrateToLatest(db);
     insertAgent(db, 'agt_1');
@@ -357,7 +357,7 @@ describe('remote cancel + lease_reject rematch', () => {
       failure_message: 'operator cancel',
     });
 
-    handleRemoteCleanupComplete(opts, 'agt_1', {
+    await handleRemoteCleanupComplete(opts, 'agt_1', {
       attempt_id: attemptId,
       lease_id: leaseId,
       lease_epoch: 1,

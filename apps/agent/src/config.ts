@@ -71,6 +71,11 @@ export const AGENT_CONFIG_FILENAME = 'agent.json';
 /** Schema version written into `agent.json` by `rbo agent init`. */
 export const AGENT_CONFIG_SCHEMA_VERSION = 1;
 
+export {
+  clearStoredAgentCredential,
+  controllerTargetChanged,
+} from './stored-state.js';
+
 const RiskLevelSchema = z.enum(['safe', 'normal', 'destructive', 'hardware']);
 
 const GitAllowlistFileSchema = z.object({
@@ -403,12 +408,23 @@ export function readAgentConfigFile(configPath: string): AgentConfigFile | undef
 }
 
 /**
+ * Discovery result from mDNS browsing, used to pre-fill controller connection fields.
+ */
+export interface AgentDiscoveryResult {
+  controllerUrl: string;
+  controllerFingerprint: string;
+}
+
+/**
  * Write a complete default `agent.json` if missing (or when `force`).
  * Returns the path, whether a write occurred, and metadata for CLI reporting.
+ *
+ * When `discovery` is provided, the discovered controller URL and fingerprint
+ * are written instead of empty strings.
  */
 export function writeDefaultAgentConfigFile(
   stateDir: string,
-  options: { force?: boolean; initializedAt?: string } = {},
+  options: { force?: boolean; initializedAt?: string; discovery?: AgentDiscoveryResult } = {},
 ): { path: string; written: boolean; initialized_at: string; schema_version: number } {
   mkdirSync(stateDir, { recursive: true });
   const path = resolveAgentConfigPath(stateDir);
@@ -432,7 +448,12 @@ export function writeDefaultAgentConfigFile(
     };
   }
   const initialized_at = options.initializedAt ?? new Date().toISOString();
-  const body = `${JSON.stringify(defaultAgentConfigFile({ initializedAt: initialized_at }), null, 2)}\n`;
+  const config = defaultAgentConfigFile({ initializedAt: initialized_at });
+  if (options.discovery) {
+    config.controller_url = options.discovery.controllerUrl;
+    config.controller_fingerprint = options.discovery.controllerFingerprint;
+  }
+  const body = `${JSON.stringify(config, null, 2)}\n`;
   writeFileSync(path, body, 'utf8');
   return {
     path,

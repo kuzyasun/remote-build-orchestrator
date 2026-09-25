@@ -9,6 +9,7 @@ import { computeRepoKey, ensureControllerIdentity } from '@rbo/shared';
 import { createGitFixtureRepo } from '@rbo/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AgentConnection } from '../../../apps/agent/src/connection/client.js';
+import { resolveDataPlaneBaseUrl } from '../src/execution/remote-execution.js';
 import { handleDataPlaneRequest, registerArtifactExpectations } from '../src/http/data-plane.js';
 import { startControllerServer } from '../src/http/server.ts';
 import { handleToolCall } from '../src/mcp/handlers.js';
@@ -16,7 +17,7 @@ import { issueDataToken } from '../src/security/data-tokens.js';
 import { approvePairingRequest } from '../src/security/pairing.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
-import { startAgentPlaneServer } from '../src/websocket/server.ts';
+import { extractConnectionHost, startAgentPlaneServer } from '../src/websocket/server.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -439,5 +440,119 @@ describe('Remote Execution End-to-End', () => {
 
     expect(status).toBe(413);
     expect(JSON.parse(responseBody).error?.category).toBe('artifact_upload');
+  });
+
+  describe('resolveDataPlaneBaseUrl and extractConnectionHost', () => {
+    it('uses default 127.0.0.1 when no agent or local agent connects', () => {
+      const opts = {
+        db: {} as unknown as ControllerDatabase,
+        identity: {} as unknown as import('@rbo/shared').ControllerIdentity,
+        dataDir: '',
+        connectedAgents: new Map(),
+        serverPort: 7411,
+        controllerPublicHost: '127.0.0.1',
+      };
+      expect(resolveDataPlaneBaseUrl(opts)).toBe('https://127.0.0.1:7411');
+
+      const localAgent = {
+        agentId: 'agt_local',
+        socket: {} as unknown as import('ws').WebSocket,
+        protocolVersion: 1,
+        lastHeartbeatAt: 0,
+        connectionHost: '127.0.0.1',
+      };
+      expect(resolveDataPlaneBaseUrl(opts, localAgent)).toBe('https://127.0.0.1:7411');
+    });
+
+    it('derives reachable host from agent connectionHost when controllerPublicHost is 127.0.0.1', () => {
+      const opts = {
+        db: {} as unknown as ControllerDatabase,
+        identity: {} as unknown as import('@rbo/shared').ControllerIdentity,
+        dataDir: '',
+        connectedAgents: new Map(),
+        serverPort: 7411,
+        controllerPublicHost: '127.0.0.1',
+      };
+      const remoteAgent = {
+        agentId: 'agt_remote',
+        socket: {} as unknown as import('ws').WebSocket,
+        protocolVersion: 1,
+        lastHeartbeatAt: 0,
+        connectionHost: '192.168.1.150',
+      };
+      expect(resolveDataPlaneBaseUrl(opts, remoteAgent)).toBe('https://192.168.1.150:7411');
+    });
+
+    it('formats IPv6 connectionHost in brackets', () => {
+      const opts = {
+        db: {} as unknown as ControllerDatabase,
+        identity: {} as unknown as import('@rbo/shared').ControllerIdentity,
+        dataDir: '',
+        connectedAgents: new Map(),
+        serverPort: 7411,
+        controllerPublicHost: '127.0.0.1',
+      };
+      const ipv6Agent = {
+        agentId: 'agt_ipv6',
+        socket: {} as unknown as import('ws').WebSocket,
+        protocolVersion: 1,
+        lastHeartbeatAt: 0,
+        connectionHost: '2001:db8::1',
+      };
+      expect(resolveDataPlaneBaseUrl(opts, ipv6Agent)).toBe('https://[2001:db8::1]:7411');
+    });
+
+    it('honors explicitly configured controllerPublicHost over agent connectionHost', () => {
+      const opts = {
+        db: {} as unknown as ControllerDatabase,
+        identity: {} as unknown as import('@rbo/shared').ControllerIdentity,
+        dataDir: '',
+        connectedAgents: new Map(),
+        serverPort: 7411,
+        controllerPublicHost: 'build-controller.custom.domain',
+      };
+      const remoteAgent = {
+        agentId: 'agt_remote',
+        socket: {} as unknown as import('ws').WebSocket,
+        protocolVersion: 1,
+        lastHeartbeatAt: 0,
+        connectionHost: '192.168.1.150',
+      };
+      expect(resolveDataPlaneBaseUrl(opts, remoteAgent)).toBe(
+        'https://build-controller.custom.domain:7411',
+      );
+    });
+
+    it('honors explicit dataPlaneBaseUrl over all other settings', () => {
+      const opts = {
+        db: {} as unknown as ControllerDatabase,
+        identity: {} as unknown as import('@rbo/shared').ControllerIdentity,
+        dataDir: '',
+        connectedAgents: new Map(),
+        serverPort: 7411,
+        controllerPublicHost: '192.168.1.10',
+        dataPlaneBaseUrl: 'https://vpn.internal:8443/',
+      };
+      expect(resolveDataPlaneBaseUrl(opts)).toBe('https://vpn.internal:8443');
+    });
+
+    it('extracts host from HTTP Host header or socket localAddress', () => {
+      const reqWithHostHeader = {
+        headers: { host: '192.168.1.50:7411' },
+        socket: { localAddress: '127.0.0.1' },
+      } as unknown as IncomingMessage;
+      expect(extractConnectionHost(reqWithHostHeader)).toBe('192.168.1.50');
+
+      const reqWithIpv6HostHeader = {
+        headers: { host: '[2001:db8::1]:7411' },
+      } as unknown as IncomingMessage;
+      expect(extractConnectionHost(reqWithIpv6HostHeader)).toBe('2001:db8::1');
+
+      const reqWithoutHostHeader = {
+        headers: {},
+        socket: { localAddress: '::ffff:10.0.0.5' },
+      } as unknown as IncomingMessage;
+      expect(extractConnectionHost(reqWithoutHostHeader)).toBe('10.0.0.5');
+    });
   });
 });

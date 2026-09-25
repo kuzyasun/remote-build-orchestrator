@@ -1,15 +1,19 @@
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import {
   RBO_CONTROLLER_VERSION,
   resolveAgentStateDir,
   resolveControllerDataDir,
 } from '@rbo/shared';
+import { runAgentStatus } from './commands/agent-status.js';
 import { runAgentInit, runAgentStart, runAgentStopProcess } from './commands/agent.js';
 import {
   approveAgentRemote,
   listAgentsRemote,
   probeAgentRemote,
+  promptPendingPairingSelection,
+  rejectPairingRemote,
   revokeAgentRemote,
 } from './commands/agents.js';
 import {
@@ -20,11 +24,13 @@ import {
   runControllerStop,
 } from './commands/controller.js';
 import { stripDaemonFlag } from './commands/daemon.js';
+import { runDiscover } from './commands/discover.js';
 import { formatDoctorCheckLine, runDoctor } from './commands/doctor.js';
 import {
   parseDataDirFlag,
   parseForceFlag,
   parseReplaceFlag,
+  parseSkipDiscoveryFlag,
   parseStateDirFlag,
 } from './commands/flags.js';
 import { formatCliHelp } from './commands/help.js';
@@ -73,7 +79,7 @@ async function confirmOnTerminal(
   }
 }
 
-const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'status', 'stop']);
+const SERVICE_ACTIONS = new Set<ServiceAction>(['install', 'uninstall', 'stop']);
 
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
@@ -126,7 +132,7 @@ async function main(): Promise<void> {
           dataDir,
           daemon,
           replace,
-          cliScriptPath: process.argv[1],
+          cliScriptPath: resolve(process.argv[1]),
         });
         if (result === null) {
           return;
@@ -157,10 +163,31 @@ async function main(): Promise<void> {
       const stateDir = flagStateDir ?? resolveAgentStateDir();
       const sub = agentArgs[0];
       if (sub === 'approve') {
-        const requestId = agentArgs[1];
-        if (!requestId) throw new Error('Usage: rbo agent approve <pairing-request-id>');
+        let requestId = agentArgs[1];
+        if (!requestId) {
+          const selected = await promptPendingPairingSelection(controllerUrl, 'approve');
+          if (!selected) {
+            process.exitCode = 1;
+            return;
+          }
+          requestId = selected.id;
+        }
         const result = await approveAgentRemote(controllerUrl, requestId);
         console.log(JSON.stringify(result));
+        return;
+      }
+      if (sub === 'reject') {
+        let requestId = agentArgs[1];
+        if (!requestId) {
+          const selected = await promptPendingPairingSelection(controllerUrl, 'reject');
+          if (!selected) {
+            process.exitCode = 1;
+            return;
+          }
+          requestId = selected.id;
+        }
+        await rejectPairingRemote(controllerUrl, requestId);
+        console.log(`rejected ${requestId}`);
         return;
       }
       if (sub === 'revoke') {
@@ -178,8 +205,9 @@ async function main(): Promise<void> {
         return;
       }
       if (sub === 'init') {
-        const { force } = parseForceFlag(agentArgs.slice(1));
-        const result = await runAgentInit({ stateDir, force });
+        const { force, rest: afterForce } = parseForceFlag(agentArgs.slice(1));
+        const { skipDiscovery } = parseSkipDiscoveryFlag(afterForce);
+        const result = await runAgentInit({ stateDir, force, skipDiscovery });
         console.log(JSON.stringify(result, null, 2));
         return;
       }
@@ -190,7 +218,7 @@ async function main(): Promise<void> {
           stateDir,
           daemon,
           replace,
-          cliScriptPath: process.argv[1],
+          cliScriptPath: resolve(process.argv[1]),
         });
         if (result === null) {
           return;
@@ -203,6 +231,10 @@ async function main(): Promise<void> {
       if (sub === 'stop-process') {
         const result = await runAgentStopProcess({ stateDir });
         console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      if (sub === 'status') {
+        console.log(await runAgentStatus({ stateDir }));
         return;
       }
       if (SERVICE_ACTIONS.has(sub as ServiceAction)) {
@@ -224,8 +256,14 @@ async function main(): Promise<void> {
         return;
       }
       throw new Error(
-        `Unknown 'agent' subcommand '${sub}'. Use approve|revoke|probe|init|start|stop-process|install|status|stop|uninstall.`,
+        `Unknown 'agent' subcommand '${sub}'. Use approve|reject|revoke|probe|init|start|stop-process|install|status|stop|uninstall.`,
       );
+    }
+
+    case 'discover': {
+      const json = rest.includes('--json');
+      await runDiscover({ json });
+      return;
     }
 
     case 'doctor': {
@@ -315,7 +353,7 @@ async function main(): Promise<void> {
         }
         const lifecycleExit = runLifecycleErrorExitCode(error);
         if (lifecycleExit !== null) {
-          process.stderr.write(`${error.message}\n`);
+          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
           process.exitCode = lifecycleExit;
           return;
         }

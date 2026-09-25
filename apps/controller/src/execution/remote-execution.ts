@@ -144,7 +144,8 @@ function sendPrepareSource(
   snapshotRow: { size_bytes: number; sha256: string; payload_path: string },
 ): void {
   const mode = snapshotManifestMode(manifest);
-  const baseUrl = resolveDataPlaneBaseUrl(opts);
+  const conn = opts.connectedAgents.get(agentId);
+  const baseUrl = resolveDataPlaneBaseUrl(opts, conn);
 
   if (mode === 'git_overlay' && manifest && typeof manifest === 'object') {
     const repo = (manifest as { repo?: Record<string, unknown> }).repo;
@@ -185,7 +186,6 @@ function sendPrepareSource(
       manifest,
     };
 
-    const conn = opts.connectedAgents.get(agentId);
     if (conn) {
       sendWsFrame(
         conn.socket,
@@ -221,7 +221,6 @@ function sendPrepareSource(
     manifest,
   };
 
-  const conn = opts.connectedAgents.get(agentId);
   if (conn) {
     sendWsFrame(
       conn.socket,
@@ -380,11 +379,42 @@ async function ensureFullFallbackArchive(
   }
 }
 
-function resolveDataPlaneBaseUrl(opts: RemoteExecutionOptions): string {
+function isLocalOrWildcardHost(host: string): boolean {
+  const normalized = host.replace(/^\[|\]$/g, '').toLowerCase();
+  return (
+    normalized === '127.0.0.1' ||
+    normalized === 'localhost' ||
+    normalized === '::1' ||
+    normalized === '0.0.0.0' ||
+    normalized === '::'
+  );
+}
+
+function formatHostForUrl(host: string): string {
+  if (host.includes(':') && !host.startsWith('[')) {
+    return `[${host}]`;
+  }
+  return host;
+}
+
+export function resolveDataPlaneBaseUrl(
+  opts: RemoteExecutionOptions,
+  agent?: ConnectedAgent,
+): string {
   if (opts.dataPlaneBaseUrl) {
     return opts.dataPlaneBaseUrl.replace(/\/$/, '');
   }
-  const host = opts.controllerPublicHost ?? '127.0.0.1';
+  // Explicitly configured non-loopback host takes precedence:
+  if (opts.controllerPublicHost && !isLocalOrWildcardHost(opts.controllerPublicHost)) {
+    const host = formatHostForUrl(opts.controllerPublicHost);
+    return `https://${host}:${opts.serverPort}`;
+  }
+  // Otherwise, if the connected agent came through a reachable interface/host, prefer it:
+  if (agent?.connectionHost && !isLocalOrWildcardHost(agent.connectionHost)) {
+    const host = formatHostForUrl(agent.connectionHost);
+    return `https://${host}:${opts.serverPort}`;
+  }
+  const host = formatHostForUrl(opts.controllerPublicHost ?? '127.0.0.1');
   return `https://${host}:${opts.serverPort}`;
 }
 
@@ -742,7 +772,7 @@ export async function handleRemoteSourceNeed(
         lease_epoch: payload.lease_epoch,
         op: 'bundle_download',
       });
-      const bundleUrl = `${resolveDataPlaneBaseUrl(opts)}/data/v1/attempts/${attempt.id}/bundle`;
+      const bundleUrl = `${resolveDataPlaneBaseUrl(opts, conn)}/data/v1/attempts/${attempt.id}/bundle`;
       const bundlePayload: BundleDownloadPayload = {
         attempt_id: attempt.id,
         lease_id: payload.lease_id,
@@ -826,7 +856,7 @@ export async function handleRemoteSourceNeed(
       lease_epoch: payload.lease_epoch,
       op: 'snapshot_download',
     });
-    const downloadUrl = `${resolveDataPlaneBaseUrl(opts)}/data/v1/attempts/${attempt.id}/snapshot`;
+    const downloadUrl = `${resolveDataPlaneBaseUrl(opts, conn)}/data/v1/attempts/${attempt.id}/snapshot`;
     const preparePayload: PrepareSourcePayload = {
       source_mode: 'full',
       attempt_id: attempt.id,
@@ -985,7 +1015,12 @@ export async function handleRemoteLogChunk(
     payload.lease_id,
     payload.lease_epoch,
   );
-  if (!rejectStale('log_chunk', attempt, agentId, ['running', 'collecting_artifacts'])) {
+  // `completed` stays open so a frame that arrives after the terminal
+  // transition is still appended when its sequence is contiguous. Lease
+  // expiry continues to reject stale frames via rejectStale.
+  if (
+    !rejectStale('log_chunk', attempt, agentId, ['running', 'collecting_artifacts', 'completed'])
+  ) {
     return;
   }
 
@@ -1058,6 +1093,27 @@ export function enqueueRemoteLogChunk(
   // error handling for `next`; this branch only performs bookkeeping.
   void next.then(clearChain, clearChain);
   return next;
+}
+
+/**
+ * Wait until log_chunk handlers queued for this attempt have settled,
+ * including any chunk enqueued while this wait yields.
+ *
+ * The agent plane does not await ingest. A fast cleanup_complete otherwise
+ * marks the attempt terminal while later chunks are still queued, so job_logs
+ * on the completed job misses them. Stop when the settled promise is still
+ * the tail, or the tail has already been cleared.
+ */
+export async function drainRemoteLogChunks(attemptId: string): Promise<void> {
+  let pending = logChunkChains.get(attemptId);
+  while (pending) {
+    await pending.catch(() => undefined);
+    const current = logChunkChains.get(attemptId);
+    if (!current || current === pending) {
+      return;
+    }
+    pending = current;
+  }
 }
 
 export function handleRemoteJobStarted(
@@ -1157,6 +1213,8 @@ export function handleRemoteArtifactManifest(
 
   void filterMissingArtifacts(opts.dataDir, attempt.id, payload.artifacts).then((missing) => {
     const pathByName = new Map(payload.artifacts.map((a) => [a.logical_name, a.path]));
+    const conn = opts.connectedAgents.get(agentId);
+    const uploadBaseUrl = resolveDataPlaneBaseUrl(opts, conn);
     const artifactsWithTokens = missing.map((art) => {
       const uploadToken = issueDataToken(opts.identity, {
         agent_id: agentId,
@@ -1167,7 +1225,7 @@ export function handleRemoteArtifactManifest(
         op: 'artifact_upload',
         artifact_id: art.logical_name,
       });
-      const uploadUrl = `${resolveDataPlaneBaseUrl(opts)}/data/v1/attempts/${attempt.id}/artifacts/${encodeURIComponent(art.logical_name)}`;
+      const uploadUrl = `${uploadBaseUrl}/data/v1/attempts/${attempt.id}/artifacts/${encodeURIComponent(art.logical_name)}`;
       return {
         logical_name: art.logical_name,
         path: pathByName.get(art.logical_name) ?? art.logical_name,
@@ -1185,7 +1243,6 @@ export function handleRemoteArtifactManifest(
       artifacts: artifactsWithTokens,
     };
 
-    const conn = opts.connectedAgents.get(agentId);
     if (conn) {
       sendWsFrame(
         conn.socket,
@@ -1199,11 +1256,26 @@ export function handleRemoteArtifactManifest(
   });
 }
 
-export function handleRemoteCleanupComplete(
+export async function handleRemoteCleanupComplete(
   opts: RemoteExecutionOptions,
   agentId: string,
   payload: CleanupCompletePayload,
-): void {
+): Promise<void> {
+  const loaded = loadAttemptByLease(
+    opts.db,
+    payload.attempt_id,
+    payload.lease_id,
+    payload.lease_epoch,
+  );
+  if (!rejectStale('cleanup_complete', loaded, agentId, ['collecting_artifacts'])) {
+    return;
+  }
+
+  // Fast jobs emit cleanup_complete within a few WS frames of the last
+  // log_chunk. Those frames are already queued; persist them before the
+  // attempt leaves collecting_artifacts so job_logs sees the full spool.
+  await drainRemoteLogChunks(loaded.id);
+
   const attempt = loadAttemptByLease(
     opts.db,
     payload.attempt_id,

@@ -6,10 +6,9 @@ pairing, use [Getting started](getting-started.md).
 Commands below assume a global npm installation. For a release archive, replace `rbo` with
 `node <RBO_ROOT>/bin/rbo.js`.
 
-## Install
+## Verify installation
 
-For first-time installation, follow [Getting started](getting-started.md). To check an existing
-installation, start with:
+To check an existing installation:
 
 ```bash
 rbo doctor
@@ -27,34 +26,45 @@ rbo controller start --daemon
 rbo controller stop
 
 rbo agent start --daemon
+rbo agent status
 rbo agent stop-process
 ```
 
-Omit `--daemon` to run a process in the current terminal. `rbo agent stop` belongs to the optional
-OS-service workflow; use `stop-process` for a foreground or daemon process.
+`rbo agent status` reports the local process, its controller URL, whether a pairing
+credential is stored, and whether the process is connected. Omit `--daemon` to run a process in
+the current terminal. `rbo agent stop` belongs to the optional OS-service workflow; use
+`stop-process` for a foreground or daemon process.
 
 ## Pair
 
-On the new worker:
+On the new worker (auto-discovery path):
 
 ```bash
-rbo agent init
-# edit ~/.rbo/agent/agent.json
+rbo agent init       # scans LAN via mDNS; select your Controller [1]
 rbo agent start --daemon
 ```
 
-The Agent will connect in `pairing_pending` state.
+*(If mDNS is unavailable, use `rbo agent init --skip-discovery` and configure `controller_url` / `controller_fingerprint` in `agent.json` manually.)*
+
+The Agent connects to the Controller and enters `pairing_pending` state.
 
 ## Approve
 
 On the Controller:
 
 ```bash
-rbo agents
-rbo agent approve <pairing-request-id>
+rbo agent approve          # interactive selection, or `rbo agent approve <pairing-request-id>`
 ```
 
 Approve only a request whose display name, host, and fingerprint exchange you expect.
+
+## Reject
+
+To reject a pending pairing request:
+
+```bash
+rbo agent reject           # interactive selection, or `rbo agent reject <pairing-request-id>`
+```
 
 ## Drain
 
@@ -129,7 +139,6 @@ Service integration is best-effort and prints a plan by default:
 ```bash
 rbo agent install
 rbo agent install --execute
-rbo agent status
 rbo agent stop --execute
 rbo agent uninstall --execute
 ```
@@ -151,3 +160,45 @@ machines, `rbo agent start --daemon` is simpler.
    ```
 
 7. Delete the RBO data directories only after confirming the backup and exact paths.
+
+## Network discovery (mDNS)
+
+The Controller advertises itself via mDNS/DNS-SD (`_rbo-controller._tcp.local`) by default. Agents
+discover controllers automatically during `rbo agent init`. You can also scan manually:
+
+```bash
+rbo discover
+```
+
+### Disabling mDNS
+
+To disable mDNS advertisement, set `mdns_enabled` to `false` in `controller.json` or use the
+environment variable:
+
+```bash
+RBO_MDNS_ENABLED=false rbo controller start
+```
+
+When mDNS is disabled, agents must be configured manually with `controller_url` and
+`controller_fingerprint` in `agent.json`.
+
+## Snapshot limits and tuning
+
+By default, the Controller enforces bounds on snapshot size to prevent unintentional uploads of large
+binaries or unbounded node_modules folders. These limits can be adjusted in `controller.json`:
+
+```json
+{
+  "max_snapshot_source_bytes": 1073741824,
+  "max_snapshot_file_count": 100000,
+  "max_snapshot_single_file_bytes": 268435456,
+  "max_git_bundle_bytes": 536870912,
+  "allow_full_snapshot_fallback": false
+}
+```
+
+- **`max_snapshot_source_bytes`**: Maximum total uncompressed source bytes across all files (default: 1 GiB / 1,073,741,824 bytes).
+- **`max_snapshot_file_count`**: Maximum number of regular files included in a snapshot (default: 100,000).
+- **`max_snapshot_single_file_bytes`**: Maximum size of any individual uncommitted file (default: 256 MiB / 268,435,456 bytes).
+- **`max_git_bundle_bytes`**: Maximum Git bundle transfer size when seeding missing commits to an Agent (default: 512 MiB / 536,870,912 bytes).
+- **`allow_full_snapshot_fallback`**: When `false` (default), jobs fail fast if Git overlay capture is unavailable (e.g. non-allowlisted remotes or missing upstream). Set to `true` to permit uploading full working trees when overlay fails.
