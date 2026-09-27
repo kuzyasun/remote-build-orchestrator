@@ -1,7 +1,16 @@
 import { RBO_AGENT_VERSION, createLogger, generateId } from '@rbo/shared';
 import { probeCapabilities } from './capabilities/probe.js';
-import { type AgentConfig, ensureStateDir, loadAgentConfig } from './config.js';
+import {
+  type AgentConfig,
+  ensureStateDir,
+  loadAgentConfig,
+  persistAgentControllerUrl,
+} from './config.js';
 import { AgentConnection } from './connection/client.js';
+import {
+  CONTROLLER_MDNS_REFRESH_INTERVAL_MS,
+  discoverRelocatedControllerUrl,
+} from './controller-refresh.js';
 import { type AgentRuntimeConnection, writeAgentRuntimeStatus } from './runtime-status.js';
 
 const logger = createLogger('agent.main');
@@ -16,6 +25,10 @@ const RECONNECT_MAX_DELAY_MS = 60_000;
 export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<void> {
   const config = loadAgentConfig(overrides);
   ensureStateDir(config);
+  // An explicit URL (env or caller) stays pinned. The file URL from discovery can go stale.
+  const rediscoveryEnabled =
+    overrides.controllerUrl === undefined && process.env.RBO_CONTROLLER_URL === undefined;
+  let controllerUrl = config.controllerUrl;
 
   let cachedFreeBytes = 0;
   const refreshFreeDisk = async () => {
@@ -51,18 +64,13 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
 
   logger.info('agent starting', {
     version: RBO_AGENT_VERSION,
-    controller: config.controllerUrl,
+    controller: controllerUrl,
     displayName: config.displayName,
+    mdns_refresh: rediscoveryEnabled,
   });
 
   let attempt = 0;
   let stopped = false;
-  process.on('SIGINT', () => {
-    stopped = true;
-  });
-  process.on('SIGTERM', () => {
-    stopped = true;
-  });
   // Daemon safety net: a single async handler failure must not kill the Agent.
   // Call sites still catch and log; this covers any remaining fire-and-forget gaps.
   process.on('unhandledRejection', (reason) => {
@@ -77,7 +85,7 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
     try {
       writeAgentRuntimeStatus(config.stateDir, {
         ...status,
-        controller_url: config.controllerUrl,
+        controller_url: controllerUrl,
       });
     } catch (error) {
       logger.warn('failed to write runtime status', { error: String(error) });
@@ -85,7 +93,7 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
   };
 
   const connection = new AgentConnection({
-    controllerUrl: config.controllerUrl,
+    controllerUrl,
     expectedFingerprint: config.controllerFingerprint,
     stateDir: config.stateDir,
     repoCacheDir: config.repoCacheDir,
@@ -102,6 +110,64 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
     getFreeDiskBytes: () => cachedFreeBytes,
   });
 
+  const stop = () => {
+    stopped = true;
+    connection.close({ killProcess: true });
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+
+  const refreshAbort = new AbortController();
+  let refreshInFlight: Promise<void> | null = null;
+  let sessionOpen = false;
+
+  const refreshControllerLocation = (): Promise<void> => {
+    if (!rediscoveryEnabled || stopped) {
+      return Promise.resolve();
+    }
+    if (refreshInFlight) {
+      return refreshInFlight;
+    }
+    const run = async () => {
+      const next = await discoverRelocatedControllerUrl({
+        currentUrl: controllerUrl,
+        fingerprint: config.controllerFingerprint,
+        signal: refreshAbort.signal,
+      });
+      if (!next || stopped || next === controllerUrl) {
+        return;
+      }
+      logger.info('controller address updated from mDNS', {
+        from: controllerUrl,
+        controller: next,
+      });
+      controllerUrl = next;
+      connection.setControllerUrl(next);
+      try {
+        persistAgentControllerUrl(config.stateDir, next);
+      } catch (error) {
+        logger.warn('failed to persist controller url', { error: String(error) });
+      }
+      reportStatus({
+        connection: sessionOpen ? 'authenticated' : 'connecting',
+      });
+      connection.dropIfOpenToOtherUrl(next);
+    };
+    refreshInFlight = run().finally(() => {
+      refreshInFlight = null;
+    });
+    return refreshInFlight;
+  };
+
+  let refreshTimer: ReturnType<typeof setInterval> | undefined;
+  if (rediscoveryEnabled) {
+    await refreshControllerLocation();
+    refreshTimer = setInterval(() => {
+      void refreshControllerLocation();
+    }, CONTROLLER_MDNS_REFRESH_INTERVAL_MS);
+    refreshTimer.unref?.();
+  }
+
   while (!stopped) {
     reportStatus({ connection: 'connecting' });
     try {
@@ -111,8 +177,10 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
       if (result.status === 'authenticated') {
         logger.info('agent authenticated', { agentId: result.agentId });
         reportStatus({ connection: 'authenticated', agent_id: result.agentId });
+        sessionOpen = true;
         // Heartbeats run inside AgentConnection; wait until disconnect or stop.
         await Promise.race([connection.waitUntilDisconnected(), waitUntil(() => stopped)]);
+        sessionOpen = false;
         if (!stopped) {
           reportStatus({ connection: 'disconnected', agent_id: result.agentId });
         }
@@ -130,10 +198,24 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
         await sleep(RECONNECT_BASE_DELAY_MS);
       }
     } catch (error) {
+      if (stopped) {
+        break;
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      const previousUrl = controllerUrl;
+      await refreshControllerLocation();
+      if (controllerUrl !== previousUrl) {
+        attempt = 0;
+        logger.info('connection failed; retrying at discovered controller address', {
+          error: detail,
+          controller: controllerUrl,
+        });
+        reportStatus({ connection: 'connecting' });
+        continue;
+      }
       attempt += 1;
       const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
-      const detail = error instanceof Error ? error.message : String(error);
-      logger.error('connection failed, retrying', { error: String(error), retry_in_ms: delay });
+      logger.error('connection failed, retrying', { error: detail, retry_in_ms: delay });
       reportStatus({ connection: 'error', detail });
       await sleep(delay);
     } finally {
@@ -144,6 +226,10 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
 
   reportStatus({ connection: 'stopped' });
 
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+  }
+  refreshAbort.abort();
   clearInterval(freeDiskTimer);
   connection.close({ killProcess: true });
   logger.info('agent stopped');

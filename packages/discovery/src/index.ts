@@ -12,6 +12,7 @@ export {
   isIpv6Address,
   isRoutableIpAddress,
   normalizeMdnsHost,
+  selectBestAddress,
 } from './address.js';
 export {
   chooseDiscoveredController,
@@ -27,6 +28,7 @@ export {
   RBO_MDNS_SERVICE_TYPE,
   RBO_MDNS_TXT_VERSION,
 } from './constants.js';
+export { agentUrlHasRoutableIp, controllerAgentUrl } from './url.js';
 export {
   parseDnsSdBrowseLine,
   parseDnsSdResolveOutput,

@@ -20,6 +20,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@rbo/discovery": "workspace:*",
     "@rbo/executor": "workspace:*",
     "@rbo/protocol": "workspace:*",
     "@rbo/shared": "workspace:*",

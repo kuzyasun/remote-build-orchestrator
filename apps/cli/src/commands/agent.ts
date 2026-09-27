@@ -11,9 +11,9 @@ import {
 import { runAgent } from '@rbo/agent/run';
 import {
   type DiscoveredController,
+  controllerAgentUrl,
   discoverControllers,
-  isRoutableIpAddress,
-  normalizeMdnsHost,
+  selectBestAddress,
 } from '@rbo/discovery';
 import { resolveAgentStateDir } from '@rbo/shared';
 import { agentLogPath, agentPidPath, spawnDetachedDaemon } from './daemon.js';
@@ -57,48 +57,7 @@ export function isAgentInitialized(stateDir: string): boolean {
   return existsSync(join(stateDir, AGENT_CONFIG_FILENAME));
 }
 
-/**
- * Select the best routable IP address from discovered addresses.
- * Prioritizes the responder address that actually delivered the advertisement packet
- * (when it is a routable IP), then private LAN IPv4 (192.168.x.x, 10.x.x.x, 172.16-31.x.x),
- * avoids APIPA (169.254.x.x) and loopback, and handles IPv6 cleanly.
- * Hostnames are not treated as addresses. A bare fallback name becomes `name.local`.
- */
-export function selectBestAddress(
-  addresses: string[],
-  fallbackHost: string,
-  responderAddress?: string,
-): string {
-  const normalizedResponder = responderAddress?.replace(/^::ffff:/i, '');
-
-  // Prefer the packet's responder IP: it came over the interface that delivered mDNS.
-  if (normalizedResponder && isRoutableIpAddress(normalizedResponder)) {
-    return normalizedResponder;
-  }
-
-  const routable = (addresses ?? []).filter((address) => isRoutableIpAddress(address));
-
-  // 1. Home / Office LAN (192.168.x.x)
-  const lan192 = routable.find((a) => a.startsWith('192.168.'));
-  if (lan192) return lan192;
-
-  // 2. Class A LAN (10.x.x.x)
-  const lan10 = routable.find((a) => a.startsWith('10.'));
-  if (lan10) return lan10;
-
-  // 3. Class B LAN (172.16.x.x - 172.31.x.x, avoid 172.17.0.1 docker0 if another exists)
-  const lan172 = routable.filter((a) => /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(a));
-  const nonDocker172 = lan172.find((a) => a !== '172.17.0.1');
-  if (nonDocker172) return nonDocker172;
-  if (lan172.length > 0) return lan172[0];
-
-  // 4. Any other routable IPv4, then IPv6.
-  const anyIpv4 = routable.find((a) => !a.includes(':'));
-  if (anyIpv4) return anyIpv4;
-  if (routable[0]) return routable[0];
-
-  return normalizeMdnsHost(fallbackHost);
-}
+export { selectBestAddress } from '@rbo/discovery';
 
 /** Strip or escape ANSI control sequences and control characters for terminal safety. */
 export function sanitizeTerminalOutput(str: string): string {
@@ -309,15 +268,8 @@ export async function runAgentInit(options: AgentInitOptions = {}): Promise<Agen
         signal: options.signal,
       });
       if (selectedController) {
-        const rawAddr = selectBestAddress(
-          selectedController.addresses,
-          selectedController.host,
-          selectedController.responderAddress,
-        );
-        const hostPart =
-          rawAddr.includes(':') && !rawAddr.startsWith('[') ? `[${rawAddr}]` : rawAddr;
         discovery = {
-          controllerUrl: `wss://${hostPart}:${selectedController.port}/agent`,
+          controllerUrl: controllerAgentUrl(selectedController),
           controllerFingerprint: selectedController.fingerprint,
         };
       }

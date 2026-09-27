@@ -159,6 +159,45 @@ describe('Agent pairing over TLS WebSocket', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('keeps the new session when the agent reconnects and the old socket closes', async () => {
+    const dir = newAgentDir();
+    const first = agentConnection(dir);
+    await first.connectOnce();
+    const request = latestPendingRequest();
+    if (!request) throw new Error('missing request');
+    const { agentId } = approvePairingRequest(db, identity, request.id);
+    const session = await first.connectOnce();
+    expect(session.status).toBe('authenticated');
+
+    const previousSocket = plane.connectedAgents.get(agentId)?.socket;
+    expect(previousSocket?.readyState).toBe(WebSocket.OPEN);
+
+    const second = agentConnection(dir);
+    const again = await second.connectOnce();
+    expect(again.status).toBe('authenticated');
+    expect(again.agentId).toBe(agentId);
+
+    const current = plane.connectedAgents.get(agentId);
+    expect(current?.socket).toBeDefined();
+    expect(current?.socket).not.toBe(previousSocket);
+    expect(current?.socket.readyState).toBe(WebSocket.OPEN);
+
+    await new Promise<void>((resolvePromise) => {
+      if (!previousSocket || previousSocket.readyState === WebSocket.CLOSED) {
+        resolvePromise();
+        return;
+      }
+      previousSocket.once('close', () => resolvePromise());
+      first.close();
+    });
+
+    expect(plane.connectedAgents.get(agentId)?.socket).toBe(current?.socket);
+    expect(listAgents(db, false).map((agent) => agent.id)).toContain(agentId);
+
+    second.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('a replayed pairing challenge signature from a stale connection is rejected on a fresh one', async () => {
     // Capture a valid (nonce, signature) pair from one connection, then try
     // to replay it against a second, independent challenge — each connection

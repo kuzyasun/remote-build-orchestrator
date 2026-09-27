@@ -390,6 +390,7 @@ export async function startAgentPlaneServer(
             }
             pendingNonce = null;
             pendingCredential = null;
+            const previous = connectedAgents.get(verified.agentId);
             authenticated = {
               agentId: verified.agentId,
               socket,
@@ -397,7 +398,17 @@ export async function startAgentPlaneServer(
               lastHeartbeatAt: Date.now(),
               connectionHost,
             };
+            // Identity is the credential, not the source address. A reconnect from a
+            // new agent IP replaces the previous session; install it before closing
+            // the old socket so that socket's close handler cannot drop this one.
             connectedAgents.set(verified.agentId, authenticated);
+            if (previous && previous.socket !== socket) {
+              logger.info('agent reconnected from a new session', {
+                agentId: verified.agentId,
+                connectionHost,
+              });
+              previous.socket.terminate();
+            }
             markAgentSeen(db, verified.agentId, 'idle');
             send(socket, 'hello_ack', { status: 'authenticated', agent_id: verified.agentId });
             maybeDispatchQueued();
@@ -554,12 +565,17 @@ export async function startAgentPlaneServer(
       if (shuttingDown) {
         return;
       }
-      if (authenticated) {
-        connectedAgents.delete(authenticated.agentId);
-        markAgentSeen(db, authenticated.agentId, 'offline');
-        recovery.onAgentDisconnect(authenticated.agentId);
-        maybeDispatchQueued();
+      if (!authenticated) {
+        return;
       }
+      const current = connectedAgents.get(authenticated.agentId);
+      if (current?.socket !== socket) {
+        return;
+      }
+      connectedAgents.delete(authenticated.agentId);
+      markAgentSeen(db, authenticated.agentId, 'offline');
+      recovery.onAgentDisconnect(authenticated.agentId);
+      maybeDispatchQueued();
     });
   });
 

@@ -206,6 +206,9 @@ importers:
 
   apps/agent:
     dependencies:
+      '@rbo/discovery':
+        specifier: workspace:*
+        version: link:../../packages/discovery
       '@rbo/executor':
         specifier: workspace:*
         version: link:../../packages/executor

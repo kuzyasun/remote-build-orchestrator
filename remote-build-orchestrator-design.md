@@ -532,6 +532,15 @@ fingerprint=<sha256:hex>
 `rbo discover` allows inspecting available controllers manually.
 Disable: `mdns_enabled: false` in `controller.json` or `RBO_MDNS_ENABLED=false`.
 
+A running Agent re-browses mDNS at startup, about once a minute, and after a failed
+connect. When the pinned `controller_fingerprint` is advertised at a new routable
+address, the Agent updates `controller_url` and reconnects. The stored credential
+stays. `RBO_CONTROLLER_URL` pins the address and skips this refresh.
+
+The Controller identifies an Agent by its credential, not by source address. A
+reconnect from a new Agent IP replaces the previous session. The old socket
+closing does not drop the new session or mark the Agent offline.
+
 mDNS is used solely for discovery. Authentication is still mandatory.
 
 ---

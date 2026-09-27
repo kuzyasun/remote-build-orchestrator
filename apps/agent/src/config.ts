@@ -388,6 +388,29 @@ export function resolveAgentConfigPath(stateDir: string): string {
   return join(stateDir, AGENT_CONFIG_FILENAME);
 }
 
+/**
+ * Replace `controller_url` in an existing `agent.json`, leaving every other field in place.
+ * Used when mDNS finds the same pinned controller at a new address.
+ * @returns false when the file is missing or already stores this URL.
+ */
+export function persistAgentControllerUrl(stateDir: string, controllerUrl: string): boolean {
+  const path = resolveAgentConfigPath(stateDir);
+  if (!existsSync(path)) {
+    return false;
+  }
+  const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`Invalid agent config JSON at ${path}: expected an object`);
+  }
+  const record = raw as Record<string, unknown>;
+  if (record.controller_url === controllerUrl) {
+    return false;
+  }
+  record.controller_url = controllerUrl;
+  writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+  return true;
+}
+
 export function readAgentConfigFile(configPath: string): AgentConfigFile | undefined {
   if (!existsSync(configPath)) {
     return undefined;
