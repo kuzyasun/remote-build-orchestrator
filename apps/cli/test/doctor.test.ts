@@ -1,9 +1,10 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   checkControllerPorts,
+  checkControllerPublicHost,
   checkFirewall,
   checkMdnsPort,
   checkNodeEngines,
@@ -24,6 +25,7 @@ import {
   parseSsTcp,
   parseSsUdp,
   parseWindowsFirewallRules,
+  resolveDoctorDiscoveryConfig,
   runDoctor,
 } from '../src/commands/doctor.js';
 
@@ -473,7 +475,7 @@ describe('doctor mDNS port binding diagnostics', () => {
 
   it('still warns when specific-IP binding belongs to a different process even with controllerPid', async () => {
     const mixedUdp = `
-  UDP    0.0.0.0:5353           *:*                                    54332
+  UDP    0.0.0.0:5353           *:*                                    42012
   UDP    192.168.0.102:5353     *:*                                    46296
 `;
     const check = await checkMdnsPort({
@@ -485,6 +487,89 @@ describe('doctor mDNS port binding diagnostics', () => {
     expect(check.ok).toBe(true);
     expect(check.warn).toBe(true);
     expect(check.detail).toContain('Zoom.exe');
+  });
+
+  it('fails when the controller is running but has no UDP 5353 socket', async () => {
+    const osOnly = `
+  UDP    0.0.0.0:5353           *:*                                    54332
+  UDP    [::]:5353              *:*                                    1908
+`;
+    const check = await checkMdnsPort({
+      platform: 'win32',
+      netstatUdpOutput: osOnly,
+      controllerPid: 32420,
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('no UDP 5353 socket');
+    expect(check.detail).toContain('mDNS advertisement is down');
+  });
+
+  it('does not require a UDP 5353 socket when mDNS advertisement is disabled', async () => {
+    const check = await checkMdnsPort({
+      platform: 'win32',
+      netstatUdpOutput:
+        '  UDP    0.0.0.0:123            *:*                                    1200\n',
+      controllerPid: 32420,
+      mdnsEnabled: false,
+    });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('UDP 5353 is available');
+  });
+});
+
+describe('doctor controller_public_host', () => {
+  it('accepts an unset or loopback host', () => {
+    expect(checkControllerPublicHost({ publicHost: null, localAddresses: [] }).ok).toBe(true);
+    expect(checkControllerPublicHost({ publicHost: '127.0.0.1', localAddresses: [] }).ok).toBe(
+      true,
+    );
+  });
+
+  it('accepts a hostname', () => {
+    const check = checkControllerPublicHost({
+      publicHost: 'build-controller.local',
+      localAddresses: ['192.168.0.105'],
+    });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('build-controller.local');
+  });
+
+  it('fails when a private LAN address is no longer assigned', () => {
+    const check = checkControllerPublicHost({
+      publicHost: '192.168.0.102',
+      localAddresses: ['192.168.0.105'],
+    });
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('192.168.0.102');
+    expect(check.detail).toContain('not assigned');
+  });
+
+  it('lets RBO_CONTROLLER_PUBLIC_HOST and RBO_MDNS_ENABLED override controller.json', () => {
+    const dataDir = tempDir();
+    writeFileSync(
+      join(dataDir, 'controller.json'),
+      JSON.stringify({ controller_public_host: '127.0.0.1', mdns_enabled: true }),
+      'utf8',
+    );
+    const fromEnv = resolveDoctorDiscoveryConfig(dataDir, {
+      RBO_CONTROLLER_PUBLIC_HOST: '192.168.0.102',
+      RBO_MDNS_ENABLED: 'false',
+    });
+    expect(fromEnv.publicHost).toBe('192.168.0.102');
+    expect(fromEnv.mdnsEnabled).toBe(false);
+
+    const fromFile = resolveDoctorDiscoveryConfig(dataDir, {});
+    expect(fromFile.publicHost).toBe('127.0.0.1');
+    expect(fromFile.mdnsEnabled).toBe(true);
+  });
+
+  it('accepts a private LAN address that is still assigned', () => {
+    const check = checkControllerPublicHost({
+      publicHost: '192.168.0.105',
+      localAddresses: ['192.168.0.105'],
+    });
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('assigned on this machine');
   });
 });
 

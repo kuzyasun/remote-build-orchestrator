@@ -1,7 +1,9 @@
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import { join } from 'node:path';
 import { promisify, styleText } from 'node:util';
+import { isIpAddress, isPrivateLanAddress } from '@rbo/discovery';
 import {
   type ResolveWindowsExecutorOptions,
   type WindowsExecutorResolveResult,
@@ -67,6 +69,20 @@ export interface DoctorOptions {
   linuxFirewalldPortsOutput?: string | null;
   /** Injected macOS firewall output for testing. */
   macFirewallOutput?: string | null;
+  /**
+   * `controller.json` `controller_public_host`. `undefined` reads the file in
+   * `dataDir`. `null` means the field is unset.
+   */
+  controllerPublicHost?: string | null;
+  /** When false, a running Controller is not required to own UDP 5353. */
+  mdnsEnabled?: boolean;
+  /** Injected local interface addresses for the public-host check. */
+  localAddresses?: readonly string[];
+  /**
+   * Environment used to resolve `RBO_CONTROLLER_PUBLIC_HOST` and
+   * `RBO_MDNS_ENABLED`. Defaults to `process.env`.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** Status tag printed by `rbo doctor` (fixed width for column alignment). */
@@ -935,6 +951,11 @@ export interface CheckMdnsPortOptions {
   resolveProcessName?: ProcessNameResolver;
   /** Known Controller PID — its own specific-IP mDNS binding is not a conflict. */
   controllerPid?: number | null;
+  /**
+   * When the Controller is running and mDNS is enabled, it must own a UDP 5353
+   * socket. Defaults to true. Pass false when advertisement is configured off.
+   */
+  mdnsEnabled?: boolean;
 }
 
 export async function checkMdnsPort(options: CheckMdnsPortOptions = {}): Promise<DoctorCheck> {
@@ -988,6 +1009,17 @@ export async function checkMdnsPort(options: CheckMdnsPortOptions = {}): Promise
   }
 
   const mdnsBindings = bindings.filter((b) => b.port === 5353);
+  const controllerPid = options.controllerPid ?? null;
+  const expectControllerSocket = controllerPid !== null && options.mdnsEnabled !== false;
+
+  if (expectControllerSocket && !mdnsBindings.some((b) => b.pid === controllerPid)) {
+    return {
+      name: 'mdns_port',
+      ok: false,
+      detail:
+        'Controller is running but has no UDP 5353 socket; mDNS advertisement is down, so agents cannot discover this controller',
+    };
+  }
 
   if (mdnsBindings.length === 0) {
     return {
@@ -999,8 +1031,6 @@ export async function checkMdnsPort(options: CheckMdnsPortOptions = {}): Promise
 
   const isWildcard = (host: string) =>
     host === '0.0.0.0' || host === '*' || host === '::' || host === '[::]';
-
-  const controllerPid = options.controllerPid ?? null;
 
   const conflicting = mdnsBindings.find(
     (b) => !isWildcard(b.host) && (controllerPid === null || b.pid !== controllerPid),
@@ -1182,6 +1212,104 @@ export async function checkFirewall(options: CheckFirewallOptions = {}): Promise
   };
 }
 
+export interface CheckControllerPublicHostOptions {
+  /** Value from `controller.json`, or null when the field is unset. */
+  publicHost: string | null;
+  /** Addresses currently assigned on local interfaces. */
+  localAddresses: readonly string[];
+}
+
+/**
+ * A DHCP LAN address in `controller_public_host` goes stale when the lease
+ * changes. Hostnames and addresses that are still assigned stay valid.
+ */
+export function checkControllerPublicHost(options: CheckControllerPublicHostOptions): DoctorCheck {
+  const host = options.publicHost?.trim() ?? '';
+  if (!host || host === '127.0.0.1' || host === 'localhost' || host === '::1') {
+    return {
+      name: 'controller_public_host',
+      ok: true,
+      detail:
+        'controller_public_host is not pinned to a LAN address; data-plane URLs follow the agent connection and mDNS uses the current LAN address',
+    };
+  }
+  if (!isIpAddress(host)) {
+    return {
+      name: 'controller_public_host',
+      ok: true,
+      detail: `controller_public_host is hostname ${host}; mDNS still uses the current LAN address`,
+    };
+  }
+  const normalized = host.replace(/^::ffff:/i, '').toLowerCase();
+  const assigned = options.localAddresses.some(
+    (address) => address.replace(/^::ffff:/i, '').toLowerCase() === normalized,
+  );
+  if (assigned) {
+    return {
+      name: 'controller_public_host',
+      ok: true,
+      detail: `controller_public_host ${host} is assigned on this machine`,
+    };
+  }
+  if (isPrivateLanAddress(host)) {
+    return {
+      name: 'controller_public_host',
+      ok: false,
+      detail: `controller_public_host ${host} is not assigned on this machine (DHCP address changed). Remove it or set a stable hostname. mDNS and data-plane URLs follow the current LAN address`,
+    };
+  }
+  return {
+    name: 'controller_public_host',
+    ok: true,
+    detail: `controller_public_host ${host} is an explicit non-local address`,
+  };
+}
+
+function listLocalAddresses(): string[] {
+  const found: string[] = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const iface of list ?? []) {
+      if (iface.address) found.push(iface.address);
+    }
+  }
+  return found;
+}
+
+/** Same precedence as `loadControllerConfig`: env, then `controller.json`, then defaults. */
+export function resolveDoctorDiscoveryConfig(
+  dataDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { publicHost: string | null; mdnsEnabled: boolean } {
+  const file = readControllerDiscoveryFile(dataDir);
+  const publicHost =
+    env.RBO_CONTROLLER_PUBLIC_HOST !== undefined ? env.RBO_CONTROLLER_PUBLIC_HOST : file.publicHost;
+  const mdnsEnabled =
+    env.RBO_MDNS_ENABLED !== undefined
+      ? !['false', '0', 'no', 'off', ''].includes(env.RBO_MDNS_ENABLED.trim().toLowerCase())
+      : file.mdnsEnabled;
+  return { publicHost, mdnsEnabled };
+}
+
+function readControllerDiscoveryFile(dataDir: string): {
+  publicHost: string | null;
+  mdnsEnabled: boolean;
+} {
+  try {
+    const raw = readFileSync(join(dataDir, 'controller.json'), 'utf8');
+    const parsed = JSON.parse(raw) as {
+      controller_public_host?: unknown;
+      mdns_enabled?: unknown;
+    };
+    return {
+      publicHost:
+        typeof parsed.controller_public_host === 'string' ? parsed.controller_public_host : null,
+      mdnsEnabled: typeof parsed.mdns_enabled === 'boolean' ? parsed.mdns_enabled : true,
+    };
+  } catch {
+    return { publicHost: null, mdnsEnabled: true };
+  }
+}
+
 // `rbo doctor` (§33): git, controller port reachability, data dir permissions
 // and shell executables run locally; database/compression/TLS/snapshot checks
 // arrive with their respective phases (§35).
@@ -1190,6 +1318,14 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
     options.controllerPid !== undefined
       ? options.controllerPid
       : readLiveControllerPid(options.dataDir);
+  const discovery = resolveDoctorDiscoveryConfig(options.dataDir, options.env ?? process.env);
+  const publicHost =
+    options.controllerPublicHost !== undefined
+      ? options.controllerPublicHost
+      : discovery.publicHost;
+  const mdnsEnabled =
+    options.mdnsEnabled !== undefined ? options.mdnsEnabled : discovery.mdnsEnabled;
+  const localAddresses = options.localAddresses ?? listLocalAddresses();
 
   const [controllerPorts, mdnsPort, firewall] = await Promise.all([
     checkControllerPorts({
@@ -1208,6 +1344,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
       lsofUdpOutput: options.lsofUdpOutput,
       resolveProcessName: options.processNameResolver,
       controllerPid,
+      mdnsEnabled,
     }),
     checkFirewall({
       platform: options.platform,
@@ -1229,6 +1366,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
     checkWindowsExecutor(undefined, options.windowsExecutorResolve),
     controllerPorts,
     mdnsPort,
+    checkControllerPublicHost({ publicHost, localAddresses }),
     firewall,
   ];
 

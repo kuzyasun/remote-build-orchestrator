@@ -1,7 +1,12 @@
 export {
   ControllerAdvertiser,
   type AdvertiserOptions,
+  type MdnsBindInfo,
+  MDNS_INTERFACE_WATCH_MS,
   getPreferredMdnsInterface,
+  isAssignedLocalAddress,
+  isMdnsInterfaceLostError,
+  resolveMdnsBindAddress,
   suppressMdnsErrors,
   validateMdnsDisplayName,
 } from './advertiser.js';
@@ -10,6 +15,7 @@ export {
   isIpAddress,
   isIpv4Address,
   isIpv6Address,
+  isPrivateLanAddress,
   isRoutableIpAddress,
   normalizeMdnsHost,
   selectBestAddress,

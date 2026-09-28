@@ -63,7 +63,6 @@ If no request appears, check the Agent's `controller_url`, network access to por
 after each failed connect. When the advertisement has the same fingerprint at a new routable IP,
 the Agent writes that address into `agent.json` and reconnects. The pairing credential is kept.
 
-Restart the Agent after upgrading so it picks up this check: `rbo agent start --replace`.
 If `rbo discover` cannot see the Controller, mDNS is not reaching this machine — set
 `controller_url` by hand, or export `RBO_CONTROLLER_URL` to pin an address and skip the refresh.
 

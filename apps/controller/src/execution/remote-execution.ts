@@ -2,8 +2,10 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
+import { isAssignedLocalAddress, isPrivateLanAddress } from '@rbo/discovery';
 import type {
   ArtifactManifestPayload,
   ArtifactUploadGrantPayload,
@@ -404,9 +406,18 @@ export function resolveDataPlaneBaseUrl(
   if (opts.dataPlaneBaseUrl) {
     return opts.dataPlaneBaseUrl.replace(/\/$/, '');
   }
-  // Explicitly configured non-loopback host takes precedence:
-  if (opts.controllerPublicHost && !isLocalOrWildcardHost(opts.controllerPublicHost)) {
-    const host = formatHostForUrl(opts.controllerPublicHost);
+  // Explicit hostname or an address that is still assigned on this machine.
+  // A private LAN IP that DHCP has moved is ignored so Agents keep using the
+  // interface they actually connected through.
+  const pinned = opts.controllerPublicHost;
+  const staleLanIp = Boolean(
+    pinned &&
+      !isLocalOrWildcardHost(pinned) &&
+      isPrivateLanAddress(pinned) &&
+      !isAssignedLocalAddress(pinned, os.networkInterfaces()),
+  );
+  if (pinned && !isLocalOrWildcardHost(pinned) && !staleLanIp) {
+    const host = formatHostForUrl(pinned);
     return `https://${host}:${opts.serverPort}`;
   }
   // Otherwise, if the connected agent came through a reachable interface/host, prefer it:
@@ -414,7 +425,8 @@ export function resolveDataPlaneBaseUrl(
     const host = formatHostForUrl(agent.connectionHost);
     return `https://${host}:${opts.serverPort}`;
   }
-  const host = formatHostForUrl(opts.controllerPublicHost ?? '127.0.0.1');
+  const fallback = staleLanIp ? '127.0.0.1' : (pinned ?? '127.0.0.1');
+  const host = formatHostForUrl(fallback);
   return `https://${host}:${opts.serverPort}`;
 }
 

@@ -63,6 +63,20 @@ export function hostLookupCandidates(host: string): string[] {
   return [trimmed];
 }
 
+/** RFC1918 and link-local IPv4. These addresses move when DHCP renews. */
+export function isPrivateLanAddress(value: string): boolean {
+  const normalized = value.replace(/^::ffff:/i, '');
+  if (!isIpv4Address(normalized)) {
+    return false;
+  }
+  return (
+    normalized.startsWith('10.') ||
+    normalized.startsWith('192.168.') ||
+    normalized.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(normalized)
+  );
+}
+
 export function isRoutableIpAddress(value: string): boolean {
   const normalized = value.replace(/^::ffff:/i, '');
   if (!isIpAddress(normalized)) {

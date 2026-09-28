@@ -14,7 +14,7 @@ export interface ControllerConfig {
   mcpHost: string;
   mcpPort: number;
   agentPlanePort: number;
-  /** Host/IP Agents use for data-plane HTTPS URLs. Defaults to 127.0.0.1. */
+  /** Data-plane host for Agents. `127.0.0.1` follows the Agent connection. */
   controllerPublicHost: string;
   /** Optional full data-plane base URL override (wins over host+port). */
   dataPlaneBaseUrl?: string;

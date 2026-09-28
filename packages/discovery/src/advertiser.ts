@@ -6,6 +6,21 @@ import {
   RBO_MDNS_TXT_VERSION,
 } from './constants.js';
 
+/** How often a live advertiser checks whether the LAN address moved. */
+export const MDNS_INTERFACE_WATCH_MS = 5_000;
+
+const MDNS_REBIND_BASE_MS = 500;
+const MDNS_REBIND_MAX_MS = 30_000;
+
+const MDNS_INTERFACE_LOST_CODES = new Set(['EADDRNOTAVAIL', 'ENETDOWN', 'ENETUNREACH', 'ENODEV']);
+
+export interface MdnsBindInfo {
+  /** Bound interface address, or undefined when no LAN interface is available. */
+  interface: string | undefined;
+  /** True when this socket replaces one that lost its previous address. */
+  recovered: boolean;
+}
+
 export interface AdvertiserOptions {
   /** Agent-plane port (typically 7411). */
   port: number;
@@ -15,20 +30,31 @@ export interface AdvertiserOptions {
   fingerprint: string;
   /** mDNS instance display name. Default: `'rbo-controller'`. */
   displayName?: string;
-  /** Optional specific network interface IP to advertise over (e.g. Wi-Fi IP). */
+  /**
+   * Optional specific network interface IP to advertise over (e.g. Wi-Fi IP).
+   * A value that is not currently assigned is ignored; the advertiser follows
+   * the current physical LAN address instead.
+   */
   interface?: string;
+  /** Fired after each successful publish, including rebinds. */
+  onBind?: (info: MdnsBindInfo) => void;
+  /** Fired when the multicast socket reports that its interface is gone. */
+  onInterfaceLost?: (error: unknown) => void;
 }
+
+type InterfaceMap = NodeJS.Dict<os.NetworkInterfaceInfo[]>;
 
 /**
  * Pick the best routable LAN interface IP address for multicast advertisement.
  * Prefers physical LAN (192.168.x.x, 10.x.x.x, 172.16-31.x.x), avoids virtual
  * adapters (WSL, Hyper-V, Docker, vEthernet, bridge), and avoids loopback.
  */
-export function getPreferredMdnsInterface(): string | undefined {
-  const ifaces = os.networkInterfaces();
+export function getPreferredMdnsInterface(
+  interfaces: InterfaceMap | undefined = os.networkInterfaces(),
+): string | undefined {
   const candidates: { name: string; address: string; isVirtual: boolean; isLan: boolean }[] = [];
 
-  for (const [name, list] of Object.entries(ifaces)) {
+  for (const [name, list] of Object.entries(interfaces ?? {})) {
     if (!list) continue;
     const lowerName = name.toLowerCase();
     const isVirtual =
@@ -73,26 +99,74 @@ export function getPreferredMdnsInterface(): string | undefined {
   return candidates[0]?.address;
 }
 
+/** True when `host` is currently assigned on a local interface. */
+export function isAssignedLocalAddress(
+  host: string,
+  interfaces: InterfaceMap | undefined = os.networkInterfaces(),
+): boolean {
+  const normalized = host.replace(/^::ffff:/i, '').toLowerCase();
+  if (!normalized) return false;
+  for (const list of Object.values(interfaces ?? {})) {
+    for (const iface of list ?? []) {
+      if (iface.address.replace(/^::ffff:/i, '').toLowerCase() === normalized) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isLoopbackAddress(host: string): boolean {
+  const normalized = host.replace(/^::ffff:/i, '').toLowerCase();
+  return normalized === '::1' || normalized.startsWith('127.');
+}
+
 /**
- * Attaches an 'error' handler to the underlying multicast-dns EventEmitter
- * to prevent uncaught socket errors (EADDRINUSE, EACCES, interface shifts)
- * from crashing the Node.js process.
+ * Interface address passed to bonjour-service.
+ * An explicit address is used only while it is assigned. Otherwise the current
+ * physical LAN address is selected, so a stale DHCP pin cannot kill the socket.
  */
-export function suppressMdnsErrors(bonjour: Bonjour): void {
+export function resolveMdnsBindAddress(
+  requested: string | undefined,
+  interfaces: InterfaceMap | undefined = os.networkInterfaces(),
+): string | undefined {
+  if (requested && !isLoopbackAddress(requested) && isAssignedLocalAddress(requested, interfaces)) {
+    return requested;
+  }
+  return getPreferredMdnsInterface(interfaces);
+}
+
+/** Socket errors that mean the bound address disappeared (DHCP, interface down). */
+export function isMdnsInterfaceLostError(err: unknown): boolean {
+  if (!err || typeof err !== 'object' || !('code' in err)) return false;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && MDNS_INTERFACE_LOST_CODES.has(code);
+}
+
+/**
+ * Attaches handlers to the underlying multicast-dns EventEmitter so uncaught
+ * socket errors (EADDRINUSE, EACCES, interface shifts) do not crash the process.
+ * `onError` is invoked for every suppressed error and warning.
+ */
+export function suppressMdnsErrors(bonjour: Bonjour, onError?: (err: unknown) => void): void {
   // bonjour-service encapsulates its internal server.mdns instance (a multicast-dns
   // EventEmitter) without exposing public TypeScript definitions for it. The cast
   // below is intentional and necessary to hook directly into the UDP socket's error
   // emitter, preventing unhandled error events from terminating the Node.js process.
   const mdnsEmitter = (
     bonjour as unknown as {
-      server?: { mdns?: { on?: (event: string, cb: (err: unknown) => void) => void } };
+      server?: {
+        mdns?: { on?: (event: string, cb: (err: unknown) => void) => void };
+      };
     }
   )?.server?.mdns;
-  if (typeof mdnsEmitter?.on === 'function') {
-    mdnsEmitter.on('error', () => {
-      // Suppress unhandled UDP socket errors so they do not crash the process.
-    });
-  }
+  if (typeof mdnsEmitter?.on !== 'function') return;
+  const handler = (err: unknown) => {
+    onError?.(err);
+  };
+  // addMembership(EADDRNOTAVAIL) is emitted as `warning`, not `error`.
+  mdnsEmitter.on('error', handler);
+  mdnsEmitter.on('warning', handler);
 }
 
 /**
@@ -129,37 +203,80 @@ export function validateMdnsDisplayName(name: string, label = 'mDNS display name
  * Publishes a `_rbo-controller._tcp` service with TXT records containing
  * the controller ID, TLS fingerprint, and protocol version. mDNS is used
  * solely for discovery — authentication remains mandatory.
+ *
+ * The multicast socket follows the current physical LAN address. When that
+ * address disappears, the advertiser tears the socket down and binds again.
  */
 export class ControllerAdvertiser {
   private bonjour: Bonjour | null = null;
   private stopPromise: Promise<void> | null = null;
+  private options: AdvertiserOptions | null = null;
+  private displayName = '';
+  private boundInterface: string | undefined;
+  private watchTimer: ReturnType<typeof setInterval> | null = null;
+  private rebindTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set for the whole teardown+publish, so a second trigger cannot publish twice. */
+  private rebindInFlight: Promise<void> | null = null;
+  private rebindAttempts = 0;
+  private generation = 0;
+  private closed = false;
 
   /**
    * Start advertising the controller service. Idempotent — calling `start()`
    * again after a previous `start()` without `stop()` is a no-op.
    */
   start(options: AdvertiserOptions): void {
-    if (this.bonjour) {
+    if (this.options) {
       return;
     }
 
-    const name = validateMdnsDisplayName(
+    this.displayName = validateMdnsDisplayName(
       options.displayName ?? RBO_MDNS_DEFAULT_DISPLAY_NAME,
       'displayName',
     );
+    this.closed = false;
+    this.rebindAttempts = 0;
+    this.options = options;
+    this.publish(false);
+    this.ensureWatch();
+  }
 
-    const iface = options.interface || getPreferredMdnsInterface();
+  /**
+   * Stop advertising and tear down mDNS resources.
+   * Sends a goodbye packet (TTL=0) so clients clear their caches.
+   */
+  async stop(): Promise<void> {
+    this.closed = true;
+    this.options = null;
+    this.clearTimers();
+    await this.teardown();
+  }
 
-    this.bonjour = new Bonjour(
+  private publish(recovered: boolean): void {
+    const options = this.options;
+    if (!options || this.closed) return;
+
+    const generation = ++this.generation;
+    const iface = resolveMdnsBindAddress(options.interface);
+    this.boundInterface = iface;
+
+    const bonjour = new Bonjour(
       (iface ? { interface: iface } : undefined) as unknown as undefined,
       () => {
-        // Suppress unhandled mDNS UDP socket query errors.
+        // Response errors are also delivered through suppressMdnsErrors.
       },
     );
-    suppressMdnsErrors(this.bonjour);
+    this.bonjour = bonjour;
+    suppressMdnsErrors(bonjour, (err) => {
+      if (generation !== this.generation || this.closed) return;
+      if (!isMdnsInterfaceLostError(err)) return;
+      if (this.rebindTimer || this.rebindInFlight) return;
+      options.onInterfaceLost?.(err);
+      this.scheduleRebind();
+    });
 
-    this.bonjour.publish({
-      name,
+    bonjour.publish({
+      name: this.displayName,
       type: RBO_MDNS_SERVICE_TYPE,
       port: options.port,
       probe: false,
@@ -171,19 +288,82 @@ export class ControllerAdvertiser {
         fingerprint: options.fingerprint,
       },
     });
+    options.onBind?.({ interface: iface, recovered });
+  }
+
+  private ensureWatch(): void {
+    if (this.watchTimer || this.closed) return;
+    this.watchTimer = setInterval(() => {
+      if (this.closed || !this.options || this.rebindTimer || this.rebindInFlight) return;
+      const next = resolveMdnsBindAddress(this.options.interface);
+      if (next === this.boundInterface) {
+        this.rebindAttempts = 0;
+        return;
+      }
+      this.rebindAttempts = 0;
+      this.scheduleRebind();
+    }, MDNS_INTERFACE_WATCH_MS);
+    this.watchTimer.unref?.();
+  }
+
+  private scheduleRebind(): void {
+    if (this.closed || this.rebindTimer || this.rebindInFlight) return;
+    const delay = Math.min(
+      MDNS_REBIND_MAX_MS,
+      MDNS_REBIND_BASE_MS * 2 ** Math.min(this.rebindAttempts, 6),
+    );
+    this.rebindAttempts += 1;
+    this.rebindTimer = setTimeout(() => {
+      this.rebindTimer = null;
+      this.beginRebind();
+    }, delay);
+    this.rebindTimer.unref?.();
   }
 
   /**
-   * Stop advertising and tear down mDNS resources.
-   * Sends a goodbye packet (TTL=0) so clients clear their caches.
+   * One rebind at a time. The in-flight flag is set before teardown starts, so a
+   * socket warning or interface watch during unpublish cannot start a second publish.
    */
-  async stop(): Promise<void> {
+  private beginRebind(): void {
+    if (this.closed || !this.options || this.rebindInFlight) return;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.rebindInFlight = gate;
+    void this.rebind().finally(() => {
+      this.rebindInFlight = null;
+      release();
+    });
+  }
+
+  private async rebind(): Promise<void> {
+    if (this.closed || !this.options) return;
+    await this.teardown();
+    if (this.closed || !this.options) return;
+    this.publish(true);
+  }
+
+  private clearTimers(): void {
+    if (this.watchTimer) {
+      clearInterval(this.watchTimer);
+      this.watchTimer = null;
+    }
+    if (this.rebindTimer) {
+      clearTimeout(this.rebindTimer);
+      this.rebindTimer = null;
+    }
+  }
+
+  private teardown(): Promise<void> {
     if (this.stopPromise) {
       return this.stopPromise;
     }
     const instance = this.bonjour;
+    this.generation += 1;
+    this.bonjour = null;
     if (!instance) {
-      return;
+      return Promise.resolve();
     }
 
     this.stopPromise = new Promise<void>((resolve) => {
@@ -191,14 +371,21 @@ export class ControllerAdvertiser {
       const finish = () => {
         if (!settled) {
           settled = true;
-          this.bonjour = null;
           this.stopPromise = null;
           resolve();
         }
       };
 
-      // Hard 2-second timeout guarantees stop resolves even if unpublishAll or destroy hangs
-      const hardTimer = setTimeout(finish, 2_000);
+      // Hard 2-second timeout guarantees stop resolves even if unpublishAll or destroy hangs.
+      // destroy() drops the UDP socket so a following publish does not leave the old one open.
+      const hardTimer = setTimeout(() => {
+        try {
+          instance.destroy();
+        } catch {
+          // The socket may already be closed.
+        }
+        finish();
+      }, 2_000);
       if (typeof hardTimer === 'object' && 'unref' in hardTimer) {
         hardTimer.unref();
       }

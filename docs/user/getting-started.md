@@ -107,15 +107,6 @@ Use absolute paths. On Windows, escape backslashes in JSON:
 }
 ```
 
-For Agents on other machines, also set `controller_public_host` to a hostname or IP address they
-can reach:
-
-```json
-{
-  "controller_public_host": "build-controller.local"
-}
-```
-
 Start the Controller:
 
 ```bash

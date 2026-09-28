@@ -1,4 +1,10 @@
-import { ControllerAdvertiser } from '@rbo/discovery';
+import os from 'node:os';
+import {
+  ControllerAdvertiser,
+  isAssignedLocalAddress,
+  isIpAddress,
+  isPrivateLanAddress,
+} from '@rbo/discovery';
 import {
   HostCpuMonitor,
   RBO_CONTROLLER_VERSION,
@@ -111,23 +117,49 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     database: config.databasePath,
   });
 
+  if (
+    isIpAddress(config.controllerPublicHost) &&
+    isPrivateLanAddress(config.controllerPublicHost) &&
+    !isAssignedLocalAddress(config.controllerPublicHost, os.networkInterfaces())
+  ) {
+    logger.warn(
+      'controller_public_host is not assigned on this machine; data-plane URLs follow the agent connection',
+      { controller_public_host: config.controllerPublicHost },
+    );
+  }
+
   const advertiser = new ControllerAdvertiser();
   if (config.mdnsEnabled) {
-    const mdnsIface =
-      config.controllerPublicHost && !config.controllerPublicHost.startsWith('127.')
-        ? config.controllerPublicHost
-        : undefined;
+    // mDNS follows the current LAN address. controller_public_host is a data-plane
+    // hint (stable hostname or VPN name) and must not pin the multicast socket:
+    // a DHCP change makes addMembership fail with EADDRNOTAVAIL and the socket dies.
     advertiser.start({
       port: agentPlane.port,
       controllerId: identity.controllerId,
       fingerprint: identity.fingerprint,
       displayName: config.mdnsDisplayName,
-      interface: mdnsIface,
-    });
-    logger.info('mDNS advertisement started', {
-      type: '_rbo-controller._tcp',
-      displayName: config.mdnsDisplayName,
-      interface: mdnsIface ?? 'auto',
+      onBind: ({ interface: iface, recovered }) => {
+        logger.info(
+          recovered
+            ? 'mDNS advertisement rebound to the current LAN address'
+            : 'mDNS advertisement started',
+          {
+            type: '_rbo-controller._tcp',
+            displayName: config.mdnsDisplayName,
+            interface: iface ?? 'auto',
+          },
+        );
+      },
+      onInterfaceLost: (error) => {
+        const code =
+          error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+            ? error.code
+            : undefined;
+        logger.warn('mDNS advertisement lost its network interface; rebinding', {
+          code,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
     });
   } else {
     logger.info('mDNS advertisement disabled');

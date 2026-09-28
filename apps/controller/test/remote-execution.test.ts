@@ -502,6 +502,45 @@ describe('Remote Execution End-to-End', () => {
       expect(resolveDataPlaneBaseUrl(opts, ipv6Agent)).toBe('https://[2001:db8::1]:7411');
     });
 
+    it('does not fall back to a stale private LAN address when the agent is local', () => {
+      const opts = {
+        db: {} as unknown as ControllerDatabase,
+        identity: {} as unknown as import('@rbo/shared').ControllerIdentity,
+        dataDir: '',
+        connectedAgents: new Map(),
+        serverPort: 7411,
+        controllerPublicHost: '10.255.255.1',
+      };
+      expect(resolveDataPlaneBaseUrl(opts)).toBe('https://127.0.0.1:7411');
+      const localAgent = {
+        agentId: 'agt_local',
+        socket: {} as unknown as import('ws').WebSocket,
+        protocolVersion: 1,
+        lastHeartbeatAt: 0,
+        connectionHost: '127.0.0.1',
+      };
+      expect(resolveDataPlaneBaseUrl(opts, localAgent)).toBe('https://127.0.0.1:7411');
+    });
+
+    it('ignores a private LAN controllerPublicHost that is not assigned locally', () => {
+      const opts = {
+        db: {} as unknown as ControllerDatabase,
+        identity: {} as unknown as import('@rbo/shared').ControllerIdentity,
+        dataDir: '',
+        connectedAgents: new Map(),
+        serverPort: 7411,
+        controllerPublicHost: '10.255.255.1',
+      };
+      const remoteAgent = {
+        agentId: 'agt_remote',
+        socket: {} as unknown as import('ws').WebSocket,
+        protocolVersion: 1,
+        lastHeartbeatAt: 0,
+        connectionHost: '192.168.0.105',
+      };
+      expect(resolveDataPlaneBaseUrl(opts, remoteAgent)).toBe('https://192.168.0.105:7411');
+    });
+
     it('honors explicitly configured controllerPublicHost over agent connectionHost', () => {
       const opts = {
         db: {} as unknown as ControllerDatabase,

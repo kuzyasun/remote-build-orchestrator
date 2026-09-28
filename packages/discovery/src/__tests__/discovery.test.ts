@@ -1,6 +1,13 @@
+import type { NetworkInterfaceInfo } from 'node:os';
 import { Bonjour, type Service } from 'bonjour-service';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ControllerAdvertiser } from '../advertiser.js';
+import {
+  ControllerAdvertiser,
+  getPreferredMdnsInterface,
+  isAssignedLocalAddress,
+  isMdnsInterfaceLostError,
+  resolveMdnsBindAddress,
+} from '../advertiser.js';
 import { discoverControllers } from '../browser.js';
 
 describe('mDNS discovery', () => {
@@ -328,5 +335,49 @@ describe('serviceToController and txtValue unit tests', () => {
     } as unknown as Service);
     expect(withBadAddresses).not.toBeNull();
     expect(withBadAddresses?.addresses).toEqual(['192.168.1.50', '10.0.0.1']);
+  });
+});
+
+function nic(address: string, internal = false): NetworkInterfaceInfo {
+  return {
+    address,
+    netmask: '255.255.255.0',
+    family: 'IPv4',
+    mac: '00:11:22:33:44:55',
+    internal,
+    cidr: `${address}/24`,
+  };
+}
+
+describe('mDNS bind address', () => {
+  const interfaces = {
+    'vEthernet (WSL)': [nic('172.22.32.1')],
+    'Wi-Fi': [nic('192.168.0.105')],
+    Loopback: [nic('127.0.0.1', true)],
+  };
+
+  it('prefers the physical LAN adapter over virtual adapters', () => {
+    expect(getPreferredMdnsInterface(interfaces)).toBe('192.168.0.105');
+  });
+
+  it('ignores a requested address that is not assigned', () => {
+    expect(resolveMdnsBindAddress('192.168.0.102', interfaces)).toBe('192.168.0.105');
+    expect(resolveMdnsBindAddress('build-controller.local', interfaces)).toBe('192.168.0.105');
+    expect(resolveMdnsBindAddress('127.0.0.1', interfaces)).toBe('192.168.0.105');
+  });
+
+  it('keeps a requested address that is still assigned', () => {
+    expect(resolveMdnsBindAddress('192.168.0.105', interfaces)).toBe('192.168.0.105');
+    expect(isAssignedLocalAddress('192.168.0.105', interfaces)).toBe(true);
+    expect(isAssignedLocalAddress('192.168.0.102', interfaces)).toBe(false);
+  });
+
+  it('treats EADDRNOTAVAIL as a lost interface and ignores port conflicts', () => {
+    expect(
+      isMdnsInterfaceLostError(Object.assign(new Error('bind'), { code: 'EADDRNOTAVAIL' })),
+    ).toBe(true);
+    expect(isMdnsInterfaceLostError(Object.assign(new Error('busy'), { code: 'EADDRINUSE' }))).toBe(
+      false,
+    );
   });
 });
