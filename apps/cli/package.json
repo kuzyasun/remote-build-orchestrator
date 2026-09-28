@@ -55,11 +55,11 @@
     "preuninstall": "node ./scripts/stop-running-rbo.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.1",
     "better-sqlite3": "^13.0.3",
     "selfsigned": "^5.5.0",
     "ulid": "^2.3.0",
-    "ws": "^8.21.1",
+    "ws": "^8.22.0",
     "zod": "^3.24.2"
   },
   "optionalDependencies": {
@@ -73,7 +73,7 @@
     "@rbo/protocol": "workspace:*",
     "@rbo/shared": "workspace:*",
     "@types/node": "^22.13.4",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "typescript": "^5.7.3"
   }
 }

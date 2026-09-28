@@ -25,7 +25,7 @@
     "@rbo/protocol": "workspace:*",
     "@rbo/shared": "workspace:*",
     "@rbo/snapshot": "workspace:*",
-    "ws": "^8.21.1",
+    "ws": "^8.22.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
