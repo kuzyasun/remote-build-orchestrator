@@ -9,7 +9,7 @@ This guide describes how to compile RBO from source, package local archives, and
 | Tool | Requirement | Notes |
 | --- | --- | --- |
 | Node.js | ≥ 24.0 | Matches `.nvmrc` and `engines` in `package.json` |
-| pnpm | 10.5.2 | Pinned via `"packageManager"` in root `package.json` |
+| pnpm | 12.6.0 | Pinned via `"packageManager"` in root `package.json` |
 | Git | on `PATH` | Required for dirty snapshots and tests |
 | Rust | 1.93.0 | Required on Windows x64 for the native Job Object executor |
 

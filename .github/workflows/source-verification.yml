@@ -52,7 +52,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install pnpm
-        run: npm install --global pnpm@10.5.2
+        run: npm install --global pnpm@12.6.0
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

@@ -20,7 +20,7 @@ packages through npm Trusted Publishing. No long-lived npm write token is stored
 
 The source-verification path is separate from publishing: `.github/workflows/source-verification.yml`
 runs on pull requests and pushes to `master` on both `ubuntu-latest` and `windows-latest`. Each job
-uses the repository Node version from `.nvmrc`, installs pnpm 10.5.2, runs
+uses the repository Node version from `.nvmrc`, installs pnpm 12.6.0, runs
 `pnpm install --frozen-lockfile`, and executes `pnpm build` followed by `pnpm verify`. The Windows
 job builds the native executor before `pnpm verify`, then regenerates packaging manifests with
 `pnpm package:archives`, fails if reproducible packaging files drifted from git
@@ -77,14 +77,14 @@ Then follow [`docs/user/getting-started.md`](../user/getting-started.md) (init �
 | Tool | Requirement |
 | --- | --- |
 | Node.js | ≥ 24.0 (see `.nvmrc`) |
-| pnpm | 10.5.2 (pinned via `"packageManager"` in root `package.json`) |
+| pnpm | 12.6.0 (pinned via `"packageManager"` in root `package.json`) |
 | Git | on `PATH` |
 | Rust | 1.93.0 (`rust-toolchain.toml`) — **required on the Windows x64 host that packs/publishes the optional package** |
 | npm | Trusted Publisher configured for both `@gemslibe` packages |
 
 ```powershell
 node -v          # v24.0.x or newer
-pnpm -v          # 10.5.2
+pnpm -v          # 12.6.0
 ```
 
 First-time clone:

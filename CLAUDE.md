@@ -51,7 +51,7 @@ call `agent_probe` to discover toolchains. Copy opaque log cursors; do not inven
 
 ## Stack Summary
 
-- **Runtime & Package Management**: Node.js ≥ 24.0 (`.nvmrc`), pnpm 10.5.2 (`packageManager` in `package.json`, pnpm workspace).
+- **Runtime & Package Management**: Node.js ≥ 24.0 (`.nvmrc`), pnpm 12.6.0 (`packageManager` in `package.json`, pnpm workspace).
 - **TypeScript & Build**: TypeScript strict mode (`tsconfig.base.json`), tsc build outputs under `dist/`.
 - **Formatting & Linting**: Biome 1.9.4 (`biome.json`, checks format, lint, import order).
 - **Testing**: Vitest 3.0.7 (`vitest.config.ts`).

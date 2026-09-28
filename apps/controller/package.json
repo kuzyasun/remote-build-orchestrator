@@ -26,7 +26,7 @@
     "@rbo/protocol": "workspace:*",
     "@rbo/shared": "workspace:*",
     "@rbo/snapshot": "workspace:*",
-    "better-sqlite3": "^13.0.1",
+    "better-sqlite3": "^13.0.3",
     "selfsigned": "^5.5.0",
     "ulid": "^2.3.0",
     "ws": "^8.21.1",
