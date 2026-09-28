@@ -301,7 +301,8 @@ Package scripts for the Windows executor:
 | `prepare-binary:require` | Hard require — exits 1 unless Cargo output **or** staged `bin/…exe` exists |
 | `prepack` | Same as `--require` — runs automatically on `pnpm pack` / `npm pack` / `npm publish` |
 
-`apps/cli` has **no** `prepack` hook — run `pnpm build` (or `pnpm --filter @gemslibe/rbo build`)
+`apps/cli` `prepack` refreshes `README.md` from the repository README (relative links become
+GitHub `blob/master` URLs, which npm can open). Run `pnpm build` (or `pnpm --filter @gemslibe/rbo build`)
 before packing. Published `"files"`: `dist/rbo.js`, `dist/rbo-mcp-stdio.js`,
 `config/controller.json`, `config/agent.json`, `scripts/stop-running-rbo.mjs`, `LICENSE`,
 `README.md`. The stop script is the `preinstall` / `preuninstall` hook that terminates running

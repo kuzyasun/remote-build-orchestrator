@@ -1,27 +1,27 @@
 {
   "schema_version": 1,
   "os": "linux",
-  "package_version": "0.9.0",
+  "package_version": "0.9.1",
   "wire_protocol": {
     "min": 1,
     "max": 1
   },
   "components": {
-    "controller": "0.9.0",
-    "agent": "0.9.0",
-    "cli": "0.9.0",
-    "mcp_stdio": "0.9.0"
+    "controller": "0.9.1",
+    "agent": "0.9.1",
+    "cli": "0.9.1",
+    "mcp_stdio": "0.9.1"
   },
   "files": [
     {
       "path": "bin/rbo.js",
-      "sha256": "e937fe53219c0684a61ee641ef2d2f913b5115857b2f46a14b5e31ef1b90af43",
+      "sha256": "92bded2b95a11cae1c51fd6a8a7b99a14f5ab68dddc81601b0b87eb9c296f850",
       "size_bytes": 928367,
       "source": "apps/cli/dist/rbo.js"
     },
     {
       "path": "bin/rbo-mcp-stdio.js",
-      "sha256": "45e58f8b8c5c84888b5a9caae1d1de28795c5025a98cb767a5bf8a8e004bc979",
+      "sha256": "6981c8dd73096dd93e523ff59c0a309559f7feceead891ff53e5b3a07dd172c9",
       "size_bytes": 28828,
       "source": "apps/cli/dist/rbo-mcp-stdio.js"
     },

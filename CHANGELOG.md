@@ -7,6 +7,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-28
+
+### Changed
+
+- The README describes RBO as a tool for a trusted local network. The npm package README is generated from that file, with links rewritten so they open on GitHub.
+- `agents_list` no longer reports a `tools` map. Toolchain activation belongs in the job script. The scheduler still matches `git` and `git-lfs` from its own probe.
+
+### Fixed
+
+- The Controller rebinds its mDNS advertisement when the LAN address changes, and a paired Agent follows a moved Controller or Agent address.
+- `rbo agent status` reports whether the Agent is actually connected.
+- `rbo doctor` no longer treats the Controller's own mDNS socket as a port conflict.
+- A job that finishes quickly no longer drops log lines that were still queued.
+
 ## [0.9.0] - 2026-09-24
 
 ### Added
@@ -113,7 +127,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.0
 [0.8.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.7.0

@@ -1,122 +1,104 @@
 # RBO — Remote Build Orchestrator
 
-RBO moves builds, tests, QEMU runs, and Docker jobs from an AI coding assistant to one or more
-worker machines. Your current checkout stays responsive and untouched, while the assistant still
-gets logs and artifacts through MCP.
-
-## What problem does it solve?
-
-AI coding assistants run commands frequently. Running every command directly in your working tree
-creates three problems:
-
-- builds compete with your editor and other work for CPU, memory, and disk;
-- a command can modify files you are editing;
-- adding another machine usually requires client-specific scripts and manual coordination.
-
-RBO gives supported AI clients one interface for this work. It captures the current state of the
-project, including uncommitted changes, and runs the job in an isolated workspace on an available
-Agent. The Controller can also run the job locally when your policy allows it.
-
-This is useful when you:
-
-- use Codex, Claude, Cursor, Antigravity, OpenCode, or ZCode for development;
-- have an idle desktop, laptop, build server, or lab machine;
-- run expensive builds, tests, emulators, or containers;
-- need outputs from a job without letting it write into the live checkout.
-
-## How it works
+RBO runs builds, tests, QEMU, and Docker jobs on a worker machine, instead of in the checkout your
+editor is using. An AI client talks only to a Controller on the same computer. The Controller sends
+the job to a paired Agent.
 
 ```text
-AI client ──MCP──> Controller ──secure connection──> Agent
-                       │                                │
-                       │ creates an isolated snapshot   │ runs the job
-                       └──────── logs and artifacts <────┘
+your computer                         worker on the same LAN
+┌───────────┐   MCP, localhost   ┌────────────┐     LAN, paired    ┌───────┐
+│ AI client │ ─────────────────► │ Controller │ ─────────────────► │ Agent │
+└───────────┘                    └────────────┘                    └───────┘
+                                      │  snapshot of the checkout       │ runs the job
+                                      └──────── logs and artifacts ◄────┘
 ```
 
-1. The AI client submits a command and project path.
-2. The Controller captures an immutable snapshot of the current working tree.
-3. The scheduler selects a compatible Agent, or uses local fallback when allowed.
-4. The job runs only inside the isolated snapshot.
-5. The client reads the result, logs, and requested artifacts.
+The Controller copies the working tree, including uncommitted changes, and the job runs only in
+that copy. Logs and requested artifacts come back to the client. The command does not run in the
+live checkout.
 
-Destructive and hardware-risk jobs require explicit confirmation before they start.
+The Agent link is for a local network you already trust (or a VPN you treat the same way). You
+approve each worker before it can take a job. This is not a secure remote-access product, and it
+does not protect you from other devices on that network. Keep the Controller's MCP port on
+localhost.
+
+The same computer can run both the Controller and an Agent. A second machine is useful when you
+want the build off the machine you are editing on.
 
 ## Quick start
 
-RBO requires Node.js 24.0 or newer on the Controller and every Agent.
-
-Install the CLI on each machine that will run a Controller or Agent:
+Node.js 24 or newer is required on the Controller and on every Agent.
 
 ```bash
 npm install -g @gemslibe/rbo
 ```
 
-### Zero-config setup
-
-1. **Controller machine**: initialize and start (advertises on LAN via mDNS by default):
-   ```bash
-   rbo controller init
-   rbo controller start --daemon
-   ```
-   *Note: For remote workers across a LAN, data-plane transfers automatically use the connecting network interface. If using custom hostnames or VPNs on the same port, set `controller_public_host`. If using a reverse proxy with port translation (e.g. port 443), set `data_plane_base_url` (e.g. `https://proxy.example/`) in `~/.rbo/controller.json` or `RBO_DATA_PLANE_BASE_URL`.*
-2. **Worker Agent machine**: auto-discover Controller and start:
-   ```bash
-   rbo agent init             # scans LAN via mDNS, select your Controller [1]
-   rbo agent start --daemon
-   ```
-3. **Controller machine**: approve the worker pairing:
-   ```bash
-   rbo agent approve          # interactive menu (or `rbo agent approve <id>`)
-   ```
-4. **AI client**: connect MCP proxy (`rbo-mcp-stdio`) and submit builds.
-
-The [getting-started guide](docs/user/getting-started.md) walks through project configuration and client snippets.
-
-Once configured, the AI client normally drives RBO for you. The CLI remains useful for operations:
+On the Controller:
 
 ```bash
-rbo discover                 # scan LAN for active Controllers via mDNS
-rbo agents                   # show workers and pending pairing requests
-rbo agent approve            # approve a worker (interactive menu or pass <id>)
-rbo run --follow -- 'cmd'    # run a job on an available worker
-rbo doctor                   # check local setup and connectivity
+rbo controller init
+rbo controller start --daemon
 ```
+
+On each worker, on the same LAN:
+
+```bash
+rbo agent init      # finds the Controller and asks you to pick it
+rbo agent start --daemon
+```
+
+Back on the Controller, approve the worker:
+
+```bash
+rbo agent approve
+```
+
+Then point your AI client at the local MCP proxy (`rbo-mcp-stdio`). After that, the client submits
+jobs. These commands are for you:
+
+```bash
+rbo agents                 # workers and pending pairing requests
+rbo run --follow -- 'cmd'  # run one command on a worker
+rbo doctor                 # local setup and connectivity
+```
+
+A worker that is not on the same LAN, and the per-client MCP snippets, are in the
+[getting-started guide](docs/user/getting-started.md).
+
+Destructive and hardware-risk jobs wait for an explicit confirmation before they start.
 
 ## Documentation
 
-Start with the document that matches your goal:
-
 | Goal | Read |
 | --- | --- |
-| Understand, install, and try RBO | [Getting started](docs/user/getting-started.md) |
-| Connect a specific AI client | [AI client configuration](docs/user/client-integration/README.md) |
-| Diagnose a problem | [Troubleshooting](docs/user/troubleshooting.md) |
-| Operate, update, back up, or remove RBO | [Operator runbook](docs/user/runbook.md) |
-| Understand the codebase | [Architecture](docs/dev/architecture.md) |
-| Compile, pack, and install locally | [Local development](docs/dev/local-development.md) |
-| Build or publish a release | [Release guide](docs/dev/release-builds.md) |
-| Review release changes | [Changelog](CHANGELOG.md) |
+| Install, pair, and run a first job | [Getting started](docs/user/getting-started.md) |
+| Connect an AI client | [AI client configuration](docs/user/client-integration/README.md) |
+| Something failed | [Troubleshooting](docs/user/troubleshooting.md) |
+| Day-to-day operation | [Operator runbook](docs/user/runbook.md) |
+| How the code is laid out | [Architecture](docs/dev/architecture.md) |
+| Build from this repository | [Local development](docs/dev/local-development.md) |
+| Cut a release | [Release guide](docs/dev/release-builds.md) |
+| What changed | [Changelog](CHANGELOG.md) |
 | Report a vulnerability | [Security policy](SECURITY.md) |
-| Work on this repository | [Contributor guidance](AGENTS.md) |
-| Read the complete design contract | [Design specification](remote-build-orchestrator-design.md) |
+| Work in this repository | [Contributor guidance](AGENTS.md) |
+| Protocol and scheduler contract | [Design specification](remote-build-orchestrator-design.md) |
 
-The design specification is intentionally detailed. Most users do not need it, and developers
-should use it only when changing a protocol, state machine, scheduler rule, or security boundary.
+The design specification is for protocol, scheduler, and security changes. You do not need it to
+install or operate RBO.
 
 ## Current limitations
 
-- Strong process-tree containment through Windows Job Objects is currently available only on
-  Windows x64 Agents. macOS and Linux are suitable for trusted development workloads but do not
-  provide equivalent containment.
-- Agent service installation is best-effort and dry-run by default. Running
-  `rbo agent start --daemon` is the simpler option today.
-- RBO isolates a job from your live checkout; it is not a general-purpose sandbox for untrusted
-  code.
+- The Agent port is for a trusted LAN or VPN. Do not publish it on the internet.
+- A job is isolated from your live checkout. RBO is not a sandbox for untrusted code.
+- Windows Job Object process trees exist only for Windows x64 Agents. macOS and Linux Agents are
+  for trusted development workloads.
+- Installing the Agent as an OS service is dry-run unless you pass `--execute`.
+  `rbo agent start --daemon` is the straightforward way to run a worker.
 
 ## Contributing
 
-See [AGENTS.md](AGENTS.md) for repository conventions, canonical commands, and the required
-`pnpm format` followed by `pnpm verify` validation gate.
+See [AGENTS.md](AGENTS.md) for repository conventions and the required `pnpm format` then
+`pnpm verify` check.
 
 ## License
 
