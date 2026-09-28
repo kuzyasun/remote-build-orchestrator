@@ -15,14 +15,14 @@
   "files": [
     {
       "path": "bin/rbo.js",
-      "sha256": "01f36c6a06efd522d82a480df0996cbec0d9b31be1f2d1ce382f4d66cbbc38e6",
-      "size_bytes": 927803,
+      "sha256": "e90c7bdf235798ececacabfe610d7b6aabe518b48acd571765867fa1591ca17f",
+      "size_bytes": 928204,
       "source": "apps/cli/dist/rbo.js"
     },
     {
       "path": "bin/rbo-mcp-stdio.js",
-      "sha256": "1ac0a2b6be134ec7c7beb0c614b4cb9c5bb6706c355e7e2f72d36c1ad04e6e2a",
-      "size_bytes": 28388,
+      "sha256": "45e58f8b8c5c84888b5a9caae1d1de28795c5025a98cb767a5bf8a8e004bc979",
+      "size_bytes": 28828,
       "source": "apps/cli/dist/rbo-mcp-stdio.js"
     },
     {

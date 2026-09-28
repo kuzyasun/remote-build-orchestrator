@@ -235,17 +235,33 @@ For a full request with required artifacts, use `rbo submit job.json`. See the
 
 ## 7. Guide your AI assistant
 
-Add this rule to your project's `AGENTS.md`:
+Add this rule to your project's `AGENTS.md`. Before you commit it, replace the two activation
+commands with the ones this repository actually uses.
 
 ```markdown
 ## Remote builds
-Use RBO MCP tools for builds and tests. Always specify `shell` and
-`target_os` matching a live Agent (`agents_list`). If `job_run` returns
-`resume: true`, call again with the same `job_id` and pass the returned
-`next_log_cursor` under `log_cursor`.
-```
 
-The complete template is in [AI client configuration](client-integration/README.md).
+Use RBO MCP tools for builds and tests.
+
+`agents_list` shows which workers are online and their OS. It does not list
+compilers or SDKs. Set `target_os` from that worker. Set `shell` to `bash` or
+`zsh` on macOS and Linux, and `powershell` on Windows. An omitted `target_os`
+is the Controller OS.
+
+Start the job script with this activation, then run the build. If a line still
+contains `REPLACE_WITH_`, stop and ask a person to put this repository's real
+activation command there. Do not invent a path.
+
+- macOS and Linux: `REPLACE_WITH_UNIX_ACTIVATION`
+- Windows: `REPLACE_WITH_WINDOWS_ACTIVATION`
+
+Do not search the agent machine for installs, and do not call `agent_probe` to
+discover toolchains. If the job fails because a tool or SDK is missing, stop
+and ask a person to install it on that agent.
+
+If `job_run` returns `resume: true`, call again with the same `job_id` and
+pass the returned `next_log_cursor` under `log_cursor`.
+```
 
 ## 8. How source transfer works
 

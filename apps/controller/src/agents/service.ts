@@ -10,7 +10,6 @@ export interface AgentSummary {
   priority: number;
   running_jobs: number;
   max_jobs: number;
-  tools: Record<string, string[]>;
 }
 
 interface AgentRow {
@@ -54,7 +53,6 @@ export function listAgents(db: ControllerDatabase, includeOffline: boolean): Age
       priority: row.priority,
       running_jobs: runningJobs.n,
       max_jobs: row.max_jobs,
-      tools: capabilities.tools ?? {},
     };
   });
 }

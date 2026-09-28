@@ -15,7 +15,6 @@ export interface AgentSummary {
   priority: number;
   running_jobs: number;
   max_jobs: number;
-  tools: Record<string, string[]>;
 }
 
 /** Pending (or otherwise listed) pairing request — id is what `rbo agent approve` takes. */

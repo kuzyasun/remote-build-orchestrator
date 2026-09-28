@@ -17,7 +17,7 @@ rbo agents
 
 `rbo doctor` checks the local installation, Controller reachability, data directory, Git, shells,
 and the Windows executor when applicable. `rbo agents` shows registered workers, pending pairing
-requests, detected tools, and current capacity.
+requests, OS, and current capacity. It does not list compilers or SDKs.
 
 ## Start and stop processes
 
@@ -89,7 +89,7 @@ and approve a new pairing request. Never copy Agent private keys between machine
 ## Repair
 
 1. Run `rbo doctor` on the Agent machine.
-2. Run `rbo agents` on the Controller and inspect the Agent's state, tools, shells, and capacity.
+2. Run `rbo agents` on the Controller and inspect the Agent's state, OS, and capacity.
 3. Check the daemon log under the Agent state directory.
 4. Restart the Agent with `rbo agent stop-process` followed by `rbo agent start --daemon`.
 5. Revoke and re-pair only when credentials or Controller identity changed.

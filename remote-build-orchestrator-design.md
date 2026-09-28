@@ -619,11 +619,7 @@ Concrete MVP mechanism:
   },
   "tools": {
     "git": ["2.50.1"],
-    "node": ["24.11.1"],
-    "python": ["3.12.8"],
-    "docker": ["28.1.1"],
-    "qemu-system-xtensa": ["9.2.2"],
-    "esp-idf": ["5.5.1", "6.0.2"]
+    "git-lfs": ["3.5.1"]
   },
   "toolchain_profiles": [
     {
@@ -648,8 +644,12 @@ Concrete MVP mechanism:
 
 ### 9.1.1. Named toolchain profiles
 
-`tools` є коротким summary для UI і diagnostics. Execution MUST використовувати
-конкретний entry з `toolchain_profiles`.
+`tools` є внутрішнім PATH-зрізом (зараз `git` і `git-lfs`) для scheduler.
+`agents_list` його не повертає: це не інвентар тулчейнів. Поле джоби
+`requirements.tools` — інше: `git` і `git-lfs` матчаться з цим зрізом, решта
+імен — з `toolchain_profiles`. Execution MUST використовувати конкретний entry
+з `toolchain_profiles`. Активація SDK живе в скрипті джоби; якщо білд падає
+через відсутній інструмент, його ставить людина на агенті.
 
 Scheduler:
 
@@ -2189,15 +2189,15 @@ Result:
       "arch": "arm64",
       "priority": 20,
       "running_jobs": 0,
-      "max_jobs": 1,
-      "tools": {
-        "esp-idf": ["6.0.2"],
-        "qemu-system-xtensa": ["9.2.2"]
-      }
+      "max_jobs": 1
     }
   ]
 }
 ```
+
+Відповідь не містить `tools`. Клієнт вибирає живого воркера за `os` і ставить
+активацію тулчейна в скрипт джоби. Окрему розвідку файлової системи агента не
+робити: відсутній SDK — це помилка білда, після якої інструмент ставить людина.
 
 ### 23.2. `job_submit`
 
@@ -2377,6 +2377,12 @@ Antigravity:
 ```text
 For build, test, QEMU, Docker, hardware or log-collection tasks, use the
 Remote Build Orchestrator MCP tools.
+
+agents_list reports which workers are online and their OS. It does not list
+compilers or SDKs. Start the script with the toolchain activation command
+documented for that OS in the project AGENTS.md. If the job fails because a
+tool is missing, stop and ask a person to install it. Do not probe the agent
+filesystem and do not call agent_probe to discover toolchains.
 
 Submit the complete script with job_submit. Do not manually choose an agent
 unless the task requires a specific machine. Poll with job_wait and read

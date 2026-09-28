@@ -162,7 +162,7 @@ rbo discover [--json]
 
 ### `rbo agents`
 
-Lists registered worker Agents, online statuses, capacity, and pending pairing requests.
+Lists registered worker Agents, online status, OS, capacity, and pending pairing requests. It does not list compilers or SDKs.
 
 ```bash
 rbo agents
@@ -213,7 +213,7 @@ rbo agent install|stop|uninstall [--execute]
 | `approve [<id>]` | Approves a pending agent pairing request on the Controller (interactive menu if `<id>` omitted). |
 | `reject [<id>]` | Rejects a pending agent pairing request (interactive menu if `<id>` omitted). |
 | `revoke <id>` | Revokes credentials and authorization for an existing Agent. |
-| `probe <id>` | Queries an active Agent for hardware capabilities, shells, and installed tools. |
+| `probe <id>` | Asks an active Agent to refresh its capability report. This does not inventory compilers or SDKs. |
 | `install\|stop\|uninstall` | Generates or executes OS service plans (systemd, launchd, Windows Service). |
 
 ---

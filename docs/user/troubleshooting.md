@@ -121,17 +121,17 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp $(which node)
 
 ## The Agent is online but receives no jobs
 
-RBO selects only an Agent that matches the job's OS, architecture, shell, tools, labels, and free
-capacity.
+RBO selects an Agent by OS, architecture, shell, labels, free capacity, and — when the job asks
+for them — `git` or `git-lfs`. It does not match compilers or SDKs from an inventory.
 
-- Inspect the Agent with `rbo agents`.
-- Re-probe installed tools with `rbo agent probe <agent-id>`.
+- Inspect the Agent with `rbo agents` (state, OS, capacity).
 - Check that `execution.shell` exists on that Agent.
 - Check the job's `requirements`.
 - Wait for capacity, or change the queue policy deliberately.
 
-Installing a tool after the Agent starts requires a new probe or restart before the Controller can
-schedule against it.
+Compilers and SDKs are activated by the job script. If the build fails because one is missing,
+install it on that Agent. `rbo agent probe` only refreshes the small PATH report (`git`,
+`git-lfs`); it does not discover SDKs.
 
 ## Git overlay capture fails
 

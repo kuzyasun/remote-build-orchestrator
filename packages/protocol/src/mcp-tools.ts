@@ -113,7 +113,8 @@ export interface McpToolDef {
 export const MCP_TOOL_DEFS: readonly McpToolDef[] = [
   {
     name: 'agents_list',
-    description: 'List registered worker agents and their capabilities.',
+    description:
+      'List worker agents that are online: id, name, state, OS, arch, and job capacity. Does not list compilers, SDKs, or other build tools. Set shell and target_os from the agent OS. Put the project toolchain activation command in the job script. If the build fails because a tool is missing, ask a person to install it. Do not probe the agent filesystem or call agent_probe to discover toolchains.',
     inputShape: AGENTS_LIST_INPUT,
   },
   {
@@ -166,7 +167,8 @@ export const MCP_TOOL_DEFS: readonly McpToolDef[] = [
   },
   {
     name: 'agent_probe',
-    description: 'Trigger a capability re-probe of one agent.',
+    description:
+      'Ask one agent to refresh its capability report. This does not inventory compilers or SDKs. Do not call it to discover toolchains before a build.',
     inputShape: AGENT_PROBE_INPUT,
   },
 ];
