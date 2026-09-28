@@ -67,19 +67,26 @@ function main() {
 
   if (isWinX64) {
     run('cargo', ['build', '--release', '--manifest-path', CARGO_MANIFEST]);
+    run('pnpm', ['--filter', '@gemslibe/rbo-windows-executor-win32-x64', 'prepare-binary:require']);
+    if (!existsSync(STAGED_EXE)) {
+      fail(
+        `missing ${STAGED_EXE}. Build on Windows x64:\n  cargo build --release --manifest-path native/windows-executor/Cargo.toml\n  pnpm --filter @gemslibe/rbo-windows-executor-win32-x64 prepare-binary:require`,
+      );
+    }
+    if (!existsSync(RELEASE_EXE)) {
+      fail(`missing Cargo release output at ${RELEASE_EXE} after cargo build --release`);
+    }
+    run('pnpm', ['--dir', EXECUTOR_DIR, 'pack']);
+  } else if (existsSync(STAGED_EXE)) {
+    run('pnpm', ['--dir', EXECUTOR_DIR, 'pack']);
   } else {
     console.warn(
-      `warn: not Windows x64 (${platform()}/${arch()}); skipping cargo build. A staged or Cargo-built rbo-windows-executor.exe is still required to pack.`,
+      `warn: not Windows x64 (${platform()}/${arch()}) and staged binary not present; skipping optional @gemslibe/rbo-windows-executor-win32-x64 package.`,
     );
   }
 
-  run('pnpm', ['--filter', '@gemslibe/rbo-windows-executor-win32-x64', 'prepare-binary:require']);
-
-  if (!existsSync(STAGED_EXE)) {
-    fail(
-      `missing ${STAGED_EXE}. Build on Windows x64:\n  cargo build --release --manifest-path native/windows-executor/Cargo.toml\n  pnpm --filter @gemslibe/rbo-windows-executor-win32-x64 prepare-binary:require`,
-    );
-  }
+  // Ensure CLI bundle is built
+  run('pnpm', ['--filter', '@gemslibe/rbo', 'build']);
 
   for (const bundle of CLI_BUNDLES) {
     if (!existsSync(bundle)) {
@@ -89,15 +96,10 @@ function main() {
     }
   }
 
-  if (!existsSync(RELEASE_EXE) && isWinX64) {
-    fail(`missing Cargo release output at ${RELEASE_EXE} after cargo build --release`);
-  }
-
   // pnpm 10: do not use --filter … pack (implies recursive; pack rejects it).
-  run('pnpm', ['--dir', EXECUTOR_DIR, 'pack']);
   run('pnpm', ['--dir', CLI_DIR, 'pack']);
 
-  console.log('release:pack ok — optional package then @gemslibe/rbo tarballs created');
+  console.log('release:pack ok — package tarball(s) created');
 }
 
 main();

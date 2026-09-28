@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import type { IncomingMessage } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import type { Server as HttpsServer } from 'node:https';
 import {
@@ -82,6 +83,36 @@ export interface ConnectedAgent {
   socket: WebSocket;
   protocolVersion: number;
   lastHeartbeatAt: number;
+  /** Host/IP through which the agent connected to the Controller (for reachable data plane URLs). */
+  connectionHost?: string;
+}
+
+/**
+ * Extract the host or IP address through which the agent connected,
+ * prioritizing the HTTP Host header, then falling back to socket localAddress.
+ */
+export function extractConnectionHost(req: IncomingMessage): string | undefined {
+  const hostHeader = req.headers.host;
+  if (hostHeader) {
+    const trimmed = hostHeader.trim();
+    if (trimmed.startsWith('[')) {
+      const closeBracket = trimmed.indexOf(']');
+      if (closeBracket !== -1) {
+        return trimmed.slice(1, closeBracket);
+      }
+    }
+    const colon = trimmed.indexOf(':');
+    const host = colon !== -1 ? trimmed.slice(0, colon) : trimmed;
+    if (host.length > 0) {
+      return host;
+    }
+  }
+  const localAddr = req.socket?.localAddress;
+  if (localAddr) {
+    const cleaned = localAddr.startsWith('::ffff:') ? localAddr.slice(7) : localAddr;
+    return cleaned.replace(/^\[|\]$/g, '');
+  }
+  return undefined;
 }
 
 export interface RunningAgentPlane {
@@ -261,10 +292,11 @@ export async function startAgentPlaneServer(
   }, 15_000);
   leaseSweep.unref?.();
 
-  wss.on('connection', (socket) => {
+  wss.on('connection', (socket, req) => {
     let authenticated: ConnectedAgent | null = null;
     let pendingNonce: string | null = null;
     let pendingCredential: string | null = null;
+    const connectionHost = req ? extractConnectionHost(req) : undefined;
 
     socket.on('message', (raw) => {
       if (shuttingDown) {
@@ -358,13 +390,25 @@ export async function startAgentPlaneServer(
             }
             pendingNonce = null;
             pendingCredential = null;
+            const previous = connectedAgents.get(verified.agentId);
             authenticated = {
               agentId: verified.agentId,
               socket,
               protocolVersion: 1,
               lastHeartbeatAt: Date.now(),
+              connectionHost,
             };
+            // Identity is the credential, not the source address. A reconnect from a
+            // new agent IP replaces the previous session; install it before closing
+            // the old socket so that socket's close handler cannot drop this one.
             connectedAgents.set(verified.agentId, authenticated);
+            if (previous && previous.socket !== socket) {
+              logger.info('agent reconnected from a new session', {
+                agentId: verified.agentId,
+                connectionHost,
+              });
+              previous.socket.terminate();
+            }
             markAgentSeen(db, verified.agentId, 'idle');
             send(socket, 'hello_ack', { status: 'authenticated', agent_id: verified.agentId });
             maybeDispatchQueued();
@@ -484,8 +528,13 @@ export async function startAgentPlaneServer(
               message.type,
             );
             if (!payload) return;
-            handleRemoteCleanupComplete(remoteOpts(), authenticated.agentId, payload);
-            maybeDispatchQueued();
+            const agentId = authenticated.agentId;
+            trackDrainable(
+              handleRemoteCleanupComplete(remoteOpts(), agentId, payload).finally(() => {
+                maybeDispatchQueued();
+              }),
+              'remote cleanup_complete handling',
+            );
             return;
           }
 
@@ -516,12 +565,17 @@ export async function startAgentPlaneServer(
       if (shuttingDown) {
         return;
       }
-      if (authenticated) {
-        connectedAgents.delete(authenticated.agentId);
-        markAgentSeen(db, authenticated.agentId, 'offline');
-        recovery.onAgentDisconnect(authenticated.agentId);
-        maybeDispatchQueued();
+      if (!authenticated) {
+        return;
       }
+      const current = connectedAgents.get(authenticated.agentId);
+      if (current?.socket !== socket) {
+        return;
+      }
+      connectedAgents.delete(authenticated.agentId);
+      markAgentSeen(db, authenticated.agentId, 'offline');
+      recovery.onAgentDisconnect(authenticated.agentId);
+      maybeDispatchQueued();
     });
   });
 

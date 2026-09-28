@@ -105,12 +105,23 @@ describe('writeZstdTarArchiveCandidate memory hygiene', () => {
     const fileHandlePrototype = Object.getPrototypeOf(probe) as typeof probe;
     await probe.close();
     const originalStat = fileHandlePrototype.stat;
-    const statSpy = vi.spyOn(fileHandlePrototype, 'stat').mockImplementationOnce(async function (
+    let callCount = 0;
+    const statSpy = vi.spyOn(fileHandlePrototype, 'stat').mockImplementation(async function (
       this: typeof probe,
       options?: { bigint?: boolean },
     ) {
       const result = await originalStat.call(this, options);
-      writeFileSync(sourcePath, Buffer.from([0x51]), { flag: 'r+' });
+      callCount += 1;
+      if (callCount === 1) {
+        writeFileSync(sourcePath, Buffer.from([0x51]), { flag: 'r+' });
+      } else if (callCount === 2) {
+        // Guarantee mtimeNs differs even if the write occurred within the filesystem timer resolution tick
+        const currentMtime = 'mtimeNs' in result ? (result.mtimeNs as bigint) : 0n;
+        return {
+          ...result,
+          mtimeNs: currentMtime + 10_000_000n,
+        } as typeof result;
+      }
       return result;
     });
     try {

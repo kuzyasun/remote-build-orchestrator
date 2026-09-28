@@ -36,7 +36,7 @@ jobs:
       - name: Install release toolchain
         shell: pwsh
         run: |
-          npm install --global npm@11.7.0 pnpm@10.5.2
+          npm install --global npm@11.7.0 pnpm@12.6.0
           node --version
           npm --version
           pnpm --version

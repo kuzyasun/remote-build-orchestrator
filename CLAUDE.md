@@ -40,14 +40,18 @@ For **other** projects (firmware, clients, etc.) that should call this Controlle
 [`docs/user/getting-started.md`](docs/user/getting-started.md) §§6–8 (client snippets, `job_run`
 preferred for AI clients, paste-ready AGENTS.md guidance including shell vs agent OS). Server
 names in clients are typically `rbo` or `user-rbo`. AI agents use pull-based `job_logs`; live follow
-is CLI `rbo run --follow` or `rbo logs --follow` for human operators. Consumer note: pass `job_run`
-`shell` and `target_os` that match a live worker (`agents_list`); an omitted `target_os` is pinned
-to the Controller OS — do not submit PowerShell jobs when only a Mac/Linux agent is online. Copy
-opaque log cursors; do not invent them.
+is CLI `rbo run --follow` or `rbo logs --follow` for human operators. Consumer note: `agents_list`
+reports which workers are online and their OS. It does not list compilers or SDKs. Pass `job_run`
+`shell` and `target_os` for that OS (`bash` or `zsh` on macOS and Linux, `powershell` on Windows).
+An omitted `target_os` is pinned to the Controller OS — do not submit PowerShell jobs when only a
+Mac/Linux agent is online. Start the job script with the toolchain activation command for that OS,
+written in the consumer project's `AGENTS.md`. If the build fails because a tool is missing, stop
+and ask a person to install it on that agent. Do not probe the agent filesystem and do not
+call `agent_probe` to discover toolchains. Copy opaque log cursors; do not invent them.
 
 ## Stack Summary
 
-- **Runtime & Package Management**: Node.js ≥ 24.0 (`.nvmrc`), pnpm 10.5.2 (`packageManager` in `package.json`, pnpm workspace).
+- **Runtime & Package Management**: Node.js ≥ 24.0 (`.nvmrc`), pnpm 12.6.0 (`packageManager` in `package.json`, pnpm workspace).
 - **TypeScript & Build**: TypeScript strict mode (`tsconfig.base.json`), tsc build outputs under `dist/`.
 - **Formatting & Linting**: Biome 1.9.4 (`biome.json`, checks format, lint, import order).
 - **Testing**: Vitest 3.0.7 (`vitest.config.ts`).
@@ -78,6 +82,7 @@ Run commands from repo root or with `--filter`:
 - Typechecking: `pnpm typecheck`
 - Rust verification: `pnpm rust:verify` (`cargo fmt --check` + `cargo test`)
 - Packaging manifests (after build): `pnpm package:archives` / `pnpm package:verify`
+- Local packaging & installation: `pnpm release:pack` → `npm install -g ./apps/cli/gemslibe-rbo-<version>.tgz` (see `docs/dev/local-development.md`)
 
 ## Working Rules & Efficiency
 

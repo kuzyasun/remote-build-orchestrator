@@ -19,6 +19,8 @@ const ENV_KEYS = [
   'RBO_MAX_SNAPSHOT_FILE_COUNT',
   'RBO_MAX_SNAPSHOT_SINGLE_FILE_BYTES',
   'RBO_MAX_SNAPSHOT_TEMPORARY_BYTES',
+  'RBO_MDNS_ENABLED',
+  'RBO_MDNS_DISPLAY_NAME',
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
@@ -265,5 +267,94 @@ describe('controller.json file load + precedence', () => {
   it('throws a clear error for invalid numeric env values', () => {
     process.env.RBO_MCP_PORT = 'abc';
     expect(() => loadControllerConfig({ configPath: null })).toThrow(/RBO_MCP_PORT/);
+  });
+});
+
+describe('mDNS discovery config (§7.2)', () => {
+  it('defaults mdns_enabled to true and mdns_display_name to rbo-controller', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    const config = loadControllerConfig({ configPath: null });
+    expect(config.mdnsEnabled).toBe(true);
+    expect(config.mdnsDisplayName).toBe('rbo-controller');
+  });
+
+  it('honours the config file, and env overrides it', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        mdns_enabled: false,
+        mdns_display_name: 'custom-controller',
+      }),
+      'utf8',
+    );
+    const fromFile = loadControllerConfig({ dataDir });
+    expect(fromFile.mdnsEnabled).toBe(false);
+    expect(fromFile.mdnsDisplayName).toBe('custom-controller');
+
+    process.env.RBO_MDNS_ENABLED = 'true';
+    process.env.RBO_MDNS_DISPLAY_NAME = 'env-controller';
+    const fromEnv = loadControllerConfig({ dataDir });
+    expect(fromEnv.mdnsEnabled).toBe(true);
+    expect(fromEnv.mdnsDisplayName).toBe('env-controller');
+  });
+
+  it('recognizes "0", "false", "no", and "off" for RBO_MDNS_ENABLED', () => {
+    process.env.RBO_MDNS_ENABLED = '0';
+    expect(loadControllerConfig({ configPath: null }).mdnsEnabled).toBe(false);
+    process.env.RBO_MDNS_ENABLED = 'false';
+    expect(loadControllerConfig({ configPath: null }).mdnsEnabled).toBe(false);
+    process.env.RBO_MDNS_ENABLED = 'no';
+    expect(loadControllerConfig({ configPath: null }).mdnsEnabled).toBe(false);
+    process.env.RBO_MDNS_ENABLED = 'off';
+    expect(loadControllerConfig({ configPath: null }).mdnsEnabled).toBe(false);
+  });
+
+  it('ignores empty RBO_MDNS_DISPLAY_NAME and falls back to default', () => {
+    process.env.RBO_MDNS_DISPLAY_NAME = '   ';
+    expect(loadControllerConfig({ configPath: null }).mdnsDisplayName).toBe('rbo-controller');
+  });
+
+  it('writeDefaultControllerConfigFile roundtrips rbo-controller without .local suffix', () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    const dataDir = tempDir();
+    writeDefaultControllerConfigFile(dataDir);
+    const loaded = loadControllerConfig({ dataDir });
+    expect(loaded.mdnsDisplayName).toBe('rbo-controller');
+  });
+
+  it('rejects mdns_display_name exceeding 63 characters (RFC 6763 §4.1.1)', () => {
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(path, JSON.stringify({ mdns_display_name: 'a'.repeat(64) }), 'utf8');
+    expect(() => readControllerConfigFile(path)).toThrow();
+  });
+
+  it('rejects mdns_display_name in controller.json containing control characters', () => {
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(path, JSON.stringify({ mdns_display_name: 'ctrl\ninjection' }), 'utf8');
+    expect(() => readControllerConfigFile(path)).toThrow();
+  });
+
+  it('rejects RBO_MDNS_DISPLAY_NAME from environment exceeding 63 bytes', () => {
+    process.env.RBO_MDNS_DISPLAY_NAME = 'a'.repeat(64);
+    expect(() => loadControllerConfig({ configPath: null })).toThrow(/exceeds 63 bytes/);
+  });
+
+  it('rejects RBO_MDNS_DISPLAY_NAME from environment containing control characters', () => {
+    process.env.RBO_MDNS_DISPLAY_NAME = 'evil\x1b[31mname';
+    expect(() => loadControllerConfig({ configPath: null })).toThrow(/control characters/);
+  });
+
+  it('rejects programmatic mdnsDisplayName override exceeding 63 bytes or with control characters', () => {
+    expect(() =>
+      loadControllerConfig({ configPath: null, mdnsDisplayName: 'a'.repeat(64) }),
+    ).toThrow(/exceeds 63 bytes/);
+    expect(() => loadControllerConfig({ configPath: null, mdnsDisplayName: 'bad\rname' })).toThrow(
+      /control characters/,
+    );
   });
 });

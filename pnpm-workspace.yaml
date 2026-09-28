@@ -1,5 +1,8 @@
 packages:
   - apps/*
   - packages/*
-onlyBuiltDependencies:
-  - esbuild
+allowBuilds:
+  '@biomejs/biome': true
+  # Ships prebuilds. A rebuild needs node-gyp, which source CI does not provide.
+  better-sqlite3: false
+  esbuild: true

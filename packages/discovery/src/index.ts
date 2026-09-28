@@ -1,0 +1,46 @@
+export {
+  ControllerAdvertiser,
+  type AdvertiserOptions,
+  type MdnsBindInfo,
+  MDNS_INTERFACE_WATCH_MS,
+  getPreferredMdnsInterface,
+  isAssignedLocalAddress,
+  isMdnsInterfaceLostError,
+  resolveMdnsBindAddress,
+  suppressMdnsErrors,
+  validateMdnsDisplayName,
+} from './advertiser.js';
+export {
+  hostLookupCandidates,
+  isIpAddress,
+  isIpv4Address,
+  isIpv6Address,
+  isPrivateLanAddress,
+  isRoutableIpAddress,
+  normalizeMdnsHost,
+  selectBestAddress,
+} from './address.js';
+export {
+  chooseDiscoveredController,
+  discoverControllers,
+  type DiscoveredController,
+  type DiscoverOptions,
+  serviceToController,
+  txtValue,
+} from './browser.js';
+export {
+  RBO_MDNS_BROWSE_TIMEOUT_MS,
+  RBO_MDNS_DEFAULT_DISPLAY_NAME,
+  RBO_MDNS_SERVICE_TYPE,
+  RBO_MDNS_TXT_VERSION,
+} from './constants.js';
+export { agentUrlHasRoutableIp, controllerAgentUrl } from './url.js';
+export {
+  parseDnsSdBrowseLine,
+  parseDnsSdResolveOutput,
+  parseDnsSdGetAddrInfoLine,
+  createDiscoveredControllerFromDnsSd,
+  discoverControllersViaDnsSd,
+  resolveHostAddresses,
+  type DnsSdResolvedService,
+} from './dnssd.js';

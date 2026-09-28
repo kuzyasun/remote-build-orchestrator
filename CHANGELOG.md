@@ -7,6 +7,52 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-24
+
+### Added
+
+- Native macOS mDNS discovery adapter in `@rbo/discovery` using `/usr/bin/dns-sd` IPC with `mDNSResponder`, resolving UDP 5353 port binding conflicts on macOS while maintaining cross-platform `bonjour-service` support on Windows and Linux.
+- Cross-platform network and port diagnostics in `rbo doctor`:
+  - `controller_ports`: TCP 7410 (HTTP) and 7411 (Agent Plane WebSocket) availability and active process inspection across Windows (`netstat`), Linux (`ss`, `lsof`), and macOS (`lsof`).
+  - `mdns_port`: UDP 5353 collision detection that warns when non-wildcard interface bindings (e.g. Zoom) intercept incoming mDNS discovery packets on the local host.
+  - `firewall`: Cross-platform firewall status checks with actionable remediation commands for Windows Defender Firewall (`New-NetFirewallRule`), Linux `ufw` and `firewalld`, and macOS Application Firewall (`socketfilterfw`).
+- Local development guide (`docs/dev/local-development.md`) covering building from source, packaging with `pnpm pack`, and global installation workflows.
+- Dedicated firewall troubleshooting guide (`docs/user/troubleshooting.md`) and getting-started reference covering inbound rules for Node.js (`nvm4w`), Agent plane (TCP 7411), and mDNS discovery (UDP 5353) across Windows, Linux, and macOS.
+
+### Changed
+
+- `scripts/bump-version.mjs`: Dynamically synchronizes all 12 monorepo workspace packages (`apps/*`, `packages/*`), `native/windows-executor/Cargo.toml`, `Cargo.lock`, runtime constants, lockfile, packaging manifests, and `CHANGELOG.md` in lockstep.
+- `scripts/release-pack.mjs`: Added cross-platform packaging support for non-Windows hosts, and automated CLI bundle rebuilding before packaging.
+- Synchronized package versions across all `@rbo/*` workspace packages and `Cargo.toml` to lockstep product version `0.8.0`.
+- Added `"private": true` to all 9 internal workspace packages (`@rbo/*`) to protect against unintended npm registry publication.
+
+### Fixed
+
+- **mDNS probe self-cancellation**: Disabled `bonjour-service` name probing (`probe: false`) which caused the Controller to silently cancel its own mDNS advertisement when LAN caches or `mDNSResponder` responded to the probe query after a restart.
+- **mDNS advertisement on wrong interface**: Added `getPreferredMdnsInterface()` to bind multicast to physical LAN adapters (Wi-Fi, Ethernet) instead of virtual adapters (WSL `vEthernet`, Hyper-V, Docker) that have higher link speed metrics on Windows.
+- Daemon script path resolution (`resolve(process.argv[1])`) in `rbo controller start --daemon` and `rbo agent start --daemon` to ensure detached child processes use absolute paths.
+- Windows Defender Firewall evaluation in `rbo doctor` now requires TCP or ANY protocol before marking `node.exe` inbound traffic allowed, preventing false positives from mDNS UDP rules.
+- Linux Controller port conflict detection now properly flags foreign occupied sockets on port 7411 when unprivileged `ss` reports PID 0.
+- macOS Application Firewall query failure handling now reports an advisory warning rather than falsely diagnosing the firewall as disabled when `socketfilterfw` is unavailable.
+- `lsof` socket parser now dynamically locates PID tokens to support command names containing whitespace.
+- Cleaned up dependency graph: moved `@rbo/testing` from `dependencies` to `devDependencies` in `apps/agent` and added missing runtime `ws` dependency in `apps/controller`.
+
+## [0.8.0] - 2026-09-16
+
+### Added
+
+- Zero-configuration mDNS/DNS-SD discovery (`@rbo/discovery`, §7.2) for automatic Controller advertisement and Agent discovery on local networks.
+- Controller automatic mDNS advertisement on start, with graceful goodbye packets on shutdown (`mdns_enabled`, `mdns_display_name`).
+- Interactive Controller selection during `rbo agent init` and standalone `rbo discover [--json]` command for scanning LAN controllers.
+- Interactive Agent pairing approval and rejection (`rbo agent approve` / `rbo agent reject`) on the Controller without needing to copy 26-character pairing IDs.
+- Standalone CLI reference guide (`docs/user/cli-reference.md`) covering all commands, options, and shell execution semantics.
+
+### Changed
+
+- Made zero-configuration mDNS discovery the primary default onboarding path in `README.md` and `docs/user/getting-started.md`.
+- Streamlined `docs/user/getting-started.md` and moved manual network configuration to a dedicated fallback section for routed subnets and headless CI.
+- Updated `rbo agent approve` and `rbo agent reject` usage to support optional `[<pairing-request-id>]` argument with TTY prompt fallback.
+
 ## [0.7.0] - 2026-08-28
 
 ### Added
@@ -67,7 +113,9 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.0
+[0.8.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.7.0
 [0.6.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.2
 [0.6.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.6.0

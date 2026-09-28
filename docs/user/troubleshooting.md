@@ -56,19 +56,82 @@ rbo agent approve <pairing-request-id>
 If no request appears, check the Agent's `controller_url`, network access to port `7411`, and
 `controller_fingerprint`. The fingerprint must exactly match `rbo controller fingerprint`.
 
+## The Agent still dials an old Controller address
+
+`rbo agent status` shows `connect ECONNREFUSED` for an address the Controller no longer uses
+(DHCP or a network change). A running Agent rechecks mDNS at startup, about once a minute, and
+after each failed connect. When the advertisement has the same fingerprint at a new routable IP,
+the Agent writes that address into `agent.json` and reconnects. The pairing credential is kept.
+
+If `rbo discover` cannot see the Controller, mDNS is not reaching this machine — set
+`controller_url` by hand, or export `RBO_CONTROLLER_URL` to pin an address and skip the refresh.
+
+The Controller accepts that Agent from a new address without re-pairing. The credential
+is the identity; the previous session is replaced and stays online when the old socket closes.
+
+## Firewall blocks Agent connections or mDNS discovery
+
+If remote Agents cannot discover the Controller (`rbo discover` finds nothing) or cannot connect to
+the Agent plane (port `7411`), the host firewall is likely blocking incoming traffic. Run
+`rbo doctor` on the Controller to inspect firewall and port status.
+
+### Windows (PowerShell as Administrator)
+
+Allow the Node.js executable (for `nvm4w` or standard installations) and open the dedicated inbound
+ports for the Agent plane (TCP `7411`) and mDNS discovery (UDP `5353`):
+
+```powershell
+# Allow Node.js binary (example for nvm4w or standard path)
+New-NetFirewallRule -DisplayName "RBO Node.js Controller" -Direction Inbound -Program "C:\nvm4w\nodejs\node.exe" -Action Allow -Profile Private,Public
+
+# Open inbound ports for Agent plane (TCP 7411) and mDNS discovery (UDP 5353)
+New-NetFirewallRule -DisplayName "RBO Agent Plane Port" -Direction Inbound -LocalPort 7411 -Protocol TCP -Action Allow -Profile Private,Public
+New-NetFirewallRule -DisplayName "RBO mDNS Port" -Direction Inbound -LocalPort 5353 -Protocol UDP -Action Allow -Profile Private,Public
+```
+
+> [!TIP]
+> To dynamically target your active Node.js executable regardless of where it is installed:
+> ```powershell
+> New-NetFirewallRule -DisplayName "RBO Node.js Controller" -Direction Inbound -Program (Get-Command node).Source -Action Allow -Profile Private,Public
+> ```
+
+### Linux
+
+If `ufw` or `firewalld` is active:
+
+```bash
+# ufw
+sudo ufw allow 7411/tcp comment "RBO Agent Plane"
+sudo ufw allow 5353/udp comment "RBO mDNS Discovery"
+
+# firewalld
+sudo firewall-cmd --permanent --add-port=7411/tcp
+sudo firewall-cmd --permanent --add-port=5353/udp
+sudo firewall-cmd --reload
+```
+
+### macOS
+
+If the macOS Application Firewall is active:
+
+```bash
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add $(which node)
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp $(which node)
+```
+
 ## The Agent is online but receives no jobs
 
-RBO selects only an Agent that matches the job's OS, architecture, shell, tools, labels, and free
-capacity.
+RBO selects an Agent by OS, architecture, shell, labels, free capacity, and — when the job asks
+for them — `git` or `git-lfs`. It does not match compilers or SDKs from an inventory.
 
-- Inspect the Agent with `rbo agents`.
-- Re-probe installed tools with `rbo agent probe <agent-id>`.
+- Inspect the Agent with `rbo agents` (state, OS, capacity).
 - Check that `execution.shell` exists on that Agent.
 - Check the job's `requirements`.
 - Wait for capacity, or change the queue policy deliberately.
 
-Installing a tool after the Agent starts requires a new probe or restart before the Controller can
-schedule against it.
+Compilers and SDKs are activated by the job script. If the build fails because one is missing,
+install it on that Agent. `rbo agent probe` only refreshes the small PATH report (`git`,
+`git-lfs`); it does not discover SDKs.
 
 ## Git overlay capture fails
 

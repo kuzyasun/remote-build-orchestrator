@@ -26,6 +26,7 @@ describe('updateAgentCapabilities', () => {
         supports_tty: false,
         supports_process_tree_kill: true,
       },
+      tools: { git: ['2.45.0'] },
     });
 
     updateAgentCapabilities(db, 'agt_1', report);
@@ -37,10 +38,12 @@ describe('updateAgentCapabilities', () => {
         max_jobs: 2,
       }),
     ]);
+    expect(listed[0]).not.toHaveProperty('tools');
     const row = db
       .prepare('SELECT max_jobs, capabilities_json FROM agents WHERE id = ?')
       .get('agt_1') as { max_jobs: number; capabilities_json: string };
     expect(row.max_jobs).toBe(2);
     expect(JSON.parse(row.capabilities_json).execution.max_jobs).toBe(2);
+    expect(JSON.parse(row.capabilities_json).tools).toEqual({ git: ['2.45.0'] });
   });
 });

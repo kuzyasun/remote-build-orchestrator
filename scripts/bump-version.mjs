@@ -9,12 +9,14 @@
  * Sites (see docs/dev/release-builds.md — Detailed steps → Bump version):
  *   - packages/shared/src/versions.ts (three runtime constants)
  *   - root package.json
+ *   - all workspace package.json files (apps/*, packages/*)
  *   - apps/cli/package.json (version + workspace optionalDependency pin)
  *   - pnpm-lock.yaml (workspace optionalDependency specifier)
- *   - packages/rbo-windows-executor-win32-x64/package.json
+ *   - native/windows-executor/Cargo.toml and Cargo.lock
  *   - packaging/{windows,macos,linux}/MANIFEST.json (package_version + components)
  *   - CHANGELOG.md (promotes ## [Unreleased] notes into ## [x.y.z] - YYYY-MM-DD)
  */
+import { existsSync } from 'node:fs';
 import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
@@ -28,7 +30,8 @@ const VERSIONS_TS = join(ROOT, 'packages', 'shared', 'src', 'versions.ts');
 const ROOT_PKG = join(ROOT, 'package.json');
 const CLI_PKG = join(ROOT, 'apps', 'cli', 'package.json');
 const PNPM_LOCK = join(ROOT, 'pnpm-lock.yaml');
-const EXECUTOR_PKG = join(ROOT, 'packages', 'rbo-windows-executor-win32-x64', 'package.json');
+const CARGO_TOML = join(ROOT, 'native', 'windows-executor', 'Cargo.toml');
+const CARGO_LOCK = join(ROOT, 'native', 'windows-executor', 'Cargo.lock');
 const PACKAGING_DIR = join(ROOT, 'packaging');
 const CHANGELOG = join(ROOT, 'CHANGELOG.md');
 const OPTIONAL_DEP = '@gemslibe/rbo-windows-executor-win32-x64';
@@ -72,6 +75,25 @@ async function listManifestPaths() {
   return paths.sort();
 }
 
+async function listAllPackageJsonPaths() {
+  const dirs = ['apps', 'packages'];
+  const paths = [ROOT_PKG];
+  for (const dir of dirs) {
+    const parent = join(ROOT, dir);
+    if (!existsSync(parent)) continue;
+    const entries = await readdir(parent, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const pkgPath = join(parent, entry.name, 'package.json');
+        if (existsSync(pkgPath)) {
+          paths.push(pkgPath);
+        }
+      }
+    }
+  }
+  return paths.sort();
+}
+
 function extractLockVersion(source) {
   const dependency = escapeRegExp(OPTIONAL_DEP);
   const match = source.match(
@@ -80,17 +102,25 @@ function extractLockVersion(source) {
   return match?.[1]?.trim() ?? null;
 }
 
-function readCurrentVersions(versionsSource, rootPkg, cliPkg, executorPkg, lockSource, manifests) {
+function extractCargoVersion(source) {
+  const match = source.match(/name\s*=\s*"rbo-windows-executor"\s*\r?\nversion\s*=\s*"([^"]+)"/);
+  return match?.[1] ?? null;
+}
+
+function readCurrentVersions(versionsSource, packageFiles, lockSource, manifests, cargoSource) {
   const fromTs = CONST_NAMES.map((name) => extractConstVersion(versionsSource, name));
+  const cliPkg = packageFiles.find((p) => p.path === CLI_PKG)?.data ?? {};
   const cliOptionalRaw = cliPkg.optionalDependencies?.[OPTIONAL_DEP] ?? null;
   return {
     versionsTs: fromTs,
-    root: rootPkg.version ?? null,
-    cli: cliPkg.version ?? null,
+    packages: packageFiles.map((p) => ({
+      path: p.path,
+      version: p.data.version ?? null,
+    })),
     cliOptionalRaw,
     cliOptional: cliOptionalRaw?.replace(/^workspace:/, '') ?? null,
     lock: extractLockVersion(lockSource),
-    executor: executorPkg.version ?? null,
+    cargo: cargoSource ? extractCargoVersion(cargoSource) : null,
     manifests: manifests.map((m) => ({
       path: m.path,
       package_version: m.data.package_version ?? null,
@@ -109,28 +139,38 @@ function assertConsistent(current) {
       fail(`missing ${CONST_NAMES[i]} in ${rel(VERSIONS_TS)}`);
     }
   }
-  if (current.root == null) fail(`missing "version" in ${rel(ROOT_PKG)}`);
-  if (current.cli == null) fail(`missing "version" in ${rel(CLI_PKG)}`);
+
+  for (const pkg of current.packages) {
+    if (pkg.version == null) {
+      fail(`missing "version" in ${rel(pkg.path)}`);
+    }
+  }
+
   if (current.cliOptional == null) {
     fail(`missing optionalDependencies["${OPTIONAL_DEP}"] in ${rel(CLI_PKG)}`);
   }
-  if (current.cliOptionalRaw !== `workspace:${current.cli}`) {
+
+  const cliVersion = current.packages.find((p) => p.path === CLI_PKG)?.version;
+  if (current.cliOptionalRaw !== `workspace:${cliVersion}`) {
     fail(
-      `optionalDependencies["${OPTIONAL_DEP}"] must equal "workspace:${current.cli}" in ${rel(CLI_PKG)}`,
+      `optionalDependencies["${OPTIONAL_DEP}"] must equal "workspace:${cliVersion}" in ${rel(CLI_PKG)}`,
     );
   }
-  if (current.executor == null) fail(`missing "version" in ${rel(EXECUTOR_PKG)}`);
+
   if (current.lock == null) {
     fail(`missing workspace optionalDependency specifier in ${rel(PNPM_LOCK)}`);
   }
 
+  if (current.cargo == null) {
+    fail(`missing version in ${rel(CARGO_TOML)}`);
+  }
+
   const all = [
     ...current.versionsTs,
-    current.root,
-    current.cli,
+    ...current.packages.map((p) => p.version),
     current.cliOptional,
     current.lock,
-    current.executor,
+    current.cargo,
   ];
 
   for (const manifest of current.manifests) {
@@ -231,6 +271,33 @@ async function writePackageVersion(path, currentVersion, next, { optionalDep } =
 
   await writeFile(path, text, 'utf8');
   return rel(path);
+}
+
+async function writeCargoTomlVersion(currentVersion, next) {
+  let text = await readFile(CARGO_TOML, 'utf8');
+  const versionRe = new RegExp(
+    `(name\\s*=\\s*"rbo-windows-executor"\\s*\\r?\\nversion\\s*=\\s*")${escapeRegExp(currentVersion)}(")`,
+  );
+  if (!versionRe.test(text)) {
+    fail(`could not find rbo-windows-executor version = "${currentVersion}" in ${rel(CARGO_TOML)}`);
+  }
+  text = text.replace(versionRe, `$1${next}$2`);
+  await writeFile(CARGO_TOML, text, 'utf8');
+  return rel(CARGO_TOML);
+}
+
+async function writeCargoLockVersion(currentVersion, next) {
+  if (!existsSync(CARGO_LOCK)) return null;
+  let text = await readFile(CARGO_LOCK, 'utf8');
+  const blockRe = new RegExp(
+    `(name\\s*=\\s*"rbo-windows-executor"\\s*\\r?\\nversion\\s*=\\s*")${escapeRegExp(currentVersion)}(")`,
+  );
+  if (blockRe.test(text)) {
+    text = text.replace(blockRe, `$1${next}$2`);
+    await writeFile(CARGO_LOCK, text, 'utf8');
+    return rel(CARGO_LOCK);
+  }
+  return null;
 }
 
 async function writeLockfileVersion(currentVersion, next) {
@@ -347,24 +414,28 @@ async function writeManifestVersions(path, currentVersion, next) {
 }
 
 async function main() {
-  const manifestPaths = await listManifestPaths();
-  const [versionsSource, rootPkg, cliPkg, executorPkg, lockSource, ...manifestFiles] =
-    await Promise.all([
-      readFile(VERSIONS_TS, 'utf8'),
-      readJson(ROOT_PKG),
-      readJson(CLI_PKG),
-      readJson(EXECUTOR_PKG),
-      readFile(PNPM_LOCK, 'utf8'),
-      ...manifestPaths.map(async (path) => ({ path, data: await readJson(path) })),
-    ]);
+  const [manifestPaths, packagePaths] = await Promise.all([
+    listManifestPaths(),
+    listAllPackageJsonPaths(),
+  ]);
+
+  const [versionsSource, lockSource, cargoSource, ...allFiles] = await Promise.all([
+    readFile(VERSIONS_TS, 'utf8'),
+    readFile(PNPM_LOCK, 'utf8'),
+    existsSync(CARGO_TOML) ? readFile(CARGO_TOML, 'utf8') : Promise.resolve(null),
+    ...packagePaths.map(async (path) => ({ type: 'pkg', path, data: await readJson(path) })),
+    ...manifestPaths.map(async (path) => ({ type: 'manifest', path, data: await readJson(path) })),
+  ]);
+
+  const packageFiles = allFiles.filter((f) => f.type === 'pkg');
+  const manifestFiles = allFiles.filter((f) => f.type === 'manifest');
 
   const current = readCurrentVersions(
     versionsSource,
-    rootPkg,
-    cliPkg,
-    executorPkg,
+    packageFiles,
     lockSource,
     manifestFiles,
+    cargoSource,
   );
   const currentVersion = assertConsistent(current);
   const changelogSource = await readFile(CHANGELOG, 'utf8');
@@ -387,10 +458,19 @@ async function main() {
 
   const changed = [];
   changed.push(await writeVersionsTs(next));
-  changed.push(await writePackageVersion(ROOT_PKG, currentVersion, next));
-  changed.push(await writePackageVersion(CLI_PKG, currentVersion, next, { optionalDep: true }));
+  for (const pkg of packageFiles) {
+    changed.push(
+      await writePackageVersion(pkg.path, currentVersion, next, {
+        optionalDep: pkg.path === CLI_PKG,
+      }),
+    );
+  }
   changed.push(await writeLockfileVersion(currentVersion, next));
-  changed.push(await writePackageVersion(EXECUTOR_PKG, currentVersion, next));
+  if (cargoSource) {
+    changed.push(await writeCargoTomlVersion(currentVersion, next));
+    const lockChanged = await writeCargoLockVersion(currentVersion, next);
+    if (lockChanged) changed.push(lockChanged);
+  }
   for (const path of manifestPaths) {
     changed.push(await writeManifestVersions(path, currentVersion, next));
   }
@@ -405,6 +485,10 @@ async function main() {
       console.log(`  - ${file} (version, workspace optionalDependencies["${OPTIONAL_DEP}"])`);
     } else if (file === rel(PNPM_LOCK)) {
       console.log(`  - ${file} (workspace optionalDependency specifier)`);
+    } else if (file === rel(CARGO_TOML)) {
+      console.log(`  - ${file} (version)`);
+    } else if (file === rel(CARGO_LOCK)) {
+      console.log(`  - ${file} (rbo-windows-executor version)`);
     } else if (file.startsWith('packaging/')) {
       console.log(`  - ${file} (package_version, components)`);
     } else if (file === rel(CHANGELOG)) {

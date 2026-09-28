@@ -108,6 +108,20 @@ describe('agent.json file load + precedence', () => {
     expect(second.initialized_at).toBe(first.initialized_at);
   });
 
+  it('writeDefaultAgentConfigFile populates discovery fields when provided', () => {
+    const stateDir = tempDir();
+    const result = writeDefaultAgentConfigFile(stateDir, {
+      discovery: {
+        controllerUrl: 'wss://192.168.1.50:7411/agent',
+        controllerFingerprint: `sha256:${'f'.repeat(64)}`,
+      },
+    });
+    expect(result.written).toBe(true);
+    const config = loadAgentConfig({ stateDir });
+    expect(config.controllerUrl).toBe('wss://192.168.1.50:7411/agent');
+    expect(config.controllerFingerprint).toBe(`sha256:${'f'.repeat(64)}`);
+  });
+
   it('loads controller_url / fingerprint from agent.json when env is unset', () => {
     setEnv('RBO_CONTROLLER_URL', undefined);
     setEnv('RBO_CONTROLLER_FINGERPRINT', undefined);

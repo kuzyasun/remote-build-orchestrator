@@ -98,7 +98,7 @@ describe('Agent pairing over TLS WebSocket', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('a revoked agent cannot authenticate again', async () => {
+  it('a revoked agent drops its credential and requests pairing again', async () => {
     const dir = newAgentDir();
     const conn = agentConnection(dir);
     await conn.connectOnce(); // pairing request
@@ -114,7 +114,8 @@ describe('Agent pairing over TLS WebSocket', () => {
 
     const conn2 = agentConnection(dir);
     const denied = await conn2.connectOnce();
-    expect(denied.status).toBe('rejected');
+    expect(denied.status).toBe('pairing_pending');
+    expect(conn2.hasStoredCredential()).toBe(false);
     conn2.close();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -155,6 +156,45 @@ describe('Agent pairing over TLS WebSocket', () => {
     expect(persisted.agentId).toBe(a.agentId);
     expect(persisted.devicePrivateKeyPem).toMatch(/BEGIN PRIVATE KEY/);
 
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps the new session when the agent reconnects and the old socket closes', async () => {
+    const dir = newAgentDir();
+    const first = agentConnection(dir);
+    await first.connectOnce();
+    const request = latestPendingRequest();
+    if (!request) throw new Error('missing request');
+    const { agentId } = approvePairingRequest(db, identity, request.id);
+    const session = await first.connectOnce();
+    expect(session.status).toBe('authenticated');
+
+    const previousSocket = plane.connectedAgents.get(agentId)?.socket;
+    expect(previousSocket?.readyState).toBe(WebSocket.OPEN);
+
+    const second = agentConnection(dir);
+    const again = await second.connectOnce();
+    expect(again.status).toBe('authenticated');
+    expect(again.agentId).toBe(agentId);
+
+    const current = plane.connectedAgents.get(agentId);
+    expect(current?.socket).toBeDefined();
+    expect(current?.socket).not.toBe(previousSocket);
+    expect(current?.socket.readyState).toBe(WebSocket.OPEN);
+
+    await new Promise<void>((resolvePromise) => {
+      if (!previousSocket || previousSocket.readyState === WebSocket.CLOSED) {
+        resolvePromise();
+        return;
+      }
+      previousSocket.once('close', () => resolvePromise());
+      first.close();
+    });
+
+    expect(plane.connectedAgents.get(agentId)?.socket).toBe(current?.socket);
+    expect(listAgents(db, false).map((agent) => agent.id)).toContain(agentId);
+
+    second.close();
     rmSync(dir, { recursive: true, force: true });
   });
 

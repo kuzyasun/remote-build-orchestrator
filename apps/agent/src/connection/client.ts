@@ -86,6 +86,8 @@ interface StoredState {
 export class AgentConnection {
   private readonly options: AgentConnectionOptions;
   private socket: WebSocket | null = null;
+  /** URL the current socket was opened with. */
+  private connectedUrl: string | null = null;
   private executor: AgentJobExecutor | null = null;
   private recovery: AgentRecoveryCoordinator;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -138,19 +140,53 @@ export class AgentConnection {
     return typeof state.credential === 'string' && state.credential.length > 0;
   }
 
+  /** Point later connects at a newly discovered controller address. */
+  setControllerUrl(controllerUrl: string): void {
+    this.options.controllerUrl = controllerUrl;
+  }
+
+  /**
+   * Drop a socket still bound to a previous controller address, including one
+   * that has not finished dialing. `connectOnce` rejects if the handshake is
+   * not done, so the reconnect loop uses the updated URL.
+   */
+  dropIfOpenToOtherUrl(controllerUrl: string): void {
+    const socket = this.socket;
+    if (!socket) {
+      return;
+    }
+    if (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING) {
+      return;
+    }
+    if (this.connectedUrl === controllerUrl) {
+      return;
+    }
+    if (socket.readyState === WebSocket.CONNECTING) {
+      socket.terminate();
+    }
+    this.close({ killProcess: false });
+  }
+
   connectOnce(): Promise<ConnectResult> {
     const state = this.loadState();
+    const controllerUrl = this.options.controllerUrl;
+    this.connectedUrl = controllerUrl;
 
     return new Promise<ConnectResult>((resolvePromise, rejectPromise) => {
-      const socket = new WebSocket(this.options.controllerUrl, {
+      const socket = new WebSocket(controllerUrl, {
         rejectUnauthorized: false,
       });
       this.socket = socket;
 
+      let settled = false;
       const finish = (result: ConnectResult) => {
+        if (settled) return;
+        settled = true;
         resolvePromise(result);
       };
       const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
         this.stopHeartbeats();
         socket.terminate();
         rejectPromise(error);
@@ -276,6 +312,23 @@ export class AgentConnection {
             return;
           }
 
+          // A credential from another controller (or a revoked one) is rejected
+          // and would otherwise retry forever without ever creating a pairing request.
+          if (state.credential) {
+            state.credential = undefined;
+            state.agentId = undefined;
+            this.saveState({
+              devicePublicKeyPem: state.devicePublicKeyPem,
+              devicePrivateKeyPem: state.devicePrivateKeyPem,
+            });
+            this.send(socket, 'pairing_request', {
+              device_public_key: state.devicePublicKeyPem,
+              display_name: this.options.displayName,
+              hostname: hostname(),
+            });
+            return;
+          }
+
           finish({ status: 'rejected' });
         }
 
@@ -390,6 +443,10 @@ export class AgentConnection {
         // Park attempt through grace — do not kill safe/normal jobs.
         void this.executor?.abandonOnDisconnect();
         // Keep executor alive across reconnect so the process and spool sender remain.
+        if (!settled) {
+          settled = true;
+          rejectPromise(new Error('connection closed before authentication'));
+        }
       });
 
       socket.on('error', (error) => {
@@ -554,6 +611,7 @@ export class AgentConnection {
       this.socket.close();
       this.socket = null;
     }
+    this.connectedUrl = null;
     logger.debug('connection closed', { killProcess: kill });
   }
 }
