@@ -9,6 +9,55 @@ export interface StdioProxyOptions {
 
 export const STDIO_JOB_RUN_HEARTBEAT_MS = 5_000;
 
+/** Extract Node/undici's system cause for operator-facing errors. */
+function describeFetchFailure(error: unknown): string {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  let detail = 'fetch failed (no underlying cause available)';
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current !== 'object' || current === null || seen.has(current)) {
+      continue;
+    }
+    seen.add(current);
+    const entry = current as Record<string, unknown>;
+    if (typeof entry.code === 'string') {
+      const address = typeof entry.address === 'string' ? entry.address : undefined;
+      const port = typeof entry.port === 'number' ? entry.port : undefined;
+      const host =
+        address === undefined ? undefined : port === undefined ? address : `${address}:${port}`;
+      detail = [entry.syscall, entry.code, host]
+        .filter((part): part is string => typeof part === 'string' && part.length > 0)
+        .join(' ');
+    } else if (entry.name === 'AbortError') {
+      detail = 'request aborted';
+    } else if (typeof entry.message === 'string' && entry.message !== 'fetch failed') {
+      detail = entry.message;
+    }
+    if ('cause' in entry) pending.push(entry.cause);
+    if (Array.isArray(entry.errors)) pending.push(...entry.errors);
+  }
+
+  return detail;
+}
+
+function controllerOrigin(controllerUrl: string): string {
+  try {
+    return new URL(controllerUrl).origin;
+  } catch {
+    return 'configured Controller URL';
+  }
+}
+
+function controllerFetchError(controllerUrl: string, toolName: string, error: unknown): string {
+  const cause = describeFetchFailure(error);
+  const hint = cause.includes('ECONNREFUSED')
+    ? 'Controller is not listening at this address. Start it with `rbo controller start --daemon`.'
+    : '';
+  return `RBO Controller ${controllerOrigin(controllerUrl)} ${toolName}: no HTTP response (${cause}).${hint ? ` ${hint}` : ''}`;
+}
+
 /** Keep MCP clients with resetTimeoutOnProgress alive during long internal job_run fetches. */
 export function startProgressHeartbeat(input: {
   progressToken: string | number | undefined;
@@ -70,19 +119,43 @@ export function createStdioProxyServer(options: StdioProxyOptions): McpServer {
             : { stop: () => undefined };
 
         try {
-          const response = await fetch(`${baseUrl}/internal/v1/tools/${def.name}`, {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              'x-rbo-client-id': options.clientId,
-              'x-rbo-client-transport': 'stdio',
-            },
-            body: JSON.stringify(args ?? {}),
-            signal: extra.signal,
-          });
+          let response: Response;
+          try {
+            response = await fetch(`${baseUrl}/internal/v1/tools/${def.name}`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-rbo-client-id': options.clientId,
+                'x-rbo-client-transport': 'stdio',
+              },
+              body: JSON.stringify(args ?? {}),
+              signal: extra.signal,
+            });
+          } catch (error) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: controllerFetchError(baseUrl, def.name, error),
+                },
+              ],
+              isError: true,
+            };
+          }
+
           const text = await response.text();
           return {
-            content: [{ type: 'text' as const, text }],
+            content: [
+              { type: 'text' as const, text },
+              ...(!response.ok
+                ? [
+                    {
+                      type: 'text' as const,
+                      text: `RBO Controller returned HTTP ${response.status}`,
+                    },
+                  ]
+                : []),
+            ],
             isError: !response.ok,
           };
         } finally {
