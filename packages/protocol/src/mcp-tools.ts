@@ -65,7 +65,11 @@ export const AGENT_PROBE_INPUT = {
  */
 export const JOB_RUN_INPUT = {
   command: z.string().min(1).optional(),
-  project_root: z.string().min(1).optional(),
+  project_root: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('Absolute path to the project on the Controller machine.'),
   job_id: z.string().min(1).optional(),
   shell: ShellIdSchema.optional(),
   target_os: z
@@ -73,7 +77,12 @@ export const JOB_RUN_INPUT = {
     .min(1)
     .optional(),
   queue_policy: JobRequestSchema.shape.queue_policy,
-  cwd: z.string().default('.'),
+  cwd: z
+    .string()
+    .default('.')
+    .describe(
+      "Directory inside project_root, relative to its root. Omit or use '.' for the root; never pass an absolute path or '..'.",
+    ),
   timeout_seconds: z.number().positive().max(3600).default(3600),
   wait_seconds: z.number().int().min(0).max(3600).optional(),
   /** Max seconds this MCP response blocks; default keeps typical 60s clients safe. */
@@ -125,7 +134,7 @@ export const MCP_TOOL_DEFS: readonly McpToolDef[] = [
   {
     name: 'job_run',
     description:
-      'Run a command remotely (snapshot + execute). Waits up to mcp_wait_slice_seconds (default 50). If still running, returns resume:true — call again with the same job_id. Preferred for interactive AI clients.',
+      "Run a command remotely (snapshot + execute). Set project_root to the absolute local project path and cwd to a relative path inside it (omit cwd or use '.' for the root). Waits up to mcp_wait_slice_seconds (default 50). If still running, returns resume:true — call again with the same job_id. Preferred for interactive AI clients.",
     inputShape: JOB_RUN_INPUT,
   },
   {

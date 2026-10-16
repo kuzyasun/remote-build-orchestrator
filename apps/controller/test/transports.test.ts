@@ -92,6 +92,42 @@ describe('MCP transports', () => {
     await client.close();
   });
 
+  it('returns a useful validation error without creating a job for absolute job_run cwd', async () => {
+    const jobsBefore = (db.prepare('SELECT COUNT(*) AS count FROM jobs').get() as { count: number })
+      .count;
+    const request = {
+      command: 'echo hello',
+      project_root: 'C:/projects/app',
+      cwd: 'C:/projects/app',
+      shell: 'bash',
+      target_os: ['macos'],
+    };
+    const response = await fetch(`http://127.0.0.1:${running.port}/internal/v1/tools/job_run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: {
+        category: 'validation',
+        retryable: false,
+        message: expect.stringContaining('source.cwd: cwd must be a relative path'),
+        details: { issues: [{ path: 'source.cwd' }] },
+      },
+    });
+
+    const stdioClient = await connectStdioStyleClient();
+    const viaStdio = await stdioClient.callTool({ name: 'job_run', arguments: request });
+    expect(viaStdio.isError).toBe(true);
+    expect(textOf(viaStdio)).toContain('source.cwd: cwd must be a relative path');
+    await stdioClient.close();
+
+    const jobsAfter = (db.prepare('SELECT COUNT(*) AS count FROM jobs').get() as { count: number })
+      .count;
+    expect(jobsAfter).toBe(jobsBefore);
+  });
+
   it('the same request over stdio and HTTP gives a schema-equivalent result', async () => {
     const httpClient = await connectHttpClient();
     const stdioClient = await connectStdioStyleClient();

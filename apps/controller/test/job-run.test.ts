@@ -275,6 +275,29 @@ describe('buildJobRunRequest', () => {
   it('rejects build without command/project_root', () => {
     expect(() => buildJobRunRequest({ command: 'echo hi' }, 'linux')).toThrow(/project_root/);
   });
+
+  it.each(['C:\\projects\\app', '../outside'])(
+    'reports invalid cwd %s as a validation error',
+    (cwd) => {
+      expect(() =>
+        buildJobRunRequest({ command: 'echo hi', project_root: 'C:/projects/app', cwd }, 'win32'),
+      ).toThrowError(
+        expect.objectContaining({
+          category: 'validation',
+          retryable: false,
+          message: expect.stringContaining('source.cwd: cwd must be a relative path'),
+          details: {
+            issues: [
+              {
+                path: 'source.cwd',
+                message: expect.stringContaining('relative path'),
+              },
+            ],
+          },
+        }),
+      );
+    },
+  );
 });
 
 describe('JOB_RUN_INPUT validation', () => {

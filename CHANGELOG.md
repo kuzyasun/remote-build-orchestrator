@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-16
+
+### Changed
+
+- `job_run` tool metadata and consumer guidance clarify that `project_root` is absolute on the Controller and `cwd` is relative to it.
+
+### Fixed
+
+- The MCP stdio proxy explains Controller connection failures instead of returning only `fetch failed`.
+- `job_run` reports an invalid `source.cwd` as a validation error with the field and reason instead of an internal error.
+
 ## [0.9.1] - 2026-09-28
 
 ### Changed
@@ -127,7 +138,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.2
 [0.9.1]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.0
 [0.8.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.8.0

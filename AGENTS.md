@@ -38,7 +38,11 @@ preferred for AI clients, paste-ready AGENTS.md guidance including shell vs agen
 names in clients are typically `rbo` or `user-rbo`. AI agents use pull-based `job_logs`; live follow
 is CLI `rbo run --follow` or `rbo logs --follow` for human operators. Consumer note: `agents_list`
 reports which workers are online and their OS. It does not list compilers or SDKs. Pass `job_run`
-`shell` and `target_os` for that OS (`bash` or `zsh` on macOS and Linux, `powershell` on Windows).
+`project_root` as an absolute path on the Controller machine; omit `cwd` or use `.` for the project
+root, and use a relative path inside the project for a subdirectory. Never repeat the absolute
+project path in `cwd` or use `..`. A `source.cwd` validation error means no job was created; fix
+the request before retrying. Set `job_run` `shell` and `target_os` for the worker OS (`bash` or
+`zsh` on macOS and Linux, `powershell` on Windows).
 An omitted `target_os` is pinned to the Controller OS — do not submit PowerShell jobs when only a
 Mac/Linux agent is online. Start the job script with the toolchain activation command for that OS,
 written in the consumer project's `AGENTS.md`. If the build fails because a tool is missing, stop

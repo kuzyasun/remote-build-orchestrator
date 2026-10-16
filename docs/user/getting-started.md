@@ -238,10 +238,22 @@ For a full request with required artifacts, use `rbo submit job.json`. See the
 Add this rule to your project's `AGENTS.md`. Before you commit it, replace the two activation
 commands with the ones this repository actually uses.
 
+For MCP `job_run`, set `project_root` to the absolute project path on the Controller machine.
+Omit `cwd` (its default is `.`) when the command runs at the project root. For a subdirectory,
+set `cwd` to a path relative to `project_root`, such as `firmware/app`. Never copy the absolute
+`project_root` into `cwd` or use `..` to escape it. The worker OS determines the shell and
+toolchain activation, but does not change how these two source paths are specified.
+
 ```markdown
 ## Remote builds
 
 Use RBO MCP tools for builds and tests.
+
+For a fresh `job_run`, set `project_root` to the absolute path of this project
+on the Controller machine. Omit `cwd` or set it to `.` to run at the project
+root. To run in a subdirectory, use a relative `cwd` such as `firmware/app`.
+Never put the absolute project path or `..` in `cwd`. A validation error for
+`source.cwd` means the job was not created; correct the request before retrying.
 
 `agents_list` shows which workers are online and their OS. It does not list
 compilers or SDKs. Set `target_os` from that worker. Set `shell` to `bash` or

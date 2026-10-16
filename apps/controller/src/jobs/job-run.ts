@@ -226,7 +226,7 @@ export function buildJobRunRequest(
     );
   }
   const timeoutSeconds = input.timeout_seconds ?? 3600;
-  return JobRequestSchema.parse({
+  const parsed = JobRequestSchema.safeParse({
     client_request_id: input.client_request_id ?? generateId('req'),
     name: input.name ?? deriveJobName(input.command),
     source: {
@@ -244,6 +244,15 @@ export function buildJobRunRequest(
     risk_level: input.risk_level ?? 'normal',
     artifacts: input.artifacts ?? [],
   });
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((issue) => ({
+      path: issue.path.join('.'),
+      message: issue.message,
+    }));
+    const summary = issues.map((issue) => `${issue.path}: ${issue.message}`).join('; ');
+    throw RboError.validation(`Invalid job_run request: ${summary}`, { issues });
+  }
+  return parsed.data;
 }
 
 function summarizeJob(job: JobRow | null | undefined): Record<string, unknown> {
