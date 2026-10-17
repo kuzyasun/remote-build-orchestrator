@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -385,85 +385,92 @@ describe('Local job execution', () => {
 
   it('isolates artifact materialization to allowed destinations', async () => {
     const client = await connectClient('client-artifact');
-    const request = { ...baseJobRequest(fixtureDir), client_request_id: `art-${Date.now()}` };
-    const submit = JSON.parse(
-      textOf(await client.callTool({ name: 'job_submit', arguments: request })),
-    );
-    await client.callTool({
-      name: 'job_wait',
-      arguments: { job_id: submit.job_id, wait_seconds: 60 },
-    });
-    const artifacts = JSON.parse(
-      textOf(
-        await client.callTool({ name: 'job_artifacts', arguments: { job_id: submit.job_id } }),
-      ),
-    );
-    const artifactId = artifacts.artifacts[0]?.id;
-    expect(artifactId).toBeTruthy();
-
-    const outsideRoot = await mkdtemp(join(tmpdir(), 'rbo-outside-artifact-'));
     try {
-      const outside = JSON.parse(
+      const request = { ...baseJobRequest(fixtureDir), client_request_id: `art-${Date.now()}` };
+      const submit = JSON.parse(
+        textOf(await client.callTool({ name: 'job_submit', arguments: request })),
+      );
+      await client.callTool({
+        name: 'job_wait',
+        arguments: { job_id: submit.job_id, wait_seconds: 60 },
+      });
+      const artifacts = JSON.parse(
+        textOf(
+          await client.callTool({ name: 'job_artifacts', arguments: { job_id: submit.job_id } }),
+        ),
+      );
+      const artifactId = artifacts.artifacts[0]?.id;
+      expect(artifactId).toBeTruthy();
+
+      const outsideRoot = await mkdtemp(join(tmpdir(), 'rbo-outside-artifact-'));
+      try {
+        const [resolvedOutsideRoot, resolvedArtifactDestRoot] = await Promise.all([
+          realpath(outsideRoot),
+          realpath(artifactDestRoot),
+        ]);
+        const outside = JSON.parse(
+          textOf(
+            await client.callTool({
+              name: 'artifact_materialize',
+              arguments: {
+                artifact_id: artifactId,
+                destination_path: join(outsideRoot, 'leak.txt'),
+                overwrite: false,
+              },
+            }),
+          ),
+        );
+        expect(outside.error).toMatchObject({
+          category: 'materialization',
+          message: 'Destination path is outside allowed artifact destinations',
+          retryable: false,
+          details: {
+            resolved_parent: resolvedOutsideRoot,
+            allowed_destinations: [artifactDestRoot],
+            resolved_allowed_roots: [resolvedArtifactDestRoot],
+          },
+        });
+      } finally {
+        await rm(outsideRoot, { recursive: true, force: true });
+      }
+
+      const missingParent = join(artifactDestRoot, 'missing-parent');
+      const missing = JSON.parse(
         textOf(
           await client.callTool({
             name: 'artifact_materialize',
             arguments: {
               artifact_id: artifactId,
-              destination_path: join(outsideRoot, 'leak.txt'),
+              destination_path: join(missingParent, 'out.txt'),
               overwrite: false,
             },
           }),
         ),
       );
-      expect(outside.error).toMatchObject({
+      expect(missing.error).toMatchObject({
         category: 'materialization',
-        message: 'Destination path is outside allowed artifact destinations',
-        retryable: false,
-        details: {
-          resolved_parent: outsideRoot,
-          allowed_destinations: [artifactDestRoot],
-          resolved_allowed_roots: [artifactDestRoot],
-        },
+        message: expect.stringContaining('Destination parent directory does not exist'),
+        details: { destination_parent: missingParent },
       });
+
+      const destPath = join(artifactDestRoot, 'materialized-out.txt');
+      const ok = JSON.parse(
+        textOf(
+          await client.callTool({
+            name: 'artifact_materialize',
+            arguments: {
+              artifact_id: artifactId,
+              destination_path: destPath,
+              overwrite: false,
+            },
+          }),
+        ),
+      );
+      expect(ok.destination_path).toBe(destPath);
+      expect((await readFile(destPath, 'utf8')).trim()).toBe('artifact-data');
     } finally {
-      await rm(outsideRoot, { recursive: true, force: true });
+      await client.close();
     }
-
-    const missingParent = join(artifactDestRoot, 'missing-parent');
-    const missing = JSON.parse(
-      textOf(
-        await client.callTool({
-          name: 'artifact_materialize',
-          arguments: {
-            artifact_id: artifactId,
-            destination_path: join(missingParent, 'out.txt'),
-            overwrite: false,
-          },
-        }),
-      ),
-    );
-    expect(missing.error).toMatchObject({
-      category: 'materialization',
-      message: expect.stringContaining('Destination parent directory does not exist'),
-      details: { destination_parent: missingParent },
-    });
-
-    const destPath = join(artifactDestRoot, 'materialized-out.txt');
-    const ok = JSON.parse(
-      textOf(
-        await client.callTool({
-          name: 'artifact_materialize',
-          arguments: {
-            artifact_id: artifactId,
-            destination_path: destPath,
-            overwrite: false,
-          },
-        }),
-      ),
-    );
-    expect(ok.destination_path).toBe(destPath);
-    expect((await readFile(destPath, 'utf8')).trim()).toBe('artifact-data');
-    await client.close();
   }, 120_000);
 
   it('does not conflict across different client_ids with the same client_request_id', async () => {
