@@ -3,9 +3,9 @@ import { link, open, rm, stat, unlink } from 'node:fs/promises';
 import { cpus, freemem } from 'node:os';
 import { dirname } from 'node:path';
 import { join } from 'node:path';
-import { appendEvent, presentLogTail } from '@rbo/executor';
+import { appendEvent, globMatch, presentLogTail } from '@rbo/executor';
 import type { AgentCapabilityReport, JobRequest, QueuePolicy } from '@rbo/protocol';
-import { JobRequestSchema } from '@rbo/protocol';
+import { ArtifactCollectionSummarySchema, JobRequestSchema } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
 import {
   RboError,
@@ -56,6 +56,7 @@ import {
   createJob,
   createJobEvent,
   getJob,
+  getJobRequest,
   getLatestAttempt,
   isDestructiveRisk,
   isTerminalJobState,
@@ -1006,5 +1007,72 @@ export function handleJobArtifacts(db: ControllerDatabase, jobId: string): Recor
   const artifacts = listArtifactsForJob(db, jobId);
   const attempts = [...new Set(artifacts.map((a) => a.attempt_id))];
   const terminalAttempt = getLatestAttempt(db, jobId)?.id ?? null;
-  return { job_id: jobId, artifacts, attempts, terminal_attempt_id: terminalAttempt };
+  const request = getJobRequest(db, jobId);
+  const collectionJson = terminalAttempt
+    ? (
+        db
+          .prepare('SELECT artifact_collection_json FROM job_attempts WHERE id = ?')
+          .get(terminalAttempt) as { artifact_collection_json: string | null } | undefined
+      )?.artifact_collection_json
+    : null;
+  const collection = collectionJson
+    ? ArtifactCollectionSummarySchema.safeParse(JSON.parse(collectionJson))
+    : null;
+  const summary = collection?.success ? collection.data : null;
+  const artifactRuleResults = isTerminalJobState(job.state)
+    ? (request?.artifacts ?? []).map((rule, index) => {
+        const collected = summary?.rules[index];
+        const storedCount = artifacts.filter((artifact) => {
+          if (artifact.attempt_id !== terminalAttempt) return false;
+          const name = artifact.logical_name.replace(/\.tar\.zst$/, '');
+          return globMatch(rule.glob, artifact.logical_name) || globMatch(rule.glob, name);
+        }).length;
+        const status =
+          storedCount > 0
+            ? 'stored'
+            : !collected
+              ? 'unknown'
+              : collected.matched_count === 0
+                ? 'no_match'
+                : summary.limit_exceeded
+                  ? 'limit_exceeded'
+                  : collected.collected_count > 0
+                    ? 'not_stored'
+                    : collected.skipped_count > 0
+                      ? 'skipped'
+                      : 'not_stored';
+        return {
+          glob: rule.glob,
+          required: rule.required,
+          stored_count: storedCount,
+          status,
+          ...(collected
+            ? {
+                matched_count: collected.matched_count,
+                collected_count: collected.collected_count,
+                skipped_count: collected.skipped_count,
+                ...(collected.skip_reasons.length > 0
+                  ? { skip_reasons: collected.skip_reasons }
+                  : {}),
+              }
+            : {}),
+        };
+      })
+    : undefined;
+  return {
+    job_id: jobId,
+    artifacts,
+    attempts,
+    terminal_attempt_id: terminalAttempt,
+    ...(artifactRuleResults
+      ? {
+          ...(request?.source?.project_root
+            ? { artifact_search_base: request.source.project_root }
+            : {}),
+          collection_reported: Boolean(summary),
+          artifact_rule_results: artifactRuleResults,
+          ...(summary?.limit_exceeded ? { collection_limit_exceeded: summary.limit_exceeded } : {}),
+        }
+      : {}),
+  };
 }

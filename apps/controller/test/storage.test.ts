@@ -7,6 +7,7 @@ import {
   getSchemaVersion,
   migrateDown,
   migrateToLatest,
+  migrateUp,
   openDatabase,
 } from '../src/storage/database.js';
 import { MIGRATIONS } from '../src/storage/migrations.js';
@@ -60,6 +61,16 @@ describe('Controller persistence (Section 25)', () => {
     for (const table of REQUIRED_TABLES) {
       expect(tables).toContain(table);
     }
+    db.close();
+  });
+
+  it('adds artifact collection storage when upgrading an existing v5 Controller', () => {
+    const db = openDatabase(tempDbPath());
+    migrateUp(db, 5);
+    expect(getSchemaVersion(db)).toBe(5);
+    migrateToLatest(db);
+    const columns = db.pragma('table_info(job_attempts)') as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain('artifact_collection_json');
     db.close();
   });
 

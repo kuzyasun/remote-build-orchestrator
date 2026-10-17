@@ -385,11 +385,14 @@ export async function handleToolCall(
         return { artifact_id: args.artifact_id, ...result };
       } catch (error) {
         return {
-          error: {
-            category: 'materialization',
-            message: error instanceof Error ? error.message : String(error),
-            retryable: false,
-          },
+          error:
+            error instanceof RboError
+              ? error.toJSON()
+              : {
+                  category: 'materialization',
+                  message: error instanceof Error ? error.message : String(error),
+                  retryable: false,
+                },
         };
       }
 

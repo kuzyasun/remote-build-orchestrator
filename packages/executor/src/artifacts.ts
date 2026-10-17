@@ -1,6 +1,6 @@
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import type { ArtifactRule } from '@rbo/protocol';
+import type { ArtifactCollectionSummary, ArtifactRule } from '@rbo/protocol';
 import { sha256 } from '@rbo/shared';
 import { createZstdTarArchive } from '@rbo/snapshot';
 
@@ -95,8 +95,40 @@ export interface ArtifactCollectionResult {
   files: CollectedArtifactFile[];
   skipped: ArtifactSkipped[];
   limitExceeded?: ArtifactLimitExceeded;
+  summary: ArtifactCollectionSummary;
   /** Temp files created during collection (directory archives); cleaned on limit breach. */
   tempPaths: string[];
+}
+
+function summarizeCollection(
+  rules: ArtifactRule[],
+  matchedCounts: number[],
+  files: CollectedArtifactFile[],
+  skipped: ArtifactSkipped[],
+  limitExceeded?: ArtifactLimitExceeded,
+): ArtifactCollectionSummary {
+  return {
+    rules: rules.map((rule, index) => {
+      const matchingSkipped = skipped.filter(
+        (item) =>
+          !item.reason.startsWith('required artifact not found for glob:') &&
+          globMatch(rule.glob, item.path),
+      );
+      return {
+        matched_count: matchedCounts[index] ?? 0,
+        collected_count: files.filter((file) => {
+          const name = file.logical_name.replace(/\.tar\.zst$/, '');
+          return globMatch(rule.glob, file.logical_name) || globMatch(rule.glob, name);
+        }).length,
+        skipped_count: matchingSkipped.length,
+        skip_reasons: [...new Set(matchingSkipped.map((item) => item.reason.slice(0, 160)))].slice(
+          0,
+          3,
+        ),
+      };
+    }),
+    ...(limitExceeded ? { limit_exceeded: limitExceeded } : {}),
+  };
 }
 
 export async function collectArtifactFiles(input: {
@@ -115,14 +147,16 @@ export async function collectArtifactFiles(input: {
   await mkdir(tempDir, { recursive: true });
 
   const allEntries = await walkEntries(input.projectPath);
+  const matchedCounts = input.rules.map(() => 0);
   const matchedDirs = new Set<string>();
   const matchedFiles = new Set<string>();
 
-  for (const rule of input.rules) {
+  for (const [index, rule] of input.rules.entries()) {
     for (const entry of allEntries) {
       if (!globMatch(rule.glob, entry.path)) {
         continue;
       }
+      matchedCounts[index] = (matchedCounts[index] ?? 0) + 1;
       if (entry.isDirectory) {
         matchedDirs.add(entry.path);
       } else {
@@ -152,6 +186,11 @@ export async function collectArtifactFiles(input: {
       files: [],
       skipped: [],
       limitExceeded: { reason: 'file_count', limit: maxFiles, actual: selected.length },
+      summary: summarizeCollection(input.rules, matchedCounts, [], [], {
+        reason: 'file_count',
+        limit: maxFiles,
+        actual: selected.length,
+      }),
       tempPaths: [],
     };
   }
@@ -185,6 +224,11 @@ export async function collectArtifactFiles(input: {
           files: [],
           skipped,
           limitExceeded: { reason: 'total_bytes', limit: maxBytes, actual: projectedTotal },
+          summary: summarizeCollection(input.rules, matchedCounts, [], skipped, {
+            reason: 'total_bytes',
+            limit: maxBytes,
+            actual: projectedTotal,
+          }),
           tempPaths: [],
         };
       }
@@ -220,6 +264,11 @@ export async function collectArtifactFiles(input: {
         files: [],
         skipped,
         limitExceeded: { reason: 'total_bytes', limit: maxBytes, actual: projectedTotal },
+        summary: summarizeCollection(input.rules, matchedCounts, [], skipped, {
+          reason: 'total_bytes',
+          limit: maxBytes,
+          actual: projectedTotal,
+        }),
         tempPaths: [],
       };
     }
@@ -250,7 +299,12 @@ export async function collectArtifactFiles(input: {
     }
   }
 
-  return { files, skipped, tempPaths };
+  return {
+    files,
+    skipped,
+    tempPaths,
+    summary: summarizeCollection(input.rules, matchedCounts, files, skipped),
+  };
 }
 
 /** Move collected artifact into persistent artifacts dir (same-volume rename). */

@@ -142,7 +142,10 @@ describe('Local job execution', () => {
             target_os: [targetOs],
             client_request_id: `job-run-${Date.now()}`,
             timeout_seconds: 60,
-            artifacts: [{ glob: 'out.txt', required: true }],
+            artifacts: [
+              { glob: 'out.txt', required: true },
+              { glob: 'tests/embedded/build/missing.bin', required: true },
+            ],
             risk_level: 'safe',
           },
         }),
@@ -160,6 +163,42 @@ describe('Local job execution', () => {
     expect(result.resume).toBeUndefined();
     // Artifacts are only present when non-empty
     expect(result.artifacts?.length ?? 0).toBeGreaterThan(0);
+    expect(result.missing_required_artifacts).toEqual([
+      {
+        glob: 'tests/embedded/build/missing.bin',
+        status: 'no_match',
+        matched_count: 0,
+        collected_count: 0,
+      },
+    ]);
+    expect(result.artifact_search_base).toBe(fixtureDir);
+    const artifactListing = JSON.parse(
+      textOf(
+        await client.callTool({ name: 'job_artifacts', arguments: { job_id: result.job_id } }),
+      ),
+    );
+    expect(artifactListing.artifact_search_base).toBe(fixtureDir);
+    expect(artifactListing.collection_reported).toBe(true);
+    expect(artifactListing.artifact_rule_results).toEqual([
+      {
+        glob: 'out.txt',
+        required: true,
+        stored_count: 1,
+        status: 'stored',
+        matched_count: 1,
+        collected_count: 1,
+        skipped_count: 0,
+      },
+      {
+        glob: 'tests/embedded/build/missing.bin',
+        required: true,
+        stored_count: 0,
+        status: 'no_match',
+        matched_count: 0,
+        collected_count: 0,
+        skipped_count: 0,
+      },
+    ]);
     await client.close();
   }, 120_000);
 
@@ -275,6 +314,18 @@ describe('Local job execution', () => {
       ),
     );
     expect(artifacts.artifacts.length).toBeGreaterThan(0);
+    expect(artifacts.artifact_search_base).toBe(fixtureDir);
+    expect(artifacts.artifact_rule_results).toEqual([
+      {
+        glob: 'out.txt',
+        required: true,
+        stored_count: 1,
+        status: 'stored',
+        matched_count: 1,
+        collected_count: 1,
+        skipped_count: 0,
+      },
+    ]);
     await client.close();
   }, 120_000);
 
@@ -350,19 +401,52 @@ describe('Local job execution', () => {
     const artifactId = artifacts.artifacts[0]?.id;
     expect(artifactId).toBeTruthy();
 
-    const outside = JSON.parse(
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'rbo-outside-artifact-'));
+    try {
+      const outside = JSON.parse(
+        textOf(
+          await client.callTool({
+            name: 'artifact_materialize',
+            arguments: {
+              artifact_id: artifactId,
+              destination_path: join(outsideRoot, 'leak.txt'),
+              overwrite: false,
+            },
+          }),
+        ),
+      );
+      expect(outside.error).toMatchObject({
+        category: 'materialization',
+        message: 'Destination path is outside allowed artifact destinations',
+        retryable: false,
+        details: {
+          resolved_parent: outsideRoot,
+          allowed_destinations: [artifactDestRoot],
+          resolved_allowed_roots: [artifactDestRoot],
+        },
+      });
+    } finally {
+      await rm(outsideRoot, { recursive: true, force: true });
+    }
+
+    const missingParent = join(artifactDestRoot, 'missing-parent');
+    const missing = JSON.parse(
       textOf(
         await client.callTool({
           name: 'artifact_materialize',
           arguments: {
             artifact_id: artifactId,
-            destination_path: join(tmpdir(), 'outside-rbo', 'leak.txt'),
+            destination_path: join(missingParent, 'out.txt'),
             overwrite: false,
           },
         }),
       ),
     );
-    expect(outside.error).toBeTruthy();
+    expect(missing.error).toMatchObject({
+      category: 'materialization',
+      message: expect.stringContaining('Destination parent directory does not exist'),
+      details: { destination_parent: missingParent },
+    });
 
     const destPath = join(artifactDestRoot, 'materialized-out.txt');
     const ok = JSON.parse(

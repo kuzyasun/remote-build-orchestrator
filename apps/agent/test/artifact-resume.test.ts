@@ -86,6 +86,9 @@ describe('Artifact upload resume (completed_awaiting_upload)', () => {
           sha256,
         },
       ],
+      artifact_collection: {
+        rules: [{ matched_count: 1, collected_count: 1, skipped_count: 0, skip_reasons: [] }],
+      },
     };
     writeAttemptMetadata(stateDir, meta);
 
@@ -161,8 +164,57 @@ describe('Artifact upload resume (completed_awaiting_upload)', () => {
     expect(manifestFrame?.payload).toMatchObject({
       attempt_id: 'att_1',
       artifacts: [{ logical_name: 'out.txt', sha256, size_bytes: content.length }],
+      collection: { rules: [{ matched_count: 1, collected_count: 1 }] },
     });
     expect(uploadSpy).toHaveBeenCalled();
+  });
+
+  it('re-sends a no-match collection summary even when no artifact was staged', async () => {
+    const socket = mockSocket();
+    const executor = new AgentJobExecutor(socket, {
+      stateDir,
+      controllerFingerprint: 'sha256:test',
+      gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+      repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
+    });
+    const originalSend = socket.send.bind(socket);
+    socket.send = (raw: string) => {
+      originalSend(raw);
+      const frame = JSON.parse(raw) as { type: string };
+      if (frame.type === 'artifact_manifest') {
+        queueMicrotask(() => {
+          executor.handleArtifactUploadGrant({
+            attempt_id: 'att_empty',
+            lease_id: 'lease_empty',
+            lease_epoch: 1,
+            artifacts: [],
+          });
+        });
+      }
+    };
+    const meta: AttemptMetadata = {
+      attempt_id: 'att_empty',
+      job_id: 'job_empty',
+      lease_id: 'lease_empty',
+      lease_epoch: 1,
+      process_identity: 'pid:42',
+      status: 'completed_awaiting_upload',
+      workspace_path: null,
+      spool_dir: join(stateDir, 'logs', 'att_empty'),
+      risk_level: 'normal',
+      updated_at: new Date().toISOString(),
+      artifact_manifest: [],
+      artifact_collection: {
+        rules: [{ matched_count: 0, collected_count: 0, skipped_count: 0, skip_reasons: [] }],
+      },
+    };
+    await executor.resumeArtifactUpload(meta);
+    const frame = socket.sent.find((entry) => entry.type === 'artifact_manifest');
+    expect(frame?.payload).toMatchObject({
+      artifacts: [],
+      collection: { rules: [{ matched_count: 0, collected_count: 0 }] },
+    });
+    expect(collectSpy).not.toHaveBeenCalled();
   });
 
   it('ignores an artifact_upload_grant with a stale/mismatched lease_epoch, then accepts the correct one', async () => {

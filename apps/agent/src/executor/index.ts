@@ -19,6 +19,7 @@ import {
   writeJobScript,
 } from '@rbo/executor';
 import type {
+  ArtifactCollectionSummary,
   ArtifactManifestPayload,
   ArtifactUploadGrantPayload,
   BuildCacheKind,
@@ -516,7 +517,7 @@ export class AgentJobExecutor {
    */
   public async resumeArtifactUpload(meta: AttemptMetadata): Promise<void> {
     const items = meta.artifact_manifest;
-    if (!items || items.length === 0) {
+    if (!items) {
       return;
     }
     const verified: AttemptArtifactManifestItem[] = [];
@@ -538,7 +539,7 @@ export class AgentJobExecutor {
         });
       }
     }
-    if (verified.length === 0) {
+    if (verified.length === 0 && items.length > 0) {
       return;
     }
 
@@ -564,6 +565,7 @@ export class AgentJobExecutor {
         size_bytes: f.size_bytes,
         sha256: f.sha256,
       })),
+      meta.artifact_collection,
     );
 
     for (const art of uploadGrant.artifacts) {
@@ -596,6 +598,7 @@ export class AgentJobExecutor {
       failure_message?: string;
     },
     artifactManifest?: AttemptArtifactManifestItem[],
+    artifactCollection?: ArtifactCollectionSummary,
   ): void {
     const existing = readAttemptMetadata(this.config.stateDir, run.attempt_id);
     writeAttemptMetadata(this.config.stateDir, {
@@ -625,6 +628,11 @@ export class AgentJobExecutor {
         ? { artifact_manifest: artifactManifest }
         : existing?.artifact_manifest
           ? { artifact_manifest: existing.artifact_manifest }
+          : {}),
+      ...(artifactCollection
+        ? { artifact_collection: artifactCollection }
+        : existing?.artifact_collection
+          ? { artifact_collection: existing.artifact_collection }
           : {}),
     });
   }
@@ -1651,6 +1659,7 @@ export class AgentJobExecutor {
           ...exitExtras,
         },
         stagedManifest,
+        collection.summary,
       );
 
       const artifactItems = stagedManifest.map((f) => ({
@@ -1665,6 +1674,7 @@ export class AgentJobExecutor {
         run.lease_id,
         run.lease_epoch,
         artifactItems,
+        collection.summary,
       );
 
       for (const art of uploadGrant.artifacts) {
@@ -1867,6 +1877,7 @@ export class AgentJobExecutor {
       size_bytes: number;
       sha256: string;
     }>,
+    collection?: ArtifactCollectionSummary,
   ): Promise<ArtifactUploadGrantPayload> {
     return new Promise((resolve, reject) => {
       const attempt = this.attempts.get(attemptId);
@@ -1891,6 +1902,7 @@ export class AgentJobExecutor {
         lease_id: leaseId,
         lease_epoch: leaseEpoch,
         artifacts,
+        ...(collection ? { collection } : {}),
       };
       this.sendFrame(
         'artifact_manifest',

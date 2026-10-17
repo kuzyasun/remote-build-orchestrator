@@ -20,6 +20,14 @@ describe('collectArtifactFiles (§22.1)', () => {
         expect.objectContaining({ path: 'link.txt', reason: expect.stringContaining('symlink') }),
       ]);
       expect(result.limitExceeded).toBeUndefined();
+      expect(result.summary.rules).toEqual([
+        {
+          matched_count: 3,
+          collected_count: 2,
+          skipped_count: 1,
+          skip_reasons: ['symlink artifacts are not collected'],
+        },
+      ]);
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }
@@ -58,6 +66,10 @@ describe('collectArtifactFiles (§22.1)', () => {
       expect(result.limitExceeded).toMatchObject({
         reason: 'file_count',
         limit: 1,
+      });
+      expect(result.summary).toMatchObject({
+        rules: [{ matched_count: 2, collected_count: 0 }],
+        limit_exceeded: { reason: 'file_count', limit: 1, actual: 2 },
       });
     } finally {
       await rm(workspace, { recursive: true, force: true });
@@ -98,6 +110,10 @@ describe('collectArtifactFiles (§22.1)', () => {
           path: 'missing.bin',
           reason: expect.stringContaining('required artifact'),
         }),
+      ]);
+      expect(result.summary.rules).toEqual([
+        { matched_count: 1, collected_count: 1, skipped_count: 0, skip_reasons: [] },
+        { matched_count: 0, collected_count: 0, skipped_count: 0, skip_reasons: [] },
       ]);
     } finally {
       await rm(workspace, { recursive: true, force: true });

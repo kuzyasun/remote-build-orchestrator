@@ -7,6 +7,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-17
+
+### Changed
+
+- `job_artifacts` reports artifact collection status and per-rule match counts relative to `project_root`, including skipped files and reasons. `job_run` highlights missing required artifacts.
+- Agent collection summaries survive reconnects, so the Controller can explain missing artifacts after a completed remote build.
+
+### Fixed
+
+- `artifact_materialize` errors identify the normalized destination and configured allowed roots, and distinguish a missing parent directory from an allowlist rejection.
+- The test script caps Vitest workers to keep the full verification suite stable on Windows.
+
 ## [0.9.2] - 2026-10-16
 
 ### Changed
@@ -138,7 +150,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.3
 [0.9.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.2
 [0.9.1]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.0

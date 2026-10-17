@@ -443,6 +443,9 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       rules: request.artifacts ?? [],
       tempDir: join(artifactsDir, '.collect-tmp'),
     });
+    ctx.db
+      .prepare('UPDATE job_attempts SET artifact_collection_json = ? WHERE id = ?')
+      .run(JSON.stringify(collection.summary), attempt.id);
     for (const skip of collection.skipped) {
       await emitJobEvent(ctx, logs, {
         type: 'artifact_skipped',

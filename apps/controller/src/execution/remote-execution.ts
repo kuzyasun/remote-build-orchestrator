@@ -1220,6 +1220,21 @@ export function handleRemoteArtifactManifest(
     return;
   }
 
+  const rules = getJobRequest(opts.db, attempt.job_id)?.artifacts ?? [];
+  if (payload.collection) {
+    if (payload.collection.rules.length === rules.length) {
+      opts.db
+        .prepare('UPDATE job_attempts SET artifact_collection_json = ? WHERE id = ?')
+        .run(JSON.stringify(payload.collection), attempt.id);
+    } else {
+      logger.warn('discarding artifact collection summary with mismatched rule count', {
+        attemptId: attempt.id,
+        expected: rules.length,
+        actual: payload.collection.rules.length,
+      });
+    }
+  }
+
   // Register full manifest expectations, then grant tokens only for missing objects.
   registerArtifactExpectations(attempt.id, payload.artifacts);
 

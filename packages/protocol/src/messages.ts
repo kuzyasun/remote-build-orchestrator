@@ -226,6 +226,24 @@ export const JobExitPayloadSchema = z.object({
 });
 
 /** Agent → Controller: declared artifacts before upload (§20.3). */
+export const ArtifactCollectionSummarySchema = z.object({
+  rules: z.array(
+    z.object({
+      matched_count: z.number().int().nonnegative(),
+      collected_count: z.number().int().nonnegative(),
+      skipped_count: z.number().int().nonnegative(),
+      skip_reasons: z.array(z.string().min(1).max(160)).max(3),
+    }),
+  ),
+  limit_exceeded: z
+    .object({
+      reason: z.enum(['file_count', 'total_bytes']),
+      limit: z.number().int().positive(),
+      actual: z.number().int().positive(),
+    })
+    .optional(),
+});
+
 export const ArtifactManifestPayloadSchema = z.object({
   attempt_id: z.string().min(1),
   lease_id: z.string().min(1),
@@ -238,6 +256,7 @@ export const ArtifactManifestPayloadSchema = z.object({
       sha256: z.string().min(1),
     }),
   ),
+  collection: ArtifactCollectionSummarySchema.optional(),
 });
 
 /** Controller → Agent: per-artifact upload URL + short-lived token. */
@@ -314,6 +333,7 @@ export type JobStartedPayload = z.infer<typeof JobStartedPayloadSchema>;
 export type LogChunkPayload = z.infer<typeof LogChunkPayloadSchema>;
 export type JobExitPayload = z.infer<typeof JobExitPayloadSchema>;
 export type ArtifactManifestPayload = z.infer<typeof ArtifactManifestPayloadSchema>;
+export type ArtifactCollectionSummary = z.infer<typeof ArtifactCollectionSummarySchema>;
 export type ArtifactUploadGrantPayload = z.infer<typeof ArtifactUploadGrantPayloadSchema>;
 export type CleanupCompletePayload = z.infer<typeof CleanupCompletePayloadSchema>;
 export type LogAckPayload = z.infer<typeof LogAckPayloadSchema>;

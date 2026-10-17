@@ -120,6 +120,10 @@ rbo submit <job-request.json>
 }
 ```
 
+Artifact globs are relative to `source.project_root`, regardless of `source.cwd`.
+For example, a command running with `cwd: "firmware/app"` that writes
+`build/app.bin` needs the glob `firmware/app/build/app.bin`.
+
 ---
 
 ### `rbo logs`

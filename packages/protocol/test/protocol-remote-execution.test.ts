@@ -101,6 +101,16 @@ describe('Protocol schemas — remote execution (lease, source, log, exit, artif
           sha256: 'abc',
         },
       ],
+      collection: {
+        rules: [
+          {
+            matched_count: 1,
+            collected_count: 1,
+            skipped_count: 0,
+            skip_reasons: [],
+          },
+        ],
+      },
     });
     expect(manifest.success).toBe(true);
 

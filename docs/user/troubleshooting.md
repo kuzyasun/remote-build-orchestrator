@@ -44,6 +44,30 @@ Add the project's absolute path to `allowed_project_roots` in
 `~/.rbo/controller.json`, then restart the Controller. Parent directories are allowed only when
 you list them explicitly.
 
+## An artifact cannot be materialized
+
+`artifact_materialize` checks the existing destination parent against
+`allowed_artifact_destinations` on the Controller PC. If it reports that the
+parent directory does not exist, create that directory before retrying. If it
+reports that the path is outside allowed destinations, compare the returned
+`resolved_parent` and `resolved_allowed_roots`. Add a stable, narrow destination
+root to Controller configuration if needed, then restart the Controller.
+Junctions and symlinks are checked by their resolved paths.
+
+## A build succeeds but required artifacts are missing
+
+Read `missing_required_artifacts` in the final `job_run` response. It includes
+the glob, status, counts, and `artifact_search_base` for the terminal attempt.
+The base is the submitted `source.project_root`, not `source.cwd`.
+
+`no_match` means the Agent found no path; `skipped` includes a collection
+reason; `limit_exceeded` reports a file-count or byte limit; `not_stored`
+means a matching path was collected but no artifact was stored by the
+Controller. `job_artifacts` provides complete per-rule counts and skip reasons.
+If `collection_reported` is false, update the remote Agent to receive exact
+match counts; the Controller can only report stored artifacts. A successful
+command still has outcome `succeeded` when a required artifact is missing.
+
 ## The Agent stays in `pairing_pending`
 
 On the Controller:

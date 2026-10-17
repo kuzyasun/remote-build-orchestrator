@@ -127,7 +127,7 @@ export const PreferencesConfigSchema = z.object({
 // --- Artifacts ---
 
 export const ArtifactRuleSchema = z.object({
-  glob: z.string().min(1),
+  glob: z.string().min(1).describe('Path pattern relative to source.project_root, not source.cwd.'),
   required: z.boolean().default(false),
 });
 

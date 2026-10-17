@@ -218,4 +218,14 @@ DROP INDEX IF EXISTS idx_snapshot_capture_leases_expires_at;
 DROP TABLE IF EXISTS snapshot_capture_leases;
 `,
   },
+  {
+    version: 6,
+    name: 'artifact-collection-summary',
+    up: `
+ALTER TABLE job_attempts ADD COLUMN artifact_collection_json TEXT;
+`,
+    down: `
+-- SQLite cannot DROP COLUMN portably in all versions used here; no-op downgrade.
+`,
+  },
 ];

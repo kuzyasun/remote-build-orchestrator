@@ -191,6 +191,10 @@ describe('Remote Execution End-to-End', () => {
         shell: process.platform === 'win32' ? 'powershell' : 'bash',
         script: 'node src/index.js',
       },
+      artifacts: [
+        { glob: 'src/index.js', required: true },
+        { glob: 'build/missing.bin', required: true },
+      ],
       queue_policy: 'wait',
     });
 
@@ -206,6 +210,30 @@ describe('Remote Execution End-to-End', () => {
     const jobData = waitRes.job as Record<string, unknown>;
     expect(jobData.state).toBe('completed');
     expect(jobData.outcome).toBe('succeeded');
+
+    const artifactResult = await handleToolCall(ctx, 'job_artifacts', { job_id: jobId });
+    expect(artifactResult.collection_reported).toBe(true);
+    expect(artifactResult.artifact_search_base).toBe(fixture.root);
+    expect(artifactResult.artifact_rule_results).toMatchObject([
+      {
+        glob: 'src/index.js',
+        status: 'stored',
+        matched_count: 1,
+        collected_count: 1,
+        stored_count: 1,
+      },
+      {
+        glob: 'build/missing.bin',
+        status: 'no_match',
+        matched_count: 0,
+        collected_count: 0,
+        stored_count: 0,
+      },
+    ]);
+    const runResult = await handleToolCall(ctx, 'job_run', { job_id: jobId });
+    expect(runResult.missing_required_artifacts).toMatchObject([
+      { glob: 'build/missing.bin', status: 'no_match', matched_count: 0 },
+    ]);
 
     conn2.close();
   });

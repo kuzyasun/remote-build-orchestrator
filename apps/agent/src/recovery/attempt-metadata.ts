@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { readdir, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import type { ArtifactCollectionSummary } from '@rbo/protocol';
 import type { ErrorCategory } from '@rbo/shared';
 
 export type AttemptMetadataStatus =
@@ -44,6 +45,7 @@ export interface AttemptMetadata {
   lease_deadline?: string;
   /** Persisted after collect; resume re-sends this manifest without re-collection. */
   artifact_manifest?: AttemptArtifactManifestItem[];
+  artifact_collection?: ArtifactCollectionSummary;
 }
 
 export function attemptMetadataDir(stateDir: string, attemptId: string): string {

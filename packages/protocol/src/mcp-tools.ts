@@ -165,13 +165,14 @@ export const MCP_TOOL_DEFS: readonly McpToolDef[] = [
   },
   {
     name: 'job_artifacts',
-    description: 'List collected artifacts of a job, grouped by attempt.',
+    description:
+      'List stored artifacts by attempt and per-rule match, collection, and storage counts for terminal jobs. Artifact globs are relative to source.project_root.',
     inputShape: JOB_ARTIFACTS_INPUT,
   },
   {
     name: 'artifact_materialize',
     description:
-      'Copy one stored artifact into an allowed local destination path on the development PC.',
+      'Copy one stored artifact into an allowed local destination path on the development PC. The destination parent directory must already exist.',
     inputShape: ARTIFACT_MATERIALIZE_INPUT,
   },
   {

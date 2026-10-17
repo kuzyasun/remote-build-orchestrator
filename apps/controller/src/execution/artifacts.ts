@@ -1,8 +1,14 @@
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { CollectedArtifactFile } from '@rbo/executor';
 import { moveArtifactToStore } from '@rbo/executor';
-import { generateId, sha256 } from '@rbo/shared';
+import {
+  RboError,
+  assertRealPathContained,
+  generateId,
+  resolveRealPath,
+  sha256,
+} from '@rbo/shared';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
 
@@ -87,20 +93,55 @@ export async function materializeArtifactToDestination(input: {
     throw new Error(`Unknown artifact_id '${input.artifactId}'`);
   }
 
-  const { assertRealPathContained, resolveRealPath } = await import('@rbo/shared');
-  const realDestParent = await resolveRealPath(join(input.destinationPath, '..'));
+  const destinationPath = resolve(input.destinationPath);
+  const destinationParent = dirname(destinationPath);
+  let realDestParent: string;
+  try {
+    realDestParent = await resolveRealPath(destinationParent);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new RboError(
+        'materialization',
+        `Destination parent directory does not exist: ${destinationParent}. Create it before materializing.`,
+        false,
+        { destination_path: destinationPath, destination_parent: destinationParent },
+      );
+    }
+    throw error;
+  }
   let allowed = false;
+  const resolvedAllowedRoots: string[] = [];
+  const unavailableAllowedRoots: string[] = [];
   for (const root of input.allowedDestinations) {
+    let realRoot: string;
     try {
-      await assertRealPathContained(await resolveRealPath(root), realDestParent);
+      realRoot = await resolveRealPath(root);
+    } catch {
+      unavailableAllowedRoots.push(root);
+      continue;
+    }
+    resolvedAllowedRoots.push(realRoot);
+    try {
+      await assertRealPathContained(realRoot, realDestParent);
       allowed = true;
       break;
     } catch {
-      // try next
+      // Try the next configured root.
     }
   }
   if (!allowed) {
-    throw new Error('Destination path is outside allowed artifact destinations');
+    throw new RboError(
+      'materialization',
+      'Destination path is outside allowed artifact destinations',
+      false,
+      {
+        destination_path: destinationPath,
+        resolved_parent: realDestParent,
+        allowed_destinations: input.allowedDestinations,
+        resolved_allowed_roots: resolvedAllowedRoots,
+        unavailable_allowed_roots: unavailableAllowedRoots,
+      },
+    );
   }
 
   const { access, readFile, rename } = await import('node:fs/promises');

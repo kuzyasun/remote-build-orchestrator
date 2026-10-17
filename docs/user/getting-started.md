@@ -255,6 +255,16 @@ root. To run in a subdirectory, use a relative `cwd` such as `firmware/app`.
 Never put the absolute project path or `..` in `cwd`. A validation error for
 `source.cwd` means the job was not created; correct the request before retrying.
 
+Set each `artifacts[].glob` relative to `project_root`, even when `cwd` runs the
+command in a subdirectory. For example, if a build in `firmware/app` writes
+`build/app.bin`, use `firmware/app/build/app.bin`. After completion, inspect
+the `missing_required_artifacts` entries in the final `job_run` response.
+`status: "no_match"` means the Agent found no path for that glob under the
+project root. `skipped` means matching files could not be collected,
+`limit_exceeded` means the collection limit was reached, and `not_stored`
+means collection found a file but the Controller has no stored artifact.
+`job_artifacts` provides the full per-rule counts when more detail is needed.
+
 `agents_list` shows which workers are online and their OS. It does not list
 compilers or SDKs. Set `target_os` from that worker. Set `shell` to `bash` or
 `zsh` on macOS and Linux, and `powershell` on Windows. An omitted `target_os`
@@ -273,6 +283,12 @@ and ask a person to install it on that agent.
 
 If `job_run` returns `resume: true`, call again with the same `job_id` and
 pass the returned `next_log_cursor` under `log_cursor`.
+
+If a successful `job_run` reports `missing_required_artifacts`, use its status
+and `artifact_search_base` to correct the request. Call `job_artifacts` only
+when the compact diagnostic is insufficient. Before
+`artifact_materialize`, create the destination's parent directory on the
+Controller PC and use a path under `allowed_artifact_destinations`.
 ```
 
 ## 8. How source transfer works

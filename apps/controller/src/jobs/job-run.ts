@@ -447,13 +447,25 @@ async function finishJobRunResponse(
   if (!job) return waitResult;
 
   const terminal = isTerminalJobState(job.state);
-  const artifactsRaw = terminal
-    ? ((handleJobArtifacts(ctx.db, jobId).artifacts as unknown[]) ?? [])
-    : [];
+  const artifactListing = terminal ? handleJobArtifacts(ctx.db, jobId) : null;
+  const artifactsRaw = (artifactListing?.artifacts as unknown[] | undefined) ?? [];
+  const missingRequired = (
+    (artifactListing?.artifact_rule_results as
+      | Array<{
+          glob: string;
+          required: boolean;
+          stored_count: number;
+          status: string;
+          matched_count?: number;
+          collected_count?: number;
+          skip_reasons?: string[];
+        }>
+      | undefined) ?? []
+  ).filter((rule) => rule.required && rule.stored_count === 0);
   const maxBytes = rawInput.max_output_bytes ?? 16384;
   const artifactPayload = fitArtifactMetadata(
     artifactsRaw,
-    job.outcome === 'succeeded' ? 1536 : 3072,
+    job.outcome === 'succeeded' ? (missingRequired.length > 0 ? 768 : 1536) : 3072,
   );
   const suppliedCursor = rawInput.log_cursor ?? null;
 
@@ -513,6 +525,25 @@ async function finishJobRunResponse(
         exit_code: job.exit_code,
       };
       Object.assign(out, artifactPayload);
+      if (missingRequired.length > 0) {
+        out.missing_required_artifacts = missingRequired.slice(0, 3).map((rule) => ({
+          glob: truncateUtf8(rule.glob, 120),
+          status: rule.status,
+          ...(rule.matched_count === undefined ? {} : { matched_count: rule.matched_count }),
+          ...(rule.collected_count === undefined ? {} : { collected_count: rule.collected_count }),
+          ...(rule.skip_reasons?.[0]
+            ? { skip_reason: truncateUtf8(rule.skip_reasons[0], 120) }
+            : {}),
+        }));
+        out.missing_required_count = missingRequired.length;
+        out.artifact_search_base = artifactListing?.artifact_search_base;
+        if (artifactListing?.collection_limit_exceeded) {
+          out.collection_limit_exceeded = artifactListing.collection_limit_exceeded;
+        }
+        if (missingRequired.some((rule) => rule.status === 'unknown')) {
+          out.artifact_hint = 'Collection summary unavailable; update the remote Agent.';
+        }
+      }
       // returned exactly the cursor if no chunks consumed
       if (decodedSupplied) out.next_log_cursor = suppliedCursor;
       return out;

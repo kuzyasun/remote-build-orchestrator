@@ -1971,6 +1971,14 @@ cleanup_complete
 agent_error
 ```
 
+`artifact_manifest` may include a bounded per-rule collection summary with
+filesystem match counts, collected counts, skipped counts and reasons, plus a
+collection limit if one was exceeded. The Agent persists this summary with the
+staged manifest so a reconnect can resend it without searching the workspace
+again. The Controller stores it per attempt and compares it with uploaded
+artifact records when reporting results. The summary does not change the job's
+process outcome.
+
 ### 20.4. Controller → Agent
 
 ```text
