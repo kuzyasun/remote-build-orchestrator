@@ -1,5 +1,16 @@
 import { execFile } from 'node:child_process';
-import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import {
+  access,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { type GitUrlAllowlist, assertAllowedRepositoryUrl, computeRepoKey } from '@rbo/shared';
@@ -190,7 +201,14 @@ export class RepoMirrorManager {
 
   private async writeMetadata(repoDir: string, metadata: MirrorMetadata): Promise<void> {
     await mkdir(repoDir, { recursive: true });
-    await writeFile(this.metadataPath(repoDir), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+    const path = this.metadataPath(repoDir);
+    const tempPath = `${path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(tempPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+      await rename(tempPath, path);
+    } finally {
+      await rm(tempPath, { force: true });
+    }
   }
 
   private async touchMetadata(
@@ -336,9 +354,9 @@ export class RepoMirrorManager {
       toGitOsPath(worktreePath),
       baseCommit,
     ]);
-    await this.touchMetadata(repo, {
-      active_worktree_count:
-        ((await this.readMetadata(repo.repoKey))?.active_worktree_count ?? 0) + 1,
+    await this.withRepoMutex(repo.repoKey, async () => {
+      const current = (await this.readMetadata(repo.repoKey))?.active_worktree_count ?? 0;
+      await this.touchMetadata(repo, { active_worktree_count: current + 1 });
     });
   }
 
@@ -351,9 +369,9 @@ export class RepoMirrorManager {
       toGitOsPath(worktreePath),
     ]);
     await runInMirror(repo.mirrorPath, ['worktree', 'prune']);
-    const current = (await this.readMetadata(repo.repoKey))?.active_worktree_count ?? 1;
-    await this.touchMetadata(repo, {
-      active_worktree_count: Math.max(0, current - 1),
+    await this.withRepoMutex(repo.repoKey, async () => {
+      const current = (await this.readMetadata(repo.repoKey))?.active_worktree_count ?? 1;
+      await this.touchMetadata(repo, { active_worktree_count: Math.max(0, current - 1) });
     });
   }
 

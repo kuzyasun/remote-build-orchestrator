@@ -17,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Fixed
 
 - `artifact_materialize` errors identify the normalized destination and configured allowed roots, and distinguish a missing parent directory from an allowlist rejection.
+- Repo mirror metadata writes are atomic and concurrent worktree count updates are serialized.
 - The test script caps Vitest workers to keep the full verification suite stable on Windows.
 
 ## [0.9.2] - 2026-10-16

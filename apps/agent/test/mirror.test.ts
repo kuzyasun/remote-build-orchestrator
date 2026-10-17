@@ -223,9 +223,13 @@ describe('RepoMirrorManager', () => {
         expect(await runGit(worktreeA, ['rev-parse', 'HEAD'])).toBe(head);
         expect(await runGit(worktreeB, ['rev-parse', 'HEAD'])).toBe(head);
         expect(worktreeA).not.toBe(worktreeB);
+        const repoKey = computeRepoKey(canonicalUrl);
+        expect((await concurrentManager.readMetadata(repoKey))?.active_worktree_count).toBe(2);
 
         await concurrentManager.removeWorktree(canonicalUrl, worktreeA);
+        expect((await concurrentManager.readMetadata(repoKey))?.active_worktree_count).toBe(1);
         await concurrentManager.removeWorktree(canonicalUrl, worktreeB);
+        expect((await concurrentManager.readMetadata(repoKey))?.active_worktree_count).toBe(0);
       } finally {
         await fixture.cleanup();
       }
