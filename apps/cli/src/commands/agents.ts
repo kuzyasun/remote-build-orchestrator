@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline/promises';
+import { readAdminToken } from '@rbo/shared';
 import { sanitizeTerminalOutput } from './agent.js';
 
 // Thin HTTP client for the Controller's local admin API (§33, Phase 2).
@@ -34,10 +35,20 @@ export interface PromptPairingOptions {
   signal?: AbortSignal;
 }
 
-async function postAdmin<T>(baseUrl: string, action: string, body: unknown): Promise<T> {
+async function postAdmin<T>(
+  baseUrl: string,
+  action: string,
+  body: unknown,
+  options?: { adminToken?: string },
+): Promise<T> {
+  const token = options?.adminToken ?? readAdminToken();
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+  }
   const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/internal/v1/admin/${action}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify(body ?? {}),
   });
   const json = (await res.json()) as { error?: { category: string; message: string } };

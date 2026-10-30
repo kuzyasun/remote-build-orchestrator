@@ -43,16 +43,99 @@ interface AdminApiBody {
   error?: { category: string };
 }
 
-async function post(path: string, body: unknown): Promise<{ status: number; body: AdminApiBody }> {
+async function post(
+  path: string,
+  body: unknown,
+  authHeader?: string,
+): Promise<{ status: number; body: AdminApiBody }> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (authHeader !== undefined) {
+    if (authHeader) headers.authorization = authHeader;
+  } else if (identity?.adminToken) {
+    headers.authorization = `Bearer ${identity.adminToken}`;
+  }
   const res = await fetch(`http://127.0.0.1:${running.port}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify(body ?? {}),
   });
   return { status: res.status, body: (await res.json()) as AdminApiBody };
 }
 
 describe('Admin API for CLI (§33)', () => {
+  it('rejects unauthorized requests without Bearer token', async () => {
+    const res = await post('/internal/v1/admin/pairing/list', {}, '');
+    expect(res.status).toBe(401);
+    expect(res.body.error?.category).toBe('unauthorized');
+  });
+
+  it('rejects unauthorized requests with invalid Bearer token', async () => {
+    const res = await post('/internal/v1/admin/pairing/list', {}, 'Bearer invalid-token');
+    expect(res.status).toBe(401);
+    expect(res.body.error?.category).toBe('unauthorized');
+  });
+
+  it('authenticates with valid Bearer token', async () => {
+    const res = await post('/internal/v1/admin/pairing/list', {}, `Bearer ${identity.adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.requests).toBeDefined();
+  });
+
+  it('supports RBO_ADMIN_TOKEN environment override for server auth', async () => {
+    const customDb = openDatabase(':memory:');
+    migrateToLatest(customDb);
+    const priorEnv = process.env.RBO_ADMIN_TOKEN;
+    process.env.RBO_ADMIN_TOKEN = 'custom-env-secret-123';
+    try {
+      const customRunning = await startControllerServer({
+        allowFullSnapshotFallback: true,
+        host: '127.0.0.1',
+        port: 0,
+        db: customDb,
+      });
+      try {
+        const unauth = await fetch(
+          `http://127.0.0.1:${customRunning.port}/internal/v1/admin/pairing/list`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(unauth.status).toBe(401);
+
+        const auth = await fetch(
+          `http://127.0.0.1:${customRunning.port}/internal/v1/admin/pairing/list`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: 'Bearer custom-env-secret-123',
+            },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(auth.status).toBe(200);
+      } finally {
+        await customRunning.close();
+      }
+    } finally {
+      if (priorEnv !== undefined) {
+        process.env.RBO_ADMIN_TOKEN = priorEnv;
+      } else {
+        // biome-ignore lint/performance/noDelete: process.env coerces undefined to string
+        delete process.env.RBO_ADMIN_TOKEN;
+      }
+    }
+  });
+
+  it('allows unauthenticated access to /internal/v1/health', async () => {
+    const res = await fetch(`http://127.0.0.1:${running.port}/internal/v1/health`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean };
+    expect(body).toEqual({ ok: true });
+  });
+
   it('lists pending pairing requests', async () => {
     const device = generateDeviceKeyPair();
     createPairingRequest(db, {

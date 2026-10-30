@@ -24,9 +24,12 @@ let running: RunningControllerServer;
 let db: ControllerDatabase;
 let baseUrl: string;
 let dataDir: string;
+let priorDataDir: string | undefined;
 
 beforeAll(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'rbo-cli-admin-'));
+  priorDataDir = process.env.RBO_DATA_DIR;
+  process.env.RBO_DATA_DIR = dataDir;
   db = openDatabase(':memory:');
   migrateToLatest(db);
   const identity = await ensureControllerIdentity(dataDir);
@@ -36,6 +39,12 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await running.close();
+  if (priorDataDir !== undefined) {
+    process.env.RBO_DATA_DIR = priorDataDir;
+  } else {
+    // biome-ignore lint/performance/noDelete: process.env coerces undefined to the string "undefined"
+    delete process.env.RBO_DATA_DIR;
+  }
   rmSync(dataDir, { recursive: true, force: true });
 });
 

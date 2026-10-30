@@ -54,21 +54,23 @@ function textOf(result: unknown): string {
   return first.text;
 }
 
-async function connectHttpClient(server = running): Promise<Client> {
+async function connectHttpClient(server = running, token?: string): Promise<Client> {
   const client = new Client({ name: 'test-http-client', version: '0.0.1' });
   const transport = new StreamableHTTPClientTransport(
     new URL(`http://127.0.0.1:${server.port}/mcp`),
+    token ? { requestInit: { headers: { authorization: `Bearer ${token}` } } } : undefined,
   );
   await client.connect(transport);
   return client;
 }
 
-async function connectStdioStyleClient(server = running): Promise<Client> {
+async function connectStdioStyleClient(server = running, token?: string): Promise<Client> {
   // The stdio adapter's MCP server logic, wired over an in-memory pair —
   // identical code path to `rbo mcp-stdio` minus the OS pipe.
   const proxy = createStdioProxyServer({
     controllerUrl: `http://127.0.0.1:${server.port}`,
     clientId: 'test-stdio-client',
+    adminToken: token,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await proxy.connect(serverTransport);
@@ -297,12 +299,13 @@ describe('MCP transports', () => {
 describe('job_logs transport parity with persistent cursor identity', () => {
   let fixtureDir: string;
   let fixtureServer: RunningControllerServer;
+  let fixtureIdentity: import('@rbo/shared').ControllerIdentity;
 
   beforeAll(async () => {
     fixtureDir = await mkdtemp(join(tmpdir(), 'rbo-job-logs-transport-'));
     const db = openDatabase(':memory:');
     migrateToLatest(db);
-    const identity = await ensureControllerIdentity(fixtureDir);
+    fixtureIdentity = await ensureControllerIdentity(fixtureDir);
     const now = new Date().toISOString();
     db.prepare(`INSERT INTO jobs (id, client_id, client_request_id, state, created_at, updated_at, request_json)
       VALUES ('job_transport_logs', 'fixture', 'transport-logs', 'running', ?, ?, '{}')`).run(
@@ -317,7 +320,7 @@ describe('job_logs transport parity with persistent cursor identity', () => {
       host: '127.0.0.1',
       port: 0,
       db,
-      identity,
+      identity: fixtureIdentity,
       dataDir: fixtureDir,
     });
   });
@@ -334,8 +337,8 @@ describe('job_logs transport parity with persistent cursor identity', () => {
     let httpClient: Client | undefined;
     let stdioClient: Client | undefined;
     try {
-      httpClient = await connectHttpClient(fixtureServer);
-      stdioClient = await connectStdioStyleClient(fixtureServer);
+      httpClient = await connectHttpClient(fixtureServer, fixtureIdentity.adminToken);
+      stdioClient = await connectStdioStyleClient(fixtureServer, fixtureIdentity.adminToken);
       const arguments_ = {
         job_id: 'job_transport_logs',
         attempt_id: 'att_transport_logs',

@@ -230,6 +230,79 @@ wait
     30_000,
   );
 
+  it.skipIf(process.platform === 'win32')(
+    'cancel terminates a setsid descendant reparented to init',
+    async () => {
+      const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-cancel-setsid-'));
+      const controlDir = join(workspace, 'control');
+      const logs = await ensureAttemptLogs(join(workspace, 'logs'));
+      const pidFile = join(workspace, 'setsid.pid');
+      try {
+        const script = `#!/bin/bash
+setsid bash -c 'echo $$ > ${pidFile}; exec sleep 120' &
+wait
+`;
+        await writeJobScript(controlDir, {
+          shell: 'bash',
+          script,
+          timeout_seconds: 120,
+          cancel_grace_seconds: 1,
+        });
+        const child = spawnJobScript({
+          attemptId: 'att_test_setsid',
+          controlDir,
+          workspacePath: workspace,
+          projectPath: workspace,
+          execution: {
+            shell: 'bash',
+            script,
+            timeout_seconds: 120,
+            cancel_grace_seconds: 1,
+          },
+          env: {},
+          logs,
+        });
+
+        let setsidPid: number | undefined;
+        for (let i = 0; i < 30; i++) {
+          try {
+            const raw = (await readFile(pidFile, 'utf8')).trim();
+            const n = Number.parseInt(raw, 10);
+            if (Number.isFinite(n) && n > 0) {
+              setsidPid = n;
+              break;
+            }
+          } catch {}
+          await new Promise((r) => setTimeout(r, 100));
+        }
+
+        expect(setsidPid).toBeDefined();
+        if (setsidPid !== undefined) {
+          expect(await pidAlive(setsidPid)).toBe(true);
+
+          await child.kill(1);
+          await child.waitForExit();
+
+          await waitForPidExit(setsidPid, 5000, 'setsid child should be terminated by cancel');
+          expect(await pidAlive(setsidPid)).toBe(false);
+        }
+      } finally {
+        await readFile(pidFile, 'utf8')
+          .then((raw) => {
+            const leaked = Number.parseInt(raw.trim(), 10);
+            if (Number.isFinite(leaked)) {
+              try {
+                process.kill(leaked, 'SIGKILL');
+              } catch {}
+            }
+          })
+          .catch(() => undefined);
+        await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      }
+    },
+    30_000,
+  );
+
   // Without job control, `kill -TERM "-$(ps -o pgid= "$BG_PID")"` resolves the
   // *wrapper's* pgid (the background job shares it), so a cleanup trap using
   // this common idiom signals the wrapper itself: cleanup dies half-done and the

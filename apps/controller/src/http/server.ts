@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -32,6 +33,8 @@ export interface ControllerServerOptions {
   port: number;
   db: ControllerDatabase;
   identity?: ControllerIdentity;
+  /** Bearer token required for /mcp, /internal/v1/tools/*, /internal/v1/admin/*, and log streams. */
+  adminToken?: string;
   connectedAgents?: Map<string, ConnectedAgent>;
   agentPlanePort?: number;
   controllerPublicHost?: string;
@@ -257,10 +260,37 @@ async function handleAdminHttpRequest(
   }
 }
 
+function isAuthorized(req: IncomingMessage, expectedToken: string | undefined): boolean {
+  if (!expectedToken) {
+    return true;
+  }
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return false;
+  }
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return false;
+  }
+  const token = match[1]?.trim();
+  if (!token) {
+    return false;
+  }
+  const tokenBuf = Buffer.from(token);
+  const expectedBuf = Buffer.from(expectedToken);
+  if (tokenBuf.length !== expectedBuf.length) {
+    return false;
+  }
+  return timingSafeEqual(tokenBuf, expectedBuf);
+}
+
 export async function startControllerServer(
   options: ControllerServerOptions,
 ): Promise<RunningControllerServer> {
   assertLoopbackHost(options.host);
+
+  const expectedAdminToken =
+    options.adminToken ?? process.env.RBO_ADMIN_TOKEN?.trim() ?? options.identity?.adminToken;
 
   const adminCtx: AdminContext = {
     db: options.db,
@@ -272,26 +302,49 @@ export async function startControllerServer(
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
     const run = async () => {
-      if (url.pathname === '/mcp') {
-        await handleMcpRequest(req, res, options);
-        return;
-      }
-      if (url.pathname.startsWith('/internal/v1/tools/')) {
-        const toolName = url.pathname.slice('/internal/v1/tools/'.length);
-        await handleInternalToolRequest(req, res, options, toolName);
-        return;
-      }
-      if (url.pathname.startsWith('/internal/v1/admin/')) {
-        const action = url.pathname.slice('/internal/v1/admin/'.length);
-        await handleAdminHttpRequest(req, res, adminCtx, action);
-        return;
-      }
       if (url.pathname === '/internal/v1/health') {
         sendJson(res, 200, { ok: true });
         return;
       }
 
+      const isMcp = url.pathname === '/mcp';
+      const isInternalTool = url.pathname.startsWith('/internal/v1/tools/');
+      const isInternalAdmin = url.pathname.startsWith('/internal/v1/admin/');
       const logStreamMatch = url.pathname.match(/^\/internal\/v1\/jobs\/([^/]+)\/logs\/stream$/);
+
+      if (!isMcp && !isInternalTool && !isInternalAdmin && !logStreamMatch) {
+        sendJson(res, 404, {
+          error: { category: 'validation', message: 'Not found', retryable: false },
+        });
+        return;
+      }
+
+      if (expectedAdminToken && !isAuthorized(req, expectedAdminToken)) {
+        sendJson(res, 401, {
+          error: {
+            category: 'unauthorized',
+            message: 'Unauthorized: valid Bearer token required',
+            retryable: false,
+          },
+        });
+        return;
+      }
+
+      if (isMcp) {
+        await handleMcpRequest(req, res, options);
+        return;
+      }
+      if (isInternalTool) {
+        const toolName = url.pathname.slice('/internal/v1/tools/'.length);
+        await handleInternalToolRequest(req, res, options, toolName);
+        return;
+      }
+      if (isInternalAdmin) {
+        const action = url.pathname.slice('/internal/v1/admin/'.length);
+        await handleAdminHttpRequest(req, res, adminCtx, action);
+        return;
+      }
+
       if (logStreamMatch) {
         const jobId = decodeURIComponent(logStreamMatch[1] ?? '');
         await handleJobLogsStreamRequest({
@@ -304,10 +357,6 @@ export async function startControllerServer(
         });
         return;
       }
-
-      sendJson(res, 404, {
-        error: { category: 'validation', message: 'Not found', retryable: false },
-      });
     };
 
     run().catch((error) => {
