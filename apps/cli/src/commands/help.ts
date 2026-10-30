@@ -33,6 +33,7 @@ Commands:
   run [options] -- <shell-command-string>
   logs <job-id> [--follow]
   cancel <job-id> [reason]
+  confirm <job-id>
 
 rbo run options:
   --json                   Write one final JSON result to stdout (not with --follow)

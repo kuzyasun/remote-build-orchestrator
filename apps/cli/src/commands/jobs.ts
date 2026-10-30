@@ -1,4 +1,5 @@
 import { readAdminToken } from '@rbo/shared';
+import { postAdmin } from './agents.js';
 import type { JobRunInput } from './run.js';
 
 // Thin HTTP client for Controller job MCP tools via /internal/v1/tools/* (§23).
@@ -91,6 +92,18 @@ export function confirmJobRemote(
     },
     options,
   );
+}
+
+/** Confirm an awaiting_confirmation job as an operator via the authenticated admin API. */
+export async function confirmJobAdmin(
+  baseUrl: string,
+  jobId: string,
+): Promise<{ ok: boolean; job_id: string; state: string }> {
+  return postAdmin(baseUrl, 'jobs/confirm', { job_id: jobId }) as Promise<{
+    ok: boolean;
+    job_id: string;
+    state: string;
+  }>;
 }
 
 export function getJobRemote(

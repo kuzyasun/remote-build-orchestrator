@@ -3,6 +3,7 @@ import type { ControllerIdentity } from '@rbo/shared';
 import { requestAgentProbe } from '../agents/probe.js';
 import { revokeAgent } from '../agents/registry.js';
 import { listAgents } from '../agents/service.js';
+import { confirmJobByAdmin } from '../jobs/submit.js';
 import type { PairingRequestRow } from '../security/pairing.js';
 import {
   approvePairingRequest,
@@ -13,13 +14,21 @@ import type { ControllerDatabase } from '../storage/database.js';
 import type { ConnectedAgent } from '../websocket/server.js';
 
 // Local-only admin operations behind the CLI (§33): pairing approve/reject,
-// agent revoke/probe. Never exposed as MCP tools — these are operator actions,
+// agent revoke/probe, job confirm. Never exposed as MCP tools — these are operator actions,
 // not something an AI coding client should be able to call.
 
 export interface AdminContext {
   db: ControllerDatabase;
   identity?: ControllerIdentity;
   connectedAgents?: Map<string, ConnectedAgent>;
+  agentPlanePort?: number;
+  dataDir?: string;
+  allowedProjectRoots?: string[];
+  allowedArtifactDestinations?: string[];
+  maxConcurrentJobs?: number;
+  gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
+  allowLocalFallback?: boolean;
+  allowFullSnapshotFallback?: boolean;
 }
 
 function requireIdentity(ctx: AdminContext): ControllerIdentity {
@@ -69,6 +78,15 @@ export async function handleAdminRequest(
       if ('error' in result) {
         return { status: 409, body: { error: result.error } };
       }
+      return { status: 200, body: result };
+    }
+
+    case 'jobs/confirm': {
+      const jobId = String(args.job_id ?? '');
+      if (!jobId) {
+        throw RboError.validation("Missing required 'job_id'");
+      }
+      const result = await confirmJobByAdmin(ctx.db, requireIdentity(ctx), jobId, ctx);
       return { status: 200, body: result };
     }
 

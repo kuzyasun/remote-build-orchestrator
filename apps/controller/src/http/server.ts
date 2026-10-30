@@ -54,6 +54,8 @@ export interface ControllerServerOptions {
   /** Host-aware local fallback (docs/dev/host-aware-local-fallback-plan.md). */
   getHostCpuBusyFraction?: () => number;
   maxHostCpuBusyFraction?: number;
+  /** Confirmation policy for destructive/hardware jobs. Default 'developer'. */
+  confirmationPolicy?: 'developer' | 'strict';
 }
 
 export interface RunningControllerServer {
@@ -132,6 +134,7 @@ function buildToolContext(
     defaultQueuePolicy: options.defaultQueuePolicy,
     getHostCpuBusyFraction: options.getHostCpuBusyFraction,
     maxHostCpuBusyFraction: options.maxHostCpuBusyFraction,
+    confirmationPolicy: options.confirmationPolicy,
     signal,
   };
 }
@@ -299,6 +302,14 @@ export async function startControllerServer(
     db: options.db,
     identity: options.identity,
     connectedAgents: options.connectedAgents,
+    agentPlanePort: options.agentPlanePort,
+    dataDir: options.dataDir,
+    allowedProjectRoots: options.allowedProjectRoots,
+    allowedArtifactDestinations: options.allowedArtifactDestinations,
+    maxConcurrentJobs: options.maxConcurrentJobs,
+    gitAllowlist: options.gitAllowlist,
+    allowLocalFallback: options.allowLocalFallback,
+    allowFullSnapshotFallback: options.allowFullSnapshotFallback,
   };
 
   const server = createServer((req, res) => {

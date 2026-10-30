@@ -6,6 +6,11 @@ import { ensureControllerIdentity, generateDeviceKeyPair } from '@rbo/shared';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startControllerServer } from '../../controller/src/http/server.js';
 import type { RunningControllerServer } from '../../controller/src/http/server.js';
+import {
+  createJob,
+  persistSnapshot,
+  transitionJobState,
+} from '../../controller/src/jobs/lifecycle.js';
 import { createPairingRequest } from '../../controller/src/security/pairing.js';
 import { migrateToLatest, openDatabase } from '../../controller/src/storage/database.js';
 import type { ControllerDatabase } from '../../controller/src/storage/database.js';
@@ -19,6 +24,7 @@ import {
   rejectPairingRemote,
   revokeAgentRemote,
 } from '../src/commands/agents.js';
+import { confirmJobAdmin } from '../src/commands/jobs.js';
 
 let running: RunningControllerServer;
 let db: ControllerDatabase;
@@ -252,6 +258,38 @@ describe('CLI agent admin commands (§33)', () => {
           signal: ac.signal,
         }),
       ).rejects.toThrow('Pairing approve cancelled by operator');
+    });
+  });
+
+  describe('rbo confirm / rbo jobs confirm (§1.1 Finding 2)', () => {
+    it('confirms an awaiting_confirmation job via confirmJobAdmin', async () => {
+      persistSnapshot(db, {
+        snapshotId: 'snap_cli_confirm',
+        contentId: 'content_cli_confirm',
+        repoId: 'repo_cli_confirm',
+        baseCommit: null,
+        dirty: false,
+        manifestPath: '/tmp/manifest.json',
+        payloadPath: '/tmp/payload.bin',
+        sizeBytes: 64,
+        sha256: 'a'.repeat(64),
+      });
+      const job = createJob(db, {
+        id: 'job_cli_confirm',
+        clientRequestId: 'req_cli_confirm',
+        clientId: 'test-cli-client',
+        request: {
+          client_request_id: 'req_cli_confirm',
+          source: { project_root: '/tmp/test', cwd: '.' },
+          execution: { script: 'echo confirm' },
+          risk_level: 'destructive',
+        },
+        initialState: 'awaiting_confirmation',
+      });
+      transitionJobState(db, job.id, 'awaiting_confirmation', { snapshot_id: 'snap_cli_confirm' });
+
+      const res = await confirmJobAdmin(baseUrl, job.id);
+      expect(res).toMatchObject({ ok: true, job_id: job.id, state: 'queued' });
     });
   });
 });

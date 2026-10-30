@@ -107,6 +107,7 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     defaultQueuePolicy: config.defaultQueuePolicy,
     getHostCpuBusyFraction,
     maxHostCpuBusyFraction: config.maxHostCpuBusyFraction,
+    confirmationPolicy: config.confirmationPolicy,
   });
 
   logger.info('controller started', {

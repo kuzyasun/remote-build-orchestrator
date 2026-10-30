@@ -36,6 +36,7 @@ import {
   renewActiveLease,
 } from '../execution/remote-execution.js';
 import { handleDataPlaneRequest } from '../http/data-plane.js';
+import { expireStaleConfirmations } from '../jobs/submit.js';
 import {
   DEFAULT_DISCONNECT_GRACE_SECONDS,
   DEFAULT_ORPHAN_TIMEOUT_SECONDS,
@@ -313,6 +314,7 @@ export async function startAgentPlaneServer(
     try {
       checkHeartbeats();
       expireStaleLeases(db);
+      expireStaleConfirmations(db);
       maybeDispatchQueued();
     } catch (error) {
       logger.error('lease sweep failed', { error: String(error) });

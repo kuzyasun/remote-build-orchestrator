@@ -35,7 +35,7 @@ export interface PromptPairingOptions {
   signal?: AbortSignal;
 }
 
-async function postAdmin<T>(
+export async function postAdmin<T>(
   baseUrl: string,
   action: string,
   body: unknown,

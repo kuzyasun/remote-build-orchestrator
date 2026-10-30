@@ -7,6 +7,8 @@ import { describe, expect, it } from 'vitest';
 import { createJob, getJob, persistSnapshot, transitionJobState } from '../src/jobs/lifecycle.js';
 import {
   type SubmitJobContext,
+  confirmJobByAdmin,
+  expireStaleConfirmations,
   handleJobConfirm,
   verifyConfirmationToken,
 } from '../src/jobs/submit.js';
@@ -252,5 +254,49 @@ describe('handleJobConfirm negative paths (§1.1)', () => {
       confirmation_token: issueToken(),
     });
     expect(result).toEqual({ job_id: jobId, state: 'queued' });
+  });
+
+  it('expires stale awaiting_confirmation jobs when TTL passes', async () => {
+    const { db, jobId } = makeConfirmationFixture();
+    const past = new Date(Date.now() - 350 * 1000).toISOString();
+    db.prepare('UPDATE jobs SET queued_at = ? WHERE id = ?').run(past, jobId);
+
+    const expired = expireStaleConfirmations(db, 300);
+    expect(expired).toEqual([{ id: jobId }]);
+
+    const job = getJob(db, jobId);
+    expect(job?.state).toBe('completed');
+    expect(job?.outcome).toBe('cancelled');
+    expect(job?.failure_category).toBe('cancelled');
+    expect(job?.failure_message).toBe('Confirmation expired before execution');
+  });
+
+  it('cleans up job when an expired confirmation token is submitted', async () => {
+    const { ctx, db, jobId, issueToken } = makeConfirmationFixture();
+    const past = new Date(Date.now() - 350 * 1000).toISOString();
+    db.prepare('UPDATE jobs SET queued_at = ? WHERE id = ?').run(past, jobId);
+
+    const expiredToken = issueToken({ exp: Math.floor(Date.now() / 1000) - 10 });
+    const result = await handleJobConfirm(ctx, {
+      job_id: jobId,
+      confirmation_token: expiredToken,
+    });
+    expect(result.error).toMatchObject({
+      category: 'validation',
+      message: 'Invalid or expired confirmation token',
+    });
+
+    const job = getJob(db, jobId);
+    expect(job?.state).toBe('completed');
+    expect(job?.outcome).toBe('cancelled');
+  });
+
+  it('allows administrator to confirm an awaiting_confirmation job directly', async () => {
+    const { db, identity, jobId, ctx } = makeConfirmationFixture();
+    const result = await confirmJobByAdmin(db, identity, jobId, ctx);
+    expect(result).toEqual({ ok: true, job_id: jobId, state: 'queued' });
+
+    const job = getJob(db, jobId);
+    expect(job?.state).toBe('queued');
   });
 });

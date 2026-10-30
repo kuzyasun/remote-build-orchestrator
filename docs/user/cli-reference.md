@@ -149,6 +149,19 @@ rbo cancel <job-id> [reason]
 
 ---
 
+### `rbo confirm`
+
+Confirms a destructive or hardware job awaiting operator confirmation.
+
+```bash
+rbo confirm <job-id>
+rbo jobs confirm <job-id>
+```
+
+Under `confirmationPolicy: "strict"`, AI clients cannot confirm destructive or hardware jobs via MCP; an operator must run `rbo confirm <job-id>` to release the job to the queue. Unconfirmed jobs expire automatically after TTL (default 300 seconds).
+
+---
+
 ## Fleet & discovery commands
 
 ### `rbo discover`
