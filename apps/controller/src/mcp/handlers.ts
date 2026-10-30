@@ -169,7 +169,7 @@ export async function handleToolCall(
 
   switch (name) {
     case 'agents_list':
-      return { agents: listAgents(ctx.db, args.include_offline === true) };
+      return { agents: listAgents(ctx.db, args.include_offline === true, ctx.connectedAgents) };
 
     case 'job_submit':
       return handleJobSubmit(submitContext(ctx), args);

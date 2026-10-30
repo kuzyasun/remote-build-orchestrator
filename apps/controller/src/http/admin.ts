@@ -55,7 +55,7 @@ export async function handleAdminRequest(
     }
 
     case 'agents/list':
-      return { status: 200, body: { agents: listAgents(ctx.db, true) } };
+      return { status: 200, body: { agents: listAgents(ctx.db, true, ctx.connectedAgents) } };
 
     case 'agents/revoke': {
       const agentId = String(args.agent_id ?? '');

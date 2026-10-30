@@ -22,37 +22,52 @@ interface AgentRow {
   capabilities_json: string;
 }
 
-export function listAgents(db: ControllerDatabase, includeOffline: boolean): AgentSummary[] {
+export function listAgents(
+  db: ControllerDatabase,
+  includeOffline: boolean,
+  connectedAgents?: Map<string, unknown> | ReadonlyMap<string, unknown>,
+): AgentSummary[] {
   const rows = db
     .prepare(
-      includeOffline
+      includeOffline || connectedAgents !== undefined
         ? 'SELECT * FROM agents WHERE disabled_at IS NULL ORDER BY priority DESC, id'
         : "SELECT * FROM agents WHERE disabled_at IS NULL AND state <> 'offline' ORDER BY priority DESC, id",
     )
     .all() as AgentRow[];
 
-  return rows.map((row) => {
-    let capabilities: Partial<AgentCapabilityReport> = {};
-    try {
-      capabilities = JSON.parse(row.capabilities_json) as Partial<AgentCapabilityReport>;
-    } catch {
-      // Capability JSON is agent-supplied; a corrupt row must not break listing.
-    }
-    const runningJobs = db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM job_attempts WHERE agent_id = ? AND state NOT IN ('completed')",
-      )
-      .get(row.id) as { n: number };
+  return rows
+    .map((row) => {
+      let capabilities: Partial<AgentCapabilityReport> = {};
+      try {
+        capabilities = JSON.parse(row.capabilities_json) as Partial<AgentCapabilityReport>;
+      } catch {
+        // Capability JSON is agent-supplied; a corrupt row must not break listing.
+      }
+      const runningJobs = db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM job_attempts WHERE agent_id = ? AND state NOT IN ('completed')",
+        )
+        .get(row.id) as { n: number };
 
-    return {
-      id: row.id,
-      name: row.display_name,
-      state: row.state,
-      os: capabilities.os?.family ?? null,
-      arch: capabilities.os?.arch ?? null,
-      priority: row.priority,
-      running_jobs: runningJobs.n,
-      max_jobs: row.max_jobs,
-    };
-  });
+      let effectiveState = row.state;
+      if (connectedAgents) {
+        if (!connectedAgents.has(row.id) && effectiveState !== 'revoked') {
+          effectiveState = 'offline';
+        } else if (connectedAgents.has(row.id) && effectiveState === 'offline') {
+          effectiveState = 'idle';
+        }
+      }
+
+      return {
+        id: row.id,
+        name: row.display_name,
+        state: effectiveState,
+        os: capabilities.os?.family ?? null,
+        arch: capabilities.os?.arch ?? null,
+        priority: row.priority,
+        running_jobs: runningJobs.n,
+        max_jobs: row.max_jobs,
+      };
+    })
+    .filter((agent) => includeOffline || (agent.state !== 'offline' && agent.state !== 'revoked'));
 }

@@ -76,7 +76,13 @@ export interface AgentPlaneOptions {
   orphanTimeoutSeconds?: number;
   reconcileDeadlineSeconds?: number;
   maxGitBundleBytes?: number;
+  /** Stale heartbeat timeout in milliseconds before closing connection. Defaults to max(60_000, disconnectGraceSeconds * 1000). */
+  heartbeatTimeoutMs?: number;
+  /** Lease and heartbeat sweep interval in milliseconds. Default 15_000. */
+  leaseSweepIntervalMs?: number;
 }
+
+export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 60_000;
 
 export interface ConnectedAgent {
   agentId: string;
@@ -282,14 +288,36 @@ export async function startAgentPlaneServer(
   });
 
   let boundPort = options.port;
+  const heartbeatTimeoutMs =
+    options.heartbeatTimeoutMs ??
+    Math.max(
+      DEFAULT_HEARTBEAT_TIMEOUT_MS,
+      (options.disconnectGraceSeconds ?? DEFAULT_DISCONNECT_GRACE_SECONDS) * 1000,
+    );
+  const checkHeartbeats = (): void => {
+    const now = Date.now();
+    for (const [agentId, agent] of connectedAgents) {
+      if (now - agent.lastHeartbeatAt > heartbeatTimeoutMs) {
+        logger.warn('agent heartbeat timed out; terminating connection', {
+          agentId,
+          lastHeartbeatAgoMs: now - agent.lastHeartbeatAt,
+          heartbeatTimeoutMs,
+        });
+        agent.socket.terminate();
+      }
+    }
+  };
+
+  const sweepIntervalMs = options.leaseSweepIntervalMs ?? 15_000;
   const leaseSweep = setInterval(() => {
     try {
+      checkHeartbeats();
       expireStaleLeases(db);
       maybeDispatchQueued();
     } catch (error) {
       logger.error('lease sweep failed', { error: String(error) });
     }
-  }, 15_000);
+  }, sweepIntervalMs);
   leaseSweep.unref?.();
 
   wss.on('connection', (socket, req) => {
@@ -599,6 +627,10 @@ export async function startAgentPlaneServer(
     recovery,
     close: async () => {
       shuttingDown = true;
+      for (const [agentId] of connectedAgents) {
+        markAgentSeen(db, agentId, 'offline');
+      }
+      connectedAgents.clear();
       await new Promise<void>((resolvePromise) => {
         clearInterval(leaseSweep);
         recovery.dispose();

@@ -79,6 +79,13 @@ export class RecoveryCoordinator {
    * Missing report by deadline → outcome=lost.
    */
   onControllerStartup(): void {
+    const updated = this.db
+      .prepare("UPDATE agents SET state = 'offline' WHERE state NOT IN ('offline', 'revoked')")
+      .run();
+    if (updated.changes > 0) {
+      logger.info('reset stale agent states to offline on startup', { count: updated.changes });
+    }
+
     const rows = this.db
       .prepare(`SELECT id FROM job_attempts WHERE state NOT IN ('completed')`)
       .all() as Array<{ id: string }>;

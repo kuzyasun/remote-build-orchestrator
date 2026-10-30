@@ -296,4 +296,79 @@ describe('Agent pairing over TLS WebSocket', () => {
     }
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it('terminates connection and updates state to offline when heartbeats time out', async () => {
+    const testDir = mkdtempSync(join(tmpdir(), 'rbo-hb-plane-'));
+    const testDb = openDatabase(':memory:');
+    migrateToLatest(testDb);
+    const testIdentity = await ensureControllerIdentity(testDir);
+    const fastPlane = await startAgentPlaneServer({
+      port: 0,
+      db: testDb,
+      identity: testIdentity,
+      dataDir: testDir,
+      heartbeatTimeoutMs: 50,
+      leaseSweepIntervalMs: 25,
+    });
+
+    const agentDir = newAgentDir();
+    const conn = new AgentConnection({
+      controllerUrl: `wss://127.0.0.1:${fastPlane.port}/agent`,
+      expectedFingerprint: testIdentity.fingerprint,
+      stateDir: agentDir,
+      displayName: 'test-agent',
+      capabilities: createMockAgentCapability({ display_name: 'test-agent' }),
+      gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
+    });
+
+    await conn.connectOnce();
+    const pending = listPairingRequests(testDb, 'pending');
+    const req = pending[0];
+    if (!req) throw new Error('missing request');
+    const { agentId } = approvePairingRequest(testDb, testIdentity, req.id);
+
+    const session = await conn.connectOnce();
+    expect(session.status).toBe('authenticated');
+
+    const connected = fastPlane.connectedAgents.get(agentId);
+    expect(connected).toBeDefined();
+
+    // Verify it is listed as idle in listAgents with live connectedAgents
+    const listedActive = listAgents(testDb, false, fastPlane.connectedAgents);
+    expect(listedActive.map((a) => a.id)).toContain(agentId);
+
+    // Stop client heartbeat emissions so the socket remains open without new heartbeats
+    (conn as unknown as { stopHeartbeats(): void }).stopHeartbeats();
+
+    // Age lastHeartbeatAt beyond the 50ms threshold
+    if (connected) {
+      connected.lastHeartbeatAt = Date.now() - 100;
+    }
+
+    // Wait for the socket close triggered by checkHeartbeats
+    const socket = connected?.socket;
+    await new Promise<void>((resolvePromise) => {
+      if (!socket || socket.readyState === WebSocket.CLOSED) {
+        resolvePromise();
+        return;
+      }
+      socket.once('close', () => resolvePromise());
+      const interval = setInterval(() => {
+        if (!fastPlane.connectedAgents.has(agentId)) {
+          clearInterval(interval);
+          resolvePromise();
+        }
+      }, 20);
+    });
+
+    expect(fastPlane.connectedAgents.has(agentId)).toBe(false);
+    const listedOffline = listAgents(testDb, true, fastPlane.connectedAgents);
+    const agent = listedOffline.find((a) => a.id === agentId);
+    expect(agent?.state).toBe('offline');
+
+    conn.close();
+    await fastPlane.close();
+    rmSync(testDir, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  });
 });
