@@ -251,6 +251,7 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
   let logFailure = false;
   let materializedWorkspacePath = '';
   let materializedProjectPath = '';
+  let inFlightCancel: Promise<void> | undefined;
   const cancelSignal = { cancelled: false };
   const logs = await ensureAttemptLogs(persistentLogs);
 
@@ -402,7 +403,8 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
     activeCancels.set(attempt.id, async () => {
       cancelled = true;
       cancelSignal.cancelled = true;
-      await child.kill(request.execution.cancel_grace_seconds);
+      inFlightCancel = child.kill(request.execution.cancel_grace_seconds);
+      await inFlightCancel;
     });
 
     transitionJobState(ctx.db, jobId, 'running');
@@ -572,6 +574,9 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
       throw error instanceof RboError ? error : new RboError('internal', message, false);
     }
   } finally {
+    if (inFlightCancel) {
+      await inFlightCancel.catch(() => undefined);
+    }
     activeCancels.delete(attempt.id);
     pendingCancels.delete(jobId);
     releaseAdmission();

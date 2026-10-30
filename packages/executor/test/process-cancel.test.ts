@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { ensureAttemptLogs } from '../src/logs.js';
-import { spawnJobScript, writeJobScript } from '../src/script.js';
+import { runCleanupScript, spawnJobScript, writeJobScript } from '../src/script.js';
 import { describeWindowsExecutorResolution } from '../src/windows-executor-path.js';
 
 const execFileAsync = promisify(execFile);
@@ -476,4 +476,67 @@ Wait-Process -Id $p.Id
     },
     30_000,
   );
+
+  it('cleanup script runs in isolated containment identity and is not killed by late cancel scan', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-cleanup-id-'));
+    const controlDir = join(workspace, 'control');
+    const logs = await ensureAttemptLogs(join(workspace, 'logs'));
+    const isWin = process.platform === 'win32';
+    try {
+      const mainScript = isWin ? 'Start-Sleep -Seconds 10' : 'sleep 10';
+      const cleanupScript = isWin ? 'Start-Sleep -Milliseconds 500; exit 0' : 'sleep 0.5; exit 0';
+      const shell = isWin ? 'powershell' : 'bash';
+
+      await writeJobScript(controlDir, {
+        shell,
+        script: mainScript,
+        timeout_seconds: 30,
+        cancel_grace_seconds: 2,
+      });
+
+      const child = spawnJobScript({
+        attemptId: 'att_cleanup_isolation',
+        controlDir,
+        workspacePath: workspace,
+        projectPath: workspace,
+        execution: {
+          shell,
+          script: mainScript,
+          timeout_seconds: 30,
+          cancel_grace_seconds: 2,
+        },
+        env: {},
+        logs,
+      });
+
+      // Trigger cancel with 2 seconds grace period in the background without awaiting it
+      const killPromise = child.kill(2);
+
+      // Main process exits on SIGTERM quickly
+      await child.waitForExit();
+
+      // Immediately run cleanup script with the same attemptId while killPromise is still sleeping in grace period
+      const cleanupPromise = runCleanupScript({
+        attemptId: 'att_cleanup_isolation',
+        controlDir,
+        workspacePath: workspace,
+        projectPath: workspace,
+        execution: {
+          shell,
+          script: mainScript,
+          cleanup_script: cleanupScript,
+          timeout_seconds: 30,
+          cancel_grace_seconds: 1,
+        },
+        env: {},
+        logs,
+      });
+
+      const [_, cleanupResult] = await Promise.all([killPromise, cleanupPromise]);
+      expect(cleanupResult.exitCode).toBe(0);
+      expect(cleanupResult.timedOut).toBe(false);
+    } finally {
+      await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
+  });
 });

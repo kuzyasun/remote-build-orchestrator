@@ -261,8 +261,8 @@ async function handleAdminHttpRequest(
 }
 
 function isAuthorized(req: IncomingMessage, expectedToken: string | undefined): boolean {
-  if (!expectedToken) {
-    return true;
+  if (!expectedToken || expectedToken.trim().length === 0) {
+    return false;
   }
   const authHeader = req.headers.authorization;
   if (!authHeader) {
@@ -277,7 +277,7 @@ function isAuthorized(req: IncomingMessage, expectedToken: string | undefined): 
     return false;
   }
   const tokenBuf = Buffer.from(token);
-  const expectedBuf = Buffer.from(expectedToken);
+  const expectedBuf = Buffer.from(expectedToken.trim());
   if (tokenBuf.length !== expectedBuf.length) {
     return false;
   }
@@ -289,8 +289,11 @@ export async function startControllerServer(
 ): Promise<RunningControllerServer> {
   assertLoopbackHost(options.host);
 
+  const envAdminToken = process.env.RBO_ADMIN_TOKEN?.trim();
   const expectedAdminToken =
-    options.adminToken ?? process.env.RBO_ADMIN_TOKEN?.trim() ?? options.identity?.adminToken;
+    (options.adminToken?.trim() || undefined) ??
+    (envAdminToken || undefined) ??
+    (options.identity?.adminToken?.trim() || undefined);
 
   const adminCtx: AdminContext = {
     db: options.db,

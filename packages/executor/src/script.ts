@@ -837,8 +837,14 @@ export async function runCleanupScript(input: {
   const isDirectWin = input.execution.shell === 'direct' && process.platform === 'win32';
   const cleanupName = isPowerShell ? 'cleanup.ps1' : isDirectWin ? 'cleanup.cmd' : 'cleanup.sh';
   await writeJobScript(input.controlDir, input.execution, cleanupName);
+  const cleanupAttemptId = `${input.attemptId}_cleanup`;
   const child = spawnJobScript({
     ...input,
+    attemptId: cleanupAttemptId,
+    env: {
+      ...input.env,
+      RBO_ATTEMPT_ID: cleanupAttemptId,
+    },
     scriptFileName: cleanupName,
   });
   const timeoutMs = (input.execution.cleanup_timeout_seconds ?? 60) * 1000;

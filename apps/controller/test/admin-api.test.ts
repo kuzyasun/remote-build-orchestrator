@@ -129,6 +129,53 @@ describe('Admin API for CLI (§33)', () => {
     }
   });
 
+  it('falls back to identity token and rejects unauthorized requests when RBO_ADMIN_TOKEN is empty string', async () => {
+    const priorEnv = process.env.RBO_ADMIN_TOKEN;
+    process.env.RBO_ADMIN_TOKEN = '   ';
+    try {
+      const customRunning = await startControllerServer({
+        allowFullSnapshotFallback: true,
+        host: '127.0.0.1',
+        port: 0,
+        db,
+        identity,
+      });
+      try {
+        const unauth = await fetch(
+          `http://127.0.0.1:${customRunning.port}/internal/v1/admin/pairing/list`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(unauth.status).toBe(401);
+
+        const auth = await fetch(
+          `http://127.0.0.1:${customRunning.port}/internal/v1/admin/pairing/list`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${identity.adminToken}`,
+            },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(auth.status).toBe(200);
+      } finally {
+        await customRunning.close();
+      }
+    } finally {
+      if (priorEnv !== undefined) {
+        process.env.RBO_ADMIN_TOKEN = priorEnv;
+      } else {
+        // biome-ignore lint/performance/noDelete: process.env coerces undefined to string
+        delete process.env.RBO_ADMIN_TOKEN;
+      }
+    }
+  });
+
   it('allows unauthenticated access to /internal/v1/health', async () => {
     const res = await fetch(`http://127.0.0.1:${running.port}/internal/v1/health`);
     expect(res.status).toBe(200);

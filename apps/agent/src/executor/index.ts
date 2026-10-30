@@ -1424,7 +1424,11 @@ export class AgentJobExecutor {
 
       // Register kill before any sync OS lookup so lease-expiry self-term cannot
       // race past spawn with activeProcessKill still null.
-      attempt.activeProcessKill = (grace) => child.kill(grace ?? 10);
+      let inFlightKill: Promise<void> | undefined;
+      attempt.activeProcessKill = (grace) => {
+        inFlightKill = child.kill(grace ?? 10);
+        return inFlightKill;
+      };
       // Keep the same cancelSignal object through waitForCompletion so a cancel
       // that fired during spawn is not wiped.
 
@@ -1693,6 +1697,10 @@ export class AgentJobExecutor {
             error: String(error),
           });
         }
+      }
+
+      if (inFlightKill) {
+        await inFlightKill.catch(() => undefined);
       }
 
       const cleanup = await runCleanupScript({
