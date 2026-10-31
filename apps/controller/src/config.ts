@@ -359,6 +359,16 @@ export function resolveDefaultDataDir(): string {
  * Operators edit `~/.rbo/controller.json` (or `$RBO_DATA_DIR/controller.json`).
  * Env vars remain available for CI/scripts and override the file.
  */
+function validateConfirmationPolicy(val: unknown, source: string): 'developer' | 'strict' {
+  if (typeof val === 'string') {
+    const normalized = val.trim().toLowerCase();
+    if (normalized === 'developer' || normalized === 'strict') {
+      return normalized;
+    }
+  }
+  throw new Error(`Invalid ${source}: "${String(val)}". Expected "developer" or "strict".`);
+}
+
 export function loadControllerConfig(
   overrides: LoadControllerConfigOptions = {},
 ): ControllerConfig {
@@ -579,11 +589,14 @@ export function loadControllerConfig(
         : undefined) ??
       RBO_MDNS_DEFAULT_DISPLAY_NAME,
     confirmationPolicy:
-      fieldOverrides.confirmationPolicy ??
+      (fieldOverrides.confirmationPolicy !== undefined
+        ? validateConfirmationPolicy(
+            fieldOverrides.confirmationPolicy,
+            'fieldOverrides.confirmationPolicy',
+          )
+        : undefined) ??
       (envSet('RBO_CONFIRMATION_POLICY')
-        ? (process.env.RBO_CONFIRMATION_POLICY ?? '').trim().toLowerCase() === 'strict'
-          ? 'strict'
-          : 'developer'
+        ? validateConfirmationPolicy(process.env.RBO_CONFIRMATION_POLICY, 'RBO_CONFIRMATION_POLICY')
         : undefined) ??
       file?.confirmation_policy ??
       'developer',
