@@ -19,14 +19,18 @@ Stdio (preferred) — ZCode accepts `mcpServers` paste:
   }
 }
 ```
-HTTP alternative:
+
+HTTP alternative (requires Bearer token from `~/.rbo/controller/admin.token`):
 
 ```json
 {
   "mcpServers": {
     "rbo": {
       "type": "http",
-      "url": "http://127.0.0.1:7410/mcp"
+      "url": "http://127.0.0.1:7410/mcp",
+      "headers": {
+        "Authorization": "Bearer <ADMIN_TOKEN>"
+      }
     }
   }
 }

@@ -14,4 +14,4 @@
 }
 ```
 
-HTTP: `http://127.0.0.1:7410/mcp`.
+HTTP alternative: `http://127.0.0.1:7410/mcp` (requires `Authorization: Bearer <ADMIN_TOKEN>`, see [overview](README.md)).
