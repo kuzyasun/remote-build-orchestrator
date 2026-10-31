@@ -1,10 +1,8 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, rmdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
-
-const execFileAsync = promisify(execFile);
+import { createInterface } from 'node:readline';
 
 export interface LinuxCgroupScope {
   cgroupDir: string;
@@ -124,31 +122,59 @@ async function findLinuxAttemptPids(attemptId: string): Promise<number[]> {
   return pids;
 }
 
-async function findDarwinAttemptPids(attemptId: string): Promise<number[]> {
+export async function parseDarwinPsOutput(
+  stream: NodeJS.ReadableStream,
+  attemptId: string,
+  ignorePid: number = process.pid,
+): Promise<number[]> {
   const pids: number[] = [];
-  try {
-    const { RBO_CONTAINMENT_ID: _omit1, RBO_ATTEMPT_ID: _omit2, ...cleanEnv } = process.env;
-    const { stdout } = await execFileAsync('ps', ['-E', '-A', '-ww', '-o', 'pid=,command='], {
-      env: cleanEnv,
-    });
-    const regex = new RegExp(
-      `(?:^|\\s)(?:RBO_CONTAINMENT_ID|RBO_ATTEMPT_ID)=${attemptId}(?:\\s|$)`,
-    );
-    for (const line of stdout.split('\n')) {
-      if (regex.test(line)) {
-        const match = line.trim().match(/^(\d+)\s+/);
-        if (match) {
-          const pid = Number(match[1]);
-          if (Number.isFinite(pid) && pid !== process.pid) {
-            pids.push(pid);
-          }
+  const regex = new RegExp(`(?:^|\\s)(?:RBO_CONTAINMENT_ID|RBO_ATTEMPT_ID)=${attemptId}(?:\\s|$)`);
+  const rl = createInterface({
+    input: stream,
+    crlfDelay: Number.POSITIVE_INFINITY,
+  });
+  for await (const line of rl) {
+    if (regex.test(line)) {
+      const match = line.trim().match(/^(\d+)\s+/);
+      if (match) {
+        const pid = Number(match[1]);
+        if (Number.isFinite(pid) && pid !== ignorePid) {
+          pids.push(pid);
         }
       }
     }
-  } catch {
-    // ignore
   }
   return pids;
+}
+
+async function findDarwinAttemptPids(attemptId: string): Promise<number[]> {
+  try {
+    const { RBO_CONTAINMENT_ID: _omit1, RBO_ATTEMPT_ID: _omit2, ...cleanEnv } = process.env;
+    const child = spawn('ps', ['-E', '-A', '-ww', '-o', 'pid=,command='], {
+      env: cleanEnv,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    child.on('error', () => {});
+
+    if (!child.stdout) {
+      return [];
+    }
+
+    const [pids] = await Promise.all([
+      parseDarwinPsOutput(child.stdout, attemptId),
+      new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.killed) {
+          resolve();
+        } else {
+          child.once('close', () => resolve());
+          child.once('error', () => resolve());
+        }
+      }),
+    ]);
+    return pids;
+  } catch {
+    return [];
+  }
 }
 
 /**
