@@ -98,7 +98,8 @@ async function findLinuxAttemptPids(attemptId: string): Promise<number[]> {
   try {
     const entries = await readdir('/proc');
     const numericEntries = entries.filter((e) => /^\d+$/.test(e) && Number(e) !== process.pid);
-    const targetVar = `RBO_ATTEMPT_ID=${attemptId}`;
+    const targetVar = `RBO_CONTAINMENT_ID=${attemptId}`;
+    const fallbackVar = `RBO_ATTEMPT_ID=${attemptId}`;
     const batchSize = 64;
 
     for (let i = 0; i < numericEntries.length; i += batchSize) {
@@ -108,7 +109,7 @@ async function findLinuxAttemptPids(attemptId: string): Promise<number[]> {
           try {
             const raw = await readFile(`/proc/${entry}/environ`, 'utf8');
             const vars = raw.split('\0');
-            if (vars.some((v) => v === targetVar)) {
+            if (vars.some((v) => v === targetVar || v === fallbackVar)) {
               pids.push(Number(entry));
             }
           } catch {
@@ -126,11 +127,13 @@ async function findLinuxAttemptPids(attemptId: string): Promise<number[]> {
 async function findDarwinAttemptPids(attemptId: string): Promise<number[]> {
   const pids: number[] = [];
   try {
-    const { RBO_ATTEMPT_ID: _omit, ...cleanEnv } = process.env;
+    const { RBO_CONTAINMENT_ID: _omit1, RBO_ATTEMPT_ID: _omit2, ...cleanEnv } = process.env;
     const { stdout } = await execFileAsync('ps', ['-E', '-A', '-ww', '-o', 'pid=,command='], {
       env: cleanEnv,
     });
-    const regex = new RegExp(`(?:^|\\s)RBO_ATTEMPT_ID=${attemptId}(?:\\s|$)`);
+    const regex = new RegExp(
+      `(?:^|\\s)(?:RBO_CONTAINMENT_ID|RBO_ATTEMPT_ID)=${attemptId}(?:\\s|$)`,
+    );
     for (const line of stdout.split('\n')) {
       if (regex.test(line)) {
         const match = line.trim().match(/^(\d+)\s+/);

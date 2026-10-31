@@ -1,5 +1,7 @@
+import type { QueuePolicy } from '@rbo/protocol';
 import { RboError } from '@rbo/shared';
-import type { ControllerIdentity } from '@rbo/shared';
+import type { ControllerIdentity, GitUrlAllowlist } from '@rbo/shared';
+import type { SnapshotCaptureLimits } from '@rbo/snapshot';
 import { requestAgentProbe } from '../agents/probe.js';
 import { revokeAgent } from '../agents/registry.js';
 import { listAgents } from '../agents/service.js';
@@ -26,9 +28,15 @@ export interface AdminContext {
   allowedProjectRoots?: string[];
   allowedArtifactDestinations?: string[];
   maxConcurrentJobs?: number;
-  gitAllowlist?: import('@rbo/shared').GitUrlAllowlist;
+  gitAllowlist?: GitUrlAllowlist;
   allowLocalFallback?: boolean;
   allowFullSnapshotFallback?: boolean;
+  controllerPublicHost?: string;
+  dataPlaneBaseUrl?: string;
+  snapshotCaptureLimits?: SnapshotCaptureLimits;
+  defaultQueuePolicy?: QueuePolicy;
+  getHostCpuBusyFraction?: () => number;
+  maxHostCpuBusyFraction?: number;
 }
 
 function requireIdentity(ctx: AdminContext): ControllerIdentity {

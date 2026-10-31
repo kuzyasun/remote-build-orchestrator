@@ -293,7 +293,11 @@ describe('handleJobConfirm negative paths (§1.1)', () => {
 
   it('allows administrator to confirm an awaiting_confirmation job directly', async () => {
     const { db, identity, jobId, ctx } = makeConfirmationFixture();
-    const result = await confirmJobByAdmin(db, identity, jobId, ctx);
+    const result = await confirmJobByAdmin(db, identity, jobId, {
+      ...ctx,
+      controllerPublicHost: 'controller.local',
+      dataPlaneBaseUrl: 'http://controller.local:9999',
+    });
     expect(result).toEqual({ ok: true, job_id: jobId, state: 'queued' });
 
     const job = getJob(db, jobId);

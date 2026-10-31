@@ -310,6 +310,12 @@ export async function startControllerServer(
     gitAllowlist: options.gitAllowlist,
     allowLocalFallback: options.allowLocalFallback,
     allowFullSnapshotFallback: options.allowFullSnapshotFallback,
+    controllerPublicHost: options.controllerPublicHost,
+    dataPlaneBaseUrl: options.dataPlaneBaseUrl,
+    snapshotCaptureLimits: options.snapshotCaptureLimits,
+    defaultQueuePolicy: options.defaultQueuePolicy,
+    getHostCpuBusyFraction: options.getHostCpuBusyFraction,
+    maxHostCpuBusyFraction: options.maxHostCpuBusyFraction,
   };
 
   const server = createServer((req, res) => {

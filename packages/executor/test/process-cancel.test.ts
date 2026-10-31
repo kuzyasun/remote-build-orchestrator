@@ -483,8 +483,11 @@ Wait-Process -Id $p.Id
     const logs = await ensureAttemptLogs(join(workspace, 'logs'));
     const isWin = process.platform === 'win32';
     try {
+      const attemptFile = join(workspace, 'attempt.txt');
       const mainScript = isWin ? 'Start-Sleep -Seconds 10' : 'sleep 10';
-      const cleanupScript = isWin ? 'Start-Sleep -Milliseconds 500; exit 0' : 'sleep 0.5; exit 0';
+      const cleanupScript = isWin
+        ? `Set-Content -Path '${attemptFile}' -Value $env:RBO_ATTEMPT_ID; Start-Sleep -Milliseconds 500; exit 0`
+        : `printf '%s' "$RBO_ATTEMPT_ID" > '${attemptFile}'; sleep 0.5; exit 0`;
       const shell = isWin ? 'powershell' : 'bash';
 
       await writeJobScript(controlDir, {
@@ -535,6 +538,8 @@ Wait-Process -Id $p.Id
       const [_, cleanupResult] = await Promise.all([killPromise, cleanupPromise]);
       expect(cleanupResult.exitCode).toBe(0);
       expect(cleanupResult.timedOut).toBe(false);
+      const recordedAttempt = await readFile(attemptFile, 'utf8');
+      expect(recordedAttempt.trim()).toBe('att_cleanup_isolation');
     } finally {
       await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     }

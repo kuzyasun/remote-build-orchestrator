@@ -1,5 +1,6 @@
 import {
   cancelJobRemote,
+  confirmJobAdmin,
   confirmJobRemote,
   followJobLogsRemote,
   getJobRemote,
@@ -160,15 +161,11 @@ export async function runJobToTerminal(
   return result;
 }
 
-function confirmationToken(result: Record<string, unknown>): string {
-  if (typeof result.confirmation_token !== 'string' || result.confirmation_token.length === 0) {
-    throw new Error('Malformed job_run confirmation response: expected confirmation_token');
-  }
-  return result.confirmation_token;
-}
-
 function formatConfirmationSummary(result: Record<string, unknown>, jobId: string): string {
   const lines = [`Job ${jobId} requires confirmation.`];
+  if (typeof result.message === 'string' && result.message.length > 0) {
+    lines.push(result.message);
+  }
   if (typeof result.snapshot_id === 'string' && result.snapshot_id.length > 0) {
     lines.push(`Snapshot: ${result.snapshot_id}`);
   }
@@ -206,7 +203,11 @@ export async function runJobWithLifecycle(
   if (!accepted) throw new ConfirmationDeclinedError(jobId);
   interrupted(options.signal, jobId);
   try {
-    await confirmJobRemote(baseUrl, jobId, confirmationToken(first), { signal: options.signal });
+    if (typeof first.confirmation_token === 'string' && first.confirmation_token.length > 0) {
+      await confirmJobRemote(baseUrl, jobId, first.confirmation_token, { signal: options.signal });
+    } else {
+      await confirmJobAdmin(baseUrl, jobId);
+    }
   } catch (error) {
     if (options.signal?.aborted) throw new RunInterruptedError(jobId);
     throw error;

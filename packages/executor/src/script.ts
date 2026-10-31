@@ -323,6 +323,7 @@ async function listDescendantPids(rootPids: number[]): Promise<number[]> {
 
 function spawnNodeProcess(input: {
   attemptId?: string;
+  containmentId?: string;
   command: string;
   args: string[];
   cwd: string;
@@ -343,10 +344,11 @@ function spawnNodeProcess(input: {
     windowsHide: true,
   });
 
+  const containmentId = input.containmentId ?? input.attemptId;
   let cgroupScope: LinuxCgroupScope | null = null;
   let processExited = false;
-  if (input.attemptId && process.platform === 'linux' && child.pid) {
-    void createLinuxCgroupScope(input.attemptId).then(async (scope) => {
+  if (containmentId && process.platform === 'linux' && child.pid) {
+    void createLinuxCgroupScope(containmentId).then(async (scope) => {
       if (!scope) return;
       if (processExited) {
         await scope.cleanup();
@@ -408,7 +410,7 @@ function spawnNodeProcess(input: {
     // reparented to init, no longer showing the wrapper as its ppid. Looking it
     // up *after* signaling would silently miss it.
     const preSignalDescendants = await listDescendantPids([pid]);
-    const envDescendants = input.attemptId ? await findAttemptPids(input.attemptId) : [];
+    const envDescendants = containmentId ? await findAttemptPids(containmentId) : [];
     const cgroupDescendants = cgroupScope ? await cgroupScope.listPids() : [];
 
     const signalAll = async (signal: NodeJS.Signals, extraDescendants: number[] = []) => {
@@ -459,7 +461,7 @@ function spawnNodeProcess(input: {
     const lateDescendants = await listDescendantPids([pid, ...preSignalDescendants]).catch(
       () => [],
     );
-    const lateEnvDescendants = input.attemptId ? await findAttemptPids(input.attemptId) : [];
+    const lateEnvDescendants = containmentId ? await findAttemptPids(containmentId) : [];
     const lateCgroupDescendants = cgroupScope ? await cgroupScope.listPids() : [];
     await signalAll('SIGKILL', [
       ...lateDescendants,
@@ -722,6 +724,7 @@ function buildChildEnv(input: {
 
 export function spawnJobScript(input: {
   attemptId: string;
+  containmentId?: string;
   controlDir: string;
   workspacePath: string;
   projectPath: string;
@@ -750,17 +753,21 @@ export function spawnJobScript(input: {
       extra[key] = value;
     }
   }
+  const containmentId = input.containmentId ?? input.attemptId;
   const { env: childEnv, ignoredRboEnvKeys } = buildChildEnv({
     execution: input.execution,
-    injected: buildReservedRboEnv({
-      jobId: input.env.RBO_JOB_ID ?? '',
-      attemptId: input.env.RBO_ATTEMPT_ID ?? input.attemptId,
-      workspacePath: input.workspacePath,
-      projectPath: input.projectPath,
-      logDir: input.logs.logDir,
-      artifactDir: input.env.RBO_ARTIFACT_DIR ?? '',
-      extra,
-    }),
+    injected: {
+      ...buildReservedRboEnv({
+        jobId: input.env.RBO_JOB_ID ?? '',
+        attemptId: input.env.RBO_ATTEMPT_ID ?? input.attemptId,
+        workspacePath: input.workspacePath,
+        projectPath: input.projectPath,
+        logDir: input.logs.logDir,
+        artifactDir: input.env.RBO_ARTIFACT_DIR ?? '',
+        extra,
+      }),
+      RBO_CONTAINMENT_ID: containmentId,
+    },
   });
 
   let command: string;
@@ -806,6 +813,7 @@ export function spawnJobScript(input: {
 
   const child = spawnNodeProcess({
     attemptId: input.attemptId,
+    containmentId,
     command,
     args,
     cwd: input.projectPath,
@@ -837,14 +845,11 @@ export async function runCleanupScript(input: {
   const isDirectWin = input.execution.shell === 'direct' && process.platform === 'win32';
   const cleanupName = isPowerShell ? 'cleanup.ps1' : isDirectWin ? 'cleanup.cmd' : 'cleanup.sh';
   await writeJobScript(input.controlDir, input.execution, cleanupName);
-  const cleanupAttemptId = `${input.attemptId}_cleanup`;
+  const cleanupContainmentId = `${input.attemptId}_cleanup`;
   const child = spawnJobScript({
     ...input,
-    attemptId: cleanupAttemptId,
-    env: {
-      ...input.env,
-      RBO_ATTEMPT_ID: cleanupAttemptId,
-    },
+    attemptId: input.attemptId,
+    containmentId: cleanupContainmentId,
     scriptFileName: cleanupName,
   });
   const timeoutMs = (input.execution.cleanup_timeout_seconds ?? 60) * 1000;
