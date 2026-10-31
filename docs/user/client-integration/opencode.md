@@ -21,7 +21,7 @@ Stdio (preferred):
 }
 ```
 
-Remote HTTP alternative (requires Bearer token from `~/.rbo/controller/admin.token`):
+Remote HTTP alternative (requires Bearer token from `~/.rbo/security/admin-token` or `<dataDir>/security/admin-token`):
 
 ```json
 {

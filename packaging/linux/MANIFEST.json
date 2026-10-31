@@ -21,8 +21,8 @@
     },
     {
       "path": "bin/rbo-mcp-stdio.js",
-      "sha256": "c53af0a49f2d4bad354770b5fbc3168f65284fde85f7793fdfb9192a8acc931c",
-      "size_bytes": 33564,
+      "sha256": "21499b3e5b9ced789f37289fee2d44395ef42bdd54951f3219fbfe890722b017",
+      "size_bytes": 33631,
       "source": "apps/cli/dist/rbo-mcp-stdio.js"
     },
     {

@@ -105,7 +105,7 @@ export function createStdioProxyServer(options: StdioProxyOptions): McpServer {
   });
 
   const baseUrl = options.controllerUrl.replace(/\/+$/, '');
-  const adminToken = options.adminToken ?? readAdminToken();
+  const resolveAdminToken = () => options.adminToken ?? readAdminToken();
 
   for (const def of MCP_TOOL_DEFS) {
     server.registerTool(
@@ -120,6 +120,8 @@ export function createStdioProxyServer(options: StdioProxyOptions): McpServer {
               })
             : { stop: () => undefined };
 
+        const currentToken = resolveAdminToken();
+
         try {
           let response: Response;
           try {
@@ -129,7 +131,7 @@ export function createStdioProxyServer(options: StdioProxyOptions): McpServer {
                 'content-type': 'application/json',
                 'x-rbo-client-id': options.clientId,
                 'x-rbo-client-transport': 'stdio',
-                ...(adminToken ? { authorization: `Bearer ${adminToken}` } : {}),
+                ...(currentToken ? { authorization: `Bearer ${currentToken}` } : {}),
               },
               body: JSON.stringify(args ?? {}),
               signal: extra.signal,
