@@ -15,7 +15,8 @@ async function main(): Promise<void> {
   const clientId =
     argValue('--client-id') ?? process.env.RBO_CLIENT_ID ?? `mcp-stdio-${process.pid}`;
 
-  const server = createStdioProxyServer({ controllerUrl, clientId });
+  const adminToken = argValue('--admin-token');
+  const server = createStdioProxyServer({ controllerUrl, clientId, adminToken });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stderr only: stdout belongs to the MCP protocol.

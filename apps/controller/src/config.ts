@@ -60,6 +60,8 @@ export interface ControllerConfig {
   mdnsEnabled: boolean;
   /** mDNS instance display name. Default: `'rbo-controller'`. */
   mdnsDisplayName: string;
+  /** Confirmation policy for destructive/hardware jobs. 'developer' (default) allows AI self-confirmation; 'strict' requires operator confirmation. */
+  confirmationPolicy: 'developer' | 'strict';
 }
 
 /** Default max git bundle size when RBO_MAX_GIT_BUNDLE_BYTES is unset (512 MiB). */
@@ -138,6 +140,7 @@ export const ControllerConfigFileSchema = z
         'mDNS display name cannot contain control characters',
       )
       .optional(),
+    confirmation_policy: z.enum(['developer', 'strict']).optional(),
   })
   .strict();
 
@@ -298,6 +301,7 @@ export function defaultControllerConfigFile(): ControllerConfigFile {
     default_queue_policy: 'wait',
     mdns_enabled: true,
     mdns_display_name: RBO_MDNS_DEFAULT_DISPLAY_NAME,
+    confirmation_policy: 'developer',
   };
 }
 
@@ -355,6 +359,16 @@ export function resolveDefaultDataDir(): string {
  * Operators edit `~/.rbo/controller.json` (or `$RBO_DATA_DIR/controller.json`).
  * Env vars remain available for CI/scripts and override the file.
  */
+function validateConfirmationPolicy(val: unknown, source: string): 'developer' | 'strict' {
+  if (typeof val === 'string') {
+    const normalized = val.trim().toLowerCase();
+    if (normalized === 'developer' || normalized === 'strict') {
+      return normalized;
+    }
+  }
+  throw new Error(`Invalid ${source}: "${String(val)}". Expected "developer" or "strict".`);
+}
+
 export function loadControllerConfig(
   overrides: LoadControllerConfigOptions = {},
 ): ControllerConfig {
@@ -574,6 +588,18 @@ export function loadControllerConfig(
         ? validateMdnsDisplayName(file.mdns_display_name, 'file.mdns_display_name')
         : undefined) ??
       RBO_MDNS_DEFAULT_DISPLAY_NAME,
+    confirmationPolicy:
+      (fieldOverrides.confirmationPolicy !== undefined
+        ? validateConfirmationPolicy(
+            fieldOverrides.confirmationPolicy,
+            'fieldOverrides.confirmationPolicy',
+          )
+        : undefined) ??
+      (envSet('RBO_CONFIRMATION_POLICY')
+        ? validateConfirmationPolicy(process.env.RBO_CONFIRMATION_POLICY, 'RBO_CONFIRMATION_POLICY')
+        : undefined) ??
+      file?.confirmation_policy ??
+      'developer',
   };
 }
 

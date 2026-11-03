@@ -3,9 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureControllerIdentity, generateDeviceKeyPair } from '@rbo/shared';
 import type { ControllerIdentity } from '@rbo/shared';
+import { createGitFixtureRepo } from '@rbo/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startControllerServer } from '../src/http/server.js';
 import type { RunningControllerServer } from '../src/http/server.js';
+import { createJob, persistSnapshot, transitionJobState } from '../src/jobs/lifecycle.js';
 import { createPairingRequest } from '../src/security/pairing.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
@@ -43,16 +45,146 @@ interface AdminApiBody {
   error?: { category: string };
 }
 
-async function post(path: string, body: unknown): Promise<{ status: number; body: AdminApiBody }> {
+async function post(
+  path: string,
+  body: unknown,
+  authHeader?: string,
+): Promise<{ status: number; body: AdminApiBody }> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (authHeader !== undefined) {
+    if (authHeader) headers.authorization = authHeader;
+  } else if (identity?.adminToken) {
+    headers.authorization = `Bearer ${identity.adminToken}`;
+  }
   const res = await fetch(`http://127.0.0.1:${running.port}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify(body ?? {}),
   });
   return { status: res.status, body: (await res.json()) as AdminApiBody };
 }
 
 describe('Admin API for CLI (§33)', () => {
+  it('rejects unauthorized requests without Bearer token', async () => {
+    const res = await post('/internal/v1/admin/pairing/list', {}, '');
+    expect(res.status).toBe(401);
+    expect(res.body.error?.category).toBe('unauthorized');
+  });
+
+  it('rejects unauthorized requests with invalid Bearer token', async () => {
+    const res = await post('/internal/v1/admin/pairing/list', {}, 'Bearer invalid-token');
+    expect(res.status).toBe(401);
+    expect(res.body.error?.category).toBe('unauthorized');
+  });
+
+  it('authenticates with valid Bearer token', async () => {
+    const res = await post('/internal/v1/admin/pairing/list', {}, `Bearer ${identity.adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.requests).toBeDefined();
+  });
+
+  it('supports RBO_ADMIN_TOKEN environment override for server auth', async () => {
+    const customDb = openDatabase(':memory:');
+    migrateToLatest(customDb);
+    const priorEnv = process.env.RBO_ADMIN_TOKEN;
+    process.env.RBO_ADMIN_TOKEN = 'custom-env-secret-123';
+    try {
+      const customRunning = await startControllerServer({
+        allowFullSnapshotFallback: true,
+        host: '127.0.0.1',
+        port: 0,
+        db: customDb,
+      });
+      try {
+        const unauth = await fetch(
+          `http://127.0.0.1:${customRunning.port}/internal/v1/admin/pairing/list`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(unauth.status).toBe(401);
+
+        const auth = await fetch(
+          `http://127.0.0.1:${customRunning.port}/internal/v1/admin/pairing/list`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: 'Bearer custom-env-secret-123',
+            },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(auth.status).toBe(200);
+      } finally {
+        await customRunning.close();
+      }
+    } finally {
+      if (priorEnv !== undefined) {
+        process.env.RBO_ADMIN_TOKEN = priorEnv;
+      } else {
+        // biome-ignore lint/performance/noDelete: process.env coerces undefined to string
+        delete process.env.RBO_ADMIN_TOKEN;
+      }
+    }
+  });
+
+  it('falls back to identity token and rejects unauthorized requests when RBO_ADMIN_TOKEN is empty string', async () => {
+    const priorEnv = process.env.RBO_ADMIN_TOKEN;
+    process.env.RBO_ADMIN_TOKEN = '   ';
+    try {
+      const customRunning = await startControllerServer({
+        allowFullSnapshotFallback: true,
+        host: '127.0.0.1',
+        port: 0,
+        db,
+        identity,
+      });
+      try {
+        const unauth = await fetch(
+          `http://127.0.0.1:${customRunning.port}/internal/v1/admin/pairing/list`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(unauth.status).toBe(401);
+
+        const auth = await fetch(
+          `http://127.0.0.1:${customRunning.port}/internal/v1/admin/pairing/list`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${identity.adminToken}`,
+            },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(auth.status).toBe(200);
+      } finally {
+        await customRunning.close();
+      }
+    } finally {
+      if (priorEnv !== undefined) {
+        process.env.RBO_ADMIN_TOKEN = priorEnv;
+      } else {
+        // biome-ignore lint/performance/noDelete: process.env coerces undefined to string
+        delete process.env.RBO_ADMIN_TOKEN;
+      }
+    }
+  });
+
+  it('allows unauthenticated access to /internal/v1/health', async () => {
+    const res = await fetch(`http://127.0.0.1:${running.port}/internal/v1/health`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean };
+    expect(body).toEqual({ ok: true });
+  });
+
   it('lists pending pairing requests', async () => {
     const device = generateDeviceKeyPair();
     createPairingRequest(db, {
@@ -138,5 +270,86 @@ describe('Admin API for CLI (§33)', () => {
     });
     expect(probe.status).toBe(409);
     expect(probe.body.error?.category).toBe('agent_lost');
+  });
+
+  it('confirms an awaiting_confirmation job as administrator via /internal/v1/admin/jobs/confirm', async () => {
+    persistSnapshot(db, {
+      snapshotId: 'snap_admin_confirm',
+      contentId: 'content_admin_confirm',
+      repoId: 'repo_admin_confirm',
+      baseCommit: null,
+      dirty: false,
+      manifestPath: '/tmp/manifest.json',
+      payloadPath: '/tmp/payload.tar',
+      sizeBytes: 100,
+      sha256: 'sha256:test',
+    });
+    const job = createJob(db, {
+      jobId: 'job_admin_confirm',
+      clientId: 'test-client',
+      clientRequestId: 'req_admin_confirm',
+      name: 'admin-confirm-test',
+      initialState: 'created',
+      request: {
+        client_request_id: 'req_admin_confirm',
+        source: { project_root: '/tmp', cwd: '.' },
+        execution: { script: 'echo hi' },
+        risk_level: 'destructive',
+      },
+    });
+    transitionJobState(db, job.id, 'awaiting_confirmation', {
+      snapshot_id: 'snap_admin_confirm',
+      queued_at: new Date().toISOString(),
+    });
+
+    const unauth = await post('/internal/v1/admin/jobs/confirm', { job_id: job.id }, '');
+    expect(unauth.status).toBe(401);
+
+    const res = await post('/internal/v1/admin/jobs/confirm', { job_id: job.id });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, job_id: job.id, state: 'queued' });
+  });
+
+  it('omits confirmation_token and requires operator confirmation in strict mode', async () => {
+    const fixture = await createGitFixtureRepo({
+      committed: [{ path: 'hello.txt', content: 'hello' }],
+    });
+    const strictRunning = await startControllerServer({
+      dataDir,
+      allowFullSnapshotFallback: true,
+      allowedProjectRoots: [fixture.root],
+      host: '127.0.0.1',
+      port: 0,
+      db,
+      identity,
+      confirmationPolicy: 'strict',
+    });
+    try {
+      const submitRes = await fetch(
+        `http://127.0.0.1:${strictRunning.port}/internal/v1/tools/job_submit`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${identity.adminToken}`,
+          },
+          body: JSON.stringify({
+            client_request_id: 'req_strict_test',
+            source: { project_root: fixture.root, cwd: '.' },
+            execution: { script: 'echo hi' },
+            risk_level: 'destructive',
+          }),
+        },
+      );
+      expect(submitRes.status).toBe(200);
+      const submitBody = (await submitRes.json()) as Record<string, unknown>;
+      expect(submitBody.state).toBe('awaiting_confirmation');
+      expect(submitBody.confirmation_token).toBeNull();
+      expect(submitBody.requires_operator_confirmation).toBe(true);
+      expect(submitBody.message).toContain('Operator confirmation required');
+    } finally {
+      await strictRunning.close();
+      await fixture.cleanup();
+    }
   });
 });

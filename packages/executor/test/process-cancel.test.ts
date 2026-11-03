@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { ensureAttemptLogs } from '../src/logs.js';
-import { spawnJobScript, writeJobScript } from '../src/script.js';
+import { runCleanupScript, spawnJobScript, writeJobScript } from '../src/script.js';
 import { describeWindowsExecutorResolution } from '../src/windows-executor-path.js';
 
 const execFileAsync = promisify(execFile);
@@ -230,6 +230,79 @@ wait
     30_000,
   );
 
+  it.skipIf(process.platform === 'win32')(
+    'cancel terminates a setsid descendant reparented to init',
+    async () => {
+      const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-cancel-setsid-'));
+      const controlDir = join(workspace, 'control');
+      const logs = await ensureAttemptLogs(join(workspace, 'logs'));
+      const pidFile = join(workspace, 'setsid.pid');
+      try {
+        const script = `#!/bin/bash
+setsid bash -c 'echo $$ > ${pidFile}; exec sleep 120' &
+wait
+`;
+        await writeJobScript(controlDir, {
+          shell: 'bash',
+          script,
+          timeout_seconds: 120,
+          cancel_grace_seconds: 1,
+        });
+        const child = spawnJobScript({
+          attemptId: 'att_test_setsid',
+          controlDir,
+          workspacePath: workspace,
+          projectPath: workspace,
+          execution: {
+            shell: 'bash',
+            script,
+            timeout_seconds: 120,
+            cancel_grace_seconds: 1,
+          },
+          env: {},
+          logs,
+        });
+
+        let setsidPid: number | undefined;
+        for (let i = 0; i < 30; i++) {
+          try {
+            const raw = (await readFile(pidFile, 'utf8')).trim();
+            const n = Number.parseInt(raw, 10);
+            if (Number.isFinite(n) && n > 0) {
+              setsidPid = n;
+              break;
+            }
+          } catch {}
+          await new Promise((r) => setTimeout(r, 100));
+        }
+
+        expect(setsidPid).toBeDefined();
+        if (setsidPid !== undefined) {
+          expect(await pidAlive(setsidPid)).toBe(true);
+
+          await child.kill(1);
+          await child.waitForExit();
+
+          await waitForPidExit(setsidPid, 5000, 'setsid child should be terminated by cancel');
+          expect(await pidAlive(setsidPid)).toBe(false);
+        }
+      } finally {
+        await readFile(pidFile, 'utf8')
+          .then((raw) => {
+            const leaked = Number.parseInt(raw.trim(), 10);
+            if (Number.isFinite(leaked)) {
+              try {
+                process.kill(leaked, 'SIGKILL');
+              } catch {}
+            }
+          })
+          .catch(() => undefined);
+        await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      }
+    },
+    30_000,
+  );
+
   // Without job control, `kill -TERM "-$(ps -o pgid= "$BG_PID")"` resolves the
   // *wrapper's* pgid (the background job shares it), so a cleanup trap using
   // this common idiom signals the wrapper itself: cleanup dies half-done and the
@@ -403,4 +476,72 @@ Wait-Process -Id $p.Id
     },
     30_000,
   );
+
+  it('cleanup script runs in isolated containment identity and is not killed by late cancel scan', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-cleanup-id-'));
+    const controlDir = join(workspace, 'control');
+    const logs = await ensureAttemptLogs(join(workspace, 'logs'));
+    const isWin = process.platform === 'win32';
+    try {
+      const attemptFile = join(workspace, 'attempt.txt');
+      const mainScript = isWin ? 'Start-Sleep -Seconds 10' : 'sleep 10';
+      const cleanupScript = isWin
+        ? `Set-Content -Path '${attemptFile}' -Value $env:RBO_ATTEMPT_ID; Start-Sleep -Milliseconds 500; exit 0`
+        : `printf '%s' "$RBO_ATTEMPT_ID" > '${attemptFile}'; sleep 0.5; exit 0`;
+      const shell = isWin ? 'powershell' : 'bash';
+
+      await writeJobScript(controlDir, {
+        shell,
+        script: mainScript,
+        timeout_seconds: 30,
+        cancel_grace_seconds: 2,
+      });
+
+      const child = spawnJobScript({
+        attemptId: 'att_cleanup_isolation',
+        controlDir,
+        workspacePath: workspace,
+        projectPath: workspace,
+        execution: {
+          shell,
+          script: mainScript,
+          timeout_seconds: 30,
+          cancel_grace_seconds: 2,
+        },
+        env: {},
+        logs,
+      });
+
+      // Trigger cancel with 2 seconds grace period in the background without awaiting it
+      const killPromise = child.kill(2);
+
+      // Main process exits on SIGTERM quickly
+      await child.waitForExit();
+
+      // Immediately run cleanup script with the same attemptId while killPromise is still sleeping in grace period
+      const cleanupPromise = runCleanupScript({
+        attemptId: 'att_cleanup_isolation',
+        controlDir,
+        workspacePath: workspace,
+        projectPath: workspace,
+        execution: {
+          shell,
+          script: mainScript,
+          cleanup_script: cleanupScript,
+          timeout_seconds: 30,
+          cancel_grace_seconds: 1,
+        },
+        env: {},
+        logs,
+      });
+
+      const [_, cleanupResult] = await Promise.all([killPromise, cleanupPromise]);
+      expect(cleanupResult.exitCode).toBe(0);
+      expect(cleanupResult.timedOut).toBe(false);
+      const recordedAttempt = await readFile(attemptFile, 'utf8');
+      expect(recordedAttempt.trim()).toBe('att_cleanup_isolation');
+    } finally {
+      await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
+  });
 });

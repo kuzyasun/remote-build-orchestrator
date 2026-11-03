@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 // selfsigned is CJS; default import via esModuleInterop.
@@ -5,6 +6,7 @@ import selfsigned from 'selfsigned';
 import { ulid } from 'ulid';
 import { certificateFingerprint } from './crypto.js';
 import { generateDeviceKeyPair } from './crypto.js';
+import { type RboLayoutOptions, resolveControllerDataDir } from './layout.js';
 
 // Controller identity (§8.1): a pinned TLS certificate for port 7411 plus an
 // Ed25519 signing key pair used to sign agent credentials and data tokens.
@@ -18,6 +20,7 @@ export interface ControllerIdentity {
   signingPublicKeyPem: string;
   signingPrivateKeyPem: string;
   fingerprint: string;
+  adminToken: string;
 }
 
 function pemToDer(certPem: string): Buffer {
@@ -67,8 +70,16 @@ export async function ensureControllerIdentity(dataDir: string): Promise<Control
     );
   }
 
+  const adminTokenPath = join(securityDir, 'admin-token');
+  if (!existsSync(adminTokenPath)) {
+    const token = randomBytes(32).toString('hex');
+    writeFileSync(adminTokenPath, `${token}\n`, { mode: 0o600 });
+  }
+
   const tlsCertPem = readFileSync(certPath, 'utf8');
   const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as { controller_id: string };
+
+  const envAdminToken = process.env.RBO_ADMIN_TOKEN?.trim();
 
   return {
     controllerId: meta.controller_id,
@@ -77,5 +88,23 @@ export async function ensureControllerIdentity(dataDir: string): Promise<Control
     signingPublicKeyPem: readFileSync(signingPublicPath, 'utf8'),
     signingPrivateKeyPem: readFileSync(signingPrivatePath, 'utf8'),
     fingerprint: certificateFingerprint(pemToDer(tlsCertPem)),
+    adminToken: envAdminToken || readFileSync(adminTokenPath, 'utf8').trim(),
   };
+}
+
+export function readAdminToken(options?: RboLayoutOptions): string | undefined {
+  const envToken = (options?.env ?? process.env).RBO_ADMIN_TOKEN?.trim();
+  if (envToken) {
+    return envToken;
+  }
+  const tokenPath = join(resolveControllerDataDir(options), 'security', 'admin-token');
+  if (existsSync(tokenPath)) {
+    try {
+      const token = readFileSync(tokenPath, 'utf8').trim();
+      return token.length > 0 ? token : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }

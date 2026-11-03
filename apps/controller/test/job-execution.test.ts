@@ -71,6 +71,7 @@ function baseJobRequest(projectRoot: string): JobRequest {
 let running: RunningControllerServer;
 let dataDir: string;
 let db: ControllerDatabase;
+let identity: import('@rbo/shared').ControllerIdentity;
 let fixtureDir: string;
 let artifactDestRoot: string;
 let cleanupFixture: () => Promise<void>;
@@ -80,7 +81,7 @@ beforeAll(async () => {
   artifactDestRoot = await mkdtemp(join(tmpdir(), 'rbo-artifact-dest-'));
   db = openDatabase(':memory:');
   migrateToLatest(db);
-  const identity = await ensureControllerIdentity(dataDir);
+  identity = await ensureControllerIdentity(dataDir);
   const fixture = await createFixtureRepo();
   fixtureDir = fixture.dir;
   cleanupFixture = fixture.cleanup;
@@ -115,7 +116,14 @@ async function connectClient(clientId: string): Promise<Client> {
   const client = new Client({ name: 'test-job-client', version: '0.0.1' });
   const transport = new StreamableHTTPClientTransport(
     new URL(`http://127.0.0.1:${running.port}/mcp`),
-    { requestInit: { headers: { 'x-rbo-client-id': clientId } } },
+    {
+      requestInit: {
+        headers: {
+          'x-rbo-client-id': clientId,
+          authorization: `Bearer ${identity.adminToken}`,
+        },
+      },
+    },
   );
   await client.connect(transport);
   return client;

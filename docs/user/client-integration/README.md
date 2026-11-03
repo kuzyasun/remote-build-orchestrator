@@ -20,8 +20,12 @@ client cannot find it, launch the same script through Node:
 | Repository build | `node` | `<REPO>/apps/cli/dist/rbo-mcp-stdio.js` |
 | Release archive | `node` | `<RBO_ROOT>/bin/rbo-mcp-stdio.js` |
 
-Keep `RBO_CONTROLLER_URL=http://127.0.0.1:7410` in the proxy environment. Clients that support
-Streamable HTTP can instead connect directly to `http://127.0.0.1:7410/mcp`.
+Keep `RBO_CONTROLLER_URL=http://127.0.0.1:7410` in the proxy environment. The `rbo-mcp-stdio` proxy
+automatically reads the admin token from `~/.rbo/security/admin-token` (or `<dataDir>/security/admin-token`
+if `RBO_DATA_DIR` is overridden, or `RBO_ADMIN_TOKEN`).
+Clients that support Streamable HTTP can instead connect directly to `http://127.0.0.1:7410/mcp`,
+supplying an `Authorization: Bearer <ADMIN_TOKEN>` header (the token can be read from
+`~/.rbo/security/admin-token` on the Controller host).
 
 These are configuration examples, not a guarantee that every client version has been tested. For
 the complete Controller and Agent setup, see [Getting started](../getting-started.md).

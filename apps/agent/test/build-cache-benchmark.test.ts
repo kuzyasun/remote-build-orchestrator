@@ -105,6 +105,7 @@ describe('Build cache benchmark report', () => {
     const snapshotPath = join(snapshotDir, 'workspace.bin');
     await writeFile(snapshotPath, payload);
     const roundTrip = await readFile(snapshotPath);
+    await sleep(2);
     const snapshotTransferMs = Date.now() - xferStart;
     expect(roundTrip.length).toBe(payload.length);
 

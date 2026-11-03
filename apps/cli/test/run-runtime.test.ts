@@ -315,6 +315,74 @@ describe('rbo run runtime', () => {
     expect(result).toMatchObject({ job_id: 'job_confirmed', outcome: 'succeeded', exit_code: 0 });
   });
 
+  it('confirms a strict confirmation job via admin endpoint when confirmation_token is omitted', async () => {
+    const requests: Array<{ path: string; body: unknown }> = [];
+    const baseUrl = await listen(
+      createServer(async (req, res) => {
+        const body = await readJson(req);
+        requests.push({ path: req.url ?? '', body });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        if (req.url === '/internal/v1/admin/jobs/confirm') {
+          res.end(JSON.stringify({ ok: true, job_id: 'job_strict_confirmed', state: 'queued' }));
+          return;
+        }
+        if (requests.filter((entry) => entry.path.endsWith('/job_run')).length === 1) {
+          res.end(
+            JSON.stringify({
+              job_id: 'job_strict_confirmed',
+              state: 'awaiting_confirmation',
+              confirmation_token: null,
+              requires_operator_confirmation: true,
+              message: "Operator confirmation required via 'rbo jobs confirm job_strict_confirmed'",
+              snapshot_id: 'snp_strict',
+              resume: false,
+            }),
+          );
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            job_id: 'job_strict_confirmed',
+            state: 'completed',
+            outcome: 'succeeded',
+            exit_code: 0,
+          }),
+        );
+      }),
+    );
+    const stderr: string[] = [];
+
+    const result = await runJobWithLifecycle(
+      baseUrl,
+      { command: 'dangerous', project_root: '/work/project', cwd: '.' },
+      {
+        io: {
+          isTTY: true,
+          writeStderr: (text) => stderr.push(text),
+          confirm: async (prompt) => prompt.includes('job_strict_confirmed'),
+        },
+      },
+    );
+
+    expect(stderr.join('')).toContain('Operator confirmation required');
+    expect(requests).toEqual([
+      {
+        path: '/internal/v1/tools/job_run',
+        body: { command: 'dangerous', project_root: '/work/project', cwd: '.' },
+      },
+      {
+        path: '/internal/v1/admin/jobs/confirm',
+        body: { job_id: 'job_strict_confirmed' },
+      },
+      { path: '/internal/v1/tools/job_run', body: { job_id: 'job_strict_confirmed' } },
+    ]);
+    expect(result).toMatchObject({
+      job_id: 'job_strict_confirmed',
+      outcome: 'succeeded',
+      exit_code: 0,
+    });
+  });
+
   it('refuses a confirmation-required job without a TTY and does not bypass it', async () => {
     const baseUrl = await listen(
       createServer((req, res) => {

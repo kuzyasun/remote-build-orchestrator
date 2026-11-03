@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -63,5 +66,47 @@ describe('stdio proxy errors', () => {
     expect(result.isError).toBe(true);
     expect(contentText(result)).toBe(body);
     expect(contentText(result, 1)).toBe('RBO Controller returned HTTP 503');
+  });
+
+  it('resolves admin token dynamically per request when token becomes available on disk', async () => {
+    let capturedHeaders: Record<string, string> = {};
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      capturedHeaders = (init?.headers ?? {}) as Record<string, string>;
+      return new Response(JSON.stringify({ agents: [] }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const tempDir = await mkdtemp(join(tmpdir(), 'rbo-mcp-test-'));
+    process.env.RBO_DATA_DIR = tempDir;
+    try {
+      const proxy = createStdioProxyServer({
+        controllerUrl: 'http://127.0.0.1:7410',
+        clientId: 'proxy-dynamic-token-test',
+      });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await proxy.connect(serverTransport);
+      const client = new Client({ name: 'proxy-dynamic-token-test', version: '0.0.1' });
+      await client.connect(clientTransport);
+
+      try {
+        // First call: token file doesn't exist
+        await client.callTool({ name: 'agents_list', arguments: { include_offline: false } });
+        expect(capturedHeaders.authorization).toBeUndefined();
+
+        // Write token file
+        const secDir = join(tempDir, 'security');
+        await mkdir(secDir, { recursive: true });
+        await writeFile(join(secDir, 'admin-token'), 'dynamic-token-123\n');
+
+        // Second call: picks up the token without restarting proxy
+        await client.callTool({ name: 'agents_list', arguments: { include_offline: false } });
+        expect(capturedHeaders.authorization).toBe('Bearer dynamic-token-123');
+      } finally {
+        await client.close();
+      }
+    } finally {
+      process.env.RBO_DATA_DIR = undefined;
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 });

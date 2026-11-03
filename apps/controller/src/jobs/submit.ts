@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { appendEvent, globMatch, presentLogTail } from '@rbo/executor';
 import type { AgentCapabilityReport, JobRequest, QueuePolicy } from '@rbo/protocol';
 import { ArtifactCollectionSummarySchema, JobRequestSchema } from '@rbo/protocol';
-import type { ControllerIdentity } from '@rbo/shared';
+import type { ControllerIdentity, ErrorCategory } from '@rbo/shared';
 import {
   RboError,
   computeCapacityScore,
@@ -212,6 +212,8 @@ export interface SubmitJobContext extends LocalRunnerContext {
   shouldContinueDispatch?: () => boolean;
   /** In-process S-03 fault injection; never populated from an external request. */
   snapshotPublicationTestHooks?: SnapshotPublicationTestHooks;
+  /** Confirmation policy for destructive/hardware jobs. Default 'developer'. */
+  confirmationPolicy?: 'developer' | 'strict';
 }
 
 function requestHash(request: JobRequest): string {
@@ -397,6 +399,7 @@ export async function handleJobSubmit(
       transitionJobState(ctx.db, job.id, job.state, { snapshot_id: snapshotId });
 
       if (isDestructiveRisk(normalizedRequest.risk_level)) {
+        const isStrict = ctx.confirmationPolicy === 'strict';
         const confirmation_token = issueConfirmationToken(ctx.controllerIdentity, {
           job_id: job.id,
           request_hash: hash,
@@ -411,7 +414,11 @@ export async function handleJobSubmit(
           content_id: contentId,
           snapshot_captured: true,
           selected_agent: null,
-          confirmation_token,
+          confirmation_token: isStrict ? null : confirmation_token,
+          requires_operator_confirmation: isStrict ? true : undefined,
+          message: isStrict
+            ? `Job has risk_level '${normalizedRequest.risk_level}'. Operator confirmation required via 'rbo jobs confirm ${job.id}'.`
+            : undefined,
           secret_warnings: secretWarnings.map((w) => w.path),
         };
         completeSubmission(
@@ -695,6 +702,15 @@ export async function handleJobConfirm(
 
   const tokenClaims = verifyConfirmationToken(ctx.controllerIdentity, args.confirmation_token);
   if (!tokenClaims || tokenClaims.job_id !== job.id) {
+    const expiredCutoff = new Date(Date.now() - CONFIRMATION_TTL_SECONDS * 1000).toISOString();
+    if (job.queued_at && job.queued_at <= expiredCutoff) {
+      transitionJobState(ctx.db, job.id, 'completed', {
+        outcome: 'cancelled',
+        finished_at: nowIso(),
+        failure_category: 'cancelled',
+        failure_message: 'Confirmation expired before execution',
+      });
+    }
     return {
       error: {
         category: 'validation',
@@ -738,6 +754,104 @@ export async function handleJobConfirm(
     });
   });
   return { job_id: job.id, state: 'queued' };
+}
+
+/**
+ * Scans jobs in `awaiting_confirmation` and transitions any whose confirmation
+ * TTL has expired into terminal `completed` state with outcome `cancelled`.
+ */
+export function expireStaleConfirmations(
+  db: ControllerDatabase,
+  ttlSeconds: number = CONFIRMATION_TTL_SECONDS,
+): Array<{ id: string }> {
+  const cutoff = new Date(Date.now() - ttlSeconds * 1000).toISOString();
+  const rows = db
+    .prepare(
+      `SELECT id FROM jobs
+       WHERE state = 'awaiting_confirmation'
+         AND (queued_at <= ? OR (queued_at IS NULL AND created_at <= ?))`,
+    )
+    .all(cutoff, cutoff) as Array<{ id: string }>;
+
+  const expired: Array<{ id: string }> = [];
+  for (const row of rows) {
+    transitionJobState(db, row.id, 'completed', {
+      outcome: 'cancelled',
+      finished_at: nowIso(),
+      failure_category: 'cancelled',
+      failure_message: 'Confirmation expired before execution',
+    });
+    expired.push(row);
+  }
+  return expired;
+}
+
+/**
+ * Confirms an `awaiting_confirmation` job directly by an authorized administrator/operator.
+ * Mints an internal valid confirmation token and advances the job to `queued`.
+ */
+export async function confirmJobByAdmin(
+  db: ControllerDatabase,
+  identity: ControllerIdentity,
+  jobId: string,
+  options?: Partial<SubmitJobContext>,
+): Promise<{ ok: boolean; job_id: string; state: string }> {
+  const job = getJob(db, jobId);
+  if (!job) {
+    throw RboError.validation(`Unknown job_id '${jobId}'`);
+  }
+  if (job.state !== 'awaiting_confirmation') {
+    throw RboError.validation(`Job is not awaiting confirmation (state=${job.state})`);
+  }
+
+  const row = db.prepare('SELECT request_json FROM jobs WHERE id = ?').get(job.id) as
+    | { request_json: string }
+    | undefined;
+  if (!row?.request_json) {
+    throw RboError.internal(`Job ${job.id} has no request_json`);
+  }
+  const request = JSON.parse(row.request_json) as JobRequest;
+  const hash = requestHash(request);
+  const snapshot = db
+    .prepare('SELECT content_id FROM snapshots WHERE id = ?')
+    .get(job.snapshot_id) as { content_id: string } | undefined;
+
+  const confirmation_token = issueConfirmationToken(identity, {
+    job_id: job.id,
+    request_hash: hash,
+    content_id: snapshot?.content_id ?? '',
+    risk_level: request.risk_level,
+  });
+
+  const ctx: SubmitJobContext = {
+    db,
+    dataDir: options?.dataDir ?? process.env.RBO_DATA_DIR ?? '',
+    clientId: 'admin',
+    controllerIdentity: identity,
+    allowedProjectRoots: options?.allowedProjectRoots ?? [],
+    allowedArtifactDestinations: options?.allowedArtifactDestinations ?? [],
+    maxConcurrentJobs: options?.maxConcurrentJobs ?? 1,
+    connectedAgents: options?.connectedAgents,
+    agentPlanePort: options?.agentPlanePort,
+    controllerPublicHost: options?.controllerPublicHost,
+    dataPlaneBaseUrl: options?.dataPlaneBaseUrl,
+    allowLocalFallback: options?.allowLocalFallback,
+    allowFullSnapshotFallback: options?.allowFullSnapshotFallback,
+    defaultQueuePolicy: options?.defaultQueuePolicy,
+    ...options,
+  };
+
+  const result = await handleJobConfirm(ctx, {
+    job_id: job.id,
+    confirmation_token,
+  });
+
+  if (result.error) {
+    const err = result.error as { message?: string; category?: ErrorCategory };
+    throw new RboError(err.category ?? 'validation', err.message ?? 'Confirmation failed');
+  }
+
+  return { ok: true, job_id: job.id, state: 'queued' };
 }
 
 export interface WaitForJobOptions {

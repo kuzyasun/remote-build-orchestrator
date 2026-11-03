@@ -29,7 +29,9 @@ async function runGit(cwd: string, args: string[]): Promise<void> {
 
 let running: RunningControllerServer;
 let dataDir: string;
+let priorDataDir: string | undefined;
 let db: ControllerDatabase;
+let identity: import('@rbo/shared').ControllerIdentity;
 let fixtureDir: string;
 let artifactDestRoot: string;
 let cleanupFixture: () => Promise<void>;
@@ -38,10 +40,12 @@ let lastStdioSmoke: Phase8SmokeResult | undefined;
 
 beforeAll(async () => {
   dataDir = await mkdtemp(join(tmpdir(), 'rbo-phase8-ctrl-'));
+  priorDataDir = process.env.RBO_DATA_DIR;
+  process.env.RBO_DATA_DIR = dataDir;
   artifactDestRoot = await mkdtemp(join(tmpdir(), 'rbo-phase8-art-'));
   db = openDatabase(':memory:');
   migrateToLatest(db);
-  const identity = await ensureControllerIdentity(dataDir);
+  identity = await ensureControllerIdentity(dataDir);
 
   const dir = await mkdtemp(join(tmpdir(), 'rbo-phase8-fix-'));
   await runGit(dir, ['init']);
@@ -72,6 +76,12 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await running.close();
+  if (priorDataDir !== undefined) {
+    process.env.RBO_DATA_DIR = priorDataDir;
+  } else {
+    // biome-ignore lint/performance/noDelete: process.env coerces undefined to the string "undefined"
+    delete process.env.RBO_DATA_DIR;
+  }
   await new Promise((r) => setTimeout(r, 500));
   await cleanupFixture();
   await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
@@ -82,7 +92,14 @@ async function connectHttpClient(clientId: string): Promise<Client> {
   const client = new Client({ name: 'phase8-http', version: '0.0.1' });
   const transport = new StreamableHTTPClientTransport(
     new URL(`http://127.0.0.1:${running.port}/mcp`),
-    { requestInit: { headers: { 'x-rbo-client-id': clientId } } },
+    {
+      requestInit: {
+        headers: {
+          'x-rbo-client-id': clientId,
+          authorization: `Bearer ${identity.adminToken}`,
+        },
+      },
+    },
   );
   await client.connect(transport);
   return client;

@@ -1,3 +1,5 @@
+import { readAdminToken } from '@rbo/shared';
+import { postAdmin } from './agents.js';
 import type { JobRunInput } from './run.js';
 
 // Thin HTTP client for Controller job MCP tools via /internal/v1/tools/* (§23).
@@ -13,6 +15,7 @@ export const JOB_RUN_INITIAL_TIMEOUT_MS = JOB_SUBMIT_TIMEOUT_MS + JOB_RUN_WAIT_T
 export interface ToolCallOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+  adminToken?: string;
 }
 
 async function postTool<T>(
@@ -21,12 +24,17 @@ async function postTool<T>(
   body: unknown,
   options?: ToolCallOptions,
 ): Promise<T> {
+  const token = options?.adminToken ?? readAdminToken();
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-rbo-client-id': process.env.RBO_CLIENT_ID ?? 'rbo-cli',
+  };
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+  }
   const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/internal/v1/tools/${tool}`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-rbo-client-id': process.env.RBO_CLIENT_ID ?? 'rbo-cli',
-    },
+    headers,
     body: JSON.stringify(body ?? {}),
     // Each request is bounded; resume polling itself intentionally has no total job deadline.
     signal: options?.signal
@@ -86,6 +94,18 @@ export function confirmJobRemote(
   );
 }
 
+/** Confirm an awaiting_confirmation job as an operator via the authenticated admin API. */
+export async function confirmJobAdmin(
+  baseUrl: string,
+  jobId: string,
+): Promise<{ ok: boolean; job_id: string; state: string }> {
+  return postAdmin(baseUrl, 'jobs/confirm', { job_id: jobId }) as Promise<{
+    ok: boolean;
+    job_id: string;
+    state: string;
+  }>;
+}
+
 export function getJobRemote(
   baseUrl: string,
   jobId: string,
@@ -137,6 +157,7 @@ export function cancelJobRemote(
 
 export interface FollowLogsOptions {
   attemptId?: string;
+  adminToken?: string;
   /** Called with each log chunk; defaults to writing stdout/stderr. */
   onChunk?: (stream: 'stdout' | 'stderr', text: string) => void;
   /** Abort signal / stop predicate. */
@@ -250,10 +271,14 @@ export async function followJobLogsRemote(
   const maxTerminalCatchUpAttempts = 5;
 
   while (!options.signal?.aborted) {
+    const token = options.adminToken ?? readAdminToken();
     const headers: Record<string, string> = {
       accept: 'text/event-stream',
       'x-rbo-client-id': process.env.RBO_CLIENT_ID ?? 'rbo-cli',
     };
+    if (token) {
+      headers.authorization = `Bearer ${token}`;
+    }
     if (lastSequence > 0) {
       headers['last-event-id'] = String(lastSequence);
     }

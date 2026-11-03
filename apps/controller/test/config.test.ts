@@ -358,3 +358,45 @@ describe('mDNS discovery config (§7.2)', () => {
     );
   });
 });
+
+describe('loadControllerConfig confirmationPolicy', () => {
+  it('defaults confirmationPolicy to developer', () => {
+    expect(loadControllerConfig({ configPath: null }).confirmationPolicy).toBe('developer');
+  });
+
+  it('reads confirmationPolicy from controller.json file', () => {
+    const dataDir = tempDir();
+    const { path } = writeDefaultControllerConfigFile(dataDir);
+    writeFileSync(path, JSON.stringify({ confirmation_policy: 'strict' }), 'utf8');
+    expect(loadControllerConfig({ dataDir }).confirmationPolicy).toBe('strict');
+  });
+
+  it('reads valid RBO_CONFIRMATION_POLICY from environment', () => {
+    try {
+      process.env.RBO_CONFIRMATION_POLICY = 'strict';
+      expect(loadControllerConfig({ configPath: null }).confirmationPolicy).toBe('strict');
+      process.env.RBO_CONFIRMATION_POLICY = 'developer';
+      expect(loadControllerConfig({ configPath: null }).confirmationPolicy).toBe('developer');
+    } finally {
+      process.env.RBO_CONFIRMATION_POLICY = undefined;
+    }
+  });
+
+  it('rejects invalid or empty RBO_CONFIRMATION_POLICY', () => {
+    try {
+      process.env.RBO_CONFIRMATION_POLICY = '';
+      expect(() => loadControllerConfig({ configPath: null })).toThrow(/RBO_CONFIRMATION_POLICY/);
+      process.env.RBO_CONFIRMATION_POLICY = 'loose';
+      expect(() => loadControllerConfig({ configPath: null })).toThrow(/RBO_CONFIRMATION_POLICY/);
+    } finally {
+      process.env.RBO_CONFIRMATION_POLICY = undefined;
+    }
+  });
+
+  it('rejects invalid programmatic confirmationPolicy override', () => {
+    expect(() =>
+      // biome-ignore lint/suspicious/noExplicitAny: testing invalid override
+      loadControllerConfig({ configPath: null, confirmationPolicy: 'invalid' as any }),
+    ).toThrow(/confirmationPolicy/);
+  });
+});

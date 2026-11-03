@@ -66,6 +66,8 @@ export interface ToolContext {
   jobRunOptions?: JobRunOptions;
   /** Disconnect/abort of the calling HTTP request; wait returns the current job. */
   signal?: AbortSignal;
+  /** Confirmation policy for destructive/hardware jobs. Default 'developer'. */
+  confirmationPolicy?: 'developer' | 'strict';
 }
 
 export interface ToolErrorResult {
@@ -134,6 +136,7 @@ function submitContext(ctx: ToolContext) {
     defaultQueuePolicy: ctx.defaultQueuePolicy,
     getHostCpuBusyFraction: ctx.getHostCpuBusyFraction,
     maxHostCpuBusyFraction: ctx.maxHostCpuBusyFraction,
+    confirmationPolicy: ctx.confirmationPolicy,
   };
 }
 

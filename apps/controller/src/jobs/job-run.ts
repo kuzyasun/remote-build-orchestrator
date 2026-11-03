@@ -300,6 +300,8 @@ function confirmationResponse(
     snapshot_id: persisted.snapshot_id ?? job.snapshot_id,
     resume: false,
     confirmation_required: true,
+    requires_operator_confirmation: persisted.requires_operator_confirmation,
+    message: persisted.message,
     log_tail: null,
     artifacts: [],
   };
@@ -703,6 +705,8 @@ export async function handleJobRun(
         job_id: jobId,
         state: 'awaiting_confirmation',
         confirmation_token: submit.confirmation_token,
+        requires_operator_confirmation: submit.requires_operator_confirmation,
+        message: submit.message,
         snapshot_id: submit.snapshot_id,
         content_id: submit.content_id,
         secret_warnings: submit.secret_warnings,

@@ -36,6 +36,7 @@ import {
 import { formatCliHelp } from './commands/help.js';
 import {
   cancelJobRemote,
+  confirmJobAdmin,
   followJobLogsRemote,
   getJobLogsRemote,
   submitJobRemote,
@@ -427,6 +428,30 @@ async function main(): Promise<void> {
       const result = await cancelJobRemote(controllerUrl, jobId, rest[1]);
       console.log(JSON.stringify(result, null, 2));
       return;
+    }
+
+    case 'confirm': {
+      const jobId = rest[0];
+      if (!jobId) {
+        throw new Error('Usage: rbo confirm <job-id>');
+      }
+      const result = await confirmJobAdmin(controllerUrl, jobId);
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    case 'jobs': {
+      const sub = rest[0];
+      if (sub === 'confirm') {
+        const jobId = rest[1];
+        if (!jobId) {
+          throw new Error('Usage: rbo jobs confirm <job-id>');
+        }
+        const result = await confirmJobAdmin(controllerUrl, jobId);
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      throw new Error("Unknown 'jobs' subcommand. Usage: rbo jobs confirm <job-id>");
     }
 
     default:
