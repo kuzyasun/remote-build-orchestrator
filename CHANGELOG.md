@@ -7,6 +7,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-03
+
+### Added
+
+- Job confirmation policy for destructive and hardware-risk jobs. A new `confirmationPolicy` Controller setting selects `developer` (default, AI clients self-confirm as before) or `strict`, where such jobs wait for an operator to run the new `rbo confirm <job-id>` CLI command. Unconfirmed requests expire through TTL cleanup, and invalid policy overrides are rejected.
+
+### Changed
+
+- Controller loopback HTTP admin and MCP routes now require Bearer token authentication. A 32-byte admin token is generated into `~/.rbo/security/admin-token` (mode 0600) and can be overridden with the `RBO_ADMIN_TOKEN` environment variable. The CLI and the `rbo-mcp-stdio` proxy forward the token automatically; direct HTTP MCP clients must send `Authorization: Bearer <token>`. The health endpoint stays unauthenticated.
+
+### Fixed
+
+- Cancelling a job now contains detached (`setsid`) descendant processes reparented to PID 1: a Linux cgroup v2 scope with atomic `cgroup.kill`, process scanning by attempt ID on Linux and macOS, and escalating SIGTERM → SIGCONT → SIGKILL termination. Cleanup scripts are isolated from late cancellation scans and run only after in-flight termination settles.
+- macOS process listing streams `ps` output so listings larger than 1 MiB no longer fail during containment.
+- Agents disconnected from the Controller are reported offline immediately, stale non-revoked agent records reset to offline at Controller startup, and silent Agent sockets are terminated after the heartbeat timeout.
+
 ## [0.9.3] - 2026-10-17
 
 ### Changed
@@ -151,7 +167,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.10.0
 [0.9.3]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.3
 [0.9.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.2
 [0.9.1]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.1
