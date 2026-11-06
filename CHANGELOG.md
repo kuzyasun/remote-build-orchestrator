@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-06
+
+### Added
+
+- Controller startup logs include total and per-phase initialization timings to help identify slow startup phases.
+
+### Fixed
+
+- `rbo controller start --daemon` waits for the new Controller to finish startup recovery and open both HTTP and agent-plane listeners before returning its PID. Startup failures and the 60-second readiness timeout report the daemon log path.
+- Snapshot startup recovery reuses known reference sets for files already protected by database references, avoiding repeated full-table scans while retaining active capture lease and live-reference checks before deletion.
+
 ## [0.10.0] - 2026-11-03
 
 ### Added
@@ -167,7 +178,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.10.1
 [0.10.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.10.0
 [0.9.3]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.3
 [0.9.2]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.2

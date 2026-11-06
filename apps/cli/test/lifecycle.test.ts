@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -293,6 +294,108 @@ describe('daemon helpers', () => {
     await writeFile(pidFile, `${process.pid}\n`, 'utf8');
     expect(isProcessAlive(process.pid)).toBe(true);
     expect(() => assertNoLivePid(pidFile, 'Controller')).toThrow(/already be running/);
+  });
+
+  function readyChild() {
+    return Object.assign(new EventEmitter(), {
+      pid: 4242,
+      connected: true,
+      unref: vi.fn(),
+      disconnect: vi.fn(),
+    });
+  }
+
+  it('receives readiness over real IPC and leaves the detached child alive after disconnect', async () => {
+    const base = await tempDir('rbo-cli-daemon-real-ipc-');
+    const pid = await spawnDetachedDaemon({
+      command: process.execPath,
+      args: ['-e', "setInterval(() => {}, 1000); setTimeout(() => process.send('ready'), 50)"],
+      pidFile: join(base, 'controller.pid'),
+      logFile: join(base, 'controller.log'),
+      readyMessage: 'ready',
+      readyTimeoutMs: 5_000,
+    });
+    try {
+      expect(isProcessAlive(pid)).toBe(true);
+      expect(await readFile(join(base, 'controller.pid'), 'utf8')).toBe(`${pid}\n`);
+    } finally {
+      process.kill(pid);
+    }
+  });
+
+  it('waits for the spawned child readiness message, then disconnects IPC', async () => {
+    const base = await tempDir('rbo-cli-daemon-ready-');
+    const child = readyChild();
+    const spawn = vi.fn(() => child);
+    const pidFile = join(base, 'controller.pid');
+    let resolved = false;
+    const start = spawnDetachedDaemon({
+      command: process.execPath,
+      args: [],
+      pidFile,
+      logFile: join(base, 'controller.log'),
+      spawn,
+      readyMessage: 'rbo:controller-ready',
+    }).then((pid) => {
+      resolved = true;
+      return pid;
+    });
+    await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+    child.emit('message', 'unrelated');
+    expect(resolved).toBe(false);
+    child.emit('message', 'rbo:controller-ready');
+    await expect(start).resolves.toBe(4242);
+    expect(spawn.mock.calls[0][2]).toMatchObject({
+      stdio: ['ignore', expect.any(Number), expect.any(Number), 'ipc'],
+      env: { RBO_DAEMON_PARENT_PID: String(process.pid) },
+    });
+    expect(child.disconnect).toHaveBeenCalledOnce();
+    expect(child.unref).toHaveBeenCalledOnce();
+    expect(child.listenerCount('message')).toBe(0);
+  });
+
+  it.each(['exit', 'disconnect', 'error'])(
+    'rejects on %s before readiness with the log path',
+    async (event) => {
+      const base = await tempDir('rbo-cli-daemon-failed-');
+      const child = readyChild();
+      const pidFile = join(base, 'controller.pid');
+      const logFile = join(base, 'controller.log');
+      const start = spawnDetachedDaemon({
+        command: process.execPath,
+        args: [],
+        pidFile,
+        logFile,
+        spawn: () => child,
+        readyMessage: 'rbo:controller-ready',
+      });
+      const rejected = expect(start).rejects.toThrow(logFile);
+      await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+      child.emit(event, 1, null);
+      await rejected;
+      expect(child.listenerCount('message')).toBe(0);
+      expect(child.disconnect).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('times out with a log path and leaves the PID available for operator recovery', async () => {
+    const base = await tempDir('rbo-cli-daemon-timeout-');
+    const child = readyChild();
+    const pidFile = join(base, 'controller.pid');
+    await expect(
+      spawnDetachedDaemon({
+        command: process.execPath,
+        args: [],
+        pidFile,
+        logFile: join(base, 'controller.log'),
+        spawn: () => child,
+        readyMessage: 'rbo:controller-ready',
+        readyTimeoutMs: 50,
+      }),
+    ).rejects.toThrow(/may still be starting/);
+    expect(await readFile(pidFile, 'utf8')).toBe('4242\n');
+    expect(child.disconnect).toHaveBeenCalledOnce();
+    expect(child.listenerCount('message')).toBe(0);
   });
 
   it('assertNoLivePid allows stale pid files', async () => {

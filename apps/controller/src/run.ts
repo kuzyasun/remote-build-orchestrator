@@ -35,11 +35,21 @@ const HOST_CPU_SAMPLE_INTERVAL_MS = 5_000;
  * SIGINT/SIGTERM; shutdown handlers call `process.exit(0)`.
  */
 export async function runController(overrides: Partial<ControllerConfig> = {}): Promise<void> {
+  const startupStartedAt = performance.now();
+  let phaseStartedAt = startupStartedAt;
+  const startupTimingsMs: Record<string, number> = {};
+  const recordStartupPhase = (phase: string) => {
+    const now = performance.now();
+    startupTimingsMs[phase] = Math.round(now - phaseStartedAt);
+    phaseStartedAt = now;
+  };
   const config = loadControllerConfig(overrides);
   ensureDataDir(config);
+  recordStartupPhase('config');
 
   const db = openDatabase(config.databasePath);
   migrateToLatest(db);
+  recordStartupPhase('database');
   let snapshotRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
   const recoverSnapshots = async (): Promise<void> => {
     const result = await recoverSnapshotPublications({ db, dataDir: config.dataDir });
@@ -53,10 +63,12 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     snapshotRecoveryTimer.unref?.();
   };
   await recoverSnapshots();
+  recordStartupPhase('snapshotRecovery');
   const lifecycleNotifier = new JobLifecycleNotifier();
   bindJobLifecycleNotifier(db, lifecycleNotifier);
 
   const identity = await ensureControllerIdentity(config.dataDir);
+  recordStartupPhase('identity');
 
   const hostCpuMonitor = new HostCpuMonitor();
   hostCpuMonitor.start(HOST_CPU_SAMPLE_INTERVAL_MS);
@@ -87,6 +99,7 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     },
   });
 
+  recordStartupPhase('agentPlane');
   const httpServer = await startControllerServer({
     host: config.mcpHost,
     port: config.mcpPort,
@@ -110,12 +123,15 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     confirmationPolicy: config.confirmationPolicy,
   });
 
+  recordStartupPhase('http');
   logger.info('controller started', {
     version: RBO_CONTROLLER_VERSION,
     mcp: `http://${httpServer.host}:${httpServer.port}/mcp`,
     agentPlane: `wss://0.0.0.0:${agentPlane.port}/agent`,
     fingerprint: identity.fingerprint,
     database: config.databasePath,
+    startupMs: Math.round(performance.now() - startupStartedAt),
+    startupTimingsMs,
   });
 
   if (
@@ -180,6 +196,12 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // Private launcher handshake, after recovery and both listeners are initialized.
+  // The launcher disconnects IPC after receiving this message so the daemon stays detached.
+  if (process.connected && process.env.RBO_DAEMON_PARENT_PID === String(process.ppid)) {
+    process.send?.('rbo:controller-ready', () => {});
+  }
 
   // Stay alive until signal handlers call process.exit.
   await new Promise<never>(() => undefined);

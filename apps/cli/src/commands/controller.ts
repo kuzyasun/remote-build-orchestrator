@@ -10,7 +10,12 @@ import {
   ensureControllerIdentity,
   validateRestore,
 } from '@rbo/shared';
-import { controllerLogPath, controllerPidPath, spawnDetachedDaemon } from './daemon.js';
+import {
+  controllerLogPath,
+  controllerPidPath,
+  isDaemonChild,
+  spawnDetachedDaemon,
+} from './daemon.js';
 import { ensureNotRunningOrReplace, stopRoleForCli } from './process-lifecycle.js';
 
 export interface ControllerInitOptions {
@@ -101,10 +106,14 @@ export async function runControllerStart(
     throw new Error('Controller is not initialized. Run `rbo controller init` first.');
   }
 
-  const shouldStart = await ensureNotRunningOrReplace('controller', {
-    dataDir: options.dataDir,
-    replace: options.replace,
-  });
+  // The daemon launcher already checked/replaced the running role. Scanning again
+  // would mistake the launcher (which now waits for readiness) for another Controller.
+  const shouldStart =
+    (!options.daemon && isDaemonChild()) ||
+    (await ensureNotRunningOrReplace('controller', {
+      dataDir: options.dataDir,
+      replace: options.replace,
+    }));
   if (!shouldStart) {
     return null;
   }
@@ -120,6 +129,7 @@ export async function runControllerStart(
       pidFile: controllerPidPath(options.dataDir),
       logFile: controllerLogPath(options.dataDir),
       label: 'Controller',
+      readyMessage: 'rbo:controller-ready',
     });
     return pid;
   }

@@ -114,6 +114,13 @@ rbo controller start --daemon
 rbo doctor
 ```
 
+With `--daemon`, the command prints the PID only after startup recovery and both HTTP and
+agent-plane listeners are ready. It waits up to 60 seconds; a startup failure or timeout reports
+the daemon log path. On timeout, the process may still be starting; check the log and `rbo doctor`
+before restarting it.
+The `controller started` log entry includes `startupMs` and `startupTimingsMs` to identify slow
+startup phases such as snapshot recovery.
+
 The Controller starts the agent plane and automatically advertises itself on the local network via
 mDNS (`_rbo-controller._tcp`). Use `rbo controller start` without `--daemon` when you want logs in
 the current terminal.

@@ -152,4 +152,100 @@ describe('snapshot publication startup recovery', () => {
     await expect(exists(referenced.temporary)).resolves.toBe(false);
     await expect(exists(unreferenced.directory)).resolves.toBe(false);
   });
+
+  it('builds the full reference sets once for files from known generations', async () => {
+    const referenceSql = 'SELECT manifest_path, payload_path FROM snapshots';
+    const referenceQueries = { count: 0 };
+    const trackedDb = new Proxy(db, {
+      get(target, property) {
+        if (property === 'prepare') {
+          return (sql: string) => {
+            if (sql === referenceSql) referenceQueries.count += 1;
+            return target.prepare(sql);
+          };
+        }
+        return Reflect.get(target, property, target);
+      },
+    });
+
+    for (let index = 0; index < 24; index += 1) {
+      const directory = join(dataDir, 'snapshots', `referenced-${index}`);
+      const manifest = join(directory, 'manifest.json.g1');
+      const payload = join(directory, 'full-source.tar.zst.g1');
+      const siblings = [
+        join(directory, 'overlay.tar.zst.g1'),
+        join(directory, 'secret-warnings.json.g1'),
+        join(directory, 'git-source-requirements.json.g1'),
+      ];
+      await mkdir(directory, { recursive: true });
+      await Promise.all([manifest, payload, ...siblings].map((path) => writeFile(path, path)));
+      persistSnapshot(db, {
+        snapshotId: `snapshot-referenced-${index}`,
+        contentId: `content-referenced-${index}`,
+        repoId: `repo-referenced-${index}`,
+        baseCommit: null,
+        dirty: true,
+        manifestPath: manifest,
+        payloadPath: payload,
+        sizeBytes: 1,
+        sha256: 'a'.repeat(64),
+      });
+    }
+
+    await expect(
+      recoverSnapshotPublications({ db: trackedDb, dataDir, now: afterExpiry }),
+    ).resolves.toEqual({ skippedForActiveLease: false, removedFiles: 0, removedDirectories: 0 });
+    expect(referenceQueries.count).toBe(1);
+  });
+
+  it('rechecks live references before deleting a file absent from the initial snapshot', async () => {
+    const directory = join(dataDir, 'snapshots', 'new-publication');
+    const manifest = join(directory, 'manifest.json.g1');
+    await mkdir(directory, { recursive: true });
+    await writeFile(manifest, manifest);
+
+    const referenceSql = 'SELECT manifest_path, payload_path FROM snapshots';
+    let referenceQueries = 0;
+    const publicationDb = new Proxy(db, {
+      get(target, property) {
+        if (property === 'prepare') {
+          return (sql: string) => {
+            const statement = target.prepare(sql);
+            if (sql !== referenceSql) return statement;
+            referenceQueries += 1;
+            if (referenceQueries !== 1) return statement;
+            return new Proxy(statement, {
+              get(preparedStatement, method) {
+                if (method === 'all') {
+                  return () => {
+                    const rows = preparedStatement.all();
+                    persistSnapshot(target, {
+                      snapshotId: 'snapshot-published-during-recovery',
+                      contentId: 'content-published-during-recovery',
+                      repoId: 'repo-published-during-recovery',
+                      baseCommit: null,
+                      dirty: true,
+                      manifestPath: manifest,
+                      payloadPath: null,
+                      sizeBytes: 1,
+                      sha256: 'b'.repeat(64),
+                    });
+                    return rows;
+                  };
+                }
+                return Reflect.get(preparedStatement, method, preparedStatement);
+              },
+            });
+          };
+        }
+        return Reflect.get(target, property, target);
+      },
+    });
+
+    await expect(
+      recoverSnapshotPublications({ db: publicationDb, dataDir, now: afterExpiry }),
+    ).resolves.toEqual({ skippedForActiveLease: false, removedFiles: 0, removedDirectories: 0 });
+    expect(referenceQueries).toBe(2);
+    await expect(exists(manifest)).resolves.toBe(true);
+  });
 });

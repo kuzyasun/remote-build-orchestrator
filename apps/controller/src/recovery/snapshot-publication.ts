@@ -143,13 +143,18 @@ export async function recoverSnapshotPublications(
       }
       const resolvedPath = resolve(path);
       const generation = generationForName(entry.name);
-      const live = referencedSnapshotPaths(options.db, snapshotsRoot);
+      const generationReferenceKey =
+        generation === null ? null : generationKey(directoryPath, generation);
       if (
         referenced.paths.has(resolvedPath) ||
+        (generationReferenceKey !== null && referenced.generations.has(generationReferenceKey))
+      ) {
+        continue;
+      }
+      const live = referencedSnapshotPaths(options.db, snapshotsRoot);
+      if (
         live.paths.has(resolvedPath) ||
-        (generation !== null &&
-          (referenced.generations.has(generationKey(directoryPath, generation)) ||
-            live.generations.has(generationKey(directoryPath, generation))))
+        (generationReferenceKey !== null && live.generations.has(generationReferenceKey))
       ) {
         continue;
       }

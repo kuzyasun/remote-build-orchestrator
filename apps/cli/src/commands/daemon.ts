@@ -62,6 +62,9 @@ export type DetachedSpawn = (
   pid?: number;
   unref?: () => void;
   on?: (event: string, listener: (...args: unknown[]) => void) => void;
+  off?: (event: string, listener: (...args: unknown[]) => void) => void;
+  connected?: boolean;
+  disconnect?: () => void;
 };
 
 export interface SpawnDetachedDaemonOptions {
@@ -72,12 +75,62 @@ export interface SpawnDetachedDaemonOptions {
   /** Human label for live-PID conflict errors (e.g. "Controller"). */
   label?: string;
   spawn?: DetachedSpawn;
+  /** Wait for this private IPC message from the newly spawned process. */
+  readyMessage?: string;
+  readyTimeoutMs?: number;
+}
+
+export function isDaemonChild(): boolean {
+  return process.connected === true && process.env.RBO_DAEMON_PARENT_PID === String(process.ppid);
+}
+
+function waitForReady(
+  child: ReturnType<DetachedSpawn>,
+  options: SpawnDetachedDaemonOptions,
+): { promise: Promise<void>; cancel: () => void } {
+  let cancel = () => {};
+  const promise = new Promise<void>((resolve, reject) => {
+    const timeoutMs = options.readyTimeoutMs ?? 60_000;
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      for (const [event, listener] of listeners) child.off?.(event, listener);
+      if (error) reject(error);
+      else resolve();
+    };
+    cancel = () => finish();
+    const failure = (detail: string) =>
+      new Error(
+        `${options.label ?? 'Daemon'} ${detail}. See ${options.logFile} (pid ${child.pid})`,
+      );
+    const listeners: Array<[string, (...args: unknown[]) => void]> = [
+      [
+        'message',
+        (message) => {
+          if (message === options.readyMessage) finish();
+        },
+      ],
+      ['error', (error) => finish(failure(`failed to start: ${String(error)}`))],
+      [
+        'exit',
+        (code, signal) =>
+          finish(failure(`exited before readiness (code ${code}, signal ${signal})`)),
+      ],
+      ['disconnect', () => finish(failure('disconnected before readiness'))],
+    ];
+    const timer = setTimeout(
+      () => finish(failure(`did not become ready within ${timeoutMs}ms; it may still be starting`)),
+      timeoutMs,
+    );
+    for (const [event, listener] of listeners) child.on?.(event, listener);
+  });
+  return { promise, cancel };
 }
 
 /**
  * Detached child with stdout/stderr redirected to `logFile` and PID persisted.
  * Caller supplies `command` + `args` (typically re-exec of this CLI without `--daemon`).
  * Refuses to start if `pidFile` still points at a live process; rejects on spawn `error`.
+ * With `readyMessage`, returns only after the child signals readiness over private IPC.
  */
 export async function spawnDetachedDaemon(options: SpawnDetachedDaemonOptions): Promise<number> {
   const spawn = options.spawn ?? nodeSpawn;
@@ -88,36 +141,55 @@ export async function spawnDetachedDaemon(options: SpawnDetachedDaemonOptions): 
   await mkdir(dirname(options.logFile), { recursive: true });
 
   const logFd = openSync(options.logFile, 'a');
-  // Keep the FD open for the child's lifetime. The daemon parent exits immediately
-  // after spawn, so leaking the handle in the parent is acceptable and safer than
+  // Keep the FD open until the launcher exits (after readiness, when requested).
+  // Retaining the handle is safer than
   // closeSync on Windows (which can revoke the child's inherited handle).
   const child = spawn(options.command, options.args, {
     detached: true,
-    stdio: ['ignore', logFd, logFd],
+    stdio: options.readyMessage ? ['ignore', logFd, logFd, 'ipc'] : ['ignore', logFd, logFd],
+    ...(options.readyMessage
+      ? { env: { ...process.env, RBO_DAEMON_PARENT_PID: String(process.pid) } }
+      : {}),
   });
 
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const onError = (error: unknown) => {
-      if (settled) return;
-      settled = true;
-      reject(error instanceof Error ? error : new Error(String(error)));
-    };
-    child.on?.('error', onError);
-    // Defer success one tick so a synchronous spawn failure can fire `error` first.
-    setImmediate(() => {
-      if (settled) return;
-      settled = true;
-      resolve();
+  // Subscribe before yielding: even an immediately ready/failed child must be observed.
+  const ready = options.readyMessage ? waitForReady(child, options) : undefined;
+  void ready?.promise.catch(() => {});
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onError = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(
+          options.readyMessage
+            ? new Error(`${label} failed to spawn: ${String(error)}. See ${options.logFile}`)
+            : error instanceof Error
+              ? error
+              : new Error(String(error)),
+        );
+      };
+      child.on?.('error', onError);
+      // Defer success one tick so a synchronous spawn failure can fire `error` first.
+      setImmediate(() => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      });
     });
-  });
 
-  const pid = child.pid;
-  if (pid === undefined) {
-    throw new Error('Failed to start detached process: no PID assigned');
+    const pid = child.pid;
+    if (pid === undefined) {
+      throw new Error('Failed to start detached process: no PID assigned');
+    }
+
+    await writeFile(options.pidFile, `${pid}\n`, 'utf8');
+    await ready?.promise;
+    return pid;
+  } finally {
+    ready?.cancel();
+    child.unref?.();
+    if (child.connected) child.disconnect?.();
   }
-
-  await writeFile(options.pidFile, `${pid}\n`, 'utf8');
-  child.unref?.();
-  return pid;
 }
