@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ensureAttemptLogs } from '../src/logs.js';
 import { CANONICAL_RBO_ENV_KEYS, buildReservedRboEnv } from '../src/runtime-env.js';
-import { spawnJobScript, writeJobScript } from '../src/script.js';
+import { runCleanupScript, spawnJobScript, writeJobScript } from '../src/script.js';
 
 describe('canonical RBO runtime env', () => {
   it('exports required keys including RBO_ARTIFACT_DIR (not plural)', () => {
@@ -93,6 +93,89 @@ describe('canonical RBO runtime env', () => {
       expect(artifactLines).toHaveLength(1);
       expect(artifactLines[0]).toBe(`RBO_ARTIFACT_DIR=${artifactDir}`);
     } finally {
+      await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
+  }, 30_000);
+
+  it('does not pass inherited service bearer tokens to job or cleanup scripts', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'rbo-service-token-env-'));
+    const controlDir = join(workspace, 'control');
+    const logs = await ensureAttemptLogs(join(workspace, 'logs'));
+    const protectedNames = new Set(['RBO_ADMIN_TOKEN', 'RBO_MCP_TOKEN']);
+    const originalEntries = Object.entries(process.env).filter(([key]) =>
+      protectedNames.has(key.toUpperCase()),
+    );
+    const isWin = process.platform === 'win32';
+    const script = isWin
+      ? '@if defined RBO_ADMIN_TOKEN exit /b 7\r\n@if defined RBO_MCP_TOKEN exit /b 7\r\n@exit /b 0'
+      : 'test -z "${RBO_ADMIN_TOKEN+x}${RBO_MCP_TOKEN+x}${rbo_mcp_token+x}"';
+
+    try {
+      for (const key of Object.keys(process.env)) {
+        if (protectedNames.has(key.toUpperCase())) {
+          delete process.env[key];
+        }
+      }
+      process.env.RBO_ADMIN_TOKEN = 'dummy-admin-token';
+      process.env.rbo_mcp_token = 'dummy-mcp-token';
+
+      const execution = {
+        shell: isWin ? ('cmd' as const) : ('bash' as const),
+        script,
+        cleanup_script: script,
+        timeout_seconds: 30,
+        cancel_grace_seconds: 1,
+        env: {
+          RBO_ADMIN_TOKEN: 'job-admin-override',
+          RBO_MCP_TOKEN: 'job-mcp-override',
+        },
+      };
+      await writeJobScript(controlDir, execution);
+      const child = spawnJobScript({
+        attemptId: 'att_service_tokens',
+        controlDir,
+        workspacePath: workspace,
+        projectPath: workspace,
+        execution,
+        env: buildReservedRboEnv({
+          jobId: 'job_service_tokens',
+          attemptId: 'att_service_tokens',
+          workspacePath: workspace,
+          projectPath: workspace,
+          logDir: logs.logDir,
+          artifactDir: join(workspace, 'artifacts'),
+        }),
+        logs,
+      });
+      expect(child.ignoredRboEnvKeys).toEqual(['RBO_ADMIN_TOKEN', 'RBO_MCP_TOKEN']);
+      expect((await child.waitForExit()).exitCode).toBe(0);
+
+      const cleanup = await runCleanupScript({
+        attemptId: 'att_service_tokens',
+        controlDir,
+        workspacePath: workspace,
+        projectPath: workspace,
+        execution,
+        env: buildReservedRboEnv({
+          jobId: 'job_service_tokens',
+          attemptId: 'att_service_tokens',
+          workspacePath: workspace,
+          projectPath: workspace,
+          logDir: logs.logDir,
+          artifactDir: join(workspace, 'artifacts'),
+        }),
+        logs,
+      });
+      expect(cleanup).toEqual({ exitCode: 0, timedOut: false });
+    } finally {
+      for (const key of Object.keys(process.env)) {
+        if (protectedNames.has(key.toUpperCase())) {
+          delete process.env[key];
+        }
+      }
+      for (const [key, value] of originalEntries) {
+        process.env[key] = value;
+      }
       await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     }
   }, 30_000);

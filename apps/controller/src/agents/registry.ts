@@ -12,6 +12,13 @@ export function revokeAgent(db: ControllerDatabase, agentId: string): void {
   }
 }
 
+export function isAgentRevoked(db: ControllerDatabase, agentId: string): boolean {
+  const row = db.prepare('SELECT revoked_at FROM agents WHERE id = ?').get(agentId) as
+    | { revoked_at: string | null }
+    | undefined;
+  return row?.revoked_at != null;
+}
+
 export function updateAgentCapabilities(
   db: ControllerDatabase,
   agentId: string,

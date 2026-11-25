@@ -1,13 +1,20 @@
-import { mkdir, readFile, readdir, rename, rm } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { access, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { join } from 'node:path';
+import { Writable } from 'node:stream';
+import { promisify } from 'node:util';
 import { ensureControllerIdentity } from '@rbo/shared';
 import { createGitFixtureRepo } from '@rbo/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { handleRemoteSourceNeed } from '../src/execution/remote-execution.js';
-import { captureAndPersistSnapshot } from '../src/execution/runner.js';
-import { createJob, persistSnapshot, transitionJobState } from '../src/jobs/lifecycle.js';
+import { attemptTransferDir, captureAndPersistSnapshot } from '../src/execution/runner.js';
+import { abortAgentTransfers, handleDataPlaneRequest } from '../src/http/data-plane.js';
+import { createJob, getJob, persistSnapshot, transitionJobState } from '../src/jobs/lifecycle.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
+
+const execFileAsync = promisify(execFile);
 
 describe('Controller source_need → bundle_download', () => {
   let tempDir: string;
@@ -73,14 +80,18 @@ describe('Controller source_need → bundle_download', () => {
     });
   }
 
-  async function prepareOverlayFallbackAttempt(suffix: string) {
+  async function prepareSourceAttempt(suffix: string, full = false) {
     const jobId = `job_fallback_${suffix}`;
     const attemptId = `att_fallback_${suffix}`;
     const agentId = `ag_fallback_${suffix}`;
     const leaseId = `lease_fallback_${suffix}`;
     const request = {
       client_request_id: `req_fallback_${suffix}`,
-      source: { project_root: fixture.root, cwd: '.' },
+      source: {
+        project_root: fixture.root,
+        cwd: '.',
+        ...(full ? { snapshot_mode: 'full' as const } : {}),
+      },
       execution: { shell: 'bash' as const, script: 'true' },
     };
     const job = createJob(db, {
@@ -119,101 +130,133 @@ describe('Controller source_need → bundle_download', () => {
     ).run(attemptId, job.id, agentId, leaseId, new Date(Date.now() + 3_600_000).toISOString());
     db.prepare('UPDATE jobs SET snapshot_id = ? WHERE id = ?').run(capture.snapshotId, job.id);
 
-    return { jobId, attemptId, agentId, leaseId };
+    return { jobId, attemptId, agentId, leaseId, capture };
   }
 
-  async function expectNoPrivateFallbackCapture(attemptId: string) {
-    const transferDir = join(tempDir, 'transfers', attemptId);
-    const names = await readdir(transferDir);
-    expect(names.some((name) => name.startsWith('snp_') || name.includes('.candidate-'))).toBe(
-      false,
-    );
-  }
+  it.each(['full_snapshot_required', 'repo_fetch_failed'] as const)(
+    'fails the original overlay without capturing the live workspace after %s',
+    async (reason) => {
+      const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
+      const socket = {
+        readyState: 1,
+        OPEN: 1,
+        send: (raw: string) =>
+          sent.push(JSON.parse(raw) as { type: string; payload: Record<string, unknown> }),
+      };
+      const attempt = await prepareSourceAttempt(reason);
+      await writeFile(join(fixture.root, 'hello.txt'), 'changed after submission');
 
-  it('discards private full-fallback capture after copying stable transfer artifacts', async () => {
+      await handleRemoteSourceNeed(
+        {
+          db,
+          identity,
+          dataDir: tempDir,
+          connectedAgents: new Map([
+            [
+              attempt.agentId,
+              {
+                agentId: attempt.agentId,
+                socket: socket as never,
+                protocolVersion: 1,
+                lastHeartbeatAt: Date.now(),
+              },
+            ],
+          ]),
+          serverPort: 7411,
+        },
+        attempt.agentId,
+        {
+          attempt_id: attempt.attemptId,
+          lease_id: attempt.leaseId,
+          lease_epoch: 1,
+          reason,
+        },
+      );
+
+      expect(sent).toEqual([
+        expect.objectContaining({
+          type: 'reconcile_decision',
+          payload: expect.objectContaining({
+            action: 'terminate_stale',
+            lease_id: attempt.leaseId,
+          }),
+        }),
+      ]);
+      expect(getJob(db, attempt.jobId)).toMatchObject({
+        state: 'completed',
+        outcome: 'failed',
+        failure_category: 'repo_fetch',
+        failure_message: expect.stringContaining('snapshot_mode=full'),
+      });
+      await expect(access(attemptTransferDir(tempDir, attempt.attemptId))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    },
+  );
+
+  it('serves the explicitly selected full snapshot from submission on a retry', async () => {
+    const { attemptId, agentId, leaseId, capture } = await prepareSourceAttempt('full', true);
+    await writeFile(join(fixture.root, 'hello.txt'), 'changed after submission');
+    const transferDir = attemptTransferDir(tempDir, attemptId);
+    await mkdir(transferDir, { recursive: true });
+    await writeFile(join(transferDir, 'snapshot.tar.zst'), 'obsolete transfer data');
+
     const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
-    const socket = {
-      readyState: 1,
-      OPEN: 1,
-      send: (raw: string) =>
-        sent.push(JSON.parse(raw) as { type: string; payload: Record<string, unknown> }),
-    };
-    const attempt = await prepareOverlayFallbackAttempt('success');
-
+    const socket = { readyState: 1, OPEN: 1, send: (raw: string) => sent.push(JSON.parse(raw)) };
     await handleRemoteSourceNeed(
       {
         db,
         identity,
         dataDir: tempDir,
+        serverPort: 7411,
         connectedAgents: new Map([
           [
-            attempt.agentId,
-            {
-              agentId: attempt.agentId,
-              socket: socket as never,
-              protocolVersion: 1,
-              lastHeartbeatAt: Date.now(),
-            },
+            agentId,
+            { agentId, socket: socket as never, protocolVersion: 1, lastHeartbeatAt: Date.now() },
           ],
         ]),
-        serverPort: 7411,
-        allowedProjectRoots: [fixture.root],
       },
-      attempt.agentId,
+      agentId,
       {
-        attempt_id: attempt.attemptId,
-        lease_id: attempt.leaseId,
+        attempt_id: attemptId,
+        lease_id: leaseId,
         lease_epoch: 1,
         reason: 'full_snapshot_required',
       },
     );
+    expect(sent).toEqual([
+      expect.objectContaining({
+        type: 'prepare_source',
+        payload: expect.objectContaining({ source_mode: 'full', expected_sha256: capture.sha256 }),
+      }),
+    ]);
 
-    expect(sent.find((frame) => frame.type === 'prepare_source')?.payload.source_mode).toBe('full');
-    await expectNoPrivateFallbackCapture(attempt.attemptId);
+    const chunks: Buffer[] = [];
+    const res = Object.assign(
+      new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(chunk);
+          callback();
+        },
+      }),
+      {
+        writeHead(status: number) {
+          expect(status).toBe(200);
+        },
+      },
+    ) as unknown as ServerResponse;
+    const req = {
+      method: 'GET',
+      url: `/data/v1/attempts/${attemptId}/snapshot`,
+      headers: { authorization: `Bearer ${sent[0]?.payload.data_token}` },
+    } as unknown as IncomingMessage;
+    await expect(
+      handleDataPlaneRequest(req, res, { identity, db, dataDir: tempDir }),
+    ).resolves.toBe(true);
+    expect(Buffer.concat(chunks)).toEqual(await readFile(generationPath(capture.archivePath)));
   });
 
-  it.each(['snapshot.tar.zst', 'snapshot.manifest.json'])(
-    'discards private full-fallback capture when writing %s fails',
-    async (blockedName) => {
-      const attempt = await prepareOverlayFallbackAttempt(`failure_${blockedName}`);
-      const transferDir = join(tempDir, 'transfers', attempt.attemptId);
-      await mkdir(join(transferDir, blockedName), { recursive: true });
-
-      await expect(
-        handleRemoteSourceNeed(
-          {
-            db,
-            identity,
-            dataDir: tempDir,
-            connectedAgents: new Map([
-              [
-                attempt.agentId,
-                {
-                  agentId: attempt.agentId,
-                  socket: { readyState: 1, OPEN: 1, send: () => undefined } as never,
-                  protocolVersion: 1,
-                  lastHeartbeatAt: Date.now(),
-                },
-              ],
-            ]),
-            serverPort: 7411,
-            allowedProjectRoots: [fixture.root],
-          },
-          attempt.agentId,
-          {
-            attempt_id: attempt.attemptId,
-            lease_id: attempt.leaseId,
-            lease_epoch: 1,
-            reason: 'repo_fetch_failed',
-          },
-        ),
-      ).rejects.toThrow();
-
-      await expectNoPrivateFallbackCapture(attempt.attemptId);
-    },
-  );
-
-  it('creates a bundle and sends bundle_download on base_commit_missing', async () => {
+  it('offers and streams only the captured commit after the checkout HEAD advances', async () => {
     const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
     const socket = {
       readyState: 1,
@@ -274,6 +317,11 @@ describe('Controller source_need → bundle_download', () => {
 
     const manifest = JSON.parse(await readFile(generationPath(capture.manifestPath), 'utf8'));
     expect(manifest.payload.mode).toBe('git_overlay');
+    const git = (...args: string[]) =>
+      execFileAsync('git', args, { cwd: fixture.root, windowsHide: true });
+    await git('commit', '--allow-empty', '-m', 'Later workspace commit');
+    const refsBefore = await git('show-ref');
+    expect((await git('rev-parse', 'HEAD')).stdout.trim()).not.toBe(manifest.repo.base_commit);
 
     await handleRemoteSourceNeed(
       {
@@ -292,7 +340,6 @@ describe('Controller source_need → bundle_download', () => {
           ],
         ]),
         serverPort: 7411,
-        allowedProjectRoots: [fixture.root],
       },
       'ag_1',
       {
@@ -307,6 +354,59 @@ describe('Controller source_need → bundle_download', () => {
     expect(bundleFrame).toBeDefined();
     expect(bundleFrame?.payload.expected_size_bytes).toBeGreaterThan(0);
     expect(bundleFrame?.payload.expected_sha256).toMatch(/^[0-9a-f]{64}$/);
+    const bundlePath = join(attemptTransferDir(tempDir, 'att_1'), 'bundle', 'bundle.gitbundle');
+    const heads = await git('bundle', 'list-heads', bundlePath);
+    expect(heads.stdout.trim().split(/\r?\n/)).toEqual([
+      `${manifest.repo.base_commit} refs/heads/rbo-captured-base`,
+    ]);
+    expect((await git('show-ref')).stdout).toBe(refsBefore.stdout);
+
+    const chunks: Buffer[] = [];
+    const writable = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk);
+        callback();
+      },
+    });
+    let headers: Record<string, string | number> = {};
+    const res = Object.assign(writable, {
+      writeHead(status: number, values: Record<string, string | number>) {
+        expect(status).toBe(200);
+        headers = values;
+      },
+    }) as unknown as ServerResponse;
+    const req = {
+      method: 'GET',
+      url: '/data/v1/attempts/att_1/bundle',
+      headers: { authorization: `Bearer ${bundleFrame?.payload.data_token}` },
+    } as unknown as IncomingMessage;
+    await expect(
+      handleDataPlaneRequest(req, res, { identity, db, dataDir: tempDir }),
+    ).resolves.toBe(true);
+    expect(headers).toMatchObject({
+      'content-length': bundleFrame?.payload.expected_size_bytes,
+      'x-rbo-sha256': bundleFrame?.payload.expected_sha256,
+    });
+    expect(Buffer.concat(chunks)).toEqual(await readFile(bundlePath));
+
+    const started = Promise.withResolvers<void>();
+    const slowResponse = Object.assign(
+      new Writable({
+        write() {
+          started.resolve();
+        },
+      }),
+      { writeHead() {} },
+    );
+    const inFlight = handleDataPlaneRequest(req, slowResponse as unknown as ServerResponse, {
+      identity,
+      db,
+      dataDir: tempDir,
+    });
+    await started.promise;
+    abortAgentTransfers(db, 'ag_1');
+    await expect(inFlight).resolves.toBe(true);
+    expect(slowResponse.destroyed).toBe(true);
   });
 
   it('fails prepare when git bundle exceeds maxGitBundleBytes', async () => {
@@ -385,7 +485,6 @@ describe('Controller source_need → bundle_download', () => {
           ],
         ]),
         serverPort: 7411,
-        allowedProjectRoots: [fixture.root],
         maxGitBundleBytes: 1,
       },
       'ag_limit',

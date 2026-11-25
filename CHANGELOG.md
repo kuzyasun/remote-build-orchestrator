@@ -7,6 +7,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-25
+
+### Changed
+
+- HTTP MCP now uses its own bearer token; administrator routes and CLI actions keep the separate admin bearer. The stdio proxy reads the MCP token from `RBO_MCP_TOKEN` or `security/mcp-token`. On first startup after upgrading, RBO rotates the file-backed admin token. Update direct HTTP MCP clients to use the MCP token; if a client used a value supplied through `RBO_ADMIN_TOKEN`, rotate that environment value manually.
+- Git overlay remains the default source transfer. Select a full snapshot per job when needed; full-snapshot fallback after overlay capture fails remains an explicit Controller opt-in. If an Agent cannot restore an already submitted overlay, submit a new job with full snapshot mode.
+- Windows Agents require the matching Windows executor helper with protocol v3 to accept jobs. Use `rbo doctor` to check the helper, install the package from the matching RBO release or set `RBO_WINDOWS_EXECUTOR` to the matching executable, then restart the Agent. Update both Controller and Agents before submitting destructive or hardware-risk jobs; Agents stop these jobs at their local lease deadline if renewals do not arrive.
+
+### Fixed
+
+- Agent recovery preserves completed attempts awaiting artifact upload and resumes transfer from persisted staging when the lease and attempt still match. Worktree cleanup intents survive Agent restarts and coordinate with shared mirror operations.
+- Controller restore validates staged database and identity files before replacement and recovers interrupted file replacement on the next start or restore attempt.
+- Artifact collection and publication now stage candidates before publishing them, while recovery reports distinguish missing, skipped, interrupted, and not-stored artifacts.
+
 ## [0.10.1] - 2026-11-06
 
 ### Added
@@ -178,7 +192,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.11.0
 [0.10.1]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.10.1
 [0.10.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.10.0
 [0.9.3]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.9.3

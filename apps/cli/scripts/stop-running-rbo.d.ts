@@ -4,6 +4,7 @@
  */
 
 export type RboDaemonRole = 'controller' | 'agent';
+type ProcessIdentity = { pid: number; commandLine: string; startedAt?: string };
 
 export function shouldSkipInstallStop(env?: NodeJS.ProcessEnv): boolean;
 
@@ -26,6 +27,17 @@ export function resolveRolePidFile(
   },
 ): string;
 
+export function registerRoleInstance(
+  role: RboDaemonRole,
+  options?: {
+    env?: NodeJS.ProcessEnv;
+    home?: string;
+    dataDir?: string;
+    stateDir?: string;
+    listProcesses?: typeof listNodeProcesses;
+  },
+): Promise<() => void>;
+
 export function clearStalePidFile(pidFile: string, isAlive: (pid: number) => boolean): boolean;
 
 export function readLivePidFromFile(
@@ -35,13 +47,14 @@ export function readLivePidFromFile(
 
 export function isProcessAlive(pid: number): boolean;
 
-export function listNodeProcesses(): Promise<{ pid: number; commandLine: string }[]>;
+export function listNodeProcesses(): Promise<ProcessIdentity[]>;
 
 export function stopPid(
   pid: number,
   options?: {
     platform?: NodeJS.Platform;
     isAlive?: (pid: number) => boolean;
+    isCurrent?: () => Promise<boolean>;
     sleepMs?: (ms: number) => Promise<void>;
   },
 ): Promise<void>;
@@ -53,7 +66,7 @@ export function findLiveRolePids(
     home?: string;
     dataDir?: string;
     stateDir?: string;
-    listProcesses?: () => Promise<{ pid: number; commandLine: string }[]>;
+    listProcesses?: () => Promise<ProcessIdentity[]>;
     isAlive?: (pid: number) => boolean;
     selfPid?: number;
   },
@@ -66,7 +79,7 @@ export function stopRoleProcesses(
     home?: string;
     dataDir?: string;
     stateDir?: string;
-    listProcesses?: () => Promise<{ pid: number; commandLine: string }[]>;
+    listProcesses?: () => Promise<ProcessIdentity[]>;
     isAlive?: (pid: number) => boolean;
     stopPid?: (pid: number) => Promise<void>;
     log?: (msg: string) => void;
@@ -79,10 +92,9 @@ export function stopRoleProcesses(
 export function stopRunningRbo(options?: {
   env?: NodeJS.ProcessEnv;
   home?: string;
-  listProcesses?: () => Promise<{ pid: number; commandLine: string }[]>;
+  listProcesses?: () => Promise<ProcessIdentity[]>;
   isAlive?: (pid: number) => boolean;
   stopPid?: (pid: number) => Promise<void>;
   log?: (msg: string) => void;
   warn?: (msg: string) => void;
-  extraPids?: number[];
 }): Promise<void>;

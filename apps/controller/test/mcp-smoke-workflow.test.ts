@@ -96,7 +96,7 @@ async function connectHttpClient(clientId: string): Promise<Client> {
       requestInit: {
         headers: {
           'x-rbo-client-id': clientId,
-          authorization: `Bearer ${identity.adminToken}`,
+          authorization: `Bearer ${identity.mcpToken}`,
         },
       },
     },
@@ -109,6 +109,7 @@ async function connectStdioClient(clientId: string): Promise<Client> {
   const proxy = createStdioProxyServer({
     controllerUrl: `http://127.0.0.1:${running.port}`,
     clientId,
+    mcpToken: identity.mcpToken,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await proxy.connect(serverTransport);

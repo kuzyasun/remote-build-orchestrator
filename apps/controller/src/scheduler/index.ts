@@ -802,6 +802,9 @@ export function selectAgentForJob(
 
   for (const candidate of agents) {
     const caps = candidate.capabilities;
+    if (caps.accepting_jobs === false) {
+      continue;
+    }
 
     // 1. Capacity: honor agent-reported execution.max_jobs (from agent.json / capabilities).
     const effectiveCapacity = caps.execution.max_jobs;

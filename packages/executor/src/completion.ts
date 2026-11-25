@@ -1,5 +1,6 @@
 import type { ExecutionConfig } from '@rbo/protocol';
 import type { AttemptLogPaths } from './logs.js';
+import type { ManagedChildProcess } from './script.js';
 
 export type CompletionResult =
   | { type: 'exit'; exitCode: number | null; signal: NodeJS.Signals | null }
@@ -7,6 +8,13 @@ export type CompletionResult =
   | { type: 'duration_complete' }
   | { type: 'log_success' }
   | { type: 'log_failure' };
+
+export class NativeExecutorResultTimeoutError extends Error {
+  constructor() {
+    super('Windows executor did not deliver its result by the result deadline');
+    this.name = 'NativeExecutorResultTimeoutError';
+  }
+}
 
 function patternMatches(haystack: string, pattern: string): boolean {
   try {
@@ -138,7 +146,8 @@ function watchLogMatch(
  * (run_to_exit, run_for_duration, run_until_log_match) plus hard timeout.
  */
 export async function waitForCompletion(input: {
-  child: { waitForExit(): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }> };
+  child: Pick<ManagedChildProcess, 'waitForExit' | 'nativeResultDelivery'> &
+    Partial<Pick<ManagedChildProcess, 'waitForStart'>>;
   execution: ExecutionConfig;
   logs: AttemptLogPaths;
   signal: { cancelled: boolean };
@@ -151,58 +160,65 @@ export async function waitForCompletion(input: {
   };
 
   try {
-    const exitP = input.child.waitForExit().then((r) => ({ type: 'exit' as const, ...r }));
-    const hardTimeout = createCancellableTimer(
-      input.execution.timeout_seconds * 1000,
-      'timeout' as const,
+    const exitP = input.child
+      .waitForExit()
+      .then(({ exitCode, signal, timedOut }) =>
+        timedOut ? ({ type: 'timeout' } as const) : ({ type: 'exit', exitCode, signal } as const),
+      );
+    type RaceResult = CompletionResult | 'native_result_timeout';
+    const native = input.child.nativeResultDelivery;
+    const hardTimeout = createCancellableTimer<RaceResult>(
+      input.execution.timeout_seconds * 1000 + (native?.graceMs ?? 0),
+      native ? 'native_result_timeout' : { type: 'timeout' },
     );
     timers.push(hardTimeout);
-    const completion = input.execution.completion;
+    const start = await Promise.race([
+      input.child.waitForStart?.() ?? { started: true },
+      hardTimeout.promise,
+    ]);
+    if (start === 'native_result_timeout') {
+      native?.abort();
+      throw new NativeExecutorResultTimeoutError();
+    }
+    if ('type' in start) return start;
 
-    if (completion.type === 'run_for_duration') {
-      const duration = createCancellableTimer(
+    const pending: Array<Promise<RaceResult>> = [exitP, hardTimeout.promise];
+    const completion = start.started ? input.execution.completion : undefined;
+
+    if (
+      completion?.type === 'run_for_duration' &&
+      completion.duration_seconds < input.execution.timeout_seconds
+    ) {
+      const duration = createCancellableTimer<CompletionResult>(
         completion.duration_seconds * 1000,
-        'duration_complete' as const,
+        { type: 'duration_complete' },
       );
       timers.push(duration);
-      const result = await Promise.race([exitP, hardTimeout.promise, duration.promise]);
-      if (result === 'timeout') {
-        return { type: 'timeout' };
-      }
-      if (result === 'duration_complete') {
-        return { type: 'duration_complete' };
-      }
-      return result;
+      pending.push(duration.promise);
     }
 
-    if (completion.type === 'run_until_log_match') {
-      const maxDuration = createCancellableTimer(
-        Math.min(completion.max_duration_seconds, input.execution.timeout_seconds) * 1000,
-        'timeout' as const,
-      );
-      timers.push(maxDuration);
+    if (completion?.type === 'run_until_log_match') {
       const watcher = watchLogMatch(input.logs, completion, input.signal);
       timers.push({ cancel: watcher.stop });
-      try {
-        const result = await Promise.race([
-          exitP,
-          hardTimeout.promise,
-          maxDuration.promise,
-          watcher.promise.then((kind) => ({ type: kind })),
-        ]);
-        if (result === 'timeout') {
-          return { type: 'timeout' };
-        }
-        return result as CompletionResult;
-      } finally {
-        watcher.stop();
+      pending.push(watcher.promise.then((type) => ({ type })));
+      if (completion.max_duration_seconds <= input.execution.timeout_seconds) {
+        const maxDuration = createCancellableTimer<CompletionResult>(
+          completion.max_duration_seconds * 1000,
+          { type: 'timeout' },
+        );
+        timers.push(maxDuration);
+        pending.push(maxDuration.promise);
+      } else if (native) {
+        // The extra window is only for delivery of the native outcome.
+        const stopLogMatch = setTimeout(watcher.stop, input.execution.timeout_seconds * 1000);
+        timers.push({ cancel: () => clearTimeout(stopLogMatch) });
       }
     }
 
-    // run_to_exit (default)
-    const result = await Promise.race([exitP, hardTimeout.promise]);
-    if (result === 'timeout') {
-      return { type: 'timeout' };
+    const result = await Promise.race(pending);
+    if (result === 'native_result_timeout') {
+      native?.abort();
+      throw new NativeExecutorResultTimeoutError();
     }
     return result;
   } finally {

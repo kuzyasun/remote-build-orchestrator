@@ -68,7 +68,7 @@ describe('stdio proxy errors', () => {
     expect(contentText(result, 1)).toBe('RBO Controller returned HTTP 503');
   });
 
-  it('resolves admin token dynamically per request when token becomes available on disk', async () => {
+  it('resolves the MCP token dynamically when it becomes available on disk', async () => {
     let capturedHeaders: Record<string, string> = {};
     const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
       capturedHeaders = (init?.headers ?? {}) as Record<string, string>;
@@ -96,7 +96,7 @@ describe('stdio proxy errors', () => {
         // Write token file
         const secDir = join(tempDir, 'security');
         await mkdir(secDir, { recursive: true });
-        await writeFile(join(secDir, 'admin-token'), 'dynamic-token-123\n');
+        await writeFile(join(secDir, 'mcp-token'), 'dynamic-token-123\n');
 
         // Second call: picks up the token without restarting proxy
         await client.callTool({ name: 'agents_list', arguments: { include_offline: false } });

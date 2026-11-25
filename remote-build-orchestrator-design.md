@@ -806,7 +806,7 @@ flowchart TD
     R --> I[Import bundle]
     I --> D{Commit є?}
     D -->|так| W
-    D -->|ні| X[Full snapshot fallback або failure]
+    D -->|ні| X[Source preparation failure]
 ```
 
 ### 10.6. Targeted fetch
@@ -841,13 +841,16 @@ git --git-dir=<mirror> fetch --no-tags origin   refs/heads/master:refs/remotes/o
 4. Імпортує objects у mirror.
 5. Створює worktree.
 
-Fallback order:
+Fallback order for a submitted Git overlay:
 
 ```text
 remote fetch
 → Git bundle
-→ full source snapshot
+→ source preparation failure
 ```
+
+For a full archive, set `source.snapshot_mode` to `full` at submission. The Controller captures
+and stores it before execution, using the same source allowlist, limits and secret policy.
 
 ### 10.8. Worktree creation
 
@@ -3410,7 +3413,7 @@ Deliverables:
 - targeted fetch;
 - Git bundle для local-only HEAD;
 - Agent-side bundle import у isolated `refs/rbo/...` namespace з retention;
-- full-snapshot fallback;
+- submission-time full snapshot selection and fallback;
 - repo LRU eviction без active worktree deletion;
 - scheduler cache-affinity score.
 

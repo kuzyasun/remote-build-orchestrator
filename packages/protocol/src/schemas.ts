@@ -88,6 +88,7 @@ export const JobAdditionalRootSchema = z.object({
 
 export const SourceConfigSchema = z.object({
   project_root: z.string().min(1),
+  snapshot_mode: z.enum(['auto', 'full']).optional(),
   // Relative path only — no absolute paths or `..` segments (§28.2 isolation).
   cwd: z
     .string()

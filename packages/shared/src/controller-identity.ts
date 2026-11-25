@@ -1,5 +1,5 @@
-import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 // selfsigned is CJS; default import via esModuleInterop.
 import selfsigned from 'selfsigned';
@@ -21,6 +21,14 @@ export interface ControllerIdentity {
   signingPrivateKeyPem: string;
   fingerprint: string;
   adminToken: string;
+  mcpToken: string;
+}
+
+const ADMIN_BEARER_SCOPE_VERSION = 2;
+
+interface ControllerIdentityMetadata {
+  controller_id: string;
+  admin_bearer_scope_version?: number;
 }
 
 function pemToDer(certPem: string): Buffer {
@@ -31,7 +39,34 @@ function pemToDer(certPem: string): Buffer {
   return Buffer.from(body, 'base64');
 }
 
-export async function ensureControllerIdentity(dataDir: string): Promise<ControllerIdentity> {
+function ensureBearerToken(securityDir: string, name: 'admin-token' | 'mcp-token'): string {
+  const path = join(securityDir, name);
+  if (!existsSync(path)) {
+    try {
+      writeFileSync(path, `${randomBytes(32).toString('hex')}\n`, { mode: 0o600, flag: 'wx' });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
+  const token = readFileSync(path, 'utf8').trim();
+  if (!token) throw new Error(`Controller bearer token file is empty: ${path}`);
+  return token;
+}
+
+function replacePrivateFile(path: string, content: string): void {
+  const candidate = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(candidate, content, { mode: 0o600, flag: 'wx' });
+    renameSync(candidate, path);
+  } finally {
+    rmSync(candidate, { force: true });
+  }
+}
+
+export async function ensureControllerIdentity(
+  dataDir: string,
+  options: { rotateLegacyAdminBearer?: boolean } = {},
+): Promise<ControllerIdentity> {
   const securityDir = join(dataDir, 'security');
   mkdirSync(securityDir, { recursive: true });
 
@@ -65,39 +100,53 @@ export async function ensureControllerIdentity(dataDir: string): Promise<Control
       JSON.stringify({
         controller_id: `controller_${ulid()}`,
         created_at: new Date().toISOString(),
+        admin_bearer_scope_version: ADMIN_BEARER_SCOPE_VERSION,
       }),
       { mode: 0o600 },
     );
   }
 
-  const adminTokenPath = join(securityDir, 'admin-token');
-  if (!existsSync(adminTokenPath)) {
-    const token = randomBytes(32).toString('hex');
-    writeFileSync(adminTokenPath, `${token}\n`, { mode: 0o600 });
-  }
-
   const tlsCertPem = readFileSync(certPath, 'utf8');
-  const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as { controller_id: string };
+  const signingPrivateKeyPem = readFileSync(signingPrivatePath, 'utf8');
+  const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as ControllerIdentityMetadata;
 
-  const envAdminToken = process.env.RBO_ADMIN_TOKEN?.trim();
+  if (options.rotateLegacyAdminBearer && meta.admin_bearer_scope_version === undefined) {
+    // Older HTTP MCP clients may know the original admin bearer. Derive the same
+    // new secret on retry if startup is interrupted between the two file writes.
+    const replacement = createHmac('sha256', signingPrivateKeyPem)
+      .update('rbo/admin-bearer-scope/v2')
+      .digest('hex');
+    replacePrivateFile(join(securityDir, 'admin-token'), `${replacement}\n`);
+    replacePrivateFile(
+      metaPath,
+      JSON.stringify({ ...meta, admin_bearer_scope_version: ADMIN_BEARER_SCOPE_VERSION }),
+    );
+  }
+  const adminToken = ensureBearerToken(securityDir, 'admin-token');
+  const mcpToken = ensureBearerToken(securityDir, 'mcp-token');
 
   return {
     controllerId: meta.controller_id,
     tlsCertPem,
     tlsKeyPem: readFileSync(keyPath, 'utf8'),
     signingPublicKeyPem: readFileSync(signingPublicPath, 'utf8'),
-    signingPrivateKeyPem: readFileSync(signingPrivatePath, 'utf8'),
+    signingPrivateKeyPem,
     fingerprint: certificateFingerprint(pemToDer(tlsCertPem)),
-    adminToken: envAdminToken || readFileSync(adminTokenPath, 'utf8').trim(),
+    adminToken: process.env.RBO_ADMIN_TOKEN?.trim() || adminToken,
+    mcpToken: process.env.RBO_MCP_TOKEN?.trim() || mcpToken,
   };
 }
 
-export function readAdminToken(options?: RboLayoutOptions): string | undefined {
-  const envToken = (options?.env ?? process.env).RBO_ADMIN_TOKEN?.trim();
+function readBearerToken(
+  options: RboLayoutOptions | undefined,
+  name: 'admin-token' | 'mcp-token',
+  envKey: 'RBO_ADMIN_TOKEN' | 'RBO_MCP_TOKEN',
+): string | undefined {
+  const envToken = (options?.env ?? process.env)[envKey]?.trim();
   if (envToken) {
     return envToken;
   }
-  const tokenPath = join(resolveControllerDataDir(options), 'security', 'admin-token');
+  const tokenPath = join(resolveControllerDataDir(options), 'security', name);
   if (existsSync(tokenPath)) {
     try {
       const token = readFileSync(tokenPath, 'utf8').trim();
@@ -107,4 +156,12 @@ export function readAdminToken(options?: RboLayoutOptions): string | undefined {
     }
   }
   return undefined;
+}
+
+export function readAdminToken(options?: RboLayoutOptions): string | undefined {
+  return readBearerToken(options, 'admin-token', 'RBO_ADMIN_TOKEN');
+}
+
+export function readMcpToken(options?: RboLayoutOptions): string | undefined {
+  return readBearerToken(options, 'mcp-token', 'RBO_MCP_TOKEN');
 }

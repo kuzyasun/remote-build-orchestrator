@@ -1,11 +1,13 @@
 export const FRAME_TAG_STDOUT = 0x01;
 export const FRAME_TAG_STDERR = 0x02;
 export const FRAME_TAG_CONTROL = 0x03;
+export const FRAME_TAG_STARTED = 0x04;
 
 export interface ParsedFrames {
   stdout: Buffer[];
   stderr: Buffer[];
   control?: Buffer;
+  started: boolean;
 }
 
 export class WindowsHelperFrameReader {
@@ -16,6 +18,7 @@ export class WindowsHelperFrameReader {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let control: Buffer | undefined;
+    let started = false;
 
     while (this.buffer.length >= 5) {
       const tag = this.buffer[0];
@@ -32,9 +35,11 @@ export class WindowsHelperFrameReader {
         stderr.push(payload);
       } else if (tag === FRAME_TAG_CONTROL) {
         control = payload;
+      } else if (tag === FRAME_TAG_STARTED && payload.length === 0) {
+        started = true;
       }
     }
 
-    return { stdout, stderr, control };
+    return { stdout, stderr, control, started };
   }
 }

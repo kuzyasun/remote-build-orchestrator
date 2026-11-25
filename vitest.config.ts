@@ -24,6 +24,7 @@ export default defineConfig({
       '@rbo/testing': pkg('testing'),
       '@rbo/discovery': pkg('discovery'),
       '@rbo/controller/config': appSrc('controller', 'config.ts'),
+      '@rbo/controller/restore': appSrc('controller', 'storage/restore-validation.ts'),
       '@rbo/controller/run': appSrc('controller', 'run.ts'),
       '@rbo/agent/config': appSrc('agent', 'config.ts'),
       '@rbo/agent/run': appSrc('agent', 'run.ts'),

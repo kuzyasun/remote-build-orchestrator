@@ -159,6 +159,16 @@ export interface WrittenArchiveCandidateResult extends WrittenArchiveResult {
   entries: WrittenArchiveEntryResult[];
 }
 
+export class ArchiveBudgetExceeded extends Error {
+  constructor(
+    readonly budget: 'entry_count' | 'source_bytes' | 'output_bytes' | 'stored_bytes',
+    readonly limit: number,
+    readonly actual: number,
+  ) {
+    super(`Archive ${budget} budget exceeded (${actual} > ${limit})`);
+  }
+}
+
 /**
  * Write a compressed archive to a unique private candidate.
  * Publication/rename of the candidate is deliberately owned by the caller.
@@ -178,6 +188,7 @@ function rethrowContentPathIdentityError(error: unknown, entryPath: string): nev
 export async function writeZstdTarArchiveCandidate(
   archivePath: string,
   entries: TarEntryInput[],
+  limits: { maxSourceBytes?: number; maxOutputBytes?: number; maxStoredBytes?: number } = {},
 ): Promise<WrittenArchiveCandidateResult> {
   const { constants, createReadStream, createWriteStream } = await import('node:fs');
   const { lstat, open, rm } = await import('node:fs/promises');
@@ -191,6 +202,16 @@ export async function writeZstdTarArchiveCandidate(
   const candidatePath = `${archivePath}.candidate-${randomUUID()}`;
   const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
   const entryResults: WrittenArchiveEntryResult[] = [];
+  const maxSourceBytes = limits.maxSourceBytes ?? Number.POSITIVE_INFINITY;
+  const maxOutputBytes = limits.maxOutputBytes ?? Number.POSITIVE_INFINITY;
+  const maxStoredBytes = limits.maxStoredBytes ?? maxOutputBytes;
+  let sourceBytes = 0;
+  const countSourceBytes = (bytes: number) => {
+    sourceBytes += bytes;
+    if (sourceBytes > maxSourceBytes) {
+      throw new ArchiveBudgetExceeded('source_bytes', maxSourceBytes, sourceBytes);
+    }
+  };
   async function* tarChunks(): AsyncGenerator<Buffer> {
     for (const entry of sorted) {
       let fileSize = 0;
@@ -198,6 +219,7 @@ export async function writeZstdTarArchiveCandidate(
       if (entry.type === 'file') {
         if (entry.content) {
           fileSize = entry.content.length;
+          countSourceBytes(fileSize);
         } else if (entry.contentPath) {
           try {
             const listed = await lstat(entry.contentPath);
@@ -217,6 +239,7 @@ export async function writeZstdTarArchiveCandidate(
                 throw new Error(`Source file is too large to archive safely: '${entry.path}'`);
               }
               fileSize = Number(before.size);
+              countSourceBytes(fileSize);
               yield writeTarHeader(entry, fileSize);
               let streamed = 0;
               if (fileSize > 0) {
@@ -285,9 +308,16 @@ export async function writeZstdTarArchiveCandidate(
   let size = 0;
   const digest = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
-      hash.update(chunk);
+      const available = maxStoredBytes - size;
       size += chunk.length;
-      callback(null, chunk);
+      if (size > maxOutputBytes) {
+        callback(new ArchiveBudgetExceeded('output_bytes', maxOutputBytes, size));
+        return;
+      }
+      hash.update(chunk);
+      // Keep counting when the remaining total is smaller than the per-file
+      // cap so the caller can distinguish a skipped file from an aggregate failure.
+      callback(null, available < chunk.length ? chunk.subarray(0, Math.max(0, available)) : chunk);
     },
   });
   try {
@@ -297,6 +327,9 @@ export async function writeZstdTarArchiveCandidate(
       digest,
       createWriteStream(candidatePath, { flags: 'wx' }),
     );
+    if (size > maxStoredBytes) {
+      throw new ArchiveBudgetExceeded('stored_bytes', maxStoredBytes, size);
+    }
   } catch (error) {
     await rm(candidatePath, { force: true }).catch(() => undefined);
     throw error;

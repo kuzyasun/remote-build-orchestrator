@@ -46,12 +46,14 @@ function snapshotPayloadMode(manifest: unknown): 'full' | 'git_overlay' {
   return 'full';
 }
 import {
+  type AttemptRow,
   createAttempt,
   createJobEvent,
   getJob,
   getLatestAttempt,
   isTerminalJobState,
   recordEvent,
+  runLifecycleTransaction,
   transitionAttemptState,
   transitionJobState,
 } from '../jobs/lifecycle.js';
@@ -141,8 +143,8 @@ export function requestJobCancel(db: ControllerDatabase, jobId: string): boolean
   }
 
   // Queued / pre-process cancel: mark terminal so fire-and-track will not execute.
-  pendingCancels.add(jobId);
-  if (attempt) {
+  if (attempt && attempt.state !== 'completed') {
+    pendingCancels.add(jobId);
     transitionAttemptState(db, attempt.id, 'completed', {
       outcome: 'cancelled',
       finished_at: nowIso(),
@@ -197,7 +199,7 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
   }
   const request = JSON.parse(row.request_json) as JobRequest;
   const current = getJob(ctx.db, jobId);
-  if (!current || isTerminalJobState(current.state) || current.outcome === 'cancelled') {
+  if (current?.state !== 'queued') {
     pendingCancels.delete(jobId);
     return;
   }
@@ -211,39 +213,27 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
     pendingCancels.delete(jobId);
     return;
   }
-  const afterAdmit = getJob(ctx.db, jobId);
-  if (!afterAdmit || isTerminalJobState(afterAdmit.state) || afterAdmit.outcome === 'cancelled') {
-    releaseAdmission();
-    pendingCancels.delete(jobId);
-    return;
-  }
-
-  const attempt = createAttempt(ctx.db, jobId, 1);
-  if (isCancelRequested(jobId)) {
-    transitionAttemptState(ctx.db, attempt.id, 'completed', {
-      outcome: 'cancelled',
-      finished_at: nowIso(),
+  let attempt: AttemptRow | null;
+  try {
+    attempt = runLifecycleTransaction(ctx.db, () => {
+      if (getJob(ctx.db, jobId)?.state !== 'queued') return null;
+      const ordinal = (getLatestAttempt(ctx.db, jobId)?.ordinal ?? 0) + 1;
+      const claimedAttempt = createAttempt(ctx.db, jobId, ordinal);
+      transitionJobState(ctx.db, jobId, 'matching');
+      return claimedAttempt;
     });
-    const latest = getJob(ctx.db, jobId);
-    if (latest && !isTerminalJobState(latest.state)) {
-      transitionJobState(ctx.db, jobId, 'completed', {
-        outcome: 'cancelled',
-        finished_at: nowIso(),
-        failure_category: 'cancelled',
-        failure_message: 'Job cancelled before execution',
-      });
-    }
+  } catch (error) {
     releaseAdmission();
-    pendingCancels.delete(jobId);
+    throw error;
+  }
+  if (!attempt) {
+    releaseAdmission();
     return;
   }
   const workspaceRoot = attemptWorkspaceDir(ctx.dataDir, attempt.id);
   const persistentLogs = attemptLogDir(ctx.dataDir, attempt.id);
   const controlDir = attemptControlDir(ctx.dataDir, attempt.id);
   const artifactsDir = attemptArtifactsDir(ctx.dataDir, attempt.id);
-  await mkdir(artifactsDir, { recursive: true });
-  await mkdir(persistentLogs, { recursive: true });
-  await mkdir(controlDir, { recursive: true });
 
   let timedOut = false;
   let cancelled = false;
@@ -253,15 +243,18 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
   let materializedProjectPath = '';
   let inFlightCancel: Promise<void> | undefined;
   const cancelSignal = { cancelled: false };
-  const logs = await ensureAttemptLogs(persistentLogs);
+  let attemptLogs: Awaited<ReturnType<typeof ensureAttemptLogs>> | undefined;
 
   try {
+    await mkdir(artifactsDir, { recursive: true });
+    await mkdir(controlDir, { recursive: true });
+    const logs = await ensureAttemptLogs(persistentLogs);
+    attemptLogs = logs;
     if (isCancelRequested(jobId)) {
       cancelled = true;
       throw new RboError('cancelled', 'Job cancelled before materialization', false);
     }
 
-    transitionJobState(ctx.db, jobId, 'matching');
     transitionJobState(ctx.db, jobId, 'leased', { started_at: nowIso() });
     transitionJobState(ctx.db, jobId, 'materializing');
 
@@ -561,13 +554,15 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
         failure_message: message,
       });
     }
-    await emitJobEvent(ctx, logs, {
-      type: 'error',
-      job_id: jobId,
-      attempt_id: attempt.id,
-      category: category === 'cancelled' ? 'cancelled' : category,
-      message,
-    }).catch(() => undefined);
+    if (attemptLogs) {
+      await emitJobEvent(ctx, attemptLogs, {
+        type: 'error',
+        job_id: jobId,
+        attempt_id: attempt.id,
+        category: category === 'cancelled' ? 'cancelled' : category,
+        message,
+      }).catch(() => undefined);
+    }
     if (!cancelled && category !== 'cancelled') {
       // Re-throw as RboError so outer dispatch catch never sees exotic ZodError
       // objects that can crash Node 24.11+ console.error / util.inspect.
@@ -580,7 +575,7 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
     activeCancels.delete(attempt.id);
     pendingCancels.delete(jobId);
     releaseAdmission();
-    if (materializedProjectPath) {
+    if (materializedProjectPath && attemptLogs) {
       let projectCwd = materializedProjectPath;
       try {
         projectCwd = await resolveContainedCwd(materializedProjectPath, request.source.cwd);
@@ -598,10 +593,10 @@ export async function runLocalJob(ctx: LocalRunnerContext, jobId: string): Promi
           RBO_ATTEMPT_ID: attempt.id,
           RBO_ARTIFACT_DIR: artifactsDir,
         },
-        logs,
+        logs: attemptLogs,
       }).catch(() => ({ exitCode: null, timedOut: false }));
       if (cleanup.exitCode !== 0 || cleanup.timedOut) {
-        await emitJobEvent(ctx, logs, {
+        await emitJobEvent(ctx, attemptLogs, {
           type: 'cleanup_error',
           job_id: jobId,
           attempt_id: attempt.id,
@@ -669,7 +664,9 @@ export async function captureAndPersistSnapshot(
           },
         };
 
-  const useOverlay = await resolveUseGitOverlay(ctx, normalizedRequest.source.project_root);
+  const useOverlay =
+    normalizedRequest.source.snapshot_mode !== 'full' &&
+    (await resolveUseGitOverlay(ctx, normalizedRequest.source.project_root));
 
   const overlayRemoteUrl =
     useOverlay && ctx.gitAllowlist
@@ -865,7 +862,7 @@ async function resolveUseGitOverlay(
     return false;
   }
   throw RboError.validation(
-    `Cannot capture this job with git overlay: ${explanation}. A full-snapshot fallback would upload the entire working tree, so it is disabled by default — fix the cause, or set "allow_full_snapshot_fallback": true in controller.json (or RBO_ALLOW_FULL_SNAPSHOT_FALLBACK=true) to opt in.`,
+    `Cannot capture this job with git overlay: ${explanation}. A full-snapshot fallback would upload the entire working tree, so it is disabled by default. Fix the cause, request snapshot_mode=full for this job, or set "allow_full_snapshot_fallback": true in controller.json (or RBO_ALLOW_FULL_SNAPSHOT_FALLBACK=true).`,
     { reason: cause.reason, project_root: projectRoot },
   );
 }

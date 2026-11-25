@@ -81,7 +81,12 @@ describe('lease_epoch monotonic fencing (§2.2)', () => {
       serverPort: 7411,
     };
 
-    const firstAttemptId = await initiateRemoteAttempt(remoteOpts, job.id, 'agt_1');
+    const [firstAttemptId, competingAttempt] = await Promise.all([
+      initiateRemoteAttempt(remoteOpts, job.id, 'agt_1'),
+      initiateRemoteAttempt(remoteOpts, job.id, 'agt_1'),
+    ]);
+    expect(firstAttemptId).toBeTypeOf('string');
+    expect(competingAttempt).toBeNull();
     const firstEpoch = (
       db.prepare('SELECT lease_epoch FROM job_attempts WHERE id = ?').get(firstAttemptId) as {
         lease_epoch: number;
@@ -91,8 +96,11 @@ describe('lease_epoch monotonic fencing (§2.2)', () => {
     db.prepare(`UPDATE job_attempts SET state = 'completed', outcome = 'failed' WHERE id = ?`).run(
       firstAttemptId,
     );
+    await expect(initiateRemoteAttempt(remoteOpts, job.id, 'agt_1')).resolves.toBeNull();
+    transitionJobState(db, job.id, 'queued');
 
     const secondAttemptId = await initiateRemoteAttempt(remoteOpts, job.id, 'agt_1');
+    expect(secondAttemptId).toBeTypeOf('string');
     const secondEpoch = (
       db.prepare('SELECT lease_epoch FROM job_attempts WHERE id = ?').get(secondAttemptId) as {
         lease_epoch: number;

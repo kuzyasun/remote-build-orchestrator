@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getAgentLastBootId, updateAgentCapabilities } from '../src/agents/registry.js';
+import { expireStaleLeases } from '../src/execution/remote-execution.js';
 import { createJob, getAttempt, getJob, transitionJobState } from '../src/jobs/lifecycle.js';
 import { RecoveryCoordinator } from '../src/recovery/coordinator.js';
 import { getActiveJobsForAgents } from '../src/scheduler/index.js';
@@ -113,6 +114,288 @@ describe('Agent boot_id restart — sweep leaked attempts on process restart', (
     expect(getAttempt(db, att)?.state).toBe('running');
     expect(getJob(db, jobId)?.state).toBe('running');
     db.close();
+  });
+
+  it.each([true, false])(
+    'preserves the exited process result after Agent restart (reports=%s)',
+    (reports) => {
+      const db = openDatabase(':memory:');
+      migrateToLatest(db);
+      insertAgent(db, 'agt_1');
+      db.prepare("UPDATE agents SET last_boot_id = 'boot_old' WHERE id = 'agt_1'").run();
+      const attemptId = seedRunningAttempt(db, 'agt_1', 'collecting_artifacts');
+      const attempt = getAttempt(db, attemptId);
+      if (!attempt) throw new Error('Missing fixture attempt');
+      db.prepare("UPDATE job_attempts SET outcome = 'succeeded' WHERE id = ?").run(attemptId);
+      db.prepare("UPDATE jobs SET state = 'collecting_artifacts', exit_code = 0 WHERE id = ?").run(
+        attempt.job_id,
+      );
+      const coordinator = makeCoordinator(db);
+      try {
+        coordinator.onAgentConnect('agt_1', 'boot_new');
+        expect(getAttempt(db, attemptId)).toMatchObject({
+          state: 'collecting_artifacts',
+          outcome: 'succeeded',
+        });
+        if (reports) {
+          expect(
+            coordinator.onRecoveryReport('agt_1', {
+              attempt_id: attemptId,
+              lease_id: attempt.lease_id,
+              lease_epoch: attempt.lease_epoch,
+              status: 'completed_awaiting_upload',
+              process_identity: 'unavailable',
+              last_sent_sequence: 0,
+              last_acked_sequence: 0,
+              artifact_upload_pending: true,
+            }).action,
+          ).toBe('adopt');
+        }
+        vi.advanceTimersByTime(8_000);
+        if (reports) {
+          expect(getAttempt(db, attemptId)).toMatchObject({
+            state: 'collecting_artifacts',
+            process_identity: null,
+          });
+        } else {
+          expect(getAttempt(db, attemptId)).toMatchObject({
+            state: 'completed',
+            outcome: 'succeeded',
+          });
+          expect(getJob(db, attempt.job_id)).toMatchObject({
+            state: 'completed',
+            outcome: 'succeeded',
+            exit_code: 0,
+            failure_category: null,
+          });
+        }
+      } finally {
+        coordinator.dispose();
+        db.close();
+      }
+    },
+  );
+
+  it('requires a recorded process exit to adopt an artifact-only recovery report', () => {
+    const db = openDatabase(':memory:');
+    migrateToLatest(db);
+    insertAgent(db, 'agt_1');
+    const attemptId = seedRunningAttempt(db, 'agt_1', 'running');
+    const attempt = getAttempt(db, attemptId);
+    if (!attempt) throw new Error('Missing fixture attempt');
+    const coordinator = makeCoordinator(db);
+    try {
+      expect(
+        coordinator.onRecoveryReport('agt_1', {
+          attempt_id: attemptId,
+          lease_id: attempt.lease_id,
+          lease_epoch: attempt.lease_epoch,
+          status: 'completed_awaiting_upload',
+          process_identity: 'unavailable',
+          last_sent_sequence: 0,
+          last_acked_sequence: 0,
+          artifact_upload_pending: true,
+        }),
+      ).toMatchObject({ action: 'terminate_stale', reason: 'process_exit_not_recorded' });
+    } finally {
+      coordinator.dispose();
+      db.close();
+    }
+  });
+
+  it.each(['completed', 'still running', 'missing report', 'expired lease'] as const)(
+    'handles a declared pending exit after Agent restart when %s',
+    (scenario) => {
+      const db = openDatabase(':memory:');
+      migrateToLatest(db);
+      insertAgent(db, 'agt_1');
+      db.prepare("UPDATE agents SET last_boot_id = 'boot_old' WHERE id = 'agt_1'").run();
+      const attemptId = seedRunningAttempt(db, 'agt_1', 'running');
+      const attempt = getAttempt(db, attemptId);
+      if (!attempt) throw new Error('Missing fixture attempt');
+      if (scenario === 'expired lease') {
+        db.prepare('UPDATE job_attempts SET lease_deadline = ? WHERE id = ?').run(
+          new Date(Date.now() - 1).toISOString(),
+          attemptId,
+        );
+      }
+      const coordinator = makeCoordinator(db);
+      try {
+        coordinator.onAgentConnect('agt_1', 'boot_new', [attemptId]);
+        if (scenario === 'missing report') {
+          expect(getAttempt(db, attemptId)?.state).toBe('running');
+          vi.advanceTimersByTime(8_000);
+          expect(getAttempt(db, attemptId)?.outcome).toBe('lost');
+          return;
+        }
+        const artifactPending = scenario !== 'still running';
+        const decision = coordinator.onRecoveryReport('agt_1', {
+          attempt_id: attemptId,
+          lease_id: attempt.lease_id,
+          lease_epoch: attempt.lease_epoch,
+          status: artifactPending ? 'completed_awaiting_upload' : 'running',
+          process_identity: 'unavailable',
+          last_sent_sequence: 0,
+          last_acked_sequence: 0,
+          artifact_upload_pending: artifactPending,
+          ...(artifactPending ? { process_exit: { exit_code: 0, outcome: 'succeeded' } } : {}),
+        });
+        if (scenario === 'completed') {
+          expect(decision.action).toBe('adopt');
+          expect(getAttempt(db, attemptId)).toMatchObject({
+            state: 'collecting_artifacts',
+            outcome: 'succeeded',
+          });
+        } else {
+          expect(decision.action).toBe('terminate_stale');
+          expect(getAttempt(db, attemptId)?.state).toBe('completed');
+        }
+      } finally {
+        coordinator.dispose();
+        db.close();
+      }
+    },
+  );
+
+  it.each(['collecting_artifacts', 'cleaning'])(
+    'finishes a %s job with an already completed remote attempt on Controller startup',
+    (state) => {
+      const db = openDatabase(':memory:');
+      migrateToLatest(db);
+      insertAgent(db, 'agt_1');
+      const attemptId = seedRunningAttempt(db, 'agt_1', 'completed');
+      const attempt = getAttempt(db, attemptId);
+      if (!attempt) throw new Error('Missing fixture attempt');
+      const finishedAt = nowIso();
+      db.prepare("UPDATE job_attempts SET outcome = 'failed', finished_at = ? WHERE id = ?").run(
+        finishedAt,
+        attemptId,
+      );
+      transitionJobState(db, attempt.job_id, state, {
+        exit_code: 7,
+        failure_category: 'process_exit',
+      });
+
+      const coordinator = makeCoordinator(db);
+      try {
+        coordinator.onControllerStartup();
+        expect(getJob(db, attempt.job_id)).toMatchObject({
+          state: 'completed',
+          outcome: 'failed',
+          finished_at: finishedAt,
+          exit_code: 7,
+          failure_category: 'process_exit',
+        });
+      } finally {
+        coordinator.dispose();
+        db.close();
+      }
+    },
+  );
+
+  it.each(['leasing', 'preparing_source', 'running', 'queued'])(
+    'reconciles a completed attempt on startup when the job is %s',
+    (state) => {
+      const db = openDatabase(':memory:');
+      migrateToLatest(db);
+      insertAgent(db, 'agt_1');
+      const attemptId = seedRunningAttempt(db, 'agt_1', 'completed');
+      const attempt = getAttempt(db, attemptId);
+      if (!attempt) throw new Error('Missing fixture attempt');
+      const outcome = state === 'running' ? 'lost' : 'failed';
+      const finishedAt = nowIso();
+      db.prepare('UPDATE job_attempts SET outcome = ?, finished_at = ? WHERE id = ?').run(
+        outcome,
+        finishedAt,
+        attemptId,
+      );
+      transitionJobState(db, attempt.job_id, state);
+
+      const coordinator = makeCoordinator(db);
+      try {
+        coordinator.onControllerStartup();
+        expect(getJob(db, attempt.job_id)).toMatchObject(
+          state === 'queued'
+            ? { state: 'queued', outcome: null, finished_at: null }
+            : {
+                state: 'completed',
+                outcome,
+                finished_at: finishedAt,
+                failure_category: 'agent_disconnected',
+              },
+        );
+      } finally {
+        coordinator.dispose();
+        db.close();
+      }
+    },
+  );
+
+  it('rolls back lease expiry if the job update fails, then finalizes both on retry', () => {
+    const db = openDatabase(':memory:');
+    migrateToLatest(db);
+    const coordinator = makeCoordinator(db);
+    try {
+      insertAgent(db, 'agt_1');
+      const attemptId = seedRunningAttempt(db, 'agt_1', 'running');
+      const attempt = getAttempt(db, attemptId);
+      if (!attempt) throw new Error('Missing fixture attempt');
+      db.prepare('UPDATE job_attempts SET lease_deadline = ? WHERE id = ?').run(
+        nowIso(),
+        attemptId,
+      );
+      db.exec(`CREATE TRIGGER fail_job_completion BEFORE UPDATE ON jobs WHEN NEW.state = 'completed'
+               BEGIN SELECT RAISE(ABORT, 'job completion failed'); END;`);
+
+      expect(() => expireStaleLeases(db)).toThrow('job completion failed');
+      expect(getAttempt(db, attemptId)).toMatchObject({ state: 'running', outcome: null });
+      expect(getJob(db, attempt.job_id)).toMatchObject({ state: 'running', outcome: null });
+
+      db.exec('DROP TRIGGER fail_job_completion');
+      expireStaleLeases(db);
+      expect(getAttempt(db, attemptId)).toMatchObject({ state: 'completed', outcome: 'failed' });
+      expect(getJob(db, attempt.job_id)).toMatchObject({
+        state: 'completed',
+        outcome: 'failed',
+        failure_category: 'agent_disconnected',
+      });
+    } finally {
+      coordinator.dispose();
+      db.close();
+    }
+  });
+
+  it('keeps artifact recovery eligible after Controller startup with an expired old lease', () => {
+    const db = openDatabase(':memory:');
+    migrateToLatest(db);
+    insertAgent(db, 'agt_1');
+    const attemptId = seedRunningAttempt(db, 'agt_1', 'collecting_artifacts');
+    const attempt = getAttempt(db, attemptId);
+    if (!attempt) throw new Error('Missing fixture attempt');
+    db.prepare(
+      "UPDATE job_attempts SET outcome = 'succeeded', lease_deadline = ? WHERE id = ?",
+    ).run(new Date(Date.now() - 1).toISOString(), attemptId);
+    const coordinator = makeCoordinator(db);
+    try {
+      coordinator.onControllerStartup();
+      vi.advanceTimersByTime(4_000);
+      expireStaleLeases(db);
+      expect(
+        coordinator.onRecoveryReport('agt_1', {
+          attempt_id: attemptId,
+          lease_id: attempt.lease_id,
+          lease_epoch: attempt.lease_epoch,
+          status: 'completed_awaiting_upload',
+          process_identity: 'unavailable',
+          last_sent_sequence: 0,
+          last_acked_sequence: 0,
+          artifact_upload_pending: true,
+        }).action,
+      ).toBe('adopt');
+    } finally {
+      coordinator.dispose();
+      db.close();
+    }
   });
 
   it('does NOT sweep when boot_id is absent (older agent — back-compat)', () => {

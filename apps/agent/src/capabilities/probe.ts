@@ -3,11 +3,14 @@ import { readFile, readdir, statfs } from 'node:fs/promises';
 import { arch, cpus, freemem, hostname, loadavg, platform, release, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { describeWindowsExecutorResolution } from '@rbo/executor';
 import type { AgentCapabilityReport, BuildCacheKind } from '@rbo/protocol';
+import { createLogger } from '@rbo/shared';
 import { listPresentBuildCacheKeys } from '../build-cache/index.js';
 import { resolveReposDir } from '../config.js';
 
 const execFileAsync = promisify(execFile);
+const logger = createLogger('agent.capabilities');
 
 // Automatic capability probing (§9.2, §9.3): OS/arch/resources always come
 // from the OS itself; shells and tool versions are detected best-effort so a
@@ -168,6 +171,13 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
   const diskFreeBytes = input.stateDir ? await probeFreeDiskBytes(input.stateDir) : 0;
   const diskMinFreeBytes = input.diskMinFreeBytes ?? 0;
   const diskPressure = diskMinFreeBytes > 0 && diskFreeBytes < diskMinFreeBytes;
+  const windowsExecutor =
+    process.platform === 'win32' ? describeWindowsExecutorResolution() : undefined;
+  if (windowsExecutor && !windowsExecutor.path) {
+    logger.warn('Windows Agent cannot accept jobs without the Job Object helper', {
+      detail: windowsExecutor.detail,
+    });
+  }
 
   return {
     agent_id: input.agentId,
@@ -193,7 +203,7 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
       max_jobs: input.maxJobs,
       shells,
       supports_tty: process.platform !== 'win32',
-      supports_process_tree_kill: process.platform === 'win32', // via native helper, wired in Phase 3
+      supports_process_tree_kill: Boolean(windowsExecutor?.path),
     },
     tools: {
       ...(gitVersions.length > 0 ? { git: gitVersions } : {}),
@@ -202,7 +212,7 @@ export async function probeCapabilities(input: ProbeInput): Promise<AgentCapabil
     toolchain_profiles: [],
     labels: {},
     secret_refs: [],
-    accepting_jobs: !diskPressure,
+    accepting_jobs: !diskPressure && (!windowsExecutor || Boolean(windowsExecutor.path)),
     ...(repository_cache.length > 0 ? { repository_cache } : {}),
     ...(build_caches.length > 0 ? { build_caches } : {}),
     ...(input.configuredPriority !== undefined

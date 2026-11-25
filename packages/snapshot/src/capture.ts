@@ -6,6 +6,7 @@ import {
   RboError,
   assertRealPathContained,
   generateId,
+  isPathContained,
   isSafeRelativePath,
   normalizeRepositoryUrl,
   resolveRealPath,
@@ -335,6 +336,39 @@ interface CaptureGuardState {
   cleanSubmodules: SubmoduleStatusEntry[];
 }
 
+interface AuthorizedAdditionalRoot extends JobAdditionalRoot {
+  realSource: string;
+}
+
+async function authorizeAdditionalRoots(
+  roots: JobAdditionalRoot[],
+  allowedProjectRoots: string[],
+): Promise<AuthorizedAdditionalRoot[]> {
+  if (roots.length === 0) {
+    return [];
+  }
+  const paths = await Promise.allSettled(allowedProjectRoots.map(resolveRealPath));
+  const allowed = paths.flatMap((path) => (path.status === 'fulfilled' ? [path.value] : []));
+  const authorized: AuthorizedAdditionalRoot[] = [];
+  for (const root of roots) {
+    if (!isSafeRelativePath(root.mount_path)) {
+      throw new RboError(
+        'validation',
+        `additional_roots.mount_path escapes snapshot storage: ${root.mount_path}`,
+      );
+    }
+    const realSource = await resolveRealPath(root.source_path);
+    if (!allowed.some((path) => isPathContained(path, realSource))) {
+      throw new RboError(
+        'materialization',
+        `Additional root is not under allowed project roots: ${root.source_path}`,
+      );
+    }
+    authorized.push({ ...root, realSource });
+  }
+  return authorized;
+}
+
 async function assertAllowedProjectRoot(
   projectRoot: string,
   allowedProjectRoots: string[],
@@ -453,7 +487,7 @@ async function buildCaptureGuard(
   repoRoot: string,
   wirePaths: string[],
   status: GitStatusSnapshot,
-  additionalRoots: JobAdditionalRoot[],
+  additionalRoots: AuthorizedAdditionalRoot[],
   cleanSubmodules: SubmoduleStatusEntry[],
 ): Promise<CaptureGuardState> {
   const identities = new Map<string, FileIdentity>();
@@ -462,11 +496,10 @@ async function buildCaptureGuard(
   }
   const additional: CaptureGuardState['additionalRoots'] = [];
   for (const root of additionalRoots) {
-    const realSource = await resolveRealPath(root.source_path);
-    const paths = (await enumerateAdditionalRootPaths(root)).sort();
+    const paths = await enumerateAdditionalRootPaths(root);
     const rootIdentities = new Map<string, FileIdentity>();
     for (const relPath of paths) {
-      rootIdentities.set(relPath, await statFileIdentity(realSource, relPath));
+      rootIdentities.set(relPath, await statFileIdentity(root.realSource, relPath));
     }
     additional.push({
       mount: normalizeWirePath(root.mount_path),
@@ -487,7 +520,7 @@ async function validateCaptureGuard(
   repoRoot: string,
   guard: CaptureGuardState,
   sourcePolicy: SourcePolicyInput,
-  additionalRoots: JobAdditionalRoot[],
+  additionalRoots: AuthorizedAdditionalRoot[],
 ): Promise<void> {
   const status = await gitStatusPorcelainV2(repoRoot);
   if (status.head !== guard.head) {
@@ -526,6 +559,13 @@ async function validateCaptureGuard(
     }
   }
 
+  await validateAdditionalRootsGuard(guard, additionalRoots);
+}
+
+async function validateAdditionalRootsGuard(
+  guard: CaptureGuardState,
+  additionalRoots: AuthorizedAdditionalRoot[],
+): Promise<void> {
   for (const rootGuard of guard.additionalRoots) {
     const root = additionalRoots.find(
       (candidate) => normalizeWirePath(candidate.mount_path) === rootGuard.mount,
@@ -536,7 +576,7 @@ async function validateCaptureGuard(
         mount: rootGuard.mount,
       });
     }
-    const currentRootPaths = (await enumerateAdditionalRootPaths(root)).sort();
+    const currentRootPaths = await enumerateAdditionalRootPaths(root);
     if (
       currentRootPaths.length !== rootGuard.paths.length ||
       currentRootPaths.some((path, index) => path !== rootGuard.paths[index])
@@ -548,10 +588,9 @@ async function validateCaptureGuard(
         { reason: 'additional_root_path_set_changed', mount: rootGuard.mount },
       );
     }
-    const realSource = await resolveRealPath(root.source_path);
     for (const relPath of currentRootPaths) {
       const before = rootGuard.identities.get(relPath);
-      const after = await statFileIdentity(realSource, relPath);
+      const after = await statFileIdentity(root.realSource, relPath);
       if (!before || !identitiesEqual(before, after)) {
         throw new RboError(
           'workspace_changed',
@@ -603,8 +642,18 @@ function globMatch(pathStr: string, pattern: string): boolean {
   return regex.test(pathStr);
 }
 
-async function enumerateAdditionalRootPaths(root: JobAdditionalRoot): Promise<string[]> {
-  const realRoot = await resolveRealPath(root.source_path);
+async function enumerateAdditionalRootPaths(root: AuthorizedAdditionalRoot): Promise<string[]> {
+  if ((await resolveRealPath(root.source_path)) !== root.realSource) {
+    throw new RboError(
+      'workspace_changed',
+      'Additional root changed during snapshot capture',
+      true,
+      {
+        reason: 'additional_root_identity_changed',
+        mount: root.mount_path,
+      },
+    );
+  }
   const paths: string[] = [];
 
   async function walk(dir: string, rel = ''): Promise<void> {
@@ -632,7 +681,7 @@ async function enumerateAdditionalRootPaths(root: JobAdditionalRoot): Promise<st
     }
   }
 
-  await walk(realRoot);
+  await walk(root.realSource);
   return paths.sort();
 }
 
@@ -682,6 +731,10 @@ export async function captureFullSnapshot(
 ): Promise<CaptureFullSnapshotResult> {
   const repoRoot = await gitFindRoot(input.projectRoot);
   await assertAllowedProjectRoot(repoRoot, input.allowedProjectRoots);
+  const additionalRoots = await authorizeAdditionalRoots(
+    input.additionalRoots ?? [],
+    input.allowedProjectRoots,
+  );
 
   const captureId = generateId('snp');
   const contentStorageDir = join(input.contentStorageDir, captureId);
@@ -697,7 +750,7 @@ export async function captureFullSnapshot(
     repoRoot,
     wirePaths,
     initialStatus,
-    input.additionalRoots ?? [],
+    additionalRoots,
     cleanSubmodules,
   );
   const stageModes = await gitLsFilesStageModes(repoRoot);
@@ -722,7 +775,7 @@ export async function captureFullSnapshot(
     }
     assertMountPathsDisjoint(
       mainMount,
-      (input.additionalRoots ?? []).map((root) => root.mount_path),
+      additionalRoots.map((root) => root.mount_path),
     );
     const effectiveCwd = await resolveSourceCwdForCapture(input.projectRoot, input.cwd);
 
@@ -758,31 +811,7 @@ export async function captureFullSnapshot(
     const additionalRootCaptures: Array<{ root: JobAdditionalRoot; files: CapturedFile[] }> = [];
     const additionalTarEntries: TarEntryInput[] = [];
 
-    for (const root of input.additionalRoots ?? []) {
-      if (!isSafeRelativePath(root.mount_path)) {
-        throw new RboError(
-          'validation',
-          `additional_roots.mount_path escapes snapshot storage: ${root.mount_path}`,
-          false,
-        );
-      }
-      const realSource = await resolveRealPath(root.source_path);
-      let rootAllowed = false;
-      for (const allowed of input.allowedProjectRoots) {
-        try {
-          await assertRealPathContained(await resolveRealPath(allowed), realSource);
-          rootAllowed = true;
-          break;
-        } catch {
-          // try next allowed root
-        }
-      }
-      if (!rootAllowed) {
-        throw new RboError(
-          'materialization',
-          `Additional root is not under allowed project roots: ${root.source_path}`,
-        );
-      }
+    for (const root of additionalRoots) {
       const rootPaths = await enumerateAdditionalRootPaths(root);
       const rootCaptured: CapturedFile[] = [];
       for (const relPath of rootPaths) {
@@ -795,7 +824,7 @@ export async function captureFullSnapshot(
           );
         }
         const captured = await captureMetadataPreflightEntry(
-          realSource,
+          root.realSource,
           relPath,
           new Map(),
           input.sourcePolicy,
@@ -834,7 +863,7 @@ export async function captureFullSnapshot(
 
     throwIfSecretViolations(secretBlockedViolations);
 
-    await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, input.additionalRoots ?? []);
+    await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, additionalRoots);
 
     const tarEntries: TarEntryInput[] = [
       ...capturedFiles.map((f) => f.tarEntry),
@@ -859,7 +888,7 @@ export async function captureFullSnapshot(
       throw archiveCaptureError(error);
     }
     assertWrittenTemporarySnapshotLimit(archive.size, input.limits);
-    await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, input.additionalRoots ?? []);
+    await validateCaptureGuard(repoRoot, guard, input.sourcePolicy, additionalRoots);
     applyArchivedFileResults(archivedFiles, archive);
     const additionalRootsManifest = additionalRootCaptures.map(({ root, files }) => {
       const fileEntries = files
@@ -1049,6 +1078,10 @@ export async function captureGitOverlaySnapshot(
 ): Promise<CaptureGitOverlaySnapshotResult> {
   const repoRoot = await gitFindRoot(input.projectRoot);
   await assertAllowedProjectRoot(repoRoot, input.allowedProjectRoots);
+  const additionalRoots = await authorizeAdditionalRoots(
+    input.additionalRoots ?? [],
+    input.allowedProjectRoots,
+  );
 
   const captureId = generateId('snp');
   const contentStorageDir = join(input.contentStorageDir, captureId);
@@ -1091,17 +1124,11 @@ export async function captureGitOverlaySnapshot(
   const mainMount = input.mainMount ?? 'project';
   assertMountPathsDisjoint(
     mainMount,
-    (input.additionalRoots ?? []).map((r) => r.mount_path),
+    additionalRoots.map((root) => root.mount_path),
   );
   const effectiveCwd = await resolveSourceCwdForCapture(input.projectRoot, input.cwd);
 
-  const guard = await buildCaptureGuard(
-    repoRoot,
-    plan.files,
-    initialStatus,
-    input.additionalRoots ?? [],
-    [],
-  );
+  const guard = await buildCaptureGuard(repoRoot, plan.files, initialStatus, additionalRoots, []);
 
   await mkdir(contentStorageDir, { recursive: true });
   const capturedFiles: CapturedFile[] = [];
@@ -1153,13 +1180,12 @@ export async function captureGitOverlaySnapshot(
 
     const additionalRootCaptures: Array<{ root: JobAdditionalRoot; files: CapturedFile[] }> = [];
     const additionalTarEntries: TarEntryInput[] = [];
-    for (const root of input.additionalRoots ?? []) {
-      const realSource = await resolveRealPath(root.source_path);
+    for (const root of additionalRoots) {
       const rootPaths = await enumerateAdditionalRootPaths(root);
       const rootCaptured: CapturedFile[] = [];
       for (const relPath of rootPaths) {
         const captured = await captureMetadataPreflightEntry(
-          realSource,
+          root.realSource,
           relPath,
           new Map(),
           input.sourcePolicy,
@@ -1226,35 +1252,7 @@ export async function captureGitOverlaySnapshot(
         });
       }
     }
-    for (const rootGuard of guard.additionalRoots) {
-      const root = (input.additionalRoots ?? []).find(
-        (candidate) => normalizeWirePath(candidate.mount_path) === rootGuard.mount,
-      );
-      if (!root) {
-        throw new RboError(
-          'workspace_changed',
-          'Additional root disappeared during capture',
-          true,
-          {
-            reason: 'additional_root_missing',
-            mount: rootGuard.mount,
-          },
-        );
-      }
-      const realSource = await resolveRealPath(root.source_path);
-      for (const relPath of rootGuard.paths) {
-        const before = rootGuard.identities.get(relPath);
-        const after = await statFileIdentity(realSource, relPath);
-        if (!before || !identitiesEqual(before, after)) {
-          throw new RboError(
-            'workspace_changed',
-            'Additional root changed during overlay capture',
-            true,
-            { reason: 'additional_root_identity_changed', mount: rootGuard.mount, path: relPath },
-          );
-        }
-      }
-    }
+    await validateAdditionalRootsGuard(guard, additionalRoots);
 
     const tarEntries: TarEntryInput[] = [
       ...capturedFiles.map((f) => f.tarEntry),
@@ -1311,35 +1309,7 @@ export async function captureGitOverlaySnapshot(
         });
       }
     }
-    for (const rootGuard of guard.additionalRoots) {
-      const root = (input.additionalRoots ?? []).find(
-        (candidate) => normalizeWirePath(candidate.mount_path) === rootGuard.mount,
-      );
-      if (!root) {
-        throw new RboError(
-          'workspace_changed',
-          'Additional root disappeared during capture',
-          true,
-          {
-            reason: 'additional_root_missing',
-            mount: rootGuard.mount,
-          },
-        );
-      }
-      const realSource = await resolveRealPath(root.source_path);
-      for (const relPath of rootGuard.paths) {
-        const before = rootGuard.identities.get(relPath);
-        const after = await statFileIdentity(realSource, relPath);
-        if (!before || !identitiesEqual(before, after)) {
-          throw new RboError(
-            'workspace_changed',
-            'Additional root changed during overlay capture',
-            true,
-            { reason: 'additional_root_identity_changed', mount: rootGuard.mount, path: relPath },
-          );
-        }
-      }
-    }
+    await validateAdditionalRootsGuard(guard, additionalRoots);
     applyArchivedFileResults(archivedFiles, archive);
     const additionalRootsManifest = additionalRootCaptures.map(({ root, files }) => {
       const fileEntries = files

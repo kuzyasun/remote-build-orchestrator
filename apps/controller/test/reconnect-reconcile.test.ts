@@ -7,8 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WebSocket } from 'ws';
 import {
   type RemoteExecutionOptions,
+  handleRemoteCleanupComplete,
   handleRemoteJobExit,
+  handleRemoteJobStarted,
   handleRemoteLogChunk,
+  renewActiveLease,
 } from '../src/execution/remote-execution.js';
 import { attemptLogDir } from '../src/execution/runner.js';
 import {
@@ -233,74 +236,81 @@ describe('reconnect reconcile (recovery)', () => {
     db.close();
   });
 
-  it('replacement / newer epoch → terminate_stale; stale log_chunk rejected', async () => {
-    const { db, remoteOpts, attemptId, leaseId, processIdentity, coordinator, jobId } = await setup(
-      {
-        withProcess: true,
-      },
-    );
+  it.each(['newer_epoch', 'lease_mismatch'])(
+    'denies messages with %s without changing the active attempt or its watchdog',
+    async (reason) => {
+      const { db, remoteOpts, attemptId, leaseId, processIdentity, coordinator, jobId } =
+        await setup({
+          withProcess: true,
+        });
 
-    connectedAgentsDelete(remoteOpts, 'agt_1');
-    coordinator.onAgentDisconnect('agt_1');
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(getAttempt(db, attemptId)?.state).toBe(ATTEMPT_STATE_ORPHANED);
+      connectedAgentsDelete(remoteOpts, 'agt_1');
+      coordinator.onAgentDisconnect('agt_1');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(getAttempt(db, attemptId)?.state).toBe(ATTEMPT_STATE_ORPHANED);
 
-    // Controller advances epoch (replacement fencing) while orphaned
-    db.prepare('UPDATE job_attempts SET lease_epoch = 2 WHERE id = ?').run(attemptId);
+      if (reason === 'newer_epoch') {
+        db.prepare('UPDATE job_attempts SET lease_epoch = 2 WHERE id = ?').run(attemptId);
+      } else {
+        db.prepare('UPDATE job_attempts SET lease_id = ? WHERE id = ?').run('new_lease', attemptId);
+      }
 
-    const socket2 = mockSocket();
-    remoteOpts.connectedAgents.set('agt_1', {
-      agentId: 'agt_1',
-      socket: socket2,
-      protocolVersion: 1,
-      lastHeartbeatAt: Date.now(),
-    });
+      const socket2 = mockSocket();
+      remoteOpts.connectedAgents.set('agt_1', {
+        agentId: 'agt_1',
+        socket: socket2,
+        protocolVersion: 1,
+        lastHeartbeatAt: Date.now(),
+      });
 
-    const decision = coordinator.onRecoveryReport('agt_1', {
-      attempt_id: attemptId,
-      lease_id: leaseId,
-      lease_epoch: 1, // stale epoch
-      status: 'running',
-      process_identity: processIdentity ?? TEST_IDENTITY,
-      last_sent_sequence: 5,
-      last_acked_sequence: 0,
-      artifact_upload_pending: false,
-    });
+      const decision = coordinator.onRecoveryReport('agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        status: 'completed_awaiting_upload',
+        process_identity: processIdentity ?? TEST_IDENTITY,
+        last_sent_sequence: 5,
+        last_acked_sequence: 0,
+        artifact_upload_pending: true,
+        process_exit: { exit_code: 0, outcome: 'succeeded' },
+      });
 
-    expect(decision).toMatchObject({
-      action: 'terminate_stale',
-      attempt_id: attemptId,
-      reason: 'newer_epoch',
-    });
-    expect(socket2.sent.some((m) => m.type === 'reconcile_decision')).toBe(true);
-    const payload = socket2.sent.find((m) => m.type === 'reconcile_decision')?.payload as Record<
-      string,
-      unknown
-    >;
-    expect(payload.action).toBe('terminate_stale');
+      expect(decision).toMatchObject({
+        action: 'terminate_stale',
+        attempt_id: attemptId,
+        reason,
+      });
+      expect(socket2.sent.some((m) => m.type === 'reconcile_decision')).toBe(true);
+      const payload = socket2.sent.find((m) => m.type === 'reconcile_decision')?.payload as Record<
+        string,
+        unknown
+      >;
+      expect(payload.action).toBe('terminate_stale');
 
-    // terminate_stale must terminalize — cannot sit forever in orphaned
-    const attempt = getAttempt(db, attemptId);
-    expect(attempt?.state).toBe('completed');
-    expect(attempt?.outcome).toBe('failed');
-    expect(attempt?.orphaned_at).toBeNull();
-    expect(getJob(db, jobId)?.failure_category).toBe('lease_expired');
+      const attempt = getAttempt(db, attemptId);
+      expect(attempt?.state).toBe(ATTEMPT_STATE_ORPHANED);
+      expect(attempt?.outcome).toBeNull();
+      expect(attempt?.orphaned_at).not.toBeNull();
+      expect(getJob(db, jobId)?.exit_code).toBeNull();
 
-    // Stale log_chunk with old epoch must not append
-    await handleRemoteLogChunk(remoteOpts, 'agt_1', {
-      attempt_id: attemptId,
-      lease_id: leaseId,
-      lease_epoch: 1,
-      stream: 'stdout',
-      sequence: 1,
-      bytes: 'stale',
-    });
-    const logDir = attemptLogDir(dataDir, attemptId);
-    await expect(readFile(join(logDir, 'stdout.log'), 'utf8')).rejects.toThrow();
+      // Stale log_chunk with old epoch must not append
+      await handleRemoteLogChunk(remoteOpts, 'agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        stream: 'stdout',
+        sequence: 1,
+        bytes: 'stale',
+      });
+      const logDir = attemptLogDir(dataDir, attemptId);
+      await expect(readFile(join(logDir, 'stdout.log'), 'utf8')).rejects.toThrow();
 
-    coordinator.dispose();
-    db.close();
-  });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(getAttempt(db, attemptId)?.outcome).toBe('lost');
+      coordinator.dispose();
+      db.close();
+    },
+  );
 
   it('reconnect during grace (before orphan) still adopts', async () => {
     const { db, remoteOpts, attemptId, leaseId, processIdentity, coordinator } = await setup({
@@ -308,6 +318,10 @@ describe('reconnect reconcile (recovery)', () => {
     });
 
     connectedAgentsDelete(remoteOpts, 'agt_1');
+    db.prepare('UPDATE job_attempts SET lease_deadline = ? WHERE id = ?').run(
+      new Date(Date.now() + 1_000).toISOString(),
+      attemptId,
+    );
     coordinator.onAgentDisconnect('agt_1');
     expect(getAttempt(db, attemptId)?.state).toBe('running');
 
@@ -422,13 +436,20 @@ describe('reconnect reconcile (recovery)', () => {
     db.close();
   });
 
-  it('adopt completed_awaiting_upload then job_exit reaches collecting_artifacts', async () => {
+  it('adopts artifact upload after a recorded exit and preserves the process result on replay', async () => {
     const { db, remoteOpts, attemptId, leaseId, processIdentity, coordinator, jobId } = await setup(
       {
         withProcess: true,
       },
     );
 
+    handleRemoteJobExit(remoteOpts, 'agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      exit_code: 0,
+      outcome: 'succeeded',
+    });
     connectedAgentsDelete(remoteOpts, 'agt_1');
     coordinator.onAgentDisconnect('agt_1');
     await vi.advanceTimersByTimeAsync(5_000);
@@ -450,6 +471,7 @@ describe('reconnect reconcile (recovery)', () => {
       last_sent_sequence: 3,
       last_acked_sequence: 1,
       artifact_upload_pending: true,
+      process_exit: { exit_code: 1, outcome: 'failed' },
     });
 
     expect(decision.action).toBe('adopt');
@@ -460,8 +482,8 @@ describe('reconnect reconcile (recovery)', () => {
       attempt_id: attemptId,
       lease_id: leaseId,
       lease_epoch: 1,
-      exit_code: 0,
-      outcome: 'succeeded',
+      exit_code: 1,
+      outcome: 'failed',
     });
 
     expect(getAttempt(db, attemptId)?.state).toBe('collecting_artifacts');
@@ -471,6 +493,129 @@ describe('reconnect reconcile (recovery)', () => {
     coordinator.dispose();
     db.close();
   });
+
+  it.each(['disconnect grace', 'orphaned lease', 'Controller restart'])(
+    'recovers a locally recorded process exit during %s',
+    async (recovery) => {
+      const { db, remoteOpts, attemptId, leaseId, coordinator, jobId, socket } = await setup({
+        withProcess: false,
+      });
+      const processIdentity = recovery === 'disconnect grace' ? null : TEST_IDENTITY;
+      handleRemoteJobStarted(remoteOpts, 'agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        pid: 4242,
+        process_identity: processIdentity,
+      });
+      expect(getAttempt(db, attemptId)?.process_identity).toBe(processIdentity);
+
+      if (recovery === 'Controller restart') {
+        coordinator.onControllerStartup();
+      } else {
+        coordinator.onAgentDisconnect('agt_1');
+        if (recovery === 'orphaned lease') {
+          await vi.advanceTimersByTimeAsync(5_000);
+        }
+      }
+      expect(getAttempt(db, attemptId)?.outcome).toBeNull();
+      const decision = coordinator.onRecoveryReport('agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        status: 'completed_awaiting_upload',
+        process_identity: processIdentity ?? 'unavailable',
+        last_sent_sequence: 0,
+        last_acked_sequence: 0,
+        artifact_upload_pending: true,
+        process_exit: {
+          exit_code: 7,
+          outcome: 'failed',
+          failure_category: 'process_exit',
+          failure_message: 'Script exited with code 7',
+        },
+      });
+      expect(decision.action).toBe('adopt');
+      expect(socket.sent.at(-1)?.payload).toMatchObject({ action: 'adopt' });
+      expect(getAttempt(db, attemptId)).toMatchObject({
+        state: 'collecting_artifacts',
+        outcome: 'failed',
+        orphaned_at: null,
+      });
+      expect(getJob(db, jobId)).toMatchObject({
+        state: 'collecting_artifacts',
+        exit_code: 7,
+        failure_category: 'process_exit',
+        failure_message: 'Script exited with code 7',
+      });
+
+      await handleRemoteCleanupComplete(remoteOpts, 'agt_1', {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        exit_code: 0,
+        timed_out: false,
+      });
+      expect(getJob(db, jobId)).toMatchObject({
+        state: 'completed',
+        outcome: 'failed',
+        exit_code: 7,
+      });
+      coordinator.dispose();
+      db.close();
+    },
+  );
+
+  it('requires the recorded process identity when recovering an unreceived result', async () => {
+    const { db, attemptId, leaseId, coordinator, jobId } = await setup();
+    const decision = coordinator.onRecoveryReport('agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      status: 'completed_awaiting_upload',
+      process_identity: formatProcessIdentity(4242, 1_700_000_000_001),
+      last_sent_sequence: 0,
+      last_acked_sequence: 0,
+      artifact_upload_pending: true,
+      process_exit: { exit_code: 0, outcome: 'succeeded' },
+    });
+    expect(decision).toMatchObject({
+      action: 'terminate_stale',
+      reason: 'process_identity_mismatch',
+    });
+    expect(getJob(db, jobId)?.exit_code).toBeNull();
+    coordinator.dispose();
+    db.close();
+  });
+
+  it('cannot recover an unreceived result after the lease has expired', async () => {
+    const { db, attemptId, leaseId, coordinator, jobId } = await setup();
+    const expired = new Date(Date.now() - 1).toISOString();
+    db.prepare('UPDATE job_attempts SET lease_deadline = ? WHERE id = ?').run(expired, attemptId);
+    coordinator.onAgentDisconnect('agt_1');
+    renewActiveLease(db, 'agt_1');
+    expect(getAttempt(db, attemptId)?.lease_deadline).toBe(expired);
+
+    const decision = coordinator.onRecoveryReport('agt_1', {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: 1,
+      status: 'completed_awaiting_upload',
+      process_identity: TEST_IDENTITY,
+      last_sent_sequence: 0,
+      last_acked_sequence: 0,
+      artifact_upload_pending: true,
+      process_exit: { exit_code: 0, outcome: 'succeeded' },
+    });
+    expect(decision).toMatchObject({ action: 'terminate_stale', reason: 'lease_expired' });
+    expect(getJob(db, jobId)?.exit_code).toBeNull();
+    expect(getAttempt(db, attemptId)?.outcome).toBeNull();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(getAttempt(db, attemptId)?.outcome).toBe('lost');
+    coordinator.dispose();
+    db.close();
+  });
+
   it('running without process_identity enters grace (not false pre-start fail)', async () => {
     const { db, remoteOpts, attemptId, coordinator } = await setup({
       withProcess: false,

@@ -23,13 +23,14 @@ describe('job_run queue_policy mapping', () => {
         {
           command: 'echo policy',
           project_root: '/tmp/app',
+          snapshot_mode: 'full',
           queue_policy,
         },
       );
 
       expect(handleJobRun).toHaveBeenLastCalledWith(
         expect.anything(),
-        expect.objectContaining({ queue_policy }),
+        expect.objectContaining({ queue_policy, snapshot_mode: 'full' }),
         undefined,
       );
     },

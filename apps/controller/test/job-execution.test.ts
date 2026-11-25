@@ -120,7 +120,7 @@ async function connectClient(clientId: string): Promise<Client> {
       requestInit: {
         headers: {
           'x-rbo-client-id': clientId,
-          authorization: `Bearer ${identity.adminToken}`,
+          authorization: `Bearer ${identity.mcpToken}`,
         },
       },
     },
@@ -525,8 +525,9 @@ describe('Local job execution', () => {
     await rm(outsideRoot, { recursive: true, force: true });
   });
 
-  it('isolates workspace, logs, and artifacts per attempt on retry', async () => {
+  it('isolates workspace, logs, and artifacts per attempt on retry', async ({ onTestFinished }) => {
     const client = await connectClient('client-retry-isolation');
+    onTestFinished(() => client.close());
     const requestA = {
       ...baseJobRequest(fixtureDir),
       client_request_id: `retry-a-${Date.now()}`,
@@ -534,6 +535,7 @@ describe('Local job execution', () => {
     const submitA = JSON.parse(
       textOf(await client.callTool({ name: 'job_submit', arguments: requestA })),
     );
+    expect(submitA, JSON.stringify(submitA)).toMatchObject({ job_id: expect.any(String) });
     await client.callTool({
       name: 'job_wait',
       arguments: { job_id: submitA.job_id, wait_seconds: 60 },
@@ -548,6 +550,7 @@ describe('Local job execution', () => {
     const submitB = JSON.parse(
       textOf(await client.callTool({ name: 'job_submit', arguments: requestB })),
     );
+    expect(submitB, JSON.stringify(submitB)).toMatchObject({ job_id: expect.any(String) });
     await client.callTool({
       name: 'job_wait',
       arguments: { job_id: submitB.job_id, wait_seconds: 60 },
@@ -578,8 +581,6 @@ describe('Local job execution', () => {
     await expect(access(dirsB.workspace)).rejects.toThrow();
     expect(dirsA.logs).not.toBe(dirsB.logs);
     expect(dirsA.artifacts).not.toBe(dirsB.artifacts);
-
-    await client.close();
   }, 180_000);
 
   it('emits secret_warning events when secret_policy=warn and still runs the job', async () => {

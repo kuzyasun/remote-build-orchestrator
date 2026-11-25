@@ -52,6 +52,9 @@ pnpm --filter @gemslibe/rbo-windows-executor-win32-x64 prepare-binary:require
 ```
 
 This stages `rbo-windows-executor.exe` into `packages/rbo-windows-executor-win32-x64/bin/`.
+Rebuild the helper together with the JavaScript packages when the native job protocol changes.
+Windows job execution requires native protocol v3. If `RBO_WINDOWS_EXECUTOR` is set, point it
+to the rebuilt helper.
 
 ---
 

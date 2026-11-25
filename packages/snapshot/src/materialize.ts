@@ -1,5 +1,16 @@
-import { chmod, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import {
   RboError,
   isPathContained,
@@ -30,30 +41,77 @@ export interface MaterializedWorkspace {
 }
 
 /**
- * Resolve a write path under workspaceRoot.
- * Lexical containment is checked BEFORE mkdir so traversal cannot create parents outside.
+ * Resolve a path under a real workspace root without traversing parent symlinks.
  */
-async function safeWritePath(workspaceRoot: string, relativePath: string): Promise<string> {
+async function safeWritePath(
+  workspaceRoot: string,
+  relativePath: string,
+  createParents = true,
+): Promise<string> {
   const normalized = relativePath.replace(/\\/g, '/');
-  if (!isSafeRelativePath(normalized)) {
+  const parts = normalized.split('/');
+  if (
+    !isSafeRelativePath(normalized) ||
+    (process.platform === 'win32' && parts.some((part) => part.includes(':') || /[. ]$/.test(part)))
+  ) {
     throw new RboError('materialization', `Path escapes workspace root: ${relativePath}`);
   }
   const absolute = resolve(workspaceRoot, normalized);
   if (!isPathContained(workspaceRoot, absolute)) {
     throw new RboError('materialization', `Path escapes workspace root: ${relativePath}`);
   }
-  const parent = resolve(absolute, '..');
-  if (parent !== resolve(workspaceRoot) && !isPathContained(workspaceRoot, parent)) {
-    throw new RboError('materialization', `Path escapes workspace root: ${relativePath}`);
-  }
-  await mkdir(parent, { recursive: true });
-  const realWorkspace = await resolveRealPath(workspaceRoot);
-  const realParent = await resolveRealPath(parent);
-  const candidate = join(realParent, basename(absolute));
-  if (!isPathContained(realWorkspace, candidate)) {
-    throw new RboError('materialization', `Path escapes workspace root: ${relativePath}`);
+  let parent = workspaceRoot;
+  for (const part of parts.slice(0, -1)) {
+    parent = join(parent, part);
+    const existing = await lstatIfPresent(parent);
+    if (existing && !existing.isDirectory()) {
+      throw new RboError('materialization', `Path has a non-directory parent: ${relativePath}`);
+    }
+    if (!existing) {
+      if (!createParents) {
+        break;
+      }
+      await mkdir(parent);
+    }
   }
   return absolute;
+}
+
+async function lstatIfPresent(path: string) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+  }
+}
+
+async function ensureOverlayDirectory(dest: string): Promise<void> {
+  const existing = await lstatIfPresent(dest);
+  if (!existing?.isDirectory()) {
+    if (existing) {
+      await rm(dest, { force: true });
+    }
+    await mkdir(dest);
+  }
+}
+
+async function writeOverlayFile(dest: string, content: Buffer, mode: number): Promise<void> {
+  const temp = join(dirname(dest), `.rbo-overlay-${randomUUID()}`);
+  try {
+    await writeFile(temp, content, { flag: 'wx' });
+    if (mode & 0o111) {
+      await chmod(temp, mode);
+    }
+    const existing = await lstatIfPresent(dest);
+    if (existing && !existing.isFile()) {
+      await rm(dest, { recursive: true, force: true });
+    }
+    await rename(temp, dest);
+  } finally {
+    await rm(temp, { force: true });
+  }
 }
 
 function resolveArchiveEntryRelativePath(
@@ -74,13 +132,16 @@ function resolveArchiveEntryRelativePath(
 }
 
 async function applyReadOnlyTree(rootPath: string): Promise<void> {
+  if (!(await lstat(rootPath)).isDirectory()) {
+    return;
+  }
   const entries = await readdir(rootPath, { withFileTypes: true });
   for (const entry of entries) {
     const full = join(rootPath, entry.name);
     if (entry.isDirectory()) {
       await applyReadOnlyTree(full);
       await chmod(full, 0o555).catch(() => undefined);
-    } else {
+    } else if (!entry.isSymbolicLink()) {
       await chmod(full, 0o444).catch(() => undefined);
     }
   }
@@ -302,13 +363,7 @@ export async function applyGitOverlay(input: ApplyGitOverlayInput): Promise<Mate
   }
 
   for (const deletion of manifest.overlay.deletions) {
-    if (!isSafeRelativePath(deletion)) {
-      throw new RboError('materialization', `Unsafe deletion path: ${deletion}`);
-    }
-    const dest = resolve(realProject, deletion);
-    if (!isPathContained(realProject, dest)) {
-      throw new RboError('materialization', `Deletion escapes project: ${deletion}`);
-    }
+    const dest = await safeWritePath(realProject, deletion, false);
     await rm(dest, { recursive: true, force: true });
   }
 
@@ -341,7 +396,7 @@ export async function applyGitOverlay(input: ApplyGitOverlayInput): Promise<Mate
       : await safeWritePath(realProject, normalized);
 
     if (entry.type === 'directory') {
-      await mkdir(dest, { recursive: true });
+      await ensureOverlayDirectory(dest);
       continue;
     }
 
@@ -351,6 +406,7 @@ export async function applyGitOverlay(input: ApplyGitOverlayInput): Promise<Mate
       }
       const containRoot = isAdditional ? realWorkspace : realProject;
       await assertSymlinkTargetContained(containRoot, dest, entry.target);
+      await rm(dest, { recursive: true, force: true });
       try {
         await symlink(entry.target, dest);
       } catch (error) {
@@ -363,17 +419,14 @@ export async function applyGitOverlay(input: ApplyGitOverlayInput): Promise<Mate
       continue;
     }
 
-    await writeFile(dest, entry.content);
-    if (entry.mode & 0o111) {
-      await chmod(dest, entry.mode);
-    }
+    await writeOverlayFile(dest, entry.content, entry.mode);
   }
 
   for (const emptyDir of manifest.overlay.empty_directories) {
     if (!isSafeRelativePath(emptyDir)) {
       throw new RboError('materialization', `Unsafe empty directory: ${emptyDir}`);
     }
-    await mkdir(await safeWritePath(realProject, emptyDir), { recursive: true });
+    await ensureOverlayDirectory(await safeWritePath(realProject, emptyDir));
   }
 
   for (const file of manifest.overlay.files) {
@@ -381,6 +434,9 @@ export async function applyGitOverlay(input: ApplyGitOverlayInput): Promise<Mate
       continue;
     }
     const dest = await safeWritePath(realProject, file.path);
+    if (!(await lstat(dest)).isFile()) {
+      throw new RboError('materialization', `Overlay path is not a regular file: ${file.path}`);
+    }
     const content = await readFile(dest);
     const hash = sha256(content);
     if (hash !== file.sha256) {

@@ -14,6 +14,7 @@ import type { ControllerDatabase } from '../storage/database.js';
 import type { ConnectedAgent } from '../websocket/server.js';
 import type { AdminContext } from './admin.js';
 import { handleAdminRequest } from './admin.js';
+import { parseRequestUrl } from './request-url.js';
 
 const logger = createLogger('controller.http');
 
@@ -33,8 +34,10 @@ export interface ControllerServerOptions {
   port: number;
   db: ControllerDatabase;
   identity?: ControllerIdentity;
-  /** Bearer token required for /mcp, /internal/v1/tools/*, /internal/v1/admin/*, and log streams. */
+  /** Bearer token for the CLI's internal tools, admin actions and log streams. */
   adminToken?: string;
+  /** Bearer token for HTTP MCP and the stdio adapter's internal tools. */
+  mcpToken?: string;
   connectedAgents?: Map<string, ConnectedAgent>;
   agentPlanePort?: number;
   controllerPublicHost?: string;
@@ -297,6 +300,13 @@ export async function startControllerServer(
     (options.adminToken?.trim() || undefined) ??
     (envAdminToken || undefined) ??
     (options.identity?.adminToken?.trim() || undefined);
+  const expectedMcpToken =
+    (options.mcpToken?.trim() || undefined) ??
+    (process.env.RBO_MCP_TOKEN?.trim() || undefined) ??
+    (options.identity?.mcpToken?.trim() || undefined);
+  if (expectedAdminToken && expectedAdminToken === expectedMcpToken) {
+    throw RboError.validation('MCP and admin bearer tokens must be different');
+  }
 
   const adminCtx: AdminContext = {
     db: options.db,
@@ -319,7 +329,13 @@ export async function startControllerServer(
   };
 
   const server = createServer((req, res) => {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    const url = parseRequestUrl(req.url);
+    if (!url) {
+      sendJson(res, 400, {
+        error: { category: 'validation', message: 'Invalid request target', retryable: false },
+      });
+      return;
+    }
 
     const run = async () => {
       if (url.pathname === '/internal/v1/health') {
@@ -339,7 +355,15 @@ export async function startControllerServer(
         return;
       }
 
-      if (expectedAdminToken && !isAuthorized(req, expectedAdminToken)) {
+      const tokens = isMcp
+        ? [expectedMcpToken]
+        : isInternalTool
+          ? [expectedMcpToken, expectedAdminToken]
+          : [expectedAdminToken];
+      if (
+        (expectedAdminToken || expectedMcpToken) &&
+        !tokens.some((token) => token && isAuthorized(req, token))
+      ) {
         sendJson(res, 401, {
           error: {
             category: 'unauthorized',

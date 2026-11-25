@@ -1,13 +1,20 @@
 import { generateDeviceKeyPair } from '@rbo/shared';
 import type { ControllerIdentity } from '@rbo/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { initiateRemoteAttempt } from '../src/execution/remote-execution.js';
 import {
   createJob,
+  getJob,
+  getJobRequest,
   getLatestAttempt,
   persistSnapshot,
   transitionJobState,
 } from '../src/jobs/lifecycle.js';
-import { type SubmitJobContext, dispatchJobExecution } from '../src/jobs/submit.js';
+import {
+  type SubmitJobContext,
+  dispatchJobExecution,
+  handleJobCancel,
+} from '../src/jobs/submit.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
 import type { ConnectedAgent } from '../src/websocket/server.js';
@@ -108,6 +115,8 @@ describe('parallel dispatch respects max_jobs capacity (not single-job busy)', (
       signingPublicKeyPem: keys.publicKeyPem,
       signingPrivateKeyPem: keys.privateKeyPem,
       fingerprint: 'sha256:cap',
+      adminToken: 'test-only-admin',
+      mcpToken: 'test-only-mcp',
     };
     offeredLeases = [];
   });
@@ -253,5 +262,96 @@ describe('parallel dispatch respects max_jobs capacity (not single-job busy)', (
       (db.prepare('SELECT state FROM jobs WHERE id = ?').get(secondJobId) as { state: string })
         .state,
     ).toBe('queued');
+  });
+
+  it('claims each queued job only once even when dispatch calls overlap', async () => {
+    seedAgent(3);
+    const ctx = buildCtx(3);
+    const jobId = submitSecondJob();
+    const request = getJobRequest(db, jobId);
+    if (!request) throw new Error('Missing fixture request');
+
+    await Promise.all([
+      dispatchJobExecution(ctx, jobId, request),
+      dispatchJobExecution(ctx, jobId, request),
+    ]);
+
+    expect(offeredLeases).toHaveLength(1);
+    expect(getLatestAttempt(db, jobId)?.ordinal).toBe(1);
+  });
+
+  it('keeps cancellation authoritative while dispatch is preparing', async () => {
+    seedAgent(3);
+    const ctx = buildCtx(3);
+    const jobId = submitSecondJob();
+    const request = getJobRequest(db, jobId);
+    if (!request) throw new Error('Missing fixture request');
+
+    const dispatch = dispatchJobExecution(ctx, jobId, request);
+    await handleJobCancel(ctx, jobId);
+    await dispatch;
+
+    expect(offeredLeases).toHaveLength(0);
+    expect(getJob(db, jobId)?.outcome).toBe('cancelled');
+  });
+
+  it('leaves a job queued until the Agent resumes accepting work', async () => {
+    seedAgent(3);
+    const ctx = buildCtx(3);
+    const jobId = submitSecondJob();
+    const request = getJobRequest(db, jobId);
+    const connection = ctx.connectedAgents?.get(AGENT_ID);
+    if (!request || !connection) throw new Error('Missing fixture request or connection');
+
+    connection.acceptingJobs = false;
+    await dispatchJobExecution(ctx, jobId, request);
+    expect(offeredLeases).toHaveLength(0);
+    expect(getJob(db, jobId)?.state).toBe('queued');
+
+    connection.acceptingJobs = true;
+    await dispatchJobExecution(ctx, jobId, request);
+    expect(offeredLeases).toHaveLength(1);
+  });
+
+  it('waits for the current session capabilities before offering a lease', async () => {
+    seedAgent(3);
+    const ctx = buildCtx(3);
+    const jobId = submitSecondJob();
+    const request = getJobRequest(db, jobId);
+    const connectedAgents = ctx.connectedAgents;
+    const connection = connectedAgents?.get(AGENT_ID);
+    if (!request || !connectedAgents || !connection) throw new Error('Missing dispatch fixture');
+
+    connection.capabilitiesReady = false;
+    const attempt = await initiateRemoteAttempt(
+      { db, identity, dataDir: ctx.dataDir, connectedAgents, serverPort: 7411 },
+      jobId,
+      AGENT_ID,
+    );
+    expect(attempt).toBeNull();
+    await dispatchJobExecution(ctx, jobId, request);
+    expect(offeredLeases).toHaveLength(0);
+    expect(getJob(db, jobId)?.state).toBe('queued');
+    expect(getLatestAttempt(db, jobId)).toBeNull();
+
+    connection.capabilitiesReady = true;
+    await dispatchJobExecution(ctx, jobId, request);
+    expect(offeredLeases).toHaveLength(1);
+  });
+
+  it('waits for remote materialization if an overlay cannot use the local fallback', async () => {
+    seedAgent(3);
+    const ctx = buildCtx(3);
+    const jobId = submitSecondJob();
+    const request = getJobRequest(db, jobId);
+    const connection = ctx.connectedAgents?.get(AGENT_ID);
+    if (!request || !connection) throw new Error('Missing fixture request or connection');
+    db.prepare("UPDATE snapshots SET base_commit = ? WHERE id = 'snp_second'").run('a'.repeat(40));
+    connection.acceptingJobs = false;
+
+    await dispatchJobExecution(ctx, jobId, { ...request, queue_policy: 'local_fallback' });
+
+    expect(getLatestAttempt(db, jobId)).toBeNull();
+    expect(getJob(db, jobId)?.state).toBe('queued');
   });
 });

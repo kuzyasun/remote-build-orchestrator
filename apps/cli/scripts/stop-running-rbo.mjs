@@ -12,9 +12,19 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 /**
@@ -38,16 +48,17 @@ export function matchRboDaemonRole(commandLine) {
     return null;
   }
   // Match the bundled CLI entrypoint, not rbo-mcp-stdio.js.
-  if (!/(?:^|[\\/\s"'])rbo\.js(?:["']|\s|$)/i.test(commandLine)) {
-    return null;
-  }
-  if (/\bcontroller\s+start\b/i.test(commandLine)) {
-    return 'controller';
-  }
-  if (/\bagent\s+start\b/i.test(commandLine)) {
-    return 'agent';
-  }
-  return null;
+  const match = /(?:^|[\\/\s"'])rbo\.js["']?\s+(controller|agent)\s+start(?:\s|$)/i.exec(
+    commandLine,
+  );
+  return match?.[1].toLowerCase() === 'controller' ? 'controller' : match ? 'agent' : null;
+}
+
+/** @param {string} commandLine @param {'controller' | 'agent'} role */
+function matchesRegisteredCommand(commandLine, role) {
+  // Unix npm bins can run the entrypoint through the symlink named "rbo".
+  const match = /(?:^|[\\/\s"'])rbo(?:\.js)?["']?\s+(controller|agent)(?:\s|$)/i.exec(commandLine);
+  return match?.[1].toLowerCase() === role;
 }
 
 /**
@@ -62,9 +73,12 @@ export function matchRboDaemonRole(commandLine) {
 export function resolveDaemonPidFiles(options = {}) {
   const env = options.env ?? process.env;
   const home = options.home ?? homedir();
-  const dataDir = options.dataDir?.trim() || env.RBO_DATA_DIR?.trim() || join(home, '.rbo');
-  const agentStateDir =
-    options.stateDir?.trim() || env.RBO_AGENT_STATE_DIR?.trim() || join(dataDir, 'agent');
+  const dataDir = physicalPath(
+    options.dataDir?.trim() || env.RBO_DATA_DIR?.trim() || join(home, '.rbo'),
+  );
+  const agentStateDir = physicalPath(
+    options.stateDir?.trim() || env.RBO_AGENT_STATE_DIR?.trim() || join(dataDir, 'agent'),
+  );
   return [
     { role: 'controller', path: join(dataDir, 'run', 'controller.pid') },
     { role: 'agent', path: join(agentStateDir, 'run', 'agent.pid') },
@@ -87,6 +101,76 @@ export function resolveRolePidFile(role, options = {}) {
     throw new Error(`unknown role: ${role}`);
   }
   return match.path;
+}
+
+/**
+ * A foreground instance records its own scope. Keep these registrations
+ * separate from the launcher's numeric PID file used during daemon startup.
+ *
+ * @param {'controller' | 'agent'} role
+ * @param {Parameters<typeof resolveRolePidFile>[1] & {
+ *   listProcesses?: () => Promise<ProcessIdentity[]>;
+ * }} [options]
+ * @returns {Promise<() => void>}
+ */
+export async function registerRoleInstance(role, options = {}) {
+  const listProcesses = options.listProcesses ?? listNodeProcesses;
+  const current = (await listProcesses()).find((proc) => proc.pid === process.pid);
+  if (!current?.startedAt || !matchesRegisteredCommand(current.commandLine, role)) return () => {};
+
+  const pidFile = resolve(resolveRolePidFile(role, options));
+  const path = instancePath(pidFile, current.pid);
+  const candidate = `${path}.${randomUUID()}.tmp`;
+  const record = JSON.stringify({
+    pid: current.pid,
+    startedAt: current.startedAt,
+    commandHash: hashCommandLine(current.commandLine),
+    directory: pathKey(dirname(dirname(pidFile))),
+  });
+  mkdirSync(dirname(path), { recursive: true });
+  try {
+    writeFileSync(candidate, record, { flag: 'wx', mode: 0o600 });
+    renameSync(candidate, path);
+  } catch (error) {
+    removeFile(candidate);
+    throw error;
+  }
+  return () => removeFile(path);
+}
+
+/** @param {string} pidFile @param {number} pid */
+function instancePath(pidFile, pid) {
+  return `${pidFile}.${pid}.instance`;
+}
+
+/** @param {string} commandLine */
+function hashCommandLine(commandLine) {
+  return createHash('sha256').update(commandLine).digest('hex');
+}
+
+/** @param {string} path */
+function removeFile(path) {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Another lifecycle operation or a manual cleanup already removed it.
+  }
+}
+
+/** @param {string} pidFile @param {ProcessIdentity} proc @param {string} targetDir */
+function matchesRoleInstance(pidFile, proc, targetDir) {
+  if (!proc.startedAt) return false;
+  try {
+    const record = JSON.parse(readFileSync(instancePath(pidFile, proc.pid), 'utf8'));
+    return (
+      record?.pid === proc.pid &&
+      record.startedAt === proc.startedAt &&
+      record.commandHash === hashCommandLine(proc.commandLine) &&
+      record.directory === pathKey(targetDir)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -156,7 +240,11 @@ export function isProcessAlive(pid) {
 }
 
 /**
- * @returns {Promise<{ pid: number; commandLine: string }[]>}
+ * @typedef {{ pid: number; commandLine: string; startedAt?: string }} ProcessIdentity
+ */
+
+/**
+ * @returns {Promise<ProcessIdentity[]>}
  */
 export async function listNodeProcesses() {
   if (process.platform === 'win32') {
@@ -167,7 +255,7 @@ export async function listNodeProcesses() {
 
 function listNodeProcessesWindows() {
   const script =
-    'Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress';
+    'Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" | Select-Object ProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress';
   let out;
   try {
     out = execFileSync('powershell.exe', ['-NoProfile', '-Command', script], {
@@ -193,16 +281,23 @@ function listNodeProcessesWindows() {
     .map((row) => ({
       pid: Number(row.ProcessId),
       commandLine: typeof row.CommandLine === 'string' ? row.CommandLine : '',
+      startedAt: typeof row.CreationDate === 'string' ? row.CreationDate : undefined,
     }))
-    .filter((row) => Number.isInteger(row.pid) && row.pid > 0);
+    .filter((row) => Number.isInteger(row.pid) && row.pid > 0 && row.startedAt);
 }
 
 function listNodeProcessesUnix() {
   let out;
+  let bootId;
   try {
-    out = execFileSync('ps', ['-ax', '-o', 'pid=', '-o', 'args='], {
+    if (process.platform === 'linux') {
+      bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      if (!bootId) return [];
+    }
+    out = execFileSync('ps', ['-ax', '-o', 'pid=', '-o', 'lstart=', '-o', 'args='], {
       encoding: 'utf8',
       maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
     });
   } catch {
     return [];
@@ -213,32 +308,48 @@ function listNodeProcessesUnix() {
     if (!trimmed) {
       continue;
     }
-    const match = /^(\d+)\s+(.*)$/.exec(trimmed);
+    const match = /^(\d+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+(.*)$/.exec(trimmed);
     if (!match) {
       continue;
     }
     const pid = Number.parseInt(match[1], 10);
-    const commandLine = match[2] ?? '';
+    const commandLine = match[3] ?? '';
     if (!Number.isInteger(pid) || pid <= 0) {
       continue;
     }
     if (!/\bnode(\.exe)?\b/i.test(commandLine) && !commandLine.includes('rbo.js')) {
       continue;
     }
-    rows.push({ pid, commandLine });
+    const ticks = bootId ? linuxProcessStartTicks(pid) : undefined;
+    const startedAt = bootId ? ticks && `${bootId}:${ticks}` : match[2];
+    if (startedAt) rows.push({ pid, commandLine, startedAt });
   }
   return rows;
+}
+
+/** @param {number} pid */
+function linuxProcessStartTicks(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closeParen = stat.lastIndexOf(')');
+    const ticks = closeParen >= 0 && stat.slice(closeParen + 2).split(' ')[19];
+    return ticks && /^\d+$/.test(ticks) ? ticks : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
  * Soft then hard stop.
  * @param {number} pid
- * @param {{ platform?: NodeJS.Platform; isAlive?: (pid: number) => boolean; sleepMs?: (ms: number) => Promise<void> }} [options]
+ * @param {{ platform?: NodeJS.Platform; isAlive?: (pid: number) => boolean; isCurrent?: () => Promise<boolean>; sleepMs?: (ms: number) => Promise<void> }} [options]
  */
 export async function stopPid(pid, options = {}) {
   const platform = options.platform ?? process.platform;
   const alive = options.isAlive ?? isProcessAlive;
+  const isCurrent = options.isCurrent ?? (async () => alive(pid));
   const sleepMs = options.sleepMs ?? ((ms) => delay(ms));
+  if (!(await isCurrent())) return;
 
   if (platform === 'win32') {
     try {
@@ -251,7 +362,7 @@ export async function stopPid(pid, options = {}) {
       // process may already be gone
     }
     await sleepMs(300);
-    if (!alive(pid)) {
+    if (!(await isCurrent())) {
       return;
     }
     execFileSync('taskkill', ['/F', '/PID', String(pid)], {
@@ -269,7 +380,7 @@ export async function stopPid(pid, options = {}) {
     return;
   }
   await sleepMs(500);
-  if (!alive(pid)) {
+  if (!(await isCurrent())) {
     return;
   }
   try {
@@ -286,7 +397,7 @@ export async function stopPid(pid, options = {}) {
 }
 
 /**
- * Discover live PIDs for one Controller/Agent role (pid file + process scan).
+ * Discover live processes for the selected Controller/Agent data directory.
  * Never includes `selfPid` (defaults to `process.pid`).
  *
  * @param {'controller' | 'agent'} role
@@ -295,21 +406,18 @@ export async function stopPid(pid, options = {}) {
  *   home?: string;
  *   dataDir?: string;
  *   stateDir?: string;
- *   listProcesses?: () => Promise<{ pid: number; commandLine: string }[]>;
+ *   listProcesses?: () => Promise<ProcessIdentity[]>;
  *   isAlive?: (pid: number) => boolean;
  *   selfPid?: number;
  * }} [options]
- * @returns {Promise<number[]>}
+ * @returns {Promise<ProcessIdentity[]>}
  */
-export async function findLiveRolePids(role, options = {}) {
+async function findLiveRoleProcesses(role, options = {}) {
   const env = options.env ?? process.env;
   const home = options.home ?? homedir();
   const listProcesses = options.listProcesses ?? listNodeProcesses;
   const alive = options.isAlive ?? isProcessAlive;
   const selfPid = options.selfPid ?? process.pid;
-  /** @type {Set<number>} */
-  const pids = new Set();
-
   const pidFile = resolveRolePidFile(role, {
     env,
     home,
@@ -317,21 +425,90 @@ export async function findLiveRolePids(role, options = {}) {
     stateDir: options.stateDir,
   });
   clearStalePidFile(pidFile, alive);
-  const fromFile = readLivePidFromFile(pidFile, alive);
-  if (fromFile !== null && fromFile !== selfPid) {
-    pids.add(fromFile);
-  }
+  const targetDir = dirname(dirname(pidFile));
+  const flag = role === 'controller' ? '--data-dir' : '--state-dir';
+  const directoryPattern = new RegExp(
+    `(?:^|\\s)${flag}\\s+(?:"([^"]+)"|'([^']+)'|(.+?)(?=\\s+--[\\w-]+(?:[=\\s]|$)|$))`,
+    'g',
+  );
 
-  for (const proc of await listProcesses()) {
-    if (proc.pid === selfPid) {
-      continue;
+  const processes = await listProcesses();
+  return processes.filter((proc) => {
+    if (proc.pid === selfPid || !alive(proc.pid)) {
+      return false;
     }
-    if (matchRboDaemonRole(proc.commandLine) === role) {
-      pids.add(proc.pid);
+    if (
+      matchesRegisteredCommand(proc.commandLine, role) &&
+      matchesRoleInstance(pidFile, proc, targetDir)
+    ) {
+      return true;
     }
-  }
+    if (
+      matchRboDaemonRole(proc.commandLine) !== role ||
+      /(?:^|\s)--daemon(?:\s|$)/.test(proc.commandLine)
+    ) {
+      return false;
+    }
 
-  return [...pids].sort((a, b) => a - b);
+    // A legacy command line with an explicit absolute directory establishes
+    // scope. Relative paths and unflagged launches need their own record.
+    const directories = [...proc.commandLine.matchAll(directoryPattern)];
+    if (directories.length !== 1) return false;
+    const [directory] = directories;
+    const configuredDir = directory?.[1] ?? directory?.[2] ?? directory?.[3];
+    return (
+      configuredDir !== undefined &&
+      isAbsolute(configuredDir) &&
+      pathKey(configuredDir) === pathKey(targetDir)
+    );
+  });
+}
+
+/** @param {string} path */
+function pathKey(path) {
+  const physical = physicalPath(path);
+  try {
+    const info = statSync(physical, { bigint: true });
+    if (info.isDirectory() && info.ino !== 0n) {
+      return `directory:${info.dev}:${info.ino}`;
+    }
+  } catch {
+    // Fall back to the canonical or lexical path below.
+  }
+  return process.platform === 'win32' ? physical.toLowerCase() : physical;
+}
+
+/** @param {string} path */
+function physicalPath(path) {
+  const absolute = resolve(path);
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    // Keep a lexical key for paths that do not exist yet. Existing aliases
+    // resolve to the same physical directory before they are compared.
+    return absolute;
+  }
+}
+
+/**
+ * @param {ProcessIdentity} expected
+ * @param {() => Promise<ProcessIdentity[]>} listProcesses
+ * @param {(pid: number) => boolean} alive
+ */
+function currentProcessCheck(expected, listProcesses, alive) {
+  return async () => {
+    if (!alive(expected.pid)) return false;
+    const actual = (await listProcesses()).find((proc) => proc.pid === expected.pid);
+    return actual?.commandLine === expected.commandLine && actual.startedAt === expected.startedAt;
+  };
+}
+
+/**
+ * @param {'controller' | 'agent'} role
+ * @param {Parameters<typeof findLiveRoleProcesses>[1]} [options]
+ */
+export async function findLiveRolePids(role, options) {
+  return (await findLiveRoleProcesses(role, options)).map((proc) => proc.pid).sort((a, b) => a - b);
 }
 
 /**
@@ -343,7 +520,7 @@ export async function findLiveRolePids(role, options = {}) {
  *   home?: string;
  *   dataDir?: string;
  *   stateDir?: string;
- *   listProcesses?: () => Promise<{ pid: number; commandLine: string }[]>;
+ *   listProcesses?: () => Promise<ProcessIdentity[]>;
  *   isAlive?: (pid: number) => boolean;
  *   stopPid?: (pid: number) => Promise<void>;
  *   log?: (msg: string) => void;
@@ -355,18 +532,22 @@ export async function findLiveRolePids(role, options = {}) {
  */
 export async function stopRoleProcesses(role, options = {}) {
   const alive = options.isAlive ?? isProcessAlive;
-  const doStop = options.stopPid ?? ((pid) => stopPid(pid, { isAlive: alive }));
+  const listProcesses = options.listProcesses ?? listNodeProcesses;
   const log = options.log ?? ((msg) => console.error(`[rbo] ${msg}`));
   const warn = options.warn ?? ((msg) => console.error(`[rbo] ${msg}`));
   const strict = options.strict === true;
 
-  const pids = await findLiveRolePids(role, options);
+  const targets = (await findLiveRoleProcesses(role, options)).sort((a, b) => a.pid - b.pid);
   const stopped = [];
 
-  for (const pid of pids) {
+  for (const target of targets) {
+    const { pid } = target;
+    const isCurrent = currentProcessCheck(target, listProcesses, alive);
+    if (!(await isCurrent())) continue;
     try {
       log(`stopping ${role} process pid=${pid}`);
-      await doStop(pid);
+      if (options.stopPid) await options.stopPid(pid);
+      else await stopPid(pid, { isAlive: alive, isCurrent });
     } catch (error) {
       const message = `failed to stop pid=${pid} (${role}): ${error instanceof Error ? error.message : String(error)}`;
       if (strict) {
@@ -375,7 +556,7 @@ export async function stopRoleProcesses(role, options = {}) {
       warn(`${message}; continuing`);
       continue;
     }
-    if (alive(pid)) {
+    if (await isCurrent()) {
       const message = `failed to stop ${role} pid=${pid}: process still alive`;
       if (strict) {
         throw new Error(message);
@@ -388,19 +569,18 @@ export async function stopRoleProcesses(role, options = {}) {
 
   clearStalePidFile(resolveRolePidFile(role, options), alive);
 
-  return { stopped, alreadyStopped: pids.length === 0 };
+  return { stopped, alreadyStopped: targets.length === 0 };
 }
 
 /**
  * @param {{
  *   env?: NodeJS.ProcessEnv;
  *   home?: string;
- *   listProcesses?: () => Promise<{ pid: number; commandLine: string }[]>;
+ *   listProcesses?: () => Promise<ProcessIdentity[]>;
  *   isAlive?: (pid: number) => boolean;
  *   stopPid?: (pid: number) => Promise<void>;
  *   log?: (msg: string) => void;
  *   warn?: (msg: string) => void;
- *   extraPids?: number[];
  * }} [options]
  */
 export async function stopRunningRbo(options = {}) {
@@ -412,41 +592,23 @@ export async function stopRunningRbo(options = {}) {
   const home = options.home ?? homedir();
   const listProcesses = options.listProcesses ?? listNodeProcesses;
   const alive = options.isAlive ?? isProcessAlive;
-  const doStop = options.stopPid ?? ((pid) => stopPid(pid, { isAlive: alive }));
   const log = options.log ?? ((msg) => console.error(`[rbo] ${msg}`));
   const warn = options.warn ?? ((msg) => console.error(`[rbo] ${msg}`));
 
-  /** @type {Map<number, string>} */
-  const targets = new Map();
-
-  for (const { role, path } of resolveDaemonPidFiles({ env, home })) {
+  for (const { path } of resolveDaemonPidFiles({ env, home })) {
     clearStalePidFile(path, alive);
-    const pid = readLivePidFromFile(path, alive);
-    if (pid !== null) {
-      targets.set(pid, role);
-    }
   }
 
-  for (const proc of await listProcesses()) {
-    if (proc.pid === process.pid) {
-      continue;
-    }
-    const role = matchRboDaemonRole(proc.commandLine);
-    if (role) {
-      targets.set(proc.pid, role);
-    }
-  }
-
-  for (const pid of options.extraPids ?? []) {
-    if (!targets.has(pid)) {
-      targets.set(pid, 'unknown');
-    }
-  }
-
-  for (const [pid, role] of targets) {
+  for (const target of await listProcesses()) {
+    const { pid, commandLine } = target;
+    const role = matchRboDaemonRole(commandLine);
+    if (pid === process.pid || !role) continue;
+    const isCurrent = currentProcessCheck(target, listProcesses, alive);
     try {
+      if (!(await isCurrent())) continue;
       log(`stopping ${role} process pid=${pid} for package install/uninstall`);
-      await doStop(pid);
+      if (options.stopPid) await options.stopPid(pid);
+      else await stopPid(pid, { isAlive: alive, isCurrent });
     } catch (error) {
       warn(
         `failed to stop pid=${pid} (${role}): ${error instanceof Error ? error.message : String(error)}; continuing`,

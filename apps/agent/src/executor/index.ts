@@ -1,8 +1,10 @@
-import { createHash } from 'node:crypto';
 import { createReadStream, existsSync } from 'node:fs';
-import { copyFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { copyFile, mkdir, rename, rm, stat } from 'node:fs/promises';
+import type { IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   type AttemptSpool,
   appendChunk,
@@ -26,15 +28,15 @@ import type {
   BundleDownloadPayload,
   CancelJobPayload,
   CleanupCompletePayload,
+  HeartbeatAckPayload,
   JobExitPayload,
   LeaseOfferPayload,
   LogAckPayload,
   PrepareSourceGitOverlayPayload,
   PrepareSourcePayload,
   RunJobPayload,
-  SourceNeedReason,
 } from '@rbo/protocol';
-import { createLogger, generateId, resolveContainedCwd } from '@rbo/shared';
+import { createLogger, generateId, resolveContainedCwd, sha256File } from '@rbo/shared';
 import type { GitUrlAllowlist } from '@rbo/shared';
 import {
   applyGitOverlay,
@@ -71,15 +73,42 @@ import {
 } from '../recovery/attempt-metadata.js';
 import type { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
 import { isAcceptingJobsUnderDiskPressure } from '../recovery/disk-pressure.js';
-import { applyControlledGitSource, checkoutOverlayGitlinkPins } from '../repos/controlled-git.js';
+import { WorktreeCleanup } from '../recovery/worktree-cleanup.js';
+import {
+  applyControlledGitSource,
+  checkoutOverlayGitlinkPins,
+  hasControlledGitLfsTrackedFiles,
+  isControlledGitLfsAvailable,
+} from '../repos/controlled-git.js';
 import { type RepoCacheConfig, RepoMirrorManager } from '../repos/mirror.js';
 import { StreamRedactor } from './redactor.js';
 import { streamDownloadWithLimits } from './stream-download-with-limits.js';
-import { assertPinnedPeerCert, pinnedTlsRequestOptions } from './tls-pin.js';
+import { pinnedTlsRequestOptions } from './tls-pin.js';
 
 const logger = createLogger('agent.executor');
+
+export interface LeaseClock {
+  epochMs: number;
+  monotonicMs: number;
+}
+
+export function readLeaseClock(): LeaseClock {
+  return { epochMs: Date.now(), monotonicMs: performance.now() };
+}
+
+function leaseRemainingMs(deadline: LeaseClock, now = readLeaseClock()): number {
+  // The monotonic clock guards against wall-clock rollback. The wall clock also
+  // guards against suspension on platforms where monotonic time pauses in sleep.
+  return Math.min(deadline.epochMs - now.epochMs, deadline.monotonicMs - now.monotonicMs);
+}
 const ARTIFACT_TOKEN_TIMEOUT_MS = 60_000;
+const ARTIFACT_UPLOAD_TIMEOUT_MS = 60_000;
+const ARTIFACT_UPLOAD_ROUNDS = 3;
 const BUNDLE_TOKEN_TIMEOUT_MS = 120_000;
+const SOURCE_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
+const SOURCE_DOWNLOAD_IDLE_TIMEOUT_MS = 60_000;
+
+class PermanentArtifactUploadError extends Error {}
 
 type ToolchainProfile = NonNullable<LeaseOfferPayload['selected_toolchain_profiles']>[number];
 type RiskLevel = AttemptMetadata['risk_level'];
@@ -127,12 +156,17 @@ interface AttemptRuntime {
   prepare: PrepareSourcePayload | null;
   /** True after source_ready until attempt clear — cancel must emit terminal itself. */
   prepareReady: boolean;
+  prepareTask?: Promise<void>;
+  sourceAbort: AbortController;
+  discardSource: boolean;
   /** True while handleRunJob owns the attempt (including pre-spawn). */
   runInProgress: boolean;
   materializedProjectPath: string | null;
   overlayRepoUrl: string | null;
   activeProcessKill?: (graceSeconds?: number) => Promise<void>;
   cancelSignal: { cancelled: boolean };
+  /** User cleanup remains subject to the lease after the main outcome is final. */
+  leaseCleanup?: { cancellation: AbortController; task?: Promise<unknown> };
   pendingArtifactUpload: {
     attemptId: string;
     leaseId: string;
@@ -141,6 +175,8 @@ interface AttemptRuntime {
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null;
+  artifactTransfer?: { socket: WebSocket; completion: Promise<void> };
+  artifactSocket: WebSocket;
   pendingBundleDownload: {
     attemptId: string;
     resolve: (grant: BundleDownloadPayload) => void;
@@ -157,34 +193,35 @@ interface AttemptRuntime {
   /** Serializes disk spool writes across concurrent stdout/stderr handlers. */
   spoolWriteChain: Promise<void>;
   spoolLimitBreached: boolean;
-  /** Local lease deadline (ms since epoch) from offer / heartbeat renewals. */
-  leaseDeadlineMs: number | null;
-  leaseTtlSeconds: number;
+  /** Local lease deadline from an offer or confirmed renewal. */
+  leaseDeadline: LeaseClock | null;
   leaseRisk: RiskLevel;
   leaseTimer: ReturnType<typeof setTimeout> | null;
   leaseExpired: boolean;
 }
 
-function createAttemptRuntime(attemptId: string, jobId: string): AttemptRuntime {
+function createAttemptRuntime(attemptId: string, jobId: string, socket: WebSocket): AttemptRuntime {
   return {
     attemptId,
     jobId,
     offer: null,
     prepare: null,
     prepareReady: false,
+    sourceAbort: new AbortController(),
+    discardSource: false,
     runInProgress: false,
     materializedProjectPath: null,
     overlayRepoUrl: null,
     cancelSignal: { cancelled: false },
     pendingArtifactUpload: null,
+    artifactSocket: socket,
     pendingBundleDownload: null,
     activeSpool: null,
     activeSpoolSender: null,
     activeSpoolLease: null,
     spoolWriteChain: Promise.resolve(),
     spoolLimitBreached: false,
-    leaseDeadlineMs: null,
-    leaseTtlSeconds: 300,
+    leaseDeadline: null,
     leaseRisk: 'normal',
     leaseTimer: null,
     leaseExpired: false,
@@ -211,6 +248,7 @@ function resolveProjectIdentity(
 export class AgentJobExecutor {
   private readonly mirrorManager: RepoMirrorManager;
   private readonly attempts = new Map<string, AttemptRuntime>();
+  private readonly worktreeCleanup: WorktreeCleanup;
   private readonly maxJobs: number;
 
   constructor(
@@ -223,10 +261,27 @@ export class AgentJobExecutor {
       allowlist: config.gitAllowlist,
       repoCache: config.repoCache,
     });
+    this.worktreeCleanup = new WorktreeCleanup(
+      config.stateDir,
+      config.gitAllowlist,
+      this.mirrorManager,
+    );
   }
 
   public isBusy(): boolean {
     return this.attempts.size > 0;
+  }
+
+  public evictInactiveRepos(inactiveThroughMs: number): Promise<string[]> {
+    return this.mirrorManager.evictMirrors({ inactiveThroughMs });
+  }
+
+  public retryPendingWorktreeCleanup(): Promise<void> {
+    return this.worktreeCleanup.retryPending((attemptId) => this.attempts.has(attemptId));
+  }
+
+  public shouldRetainWorkspace(attemptId: string): boolean {
+    return this.attempts.has(attemptId) || this.worktreeCleanup.hasPending(attemptId);
   }
 
   public getActiveJobs(): Array<{ attempt_id: string; job_id: string }> {
@@ -302,12 +357,7 @@ export class AgentJobExecutor {
       attempt.pendingArtifactUpload = null;
       pending.reject(new Error('attempt cleared'));
     }
-    if (attempt.pendingBundleDownload) {
-      clearTimeout(attempt.pendingBundleDownload.timer);
-      const pending = attempt.pendingBundleDownload;
-      attempt.pendingBundleDownload = null;
-      pending.reject(new Error('attempt cleared'));
-    }
+    this.cancelSourcePreparation(attempt, new Error('attempt cleared'));
     this.attempts.delete(attemptId);
   }
 
@@ -320,10 +370,10 @@ export class AgentJobExecutor {
 
   private scheduleLeaseTimer(attempt: AttemptRuntime): void {
     this.clearLeaseTimer(attempt);
-    if (attempt.leaseDeadlineMs === null) {
+    if (attempt.leaseDeadline === null) {
       return;
     }
-    const delay = Math.max(0, attempt.leaseDeadlineMs - Date.now());
+    const delay = Math.max(0, Math.ceil(leaseRemainingMs(attempt.leaseDeadline)));
     const attemptId = attempt.attemptId;
     attempt.leaseTimer = setTimeout(() => {
       void this.onLeaseExpired(attemptId);
@@ -331,49 +381,115 @@ export class AgentJobExecutor {
     attempt.leaseTimer.unref?.();
   }
 
-  /**
-   * Arm / re-arm local lease deadline from offer TTL.
-   * Heartbeat renewals call {@link renewLeaseDeadline} while connected.
-   */
+  /** Arm the initial local lease deadline from the offer TTL. */
   private armLeaseDeadline(attempt: AttemptRuntime, offer: LeaseOfferPayload): void {
-    attempt.leaseTtlSeconds = offer.lease_ttl_seconds;
     attempt.leaseRisk = offer.job_request.risk_level ?? 'normal';
-    attempt.leaseDeadlineMs = Date.now() + offer.lease_ttl_seconds * 1000;
+    const now = readLeaseClock();
+    const ttlMs = offer.lease_ttl_seconds * 1000;
+    attempt.leaseDeadline = { epochMs: now.epochMs + ttlMs, monotonicMs: now.monotonicMs + ttlMs };
     attempt.leaseExpired = false;
     this.scheduleLeaseTimer(attempt);
   }
 
-  /** Mirror Controller renewActiveLease while heartbeats succeed. Renews ALL active attempts. */
-  public renewLeaseDeadline(ttlSeconds?: number): void {
-    for (const attempt of this.attempts.values()) {
-      if (attempt.leaseDeadlineMs === null || attempt.leaseExpired) {
+  public confirmLeaseRenewal(ack: HeartbeatAckPayload, heartbeatSentAt: LeaseClock): void {
+    for (const renewed of ack.renewed_leases) {
+      const attempt = this.attempts.get(renewed.attempt_id);
+      // Recovery authorizes the lease on a new socket only after adoption.
+      if (
+        !attempt ||
+        attempt.artifactSocket !== this.socket ||
+        attempt.leaseDeadline === null ||
+        attempt.leaseExpired ||
+        this.config.recovery?.isRejected(renewed.attempt_id)
+      ) {
         continue;
       }
-      const ttl = ttlSeconds ?? attempt.leaseTtlSeconds;
-      attempt.leaseDeadlineMs = Date.now() + ttl * 1000;
-      this.scheduleLeaseTimer(attempt);
-      const existing = readAttemptMetadata(this.config.stateDir, attempt.attemptId);
-      if (existing) {
-        writeAttemptMetadata(this.config.stateDir, {
-          ...existing,
-          lease_deadline: new Date(attempt.leaseDeadlineMs).toISOString(),
-          updated_at: new Date().toISOString(),
+
+      const existing = readAttemptMetadata(this.config.stateDir, renewed.attempt_id);
+      const lease = attempt.offer ?? existing;
+      if (
+        !lease ||
+        lease.lease_id !== renewed.lease_id ||
+        lease.lease_epoch !== renewed.lease_epoch ||
+        (existing &&
+          (existing.lease_id !== renewed.lease_id ||
+            existing.lease_epoch !== renewed.lease_epoch ||
+            existing.status === 'terminal'))
+      ) {
+        continue;
+      }
+
+      // The Controller's renewal can only have started after we sent the heartbeat.
+      const ttlMs =
+        Math.min(ack.lease_ttl_seconds, attempt.offer?.lease_ttl_seconds ?? ack.lease_ttl_seconds) *
+        1000;
+      const deadline = {
+        epochMs: heartbeatSentAt.epochMs + ttlMs,
+        monotonicMs: heartbeatSentAt.monotonicMs + ttlMs,
+      };
+      const now = readLeaseClock();
+      const remainingMs = leaseRemainingMs(attempt.leaseDeadline, now);
+      if (remainingMs <= 0) {
+        void this.onLeaseExpired(attempt.attemptId, now).catch((error) => {
+          logger.warn('failed to finalize an expired lease', {
+            attemptId: attempt.attemptId,
+            error: String(error),
+          });
         });
+        continue;
+      }
+      // A wall-clock correction may move the UTC timestamp back. Compare both
+      // remaining budgets on the same clocks and keep renewals in monotonic order.
+      if (
+        deadline.monotonicMs <= attempt.leaseDeadline.monotonicMs ||
+        leaseRemainingMs(deadline, now) <= remainingMs
+      ) {
+        continue;
+      }
+      attempt.leaseDeadline = deadline;
+      this.scheduleLeaseTimer(attempt);
+      if (existing) {
+        try {
+          writeAttemptMetadata(this.config.stateDir, {
+            ...existing,
+            lease_deadline: new Date(deadline.epochMs).toISOString(),
+            updated_at: new Date(now.epochMs).toISOString(),
+          });
+        } catch (error) {
+          logger.warn('could not persist renewed lease deadline', {
+            attemptId: attempt.attemptId,
+            error: String(error),
+          });
+        }
       }
     }
   }
 
-  private async onLeaseExpired(attemptId: string): Promise<void> {
+  private async onLeaseExpired(attemptId: string, observedAt = readLeaseClock()): Promise<void> {
     const attempt = this.attempts.get(attemptId);
-    if (!attempt || attempt.leaseExpired || attempt.leaseDeadlineMs === null) {
+    if (!attempt || attempt.leaseExpired || attempt.leaseDeadline === null) {
       return;
     }
-    if (Date.now() < attempt.leaseDeadlineMs) {
+    if (leaseRemainingMs(attempt.leaseDeadline, observedAt) > 0) {
       this.scheduleLeaseTimer(attempt);
       return;
     }
+    // Once either clock observes expiry, the monotonic cutoff cannot reopen.
+    attempt.leaseDeadline.monotonicMs = Math.min(
+      attempt.leaseDeadline.monotonicMs,
+      observedAt.monotonicMs,
+    );
+    this.clearLeaseTimer(attempt);
     if (!isDestructiveOrHardwareRisk(attempt.leaseRisk)) {
       // safe/normal: Controller owns lease expiry / orphan / lost.
+      return;
+    }
+    if (
+      attempt.leaseCleanup ||
+      readAttemptMetadata(this.config.stateDir, attemptId)?.status === 'completed_awaiting_upload'
+    ) {
+      attempt.leaseExpired = true;
+      attempt.leaseCleanup?.cancellation.abort(new Error('lease expired'));
       return;
     }
     attempt.leaseExpired = true;
@@ -383,12 +499,34 @@ export class AgentJobExecutor {
       risk: attempt.leaseRisk,
     });
     attempt.cancelSignal.cancelled = true;
-    if (attempt.activeProcessKill) {
-      try {
-        await attempt.activeProcessKill(10);
-      } catch (error) {
-        logger.warn('failed to kill process on lease expiry', { error: String(error) });
+    this.cancelSourcePreparation(attempt, new Error('Lease expired during source preparation'));
+    if (!attempt.runInProgress && offer) {
+      if (attempt.prepareTask) {
+        await attempt.prepareTask;
+      } else {
+        try {
+          this.failTerminal(
+            attemptId,
+            offer.lease_id,
+            offer.lease_epoch,
+            'lease_expired',
+            'Lease expired before process start',
+          );
+        } finally {
+          await this.cleanupSourceWorkspace(attempt);
+          this.clearAttempt(attemptId);
+        }
       }
+      return;
+    }
+    if (!attempt.activeProcessKill) {
+      // run_job owns finalization while its pre-spawn setup is in progress.
+      return;
+    }
+    try {
+      await attempt.activeProcessKill(10);
+    } catch (error) {
+      logger.warn('failed to kill process on lease expiry', { error: String(error) });
     }
     if (offer) {
       const existing = readAttemptMetadata(this.config.stateDir, attemptId);
@@ -404,7 +542,7 @@ export class AgentJobExecutor {
         spool_dir: existing?.spool_dir ?? join(this.config.stateDir, 'logs', attemptId),
         risk_level: attempt.leaseRisk,
         updated_at: new Date().toISOString(),
-        lease_deadline: new Date(attempt.leaseDeadlineMs).toISOString(),
+        lease_deadline: new Date(attempt.leaseDeadline.epochMs).toISOString(),
         last_exit: {
           exit_code: null,
           outcome: 'failed',
@@ -417,20 +555,18 @@ export class AgentJobExecutor {
     // Terminal frames are emitted from handleRunJob after waitForCompletion observes the kill.
   }
 
-  private async cleanupOverlayWorktree(attempt: AttemptRuntime): Promise<void> {
-    if (attempt.overlayRepoUrl && attempt.materializedProjectPath) {
-      await this.mirrorManager
-        .removeWorktree(attempt.overlayRepoUrl, attempt.materializedProjectPath)
-        .catch(() => undefined);
-    }
-    attempt.overlayRepoUrl = null;
-  }
-
   /**
    * Re-bind the WebSocket after reconnect so frames (including spool replay) use the new socket.
    */
   public attachSocket(socket: WebSocket): void {
     this.socket = socket;
+  }
+
+  public authorizeArtifactUpload(attemptId: string, socket: WebSocket): void {
+    const attempt = this.attempts.get(attemptId);
+    if (attempt && this.socket === socket) {
+      attempt.artifactSocket = socket;
+    }
   }
 
   /** First active attempt id (test helper); prefer {@link getActiveJobs}. */
@@ -445,13 +581,24 @@ export class AgentJobExecutor {
    * Frames are not sent — Controller enters grace/orphan reconciliation.
    */
   public async abandonOnDisconnect(): Promise<void> {
-    if (this.config.recovery) {
-      for (const attemptId of this.attempts.keys()) {
-        this.config.recovery.onDisconnectPark(attemptId);
+    const abandonedSources: Promise<void>[] = [];
+    for (const attempt of this.attempts.values()) {
+      if (attempt.offer && !attempt.runInProgress && !attempt.activeProcessKill) {
+        abandonedSources.push(this.forceAbandonAttempt(attempt.attemptId));
+        continue;
       }
-      this.config.recovery.detachSocket();
+      if (attempt.pendingArtifactUpload) {
+        clearTimeout(attempt.pendingArtifactUpload.timer);
+        attempt.pendingArtifactUpload.reject(
+          new Error('Controller disconnected during artifact transfer'),
+        );
+        attempt.pendingArtifactUpload = null;
+      }
+      this.config.recovery?.onDisconnectPark(attempt.attemptId);
     }
-    // Intentionally do NOT kill processes or clearAttempt — Phase 6 grace/adopt.
+    this.config.recovery?.detachSocket();
+    // Running processes are parked for grace/adopt. Pre-start attempts have no process to adopt.
+    await Promise.all(abandonedSources);
   }
 
   /** Operator shutdown / terminate_stale: kill all processes and free slots. */
@@ -468,6 +615,19 @@ export class AgentJobExecutor {
       return;
     }
     attempt.cancelSignal.cancelled = true;
+    attempt.leaseCleanup?.cancellation.abort(new Error('attempt abandoned'));
+    if (!attempt.runInProgress && !attempt.activeProcessKill && attempt.offer) {
+      attempt.discardSource = true;
+      this.cancelSourcePreparation(attempt, new Error('Source preparation abandoned'));
+      if (attempt.prepareTask) {
+        await attempt.prepareTask;
+      } else {
+        await this.cleanupSourceWorkspace(attempt);
+        await removeAttemptMetadata(this.config.stateDir, attemptId);
+        this.clearAttempt(attemptId);
+      }
+      return;
+    }
     if (attempt.activeProcessKill) {
       try {
         await attempt.activeProcessKill(10);
@@ -475,6 +635,7 @@ export class AgentJobExecutor {
         logger.warn('failed to kill process on force abandon', { error: String(error) });
       }
     }
+    await attempt.leaseCleanup?.task;
     this.clearAttempt(attemptId);
   }
 
@@ -515,76 +676,212 @@ export class AgentJobExecutor {
    * Resume artifact upload from persisted hash-verified staging only.
    * Never re-collects from a mutable workspace.
    */
-  public async resumeArtifactUpload(meta: AttemptMetadata): Promise<void> {
-    const items = meta.artifact_manifest;
-    if (!items) {
-      return;
-    }
-    const verified: AttemptArtifactManifestItem[] = [];
-    for (const item of items) {
-      try {
-        const buf = await readFile(item.path);
-        const hash = createHash('sha256').update(buf).digest('hex');
-        if (hash !== item.sha256 || buf.length !== item.size_bytes) {
-          logger.warn('skipping artifact resume — staging hash mismatch', {
-            logical_name: item.logical_name,
-          });
-          continue;
-        }
-        verified.push(item);
-      } catch (error) {
-        logger.warn('skipping missing staging artifact on resume', {
-          logical_name: item.logical_name,
-          error: String(error),
-        });
+  public async resumeArtifactUpload(saved: AttemptMetadata): Promise<void> {
+    const socket = this.socket;
+    let attempt = this.attempts.get(saved.attempt_id);
+    if (attempt?.artifactTransfer) {
+      const inFlight = attempt.artifactTransfer;
+      await inFlight.completion;
+      if (inFlight.socket === socket || this.socket !== socket) {
+        return;
       }
+      return this.resumeArtifactUpload(saved);
     }
-    if (verified.length === 0 && items.length > 0) {
+    if (
+      socket.readyState !== socket.OPEN ||
+      (attempt && attempt.artifactSocket !== socket) ||
+      this.config.recovery?.isRejected(saved.attempt_id)
+    ) {
       return;
     }
 
-    let attempt = this.attempts.get(meta.attempt_id);
+    const meta = readAttemptMetadata(this.config.stateDir, saved.attempt_id) ?? saved;
+    if (
+      meta.status !== 'completed_awaiting_upload' ||
+      (attempt?.runInProgress && !meta.cleanup_result)
+    ) {
+      return;
+    }
     if (!attempt) {
-      attempt = createAttemptRuntime(meta.attempt_id, meta.job_id);
+      attempt = createAttemptRuntime(meta.attempt_id, meta.job_id, socket);
       this.attempts.set(meta.attempt_id, attempt);
     } else {
       attempt.jobId = meta.job_id;
     }
     attempt.leaseRisk = meta.risk_level;
-    if (meta.lease_deadline) {
-      attempt.leaseDeadlineMs = Date.parse(meta.lease_deadline);
+    if (!attempt.leaseDeadline && meta.lease_deadline) {
+      const epochMs = Date.parse(meta.lease_deadline);
+      if (Number.isFinite(epochMs)) {
+        const now = readLeaseClock();
+        attempt.leaseDeadline = { epochMs, monotonicMs: now.monotonicMs + epochMs - now.epochMs };
+      }
     }
 
-    const uploadGrant = await this.requestArtifactUploadTokens(
-      meta.attempt_id,
-      meta.lease_id,
-      meta.lease_epoch,
-      verified.map((f) => ({
-        logical_name: f.logical_name,
-        path: f.path,
-        size_bytes: f.size_bytes,
-        sha256: f.sha256,
-      })),
-      meta.artifact_collection,
-    );
+    const isActive = () =>
+      this.socket === socket &&
+      socket.readyState === socket.OPEN &&
+      this.attempts.get(meta.attempt_id) === attempt;
+    const completion = this.finishArtifactTransfer(meta, isActive).catch((error) => {
+      logger.warn('could not finalize artifact transfer', {
+        attemptId: meta.attempt_id,
+        error: String(error),
+      });
+    });
+    attempt.artifactTransfer = { socket, completion };
+    try {
+      await completion;
+    } finally {
+      attempt.artifactTransfer = undefined;
+      if (!attempt.runInProgress && this.attempts.get(meta.attempt_id) === attempt) {
+        this.clearAttempt(meta.attempt_id);
+      }
+    }
+  }
 
-    for (const art of uploadGrant.artifacts) {
+  private async finishArtifactTransfer(
+    meta: AttemptMetadata,
+    isActive: () => boolean,
+  ): Promise<void> {
+    const { attempt_id: attemptId, lease_id: leaseId, lease_epoch: leaseEpoch } = meta;
+    const stagingCompleted =
+      meta.artifact_staging === 'complete' ||
+      (meta.artifact_staging === undefined &&
+        Boolean(
+          meta.artifact_manifest ||
+            meta.artifact_collection ||
+            (meta.artifact_transfer && meta.cleanup_result),
+        ));
+    const stagingInterrupted = !stagingCompleted;
+    const staging = stagingCompleted ? 'complete' : 'interrupted';
+    let transfer = meta.artifact_transfer;
+    if (!transfer) {
+      const stored =
+        (!stagingInterrupted || Boolean(meta.artifact_manifest?.length)) &&
+        (await this.uploadStagedArtifacts(meta, isActive));
+      if (!isActive()) {
+        return;
+      }
+      transfer = stored ? 'stored' : 'failed';
+    } else if (stagingInterrupted && meta.artifact_staging === undefined) {
+      transfer = 'failed';
+    }
+
+    try {
+      if (
+        transfer !== meta.artifact_transfer ||
+        staging !== meta.artifact_staging ||
+        meta.artifact_manifest
+      ) {
+        const current = readAttemptMetadata(this.config.stateDir, attemptId) ?? meta;
+        writeAttemptMetadata(this.config.stateDir, {
+          ...current,
+          artifact_staging: staging,
+          artifact_transfer: transfer,
+          artifact_manifest: undefined,
+          updated_at: new Date().toISOString(),
+        });
+      }
+      await rm(join(this.config.stateDir, 'artifacts', attemptId), {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+      });
+    } catch (error) {
+      logger.warn('could not retire artifact transfer staging', {
+        attemptId,
+        error: String(error),
+      });
+    }
+    if (isActive()) {
+      this.sendFrame('cleanup_complete', attemptId, leaseId, leaseEpoch, {
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: leaseEpoch,
+        ...(meta.cleanup_result ?? { exit_code: null, timed_out: false }),
+        ...(stagingInterrupted ? { artifact_staging_interrupted: true } : {}),
+        ...(meta.cleanup_result ? {} : { cleanup_interrupted: true }),
+      });
+    }
+  }
+
+  private async uploadStagedArtifacts(
+    meta: AttemptMetadata,
+    isActive: () => boolean,
+  ): Promise<boolean> {
+    const { attempt_id: attemptId, lease_id: leaseId, lease_epoch: leaseEpoch } = meta;
+    const staged = new Map((meta.artifact_manifest ?? []).map((item) => [item.logical_name, item]));
+    const permanentFailures = new Set<string>();
+    for (let round = 0; round < ARTIFACT_UPLOAD_ROUNDS && isActive(); round++) {
+      if (round > 0) {
+        await delay(250 * 2 ** (round - 1));
+        if (!isActive()) break;
+      }
       try {
-        await this.uploadArtifactFile(
-          art.upload_url,
-          art.upload_token,
-          art.path,
-          art.logical_name,
-          art.size_bytes,
-          art.sha256,
+        const grant = await this.requestArtifactUploadTokens(
+          attemptId,
+          leaseId,
+          leaseEpoch,
+          [...staged.values()],
+          meta.artifact_collection,
         );
+        let retry = false;
+        for (const artifact of grant.artifacts) {
+          if (!isActive()) return false;
+          const item = staged.get(artifact.logical_name);
+          if (!item || item.size_bytes !== artifact.size_bytes || item.sha256 !== artifact.sha256) {
+            logger.warn('ignoring upload grant inconsistent with staged manifest', {
+              attemptId,
+              artifact: artifact.logical_name,
+            });
+            retry = true;
+            continue;
+          }
+          if (permanentFailures.has(item.logical_name)) continue;
+          try {
+            const file = await stat(item.path).catch(() => null);
+            if (
+              !file?.isFile() ||
+              file.size !== item.size_bytes ||
+              (await sha256File(item.path)) !== item.sha256
+            ) {
+              throw new PermanentArtifactUploadError(
+                'Staged artifact missing or checksum mismatch',
+              );
+            }
+            if (!isActive()) return false;
+            await this.uploadArtifactFile(
+              artifact.upload_url,
+              artifact.upload_token,
+              item.path,
+              item.logical_name,
+              item.size_bytes,
+              item.sha256,
+            );
+          } catch (error) {
+            if (error instanceof PermanentArtifactUploadError) {
+              permanentFailures.add(item.logical_name);
+            } else {
+              retry = true;
+            }
+            logger.warn('artifact upload attempt failed', {
+              attemptId,
+              artifact: item.logical_name,
+              round: round + 1,
+              error: String(error),
+            });
+          }
+        }
+        if (!retry)
+          return !grant.artifacts.some((artifact) => permanentFailures.has(artifact.logical_name));
       } catch (error) {
-        logger.error('failed artifact resume upload', {
-          artifact: art.logical_name,
+        logger.warn('artifact upload grant failed', {
+          attemptId,
+          round: round + 1,
           error: String(error),
         });
       }
     }
+    return false;
   }
 
   private persistCompletedAwaitingUpload(
@@ -597,8 +894,11 @@ export class AgentJobExecutor {
       failure_category?: JobExitPayload['failure_category'];
       failure_message?: string;
     },
-    artifactManifest?: AttemptArtifactManifestItem[],
-    artifactCollection?: ArtifactCollectionSummary,
+    staging?: {
+      manifest: AttemptArtifactManifestItem[];
+      collection?: ArtifactCollectionSummary;
+      interrupted: boolean;
+    },
   ): void {
     const existing = readAttemptMetadata(this.config.stateDir, run.attempt_id);
     writeAttemptMetadata(this.config.stateDir, {
@@ -613,8 +913,8 @@ export class AgentJobExecutor {
       spool_dir: existing?.spool_dir ?? join(this.config.stateDir, 'logs', run.attempt_id),
       risk_level: offer.job_request.risk_level ?? existing?.risk_level ?? 'normal',
       updated_at: new Date().toISOString(),
-      ...(attempt.leaseDeadlineMs
-        ? { lease_deadline: new Date(attempt.leaseDeadlineMs).toISOString() }
+      ...(attempt.leaseDeadline
+        ? { lease_deadline: new Date(attempt.leaseDeadline.epochMs).toISOString() }
         : existing?.lease_deadline
           ? { lease_deadline: existing.lease_deadline }
           : {}),
@@ -624,16 +924,9 @@ export class AgentJobExecutor {
         ...(exit.failure_category ? { failure_category: exit.failure_category } : {}),
         ...(exit.failure_message ? { failure_message: exit.failure_message } : {}),
       },
-      ...(artifactManifest
-        ? { artifact_manifest: artifactManifest }
-        : existing?.artifact_manifest
-          ? { artifact_manifest: existing.artifact_manifest }
-          : {}),
-      ...(artifactCollection
-        ? { artifact_collection: artifactCollection }
-        : existing?.artifact_collection
-          ? { artifact_collection: existing.artifact_collection }
-          : {}),
+      artifact_staging: staging ? (staging.interrupted ? 'interrupted' : 'complete') : 'pending',
+      artifact_manifest: staging?.manifest,
+      artifact_collection: staging?.collection,
     });
   }
 
@@ -643,12 +936,19 @@ export class AgentJobExecutor {
     if (!existing) {
       return;
     }
-    writeAttemptMetadata(this.config.stateDir, {
-      ...existing,
-      status: 'terminal',
-      last_exit: lastExit,
-      updated_at: new Date().toISOString(),
-    });
+    try {
+      writeAttemptMetadata(this.config.stateDir, {
+        ...existing,
+        status: 'terminal',
+        last_exit: lastExit,
+        updated_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.warn('could not persist terminal attempt metadata', {
+        attemptId,
+        error: String(error),
+      });
+    }
     void removeAttemptMetadata(this.config.stateDir, attemptId).catch(() => undefined);
   }
 
@@ -749,12 +1049,15 @@ export class AgentJobExecutor {
     if (this.config.recovery?.isRejected(offer.attempt_id)) {
       return;
     }
-    if (this.attempts.size >= this.maxJobs) {
+    const cleanupPending = this.worktreeCleanup.hasPending(offer.attempt_id);
+    if (cleanupPending || this.attempts.size >= this.maxJobs) {
       this.sendFrame('lease_reject', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
         attempt_id: offer.attempt_id,
         lease_id: offer.lease_id,
         lease_epoch: offer.lease_epoch,
-        reason: `Agent capacity limit reached (${this.maxJobs} active job max)`,
+        reason: cleanupPending
+          ? 'Previous source workspace cleanup is still pending'
+          : `Agent capacity limit reached (${this.maxJobs} active job max)`,
       });
       return;
     }
@@ -784,7 +1087,7 @@ export class AgentJobExecutor {
       }
     }
 
-    const attempt = createAttemptRuntime(offer.attempt_id, offer.job_id);
+    const attempt = createAttemptRuntime(offer.attempt_id, offer.job_id, this.socket);
     attempt.offer = offer;
     this.attempts.set(offer.attempt_id, attempt);
     this.armLeaseDeadline(attempt, offer);
@@ -802,7 +1105,7 @@ export class AgentJobExecutor {
       spool_dir: spoolDir,
       risk_level: risk,
       updated_at: new Date().toISOString(),
-      lease_deadline: new Date(attempt.leaseDeadlineMs ?? Date.now()).toISOString(),
+      lease_deadline: new Date(attempt.leaseDeadline?.epochMs ?? Date.now()).toISOString(),
     });
 
     this.sendFrame('lease_accept', offer.attempt_id, offer.lease_id, offer.lease_epoch, {
@@ -818,67 +1121,53 @@ export class AgentJobExecutor {
       prepare.lease_id,
       prepare.lease_epoch,
     );
-    if (!attempt) {
+    if (!attempt || attempt.prepare || attempt.discardSource) {
       return;
     }
     attempt.prepare = prepare;
-    attempt.prepareReady = false;
-
-    if (prepare.source_mode === 'git_overlay') {
-      await this.handlePrepareGitOverlay(attempt, prepare);
-      return;
-    }
-
-    await this.cleanupOverlayWorktree(attempt);
-
-    const attemptDir = join(this.config.stateDir, 'workspaces', prepare.attempt_id);
-    const archivePartPath = join(attemptDir, 'snapshot.tar.zst.part');
-    const archivePath = join(attemptDir, 'snapshot.tar.zst');
-    const workspaceRoot = join(attemptDir, 'workspace');
-
-    await mkdir(attemptDir, { recursive: true });
-
+    attempt.prepareTask = this.prepareSource(attempt, prepare);
     try {
-      if (prepare.expected_size_bytes <= 0 || !prepare.expected_sha256) {
-        throw new Error('prepare_source missing expected size or sha256');
-      }
-      if (attempt.cancelSignal.cancelled) {
-        throw new Error('cancelled');
-      }
+      await attempt.prepareTask;
+    } finally {
+      attempt.prepareTask = undefined;
+    }
+  }
 
-      await this.downloadSnapshotFile(
-        prepare.download_url,
-        prepare.data_token,
-        archivePartPath,
-        prepare.expected_size_bytes,
-        prepare.expected_sha256,
-      );
-
-      if (attempt.cancelSignal.cancelled) {
-        throw new Error('cancelled');
-      }
-
-      await rename(archivePartPath, archivePath);
-
-      const materialized = await materializeFullSnapshot({
-        manifest: prepare.manifest,
-        archivePath,
-        workspaceRoot,
-      });
-      attempt.materializedProjectPath = materialized.projectPath;
-
-      if (attempt.cancelSignal.cancelled) {
-        this.sendCancelledTerminal(
-          prepare.attempt_id,
-          prepare.lease_id,
-          prepare.lease_epoch,
-          'Job cancelled during prepare_source',
+  private async prepareSource(
+    attempt: AttemptRuntime,
+    prepare: PrepareSourcePayload,
+  ): Promise<void> {
+    const attemptDir = join(this.config.stateDir, 'workspaces', prepare.attempt_id);
+    const signal = attempt.sourceAbort.signal;
+    try {
+      await mkdir(attemptDir, { recursive: true });
+      signal.throwIfAborted();
+      if (prepare.source_mode === 'git_overlay') {
+        await this.handlePrepareGitOverlay(attempt, prepare, attemptDir, signal);
+      } else {
+        if (prepare.expected_size_bytes <= 0 || !prepare.expected_sha256) {
+          throw new Error('prepare_source missing expected size or sha256');
+        }
+        const archivePartPath = join(attemptDir, 'snapshot.tar.zst.part');
+        const archivePath = join(attemptDir, 'snapshot.tar.zst');
+        await this.downloadSnapshotFile(
+          prepare.download_url,
+          prepare.data_token,
+          archivePartPath,
+          prepare.expected_size_bytes,
+          prepare.expected_sha256,
+          signal,
         );
-        await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        this.clearAttempt(prepare.attempt_id);
-        return;
+        signal.throwIfAborted();
+        await rename(archivePartPath, archivePath);
+        const materialized = await materializeFullSnapshot({
+          manifest: prepare.manifest,
+          archivePath,
+          workspaceRoot: join(attemptDir, 'workspace'),
+        });
+        attempt.materializedProjectPath = materialized.projectPath;
       }
-
+      signal.throwIfAborted();
       attempt.prepareReady = true;
       this.sendFrame('source_ready', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
         attempt_id: prepare.attempt_id,
@@ -886,32 +1175,43 @@ export class AgentJobExecutor {
         lease_epoch: prepare.lease_epoch,
       });
     } catch (error) {
-      logger.error('prepare_source failed', {
-        attemptId: prepare.attempt_id,
-        error: String(error),
-      });
-      if (!this.matchesReservedLease(prepare.attempt_id, prepare.lease_id, prepare.lease_epoch)) {
-        await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        return;
+      try {
+        if (attempt.discardSource) {
+          await removeAttemptMetadata(this.config.stateDir, prepare.attempt_id);
+        } else if (attempt.leaseExpired) {
+          this.failTerminal(
+            prepare.attempt_id,
+            prepare.lease_id,
+            prepare.lease_epoch,
+            'lease_expired',
+            'Lease expired during source preparation',
+          );
+        } else if (attempt.cancelSignal.cancelled) {
+          this.sendCancelledTerminal(
+            prepare.attempt_id,
+            prepare.lease_id,
+            prepare.lease_epoch,
+            'Job cancelled during prepare_source',
+          );
+        } else {
+          logger.error('prepare_source failed', {
+            attemptId: prepare.attempt_id,
+            error: String(error),
+          });
+          this.failTerminal(
+            prepare.attempt_id,
+            prepare.lease_id,
+            prepare.lease_epoch,
+            prepare.source_mode === 'git_overlay' && String(error).includes('fetch')
+              ? 'repo_fetch'
+              : 'materialization',
+            String(error),
+          );
+        }
+      } finally {
+        await this.cleanupSourceWorkspace(attempt);
+        this.clearAttempt(prepare.attempt_id);
       }
-      if (attempt.cancelSignal.cancelled || String(error).includes('cancelled')) {
-        this.sendCancelledTerminal(
-          prepare.attempt_id,
-          prepare.lease_id,
-          prepare.lease_epoch,
-          'Job cancelled during prepare_source',
-        );
-      } else {
-        this.failTerminal(
-          prepare.attempt_id,
-          prepare.lease_id,
-          prepare.lease_epoch,
-          'materialization',
-          String(error),
-        );
-      }
-      await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-      this.clearAttempt(prepare.attempt_id);
     }
   }
 
@@ -919,232 +1219,146 @@ export class AgentJobExecutor {
   private async handlePrepareGitOverlay(
     attempt: AttemptRuntime,
     prepare: PrepareSourceGitOverlayPayload,
+    attemptDir: string,
+    signal: AbortSignal,
   ): Promise<void> {
-    const attemptDir = join(this.config.stateDir, 'workspaces', prepare.attempt_id);
     const projectPath = join(attemptDir, 'project');
-    let worktreeCreated = false;
 
-    await mkdir(attemptDir, { recursive: true });
-
+    let repoKey: string | undefined;
+    let fetchFailed = false;
+    let fetchError: unknown;
     try {
-      if (attempt.cancelSignal.cancelled) {
-        throw new Error('cancelled');
+      const mirror = await this.mirrorManager.ensureMirror(prepare.repo.url, signal);
+      signal.throwIfAborted();
+      repoKey = mirror.repoKey;
+      if (prepare.repo.fetch_refs.length > 0) {
+        await this.mirrorManager.fetchRefs(prepare.repo.url, prepare.repo.fetch_refs, signal);
       }
-
-      let repoKey: string | undefined;
-      let fetchFailed = false;
-      let fetchError: unknown;
-      try {
-        const mirror = await this.mirrorManager.ensureMirror(prepare.repo.url);
-        repoKey = mirror.repoKey;
-        if (prepare.repo.fetch_refs.length > 0) {
-          await this.mirrorManager.fetchRefs(prepare.repo.url, prepare.repo.fetch_refs);
-        }
-      } catch (error) {
-        fetchFailed = true;
-        fetchError = error;
-        logger.warn('mirror ensure/fetch failed', {
-          attemptId: prepare.attempt_id,
-          error: String(error),
-        });
-      }
-
-      let hasCommit =
-        repoKey != null && (await this.mirrorManager.hasCommit(repoKey, prepare.repo.base_commit));
-
-      if (!hasCommit) {
-        // Design order: fetch → bundle → full. Always try bundle before escalating.
-        this.sendFrame('source_need', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
-          attempt_id: prepare.attempt_id,
-          lease_id: prepare.lease_id,
-          lease_epoch: prepare.lease_epoch,
-          reason: 'base_commit_missing',
-          detail: fetchFailed
-            ? `Fetch failed (${String(fetchError)}); requesting bundle for ${prepare.repo.base_commit}`
-            : `Commit ${prepare.repo.base_commit} missing`,
-        });
-
-        let bundle: BundleDownloadPayload;
-        try {
-          bundle = await this.waitForBundleDownload(attempt);
-        } catch (bundleError) {
-          if (attempt.cancelSignal.cancelled || String(bundleError).includes('cancelled')) {
-            throw new Error('cancelled');
-          }
-          const escalate: SourceNeedReason = fetchFailed
-            ? 'repo_fetch_failed'
-            : 'full_snapshot_required';
-          this.sendFrame('source_need', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
-            attempt_id: prepare.attempt_id,
-            lease_id: prepare.lease_id,
-            lease_epoch: prepare.lease_epoch,
-            reason: escalate,
-            detail: `Bundle unavailable after missing commit: ${String(bundleError)}`,
-          });
-          return;
-        }
-        if (attempt.cancelSignal.cancelled) {
-          throw new Error('cancelled');
-        }
-
-        const bundlePartPath = join(attemptDir, 'bundle.part');
-        const bundlePath = join(attemptDir, 'bundle.gitbundle');
-        await this.downloadSnapshotFile(
-          bundle.download_url,
-          bundle.data_token,
-          bundlePartPath,
-          bundle.expected_size_bytes,
-          bundle.expected_sha256,
-        );
-        await rename(bundlePartPath, bundlePath);
-        const bundleId = `${prepare.attempt_id}-${Date.now()}`;
-        await this.mirrorManager.importBundle(prepare.repo.url, bundlePath, bundleId);
-        if (!repoKey) {
-          const mirror = await this.mirrorManager.ensureMirror(prepare.repo.url);
-          repoKey = mirror.repoKey;
-        }
-        hasCommit = await this.mirrorManager.hasCommit(repoKey, prepare.repo.base_commit);
-        if (!hasCommit) {
-          const escalate: SourceNeedReason = fetchFailed
-            ? 'repo_fetch_failed'
-            : 'full_snapshot_required';
-          this.sendFrame('source_need', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
-            attempt_id: prepare.attempt_id,
-            lease_id: prepare.lease_id,
-            lease_epoch: prepare.lease_epoch,
-            reason: escalate,
-            detail: `Commit ${prepare.repo.base_commit} still missing after bundle import`,
-          });
-          return;
-        }
-      }
-
-      await this.mirrorManager.createWorktree(
-        prepare.repo.url,
-        prepare.repo.base_commit,
-        projectPath,
-      );
-      worktreeCreated = true;
-      attempt.overlayRepoUrl = prepare.repo.url;
-      attempt.materializedProjectPath = projectPath;
-
-      const gitSourceRequirements = await detectGitSourceRequirements(projectPath);
-      let gitLfsAvailable = false;
-      try {
-        const { execFile } = await import('node:child_process');
-        const { promisify } = await import('node:util');
-        await promisify(execFile)('git-lfs', ['version'], { windowsHide: true });
-        gitLfsAvailable = true;
-      } catch {
-        gitLfsAvailable = false;
-      }
-      await applyControlledGitSource({
-        repoRoot: projectPath,
-        allowlist: this.config.gitAllowlist,
-        submodules: gitSourceRequirements.submodules,
-        lfs: gitSourceRequirements.lfs,
-        gitLfsAvailable,
-      });
-
-      const gitlinkPins = listGitlinkPins(prepare.manifest);
-      if (gitlinkPins.length > 0) {
-        await checkoutOverlayGitlinkPins({
-          projectPath,
-          pins: gitlinkPins,
-          allowlist: this.config.gitAllowlist,
-        });
-      }
-
-      if (attempt.cancelSignal.cancelled) {
-        throw new Error('cancelled');
-      }
-
-      const overlayPartPath = join(attemptDir, 'overlay.tar.zst.part');
-      const overlayPath = join(attemptDir, 'overlay.tar.zst');
-      await this.downloadSnapshotFile(
-        prepare.overlay.download_url,
-        prepare.overlay.data_token,
-        overlayPartPath,
-        prepare.overlay.expected_size_bytes,
-        prepare.overlay.expected_sha256,
-      );
-      await rename(overlayPartPath, overlayPath);
-
-      if (attempt.cancelSignal.cancelled) {
-        throw new Error('cancelled');
-      }
-
-      await applyGitOverlay({
-        manifest: prepare.manifest,
-        archivePath: overlayPath,
-        workspaceRoot: attemptDir,
-        projectPath,
-      });
-
-      if (attempt.cancelSignal.cancelled) {
-        this.sendCancelledTerminal(
-          prepare.attempt_id,
-          prepare.lease_id,
-          prepare.lease_epoch,
-          'Job cancelled during prepare_source',
-        );
-        await this.cleanupOverlayAttempt(
-          attempt,
-          attemptDir,
-          prepare.repo.url,
-          projectPath,
-          worktreeCreated,
-        );
-        this.clearAttempt(prepare.attempt_id);
-        return;
-      }
-
-      attempt.prepareReady = true;
-      this.sendFrame('source_ready', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
-        attempt_id: prepare.attempt_id,
-        lease_id: prepare.lease_id,
-        lease_epoch: prepare.lease_epoch,
-      });
     } catch (error) {
-      logger.error('git_overlay prepare_source failed', {
+      signal.throwIfAborted();
+      fetchFailed = true;
+      fetchError = error;
+      logger.warn('mirror ensure/fetch failed', {
         attemptId: prepare.attempt_id,
         error: String(error),
       });
-      if (!this.matchesReservedLease(prepare.attempt_id, prepare.lease_id, prepare.lease_epoch)) {
-        await this.cleanupOverlayAttempt(
-          attempt,
-          attemptDir,
-          prepare.repo.url,
-          projectPath,
-          worktreeCreated,
-        );
-        return;
-      }
-      if (attempt.cancelSignal.cancelled || String(error).includes('cancelled')) {
-        this.sendCancelledTerminal(
-          prepare.attempt_id,
-          prepare.lease_id,
-          prepare.lease_epoch,
-          'Job cancelled during prepare_source',
-        );
-      } else {
-        this.failTerminal(
-          prepare.attempt_id,
-          prepare.lease_id,
-          prepare.lease_epoch,
-          String(error).includes('fetch') ? 'repo_fetch' : 'materialization',
-          String(error),
-        );
-      }
-      await this.cleanupOverlayAttempt(
-        attempt,
-        attemptDir,
-        prepare.repo.url,
-        projectPath,
-        worktreeCreated,
-      );
-      this.clearAttempt(prepare.attempt_id);
     }
+
+    signal.throwIfAborted();
+    let hasCommit =
+      repoKey != null &&
+      (await this.mirrorManager.hasCommit(repoKey, prepare.repo.base_commit, signal));
+    signal.throwIfAborted();
+
+    if (!hasCommit) {
+      // Try to restore the original base from a bundle after fetch. The
+      // Controller cannot substitute source captured after submission.
+      this.sendFrame('source_need', prepare.attempt_id, prepare.lease_id, prepare.lease_epoch, {
+        attempt_id: prepare.attempt_id,
+        lease_id: prepare.lease_id,
+        lease_epoch: prepare.lease_epoch,
+        reason: 'base_commit_missing',
+        detail: fetchFailed
+          ? `Fetch failed (${String(fetchError)}); requesting bundle for ${prepare.repo.base_commit}`
+          : `Commit ${prepare.repo.base_commit} missing`,
+      });
+
+      let bundle: BundleDownloadPayload;
+      try {
+        bundle = await this.waitForBundleDownload(attempt);
+      } catch (bundleError) {
+        signal.throwIfAborted();
+        throw new Error(
+          `Git fetch and bundle could not restore the submitted overlay. Submit a new job with snapshot_mode=full. Bundle unavailable: ${String(bundleError)}`,
+        );
+      }
+      signal.throwIfAborted();
+
+      const bundlePartPath = join(attemptDir, 'bundle.part');
+      const bundlePath = join(attemptDir, 'bundle.gitbundle');
+      await this.downloadSnapshotFile(
+        bundle.download_url,
+        bundle.data_token,
+        bundlePartPath,
+        bundle.expected_size_bytes,
+        bundle.expected_sha256,
+        signal,
+      );
+      signal.throwIfAborted();
+      await rename(bundlePartPath, bundlePath);
+      const bundleId = `${prepare.attempt_id}-${Date.now()}`;
+      await this.mirrorManager.importBundle(prepare.repo.url, bundlePath, bundleId, signal);
+      signal.throwIfAborted();
+      if (!repoKey) {
+        const mirror = await this.mirrorManager.ensureMirror(prepare.repo.url, signal);
+        repoKey = mirror.repoKey;
+      }
+      signal.throwIfAborted();
+      hasCommit = await this.mirrorManager.hasCommit(repoKey, prepare.repo.base_commit, signal);
+      signal.throwIfAborted();
+      if (!hasCommit) {
+        throw new Error(
+          `Git fetch and bundle did not restore the submitted commit ${prepare.repo.base_commit}. Submit a new job with snapshot_mode=full.`,
+        );
+      }
+    }
+
+    signal.throwIfAborted();
+    await this.mirrorManager.createWorktree(
+      prepare.repo.url,
+      prepare.repo.base_commit,
+      projectPath,
+      signal,
+    );
+    attempt.overlayRepoUrl = prepare.repo.url;
+    attempt.materializedProjectPath = projectPath;
+    signal.throwIfAborted();
+
+    const gitSourceRequirements = await detectGitSourceRequirements(projectPath, (repoRoot) =>
+      hasControlledGitLfsTrackedFiles(repoRoot, signal),
+    );
+    const gitLfsAvailable =
+      gitSourceRequirements.lfs && (await isControlledGitLfsAvailable(signal));
+    await applyControlledGitSource({
+      repoRoot: projectPath,
+      allowlist: this.config.gitAllowlist,
+      submodules: gitSourceRequirements.submodules,
+      lfs: gitSourceRequirements.lfs,
+      gitLfsAvailable,
+      signal,
+    });
+
+    const gitlinkPins = listGitlinkPins(prepare.manifest);
+    if (gitlinkPins.length > 0) {
+      await checkoutOverlayGitlinkPins({
+        projectPath,
+        pins: gitlinkPins,
+        allowlist: this.config.gitAllowlist,
+        signal,
+      });
+    }
+
+    signal.throwIfAborted();
+
+    const overlayPartPath = join(attemptDir, 'overlay.tar.zst.part');
+    const overlayPath = join(attemptDir, 'overlay.tar.zst');
+    await this.downloadSnapshotFile(
+      prepare.overlay.download_url,
+      prepare.overlay.data_token,
+      overlayPartPath,
+      prepare.overlay.expected_size_bytes,
+      prepare.overlay.expected_sha256,
+      signal,
+    );
+    signal.throwIfAborted();
+    await rename(overlayPartPath, overlayPath);
+
+    await applyGitOverlay({
+      manifest: prepare.manifest,
+      archivePath: overlayPath,
+      workspaceRoot: attemptDir,
+      projectPath,
+    });
   }
 
   public handleBundleDownload(bundle: BundleDownloadPayload): void {
@@ -1185,23 +1399,47 @@ export class AgentJobExecutor {
     });
   }
 
-  private async cleanupOverlayAttempt(
-    attempt: AttemptRuntime,
-    attemptDir: string,
-    repoUrl: string,
-    projectPath: string,
-    worktreeCreated: boolean,
-  ): Promise<void> {
-    if (worktreeCreated) {
-      await this.mirrorManager.removeWorktree(repoUrl, projectPath).catch(() => undefined);
+  private cancelSourcePreparation(attempt: AttemptRuntime, reason: Error): void {
+    attempt.sourceAbort.abort(reason);
+    if (attempt.pendingBundleDownload) {
+      clearTimeout(attempt.pendingBundleDownload.timer);
+      const pending = attempt.pendingBundleDownload;
+      attempt.pendingBundleDownload = null;
+      pending.reject(reason);
     }
-    attempt.overlayRepoUrl = null;
-    await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  private async cleanupSourceWorkspace(attempt: AttemptRuntime): Promise<void> {
+    const workspace = join(this.config.stateDir, 'workspaces', attempt.attemptId);
+    if (attempt.overlayRepoUrl) {
+      await this.worktreeCleanup.enqueue(attempt.attemptId, attempt.overlayRepoUrl);
+      attempt.overlayRepoUrl = null;
+      return;
+    }
+    if (this.worktreeCleanup.hasPending(attempt.attemptId)) {
+      return;
+    }
+    await rm(workspace, {
+      recursive: true,
+      force: true,
+    }).catch((error) => {
+      logger.warn('could not remove source workspace', {
+        attemptId: attempt.attemptId,
+        error: String(error),
+      });
+    });
   }
 
   public async handleRunJob(run: RunJobPayload): Promise<void> {
     const attempt = this.matchesReservedLease(run.attempt_id, run.lease_id, run.lease_epoch);
-    if (!attempt || !attempt.offer || !attempt.prepare) {
+    if (
+      !attempt ||
+      !attempt.offer ||
+      !attempt.prepare ||
+      attempt.discardSource ||
+      attempt.runInProgress ||
+      (attempt.prepareTask && !attempt.prepareReady)
+    ) {
       return;
     }
 
@@ -1216,131 +1454,147 @@ export class AgentJobExecutor {
     const artifactsDir = join(attemptDir, 'artifacts');
     // Canonical spool: {stateDir}/logs/<attempt-id>/ (also RBO_LOG_DIR via AttemptLogPaths)
     const logsDir = join(this.config.stateDir, 'logs', run.attempt_id);
-
-    await mkdir(controlDir, { recursive: true });
-    await mkdir(artifactsDir, { recursive: true });
-
-    const spool = await openAttemptSpool(logsDir);
-    const logs = spool.logs;
-    const logSpoolMaxBytes = this.config.logSpoolMaxBytes ?? DEFAULT_LOG_SPOOL_MAX_BYTES;
-    const logSendQueueMax = this.config.logSendQueueMax ?? DEFAULT_LOG_SEND_QUEUE_MAX;
-    attempt.activeSpool = spool;
-    attempt.activeSpoolLease = {
-      attemptId: run.attempt_id,
-      leaseId: run.lease_id,
-      leaseEpoch: run.lease_epoch,
-    };
-    attempt.spoolLimitBreached = false;
-    attempt.spoolWriteChain = Promise.resolve();
-    const sender = new SpoolSender({
-      maxQueue: logSendQueueMax,
-      getSpool: () => attempt.activeSpool ?? spool,
-      send: (chunk) => {
-        if (this.socket.readyState !== this.socket.OPEN) {
-          return false;
-        }
-        this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
-          attempt_id: run.attempt_id,
-          lease_id: run.lease_id,
-          lease_epoch: run.lease_epoch,
-          stream: chunk.stream,
-          sequence: chunk.sequence,
-          bytes: chunk.bytes,
-        });
-        return true;
-      },
-    });
-    sender.setAcked(await readAck(spool));
-    attempt.activeSpoolSender = sender;
-    this.config.recovery?.registerLiveSender(run.attempt_id, sender);
-
-    // Toolchain recheck before spawn: path + environment_fingerprint vs current caps
-    const currentProfiles = this.config.toolchainProfiles ?? [];
-    for (const profile of offer.selected_toolchain_profiles ?? []) {
-      const activationPath = profile.activation.path;
-      if (activationPath && !existsSync(activationPath)) {
-        this.failTerminal(
-          run.attempt_id,
-          run.lease_id,
-          run.lease_epoch,
-          'toolchain_changed',
-          `Selected toolchain path missing: ${activationPath}`,
-        );
-        await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        this.clearAttempt(run.attempt_id);
-        return;
-      }
-      const current = currentProfiles.find((p) => p.id === profile.id);
-      if (
-        !current ||
-        current.environment_fingerprint !== profile.environment_fingerprint ||
-        current.version !== profile.version ||
-        (activationPath && current.activation.path && current.activation.path !== activationPath)
-      ) {
-        this.failTerminal(
-          run.attempt_id,
-          run.lease_id,
-          run.lease_epoch,
-          'toolchain_changed',
-          `Selected toolchain fingerprint mismatch for profile '${profile.id}'`,
-        );
-        await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        this.clearAttempt(run.attempt_id);
-        return;
-      }
-    }
-
-    if (attempt.cancelSignal.cancelled) {
-      this.sendCancelledTerminal(
-        run.attempt_id,
-        run.lease_id,
-        run.lease_epoch,
-        'Job cancelled before spawn',
-      );
-      await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-      this.clearAttempt(run.attempt_id);
-      return;
-    }
-
-    // Resolve secrets: execution.secret_refs is { ENV_NAME: store_ref }
-    const secretMap = this.config.secretMap ?? {};
-    const secretEnv: Record<string, string> = {};
-    const secretValuesToRedact: string[] = [];
-
-    for (const [envName, storeRef] of Object.entries(request.execution.secret_refs ?? {})) {
-      const sourceEnvVar = secretMap[storeRef] ?? storeRef;
-      const val = process.env[sourceEnvVar];
-      if (!val) {
-        this.failTerminal(
-          run.attempt_id,
-          run.lease_id,
-          run.lease_epoch,
-          'secret_missing',
-          `Missing required secret ref '${storeRef}'`,
-        );
-        await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-        this.clearAttempt(run.attempt_id);
-        return;
-      }
-      secretEnv[envName] = val;
-      secretValuesToRedact.push(val);
-    }
-
-    const stdoutRedactor = new StreamRedactor(secretValuesToRedact);
-    const stderrRedactor = new StreamRedactor(secretValuesToRedact);
-
-    const buildCacheConfig = this.config.buildCache ?? DEFAULT_BUILD_CACHE_CONFIG;
-    const cacheStore = new BuildCacheStore(
-      resolveBuildCachesDir(this.config.stateDir),
-      buildCacheConfig,
-    );
     const acquiredCaches: Array<{
       cacheKey: string;
       kind: BuildCacheKind;
       result: AcquireResult;
     }> = [];
+    let stopOwnedProcess: ((sweepExited?: boolean) => Promise<void>) | undefined;
+    const stopBeforeSpawn = (): boolean => {
+      const leaseExpired =
+        isDestructiveOrHardwareRisk(attempt.leaseRisk) &&
+        (attempt.leaseExpired ||
+          !attempt.leaseDeadline ||
+          leaseRemainingMs(attempt.leaseDeadline) <= 0);
+      if (!leaseExpired && !attempt.cancelSignal.cancelled) return false;
+
+      if (
+        this.attempts.get(run.attempt_id) === attempt &&
+        !this.config.recovery?.isRejected(run.attempt_id)
+      ) {
+        if (leaseExpired) {
+          attempt.leaseExpired = true;
+          this.failTerminal(
+            run.attempt_id,
+            run.lease_id,
+            run.lease_epoch,
+            'lease_expired',
+            'Lease expired before process start',
+          );
+        } else {
+          this.sendCancelledTerminal(
+            run.attempt_id,
+            run.lease_id,
+            run.lease_epoch,
+            'Job cancelled before spawn',
+          );
+        }
+      }
+      return true;
+    };
 
     try {
+      await mkdir(controlDir, { recursive: true });
+      await mkdir(artifactsDir, { recursive: true });
+
+      const spool = await openAttemptSpool(logsDir);
+      const logs = spool.logs;
+      const logSpoolMaxBytes = this.config.logSpoolMaxBytes ?? DEFAULT_LOG_SPOOL_MAX_BYTES;
+      const logSendQueueMax = this.config.logSendQueueMax ?? DEFAULT_LOG_SEND_QUEUE_MAX;
+      attempt.activeSpool = spool;
+      attempt.activeSpoolLease = {
+        attemptId: run.attempt_id,
+        leaseId: run.lease_id,
+        leaseEpoch: run.lease_epoch,
+      };
+      attempt.spoolLimitBreached = false;
+      attempt.spoolWriteChain = Promise.resolve();
+      const sender = new SpoolSender({
+        maxQueue: logSendQueueMax,
+        getSpool: () => attempt.activeSpool ?? spool,
+        send: (chunk) => {
+          if (this.socket.readyState !== this.socket.OPEN) {
+            return false;
+          }
+          this.sendFrame('log_chunk', run.attempt_id, run.lease_id, run.lease_epoch, {
+            attempt_id: run.attempt_id,
+            lease_id: run.lease_id,
+            lease_epoch: run.lease_epoch,
+            stream: chunk.stream,
+            sequence: chunk.sequence,
+            bytes: chunk.bytes,
+          });
+          return true;
+        },
+      });
+      sender.setAcked(await readAck(spool));
+      attempt.activeSpoolSender = sender;
+      this.config.recovery?.registerLiveSender(run.attempt_id, sender);
+
+      // Toolchain recheck before spawn: path + environment_fingerprint vs current caps
+      const currentProfiles = this.config.toolchainProfiles ?? [];
+      for (const profile of offer.selected_toolchain_profiles ?? []) {
+        const activationPath = profile.activation.path;
+        if (activationPath && !existsSync(activationPath)) {
+          this.failTerminal(
+            run.attempt_id,
+            run.lease_id,
+            run.lease_epoch,
+            'toolchain_changed',
+            `Selected toolchain path missing: ${activationPath}`,
+          );
+          return;
+        }
+        const current = currentProfiles.find((p) => p.id === profile.id);
+        if (
+          !current ||
+          current.environment_fingerprint !== profile.environment_fingerprint ||
+          current.version !== profile.version ||
+          (activationPath && current.activation.path && current.activation.path !== activationPath)
+        ) {
+          this.failTerminal(
+            run.attempt_id,
+            run.lease_id,
+            run.lease_epoch,
+            'toolchain_changed',
+            `Selected toolchain fingerprint mismatch for profile '${profile.id}'`,
+          );
+          return;
+        }
+      }
+
+      if (stopBeforeSpawn()) return;
+
+      // Resolve secrets: execution.secret_refs is { ENV_NAME: store_ref }
+      const secretMap = this.config.secretMap ?? {};
+      const secretEnv: Record<string, string> = {};
+      const secretValuesToRedact: string[] = [];
+
+      for (const [envName, storeRef] of Object.entries(request.execution.secret_refs ?? {})) {
+        const sourceEnvVar = secretMap[storeRef] ?? storeRef;
+        const val = process.env[sourceEnvVar];
+        if (!val) {
+          this.failTerminal(
+            run.attempt_id,
+            run.lease_id,
+            run.lease_epoch,
+            'secret_missing',
+            `Missing required secret ref '${storeRef}'`,
+          );
+          return;
+        }
+        secretEnv[envName] = val;
+        secretValuesToRedact.push(val);
+      }
+
+      const stdoutRedactor = new StreamRedactor(secretValuesToRedact);
+      const stderrRedactor = new StreamRedactor(secretValuesToRedact);
+
+      const buildCacheConfig = this.config.buildCache ?? DEFAULT_BUILD_CACHE_CONFIG;
+      const cacheStore = new BuildCacheStore(
+        resolveBuildCachesDir(this.config.stateDir),
+        buildCacheConfig,
+      );
       await writeJobScript(controlDir, request.execution);
 
       const projectPath = attempt.materializedProjectPath ?? join(workspaceRoot, 'main_mount');
@@ -1385,8 +1639,17 @@ export class AgentJobExecutor {
         env: strippedUserEnv,
       };
 
+      if (stopBeforeSpawn()) return;
+
       const child = spawnJobScript({
         attemptId: run.attempt_id,
+        requireWindowsJobObject: true,
+        getWindowsStartBudgetMs: isDestructiveOrHardwareRisk(attempt.leaseRisk)
+          ? () =>
+              !attempt.leaseExpired && attempt.leaseDeadline
+                ? leaseRemainingMs(attempt.leaseDeadline)
+                : 0
+          : undefined,
         controlDir,
         workspacePath: workspaceRoot,
         projectPath: projectCwd,
@@ -1403,6 +1666,59 @@ export class AgentJobExecutor {
         attachLogs: false,
       });
 
+      // Own the child before the first bookkeeping operation can fail or yield.
+      let processExited = false;
+      const childExit = child.waitForExit();
+      void childExit.then(() => {
+        processExited = true;
+      });
+      let stopping: Promise<void> | undefined;
+      const stopProcess = (grace = 10, sweepExited = false): Promise<void> => {
+        if ((!processExited || sweepExited) && !stopping) {
+          stopping = (async () => {
+            // Allow an already-observed close to settle before signalling a PID.
+            await Promise.resolve();
+            if (!processExited || sweepExited) {
+              try {
+                await child.kill(grace);
+              } catch (error) {
+                logger.warn('failed to stop owned process tree', {
+                  attemptId: run.attempt_id,
+                  error: String(error),
+                });
+              }
+            }
+            // Keep the workspace and slot until the managed child closes.
+            await childExit;
+          })();
+        }
+        return stopping ?? Promise.resolve();
+      };
+      attempt.activeProcessKill = stopProcess;
+      const stopAfterFailure = () => stopProcess(request.execution.cancel_grace_seconds);
+      stopOwnedProcess = (sweepExited) =>
+        stopProcess(request.execution.cancel_grace_seconds, sweepExited);
+      if (attempt.cancelSignal.cancelled) {
+        void stopAfterFailure();
+      }
+
+      const pid = child.pid;
+      const processIdentity = pid && pid > 0 ? processIdentityFromPid(pid) : null;
+      writeAttemptMetadata(this.config.stateDir, {
+        attempt_id: run.attempt_id,
+        job_id: offer.job_id,
+        lease_id: run.lease_id,
+        lease_epoch: run.lease_epoch,
+        process_identity: processIdentity,
+        status: 'running',
+        workspace_path: workspaceRoot,
+        spool_dir: logsDir,
+        risk_level: request.risk_level ?? 'normal',
+        ...(attempt.leaseDeadline
+          ? { lease_deadline: new Date(attempt.leaseDeadline.epochMs).toISOString() }
+          : {}),
+        updated_at: new Date().toISOString(),
+      });
       for (const key of child.ignoredRboEnvKeys ?? []) {
         await appendEvent(logs, {
           type: 'env_override_ignored',
@@ -1415,47 +1731,11 @@ export class AgentJobExecutor {
         });
       }
 
-      this.sendFrame('job_started', run.attempt_id, run.lease_id, run.lease_epoch, {
-        attempt_id: run.attempt_id,
-        lease_id: run.lease_id,
-        lease_epoch: run.lease_epoch,
-        ...(child.pid && child.pid > 0 ? { pid: child.pid } : {}),
-      });
-
-      // Register kill before any sync OS lookup so lease-expiry self-term cannot
-      // race past spawn with activeProcessKill still null.
-      let inFlightKill: Promise<void> | undefined;
-      attempt.activeProcessKill = (grace) => {
-        inFlightKill = child.kill(grace ?? 10);
-        return inFlightKill;
-      };
-      // Keep the same cancelSignal object through waitForCompletion so a cancel
-      // that fired during spawn is not wiped.
-
-      if (child.pid && child.pid > 0) {
-        const identity = processIdentityFromPid(child.pid);
-        if (identity) {
-          const risk = request.risk_level ?? 'normal';
-          writeAttemptMetadata(this.config.stateDir, {
-            attempt_id: run.attempt_id,
-            job_id: offer.job_id,
-            lease_id: run.lease_id,
-            lease_epoch: run.lease_epoch,
-            process_identity: identity,
-            status: 'running',
-            workspace_path: workspaceRoot,
-            spool_dir: logsDir,
-            risk_level: risk,
-            updated_at: new Date().toISOString(),
-          });
-        }
-      }
-
       // If lease already expired before kill was registered, terminate now.
       if (
         isDestructiveOrHardwareRisk(attempt.leaseRisk) &&
-        attempt.leaseDeadlineMs !== null &&
-        Date.now() >= attempt.leaseDeadlineMs
+        attempt.leaseDeadline !== null &&
+        leaseRemainingMs(attempt.leaseDeadline) <= 0
       ) {
         if (attempt.leaseExpired) {
           // Timer already ran with null activeProcessKill — kill now.
@@ -1482,7 +1762,7 @@ export class AgentJobExecutor {
               attemptId: run.attempt_id,
               maxBytes: logSpoolMaxBytes,
             });
-            void child.kill(request.execution.cancel_grace_seconds);
+            void stopAfterFailure();
           }
         };
         attempt.spoolWriteChain = attempt.spoolWriteChain.then(runAppend, runAppend);
@@ -1503,8 +1783,29 @@ export class AgentJobExecutor {
         }
       });
 
+      const childStart = child.waitForStart().then((start) => {
+        if (
+          start.started &&
+          this.attempts.get(run.attempt_id) === attempt &&
+          attempt.artifactSocket === this.socket &&
+          !this.config.recovery?.isRejected(run.attempt_id)
+        ) {
+          this.sendFrame('job_started', run.attempt_id, run.lease_id, run.lease_epoch, {
+            attempt_id: run.attempt_id,
+            lease_id: run.lease_id,
+            lease_epoch: run.lease_epoch,
+            ...(pid && pid > 0 ? { pid } : {}),
+            process_identity: processIdentity,
+          });
+        }
+        return start;
+      });
       const result = await waitForCompletion({
-        child,
+        child: {
+          waitForStart: () => childStart,
+          waitForExit: () => childExit,
+          nativeResultDelivery: child.nativeResultDelivery,
+        },
         execution: request.execution,
         logs,
         signal: attempt.cancelSignal,
@@ -1519,7 +1820,12 @@ export class AgentJobExecutor {
       ] as const) {
         const flushed = redactor.flush();
         if (flushed) {
-          await appendAndEnqueue(stream, flushed);
+          await appendAndEnqueue(stream, flushed).catch((error) => {
+            logger.warn('could not flush final job output', {
+              attemptId: run.attempt_id,
+              error: String(error),
+            });
+          });
         }
       }
 
@@ -1530,16 +1836,18 @@ export class AgentJobExecutor {
 
       if (result.type === 'timeout') {
         timedOut = true;
-        await child.kill(request.execution.cancel_grace_seconds);
+        await stopProcess(request.execution.cancel_grace_seconds);
       } else if (result.type === 'duration_complete') {
         durationComplete = true;
-        await child.kill(request.execution.cancel_grace_seconds);
+        await stopProcess(request.execution.cancel_grace_seconds);
       } else if (result.type === 'log_success') {
-        await child.kill(request.execution.cancel_grace_seconds);
+        await stopProcess(request.execution.cancel_grace_seconds);
       } else if (result.type === 'log_failure') {
         logFailure = true;
-        await child.kill(request.execution.cancel_grace_seconds);
+        await stopProcess(request.execution.cancel_grace_seconds);
       }
+
+      const start = await childStart;
 
       const exitCode = result.type === 'exit' ? result.exitCode : null;
       const outcome = attempt.cancelSignal.cancelled
@@ -1548,7 +1856,7 @@ export class AgentJobExecutor {
           ? 'failed'
           : timedOut
             ? 'timed_out'
-            : logFailure
+            : !start.started || logFailure
               ? 'failed'
               : durationComplete || result.type === 'log_success'
                 ? 'succeeded'
@@ -1568,10 +1876,14 @@ export class AgentJobExecutor {
             }
           : outcome === 'failed'
             ? {
-                failure_category: 'process_exit' as const,
-                failure_message: logFailure
-                  ? 'Completion failure_pattern matched in logs'
-                  : `Script exited with code ${exitCode}`,
+                failure_category: start.started
+                  ? ('process_exit' as const)
+                  : ('process_spawn' as const),
+                failure_message: start.started
+                  ? logFailure
+                    ? 'Completion failure_pattern matched in logs'
+                    : `Script exited with code ${exitCode}`
+                  : (start.errorMessage ?? 'Job process exited before confirming startup'),
               }
             : outcome === 'timed_out'
               ? {
@@ -1586,6 +1898,12 @@ export class AgentJobExecutor {
           ? ('cancelled' as const)
           : outcome;
 
+      const canFinalize = () =>
+        this.attempts.get(run.attempt_id) === attempt &&
+        !this.config.recovery?.isRejected(run.attempt_id);
+      if (!canFinalize()) {
+        return;
+      }
       if (attempt.leaseExpired) {
         // Metadata already written in onLeaseExpired; emit terminals if still connected.
         const exitPayload: JobExitPayload = {
@@ -1616,95 +1934,114 @@ export class AgentJobExecutor {
       }
 
       // Persist before/alongside job_exit so reconnect can recover completion.
-      this.persistCompletedAwaitingUpload(attempt, offer, run, {
+      const leaseCleanup: AttemptRuntime['leaseCleanup'] = isDestructiveOrHardwareRisk(
+        attempt.leaseRisk,
+      )
+        ? { cancellation: new AbortController() }
+        : undefined;
+      attempt.leaseCleanup = leaseCleanup;
+      const processExit: AttemptExitRecord = {
         exit_code: exitCode,
         outcome: effectiveOutcome,
         ...exitExtras,
-      });
+      };
+      try {
+        this.persistCompletedAwaitingUpload(attempt, offer, run, processExit);
+      } catch (error) {
+        logger.warn('could not persist completed process outcome', {
+          attemptId: run.attempt_id,
+          error: String(error),
+        });
+      }
 
-      this.sendFrame('job_exit', run.attempt_id, run.lease_id, run.lease_epoch, {
-        attempt_id: run.attempt_id,
-        lease_id: run.lease_id,
-        lease_epoch: run.lease_epoch,
-        exit_code: exitCode,
-        outcome: effectiveOutcome,
-        ...exitExtras,
-      });
+      if (attempt.artifactSocket === this.socket) {
+        this.sendFrame('job_exit', run.attempt_id, run.lease_id, run.lease_epoch, {
+          attempt_id: run.attempt_id,
+          lease_id: run.lease_id,
+          lease_epoch: run.lease_epoch,
+          exit_code: exitCode,
+          outcome: effectiveOutcome,
+          ...exitExtras,
+        });
+      } else {
+        void this.config.recovery?.reportCompletedAttempt(run.attempt_id).catch((error) => {
+          logger.warn('could not report completed attempt after reconnect', {
+            attemptId: run.attempt_id,
+            error: String(error),
+          });
+        });
+      }
 
       const collection = await collectArtifactFiles({
         projectPath,
         rules: request.artifacts ?? [],
         tempDir: join(artifactsDir, '.collect-tmp'),
+      }).catch((error) => {
+        logger.warn('artifact collection failed after process exit', {
+          attemptId: run.attempt_id,
+          error: String(error),
+        });
+        return null;
       });
 
       // Stage under durable artifacts dir for resume (never re-glob workspace later).
       const stagingRoot = join(this.config.stateDir, 'artifacts', run.attempt_id);
-      await mkdir(stagingRoot, { recursive: true });
       const stagedManifest: AttemptArtifactManifestItem[] = [];
-      for (const f of collection.files) {
-        const stagedPath = join(stagingRoot, f.logical_name);
-        await mkdir(join(stagedPath, '..'), { recursive: true });
-        await copyFile(f.sourcePath, stagedPath);
-        stagedManifest.push({
-          logical_name: f.logical_name,
-          path: stagedPath,
-          size_bytes: f.size_bytes,
-          sha256: f.sha256,
-        });
-      }
-
-      this.persistCompletedAwaitingUpload(
-        attempt,
-        offer,
-        run,
-        {
-          exit_code: exitCode,
-          outcome: effectiveOutcome,
-          ...exitExtras,
-        },
-        stagedManifest,
-        collection.summary,
-      );
-
-      const artifactItems = stagedManifest.map((f) => ({
-        logical_name: f.logical_name,
-        path: f.path,
-        size_bytes: f.size_bytes,
-        sha256: f.sha256,
-      }));
-
-      const uploadGrant = await this.requestArtifactUploadTokens(
-        run.attempt_id,
-        run.lease_id,
-        run.lease_epoch,
-        artifactItems,
-        collection.summary,
-      );
-
-      for (const art of uploadGrant.artifacts) {
+      for (const f of collection?.files ?? []) {
+        if (!canFinalize()) return;
         try {
-          await this.uploadArtifactFile(
-            art.upload_url,
-            art.upload_token,
-            art.path,
-            art.logical_name,
-            art.size_bytes,
-            art.sha256,
-          );
+          const stagedPath = join(stagingRoot, f.logical_name);
+          await mkdir(join(stagedPath, '..'), { recursive: true });
+          if (!canFinalize()) return;
+          await copyFile(f.sourcePath, stagedPath);
+          stagedManifest.push({
+            logical_name: f.logical_name,
+            path: stagedPath,
+            size_bytes: f.size_bytes,
+            sha256: f.sha256,
+          });
         } catch (error) {
-          logger.error('failed artifact upload', {
-            artifact: art.logical_name,
+          logger.warn('could not stage artifact after process exit', {
+            attemptId: run.attempt_id,
+            artifact: f.logical_name,
             error: String(error),
           });
         }
       }
 
-      if (inFlightKill) {
-        await inFlightKill.catch(() => undefined);
+      if (!canFinalize()) return;
+      try {
+        this.persistCompletedAwaitingUpload(attempt, offer, run, processExit, {
+          manifest: stagedManifest,
+          collection: collection?.summary,
+          interrupted: collection === null,
+        });
+      } catch (error) {
+        logger.warn('could not persist staged artifact manifest', {
+          attemptId: run.attempt_id,
+          error: String(error),
+        });
       }
 
-      const cleanup = await runCleanupScript({
+      if (stopping) {
+        await stopping.catch(() => undefined);
+      }
+
+      const cleanupTask = runCleanupScript({
         attemptId: run.attempt_id,
+        requireWindowsJobObject: true,
+        cancelSignal: leaseCleanup?.cancellation.signal,
+        getWindowsStartBudgetMs: leaseCleanup
+          ? () => {
+              const observedAt = readLeaseClock();
+              const remainingMs =
+                !attempt.leaseExpired && attempt.leaseDeadline
+                  ? leaseRemainingMs(attempt.leaseDeadline, observedAt)
+                  : 0;
+              if (remainingMs <= 0) void this.onLeaseExpired(run.attempt_id, observedAt);
+              return remainingMs;
+            }
+          : undefined,
         controlDir,
         workspacePath: workspaceRoot,
         projectPath: projectCwd,
@@ -1715,15 +2052,50 @@ export class AgentJobExecutor {
           RBO_ARTIFACT_DIR: artifactsDir,
         },
         logs,
-      }).catch(() => ({ exitCode: null, timedOut: false }));
+      }).catch((error) => {
+        const message = `Could not run cleanup script: ${String(error)}`;
+        logger.warn(message, { attemptId: run.attempt_id });
+        return { exitCode: null, timedOut: false, message };
+      });
+      if (leaseCleanup) leaseCleanup.task = cleanupTask;
+      const cleanup = await cleanupTask;
+      if (leaseCleanup) leaseCleanup.task = undefined;
 
-      this.sendFrame('cleanup_complete', run.attempt_id, run.lease_id, run.lease_epoch, {
-        attempt_id: run.attempt_id,
-        lease_id: run.lease_id,
-        lease_epoch: run.lease_epoch,
+      if (!canFinalize()) return;
+      const cleanupResult = {
         exit_code: cleanup.exitCode,
         timed_out: cleanup.timedOut,
-      });
+        ...('message' in cleanup ? { message: cleanup.message } : {}),
+      };
+      const meta = readAttemptMetadata(this.config.stateDir, run.attempt_id);
+      try {
+        if (meta?.status !== 'completed_awaiting_upload') {
+          throw new Error('Attempt metadata unavailable after cleanup');
+        }
+        const completed = {
+          ...meta,
+          cleanup_result: cleanupResult,
+          updated_at: new Date().toISOString(),
+        };
+        writeAttemptMetadata(this.config.stateDir, completed);
+        await this.resumeArtifactUpload(completed);
+      } catch (error) {
+        if (meta?.status !== 'completed_awaiting_upload') {
+          this.persistTerminalMetadata(run.attempt_id, processExit);
+        }
+        logger.warn('could not persist artifact completion', {
+          attemptId: run.attempt_id,
+          error: String(error),
+        });
+        if (attempt.artifactSocket === this.socket) {
+          this.sendFrame('cleanup_complete', run.attempt_id, run.lease_id, run.lease_epoch, {
+            attempt_id: run.attempt_id,
+            lease_id: run.lease_id,
+            lease_epoch: run.lease_epoch,
+            ...cleanupResult,
+          });
+        }
+      }
 
       // Promote miss caches only on successful job outcome (risk-gated inside store).
       for (const entry of acquiredCaches) {
@@ -1748,9 +2120,17 @@ export class AgentJobExecutor {
           });
       }
     } catch (error) {
+      await stopOwnedProcess?.(true);
       logger.error('run_job failed', { attemptId: run.attempt_id, error: String(error) });
-      this.failTerminal(run.attempt_id, run.lease_id, run.lease_epoch, 'internal', String(error));
+      if (
+        this.attempts.get(run.attempt_id) === attempt &&
+        !this.config.recovery?.isRejected(run.attempt_id)
+      ) {
+        this.failTerminal(run.attempt_id, run.lease_id, run.lease_epoch, 'internal', String(error));
+      }
     } finally {
+      await stopOwnedProcess?.();
+      await attempt.spoolWriteChain.catch(() => undefined);
       for (const entry of acquiredCaches) {
         await entry.result.release().catch(() => undefined);
       }
@@ -1761,13 +2141,11 @@ export class AgentJobExecutor {
           error: String(error),
         });
       });
-      if (attempt.overlayRepoUrl && attempt.materializedProjectPath) {
-        await this.mirrorManager
-          .removeWorktree(attempt.overlayRepoUrl, attempt.materializedProjectPath)
-          .catch(() => undefined);
+      await this.cleanupSourceWorkspace(attempt);
+      attempt.runInProgress = false;
+      if (!attempt.artifactTransfer && this.attempts.get(run.attempt_id) === attempt) {
+        this.clearAttempt(run.attempt_id);
       }
-      await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-      this.clearAttempt(run.attempt_id);
     }
   }
 
@@ -1833,6 +2211,12 @@ export class AgentJobExecutor {
       return;
     }
     attempt.cancelSignal.cancelled = true;
+    this.cancelSourcePreparation(attempt, new Error('Job cancelled during source preparation'));
+    if (attempt.leaseCleanup) {
+      attempt.leaseCleanup.cancellation.abort(new Error('job cancelled'));
+      await attempt.leaseCleanup.task;
+      return;
+    }
     if (attempt.activeProcessKill) {
       await attempt.activeProcessKill(cancel.grace_seconds);
       return;
@@ -1842,37 +2226,23 @@ export class AgentJobExecutor {
     if (attempt.runInProgress) {
       return;
     }
-
-    // Unblock prepare waiting on bundle_download.
-    if (attempt.pendingBundleDownload?.attemptId === cancel.attempt_id) {
-      clearTimeout(attempt.pendingBundleDownload.timer);
-      const pending = attempt.pendingBundleDownload;
-      attempt.pendingBundleDownload = null;
-      pending.reject(new Error('cancelled'));
-    }
-
-    const attemptDir = join(this.config.stateDir, 'workspaces', cancel.attempt_id);
-    const projectPath = join(attemptDir, 'project');
-    if (attempt.overlayRepoUrl) {
-      await this.mirrorManager
-        .removeWorktree(attempt.overlayRepoUrl, projectPath)
-        .catch(() => undefined);
-    }
-    await rm(attemptDir, { recursive: true, force: true }).catch(() => undefined);
-
-    // In-flight prepare (before source_ready): prepare observes cancelSignal / bundle reject.
-    if (attempt.prepare && !attempt.prepareReady) {
+    if (attempt.prepareTask && !attempt.prepareReady) {
+      await attempt.prepareTask;
       return;
     }
 
     // Lease reserved, prepare ready (or not started) — free the slot now.
-    this.sendCancelledTerminal(
-      cancel.attempt_id,
-      cancel.lease_id,
-      cancel.lease_epoch,
-      cancel.reason ?? 'Job cancelled before process start',
-    );
-    this.clearAttempt(cancel.attempt_id);
+    try {
+      this.sendCancelledTerminal(
+        cancel.attempt_id,
+        cancel.lease_id,
+        cancel.lease_epoch,
+        cancel.reason ?? 'Job cancelled before process start',
+      );
+    } finally {
+      await this.cleanupSourceWorkspace(attempt);
+      this.clearAttempt(cancel.attempt_id);
+    }
   }
 
   private requestArtifactUploadTokens(
@@ -1889,7 +2259,7 @@ export class AgentJobExecutor {
   ): Promise<ArtifactUploadGrantPayload> {
     return new Promise((resolve, reject) => {
       const attempt = this.attempts.get(attemptId);
-      if (!attempt) {
+      if (!attempt || this.socket.readyState !== this.socket.OPEN) {
         reject(new Error('attempt not active for artifact upload'));
         return;
       }
@@ -1912,55 +2282,68 @@ export class AgentJobExecutor {
         artifacts,
         ...(collection ? { collection } : {}),
       };
-      this.sendFrame(
-        'artifact_manifest',
-        attemptId,
-        leaseId,
-        leaseEpoch,
-        manifest as unknown as Record<string, unknown>,
-      );
+      try {
+        this.sendFrame(
+          'artifact_manifest',
+          attemptId,
+          leaseId,
+          leaseEpoch,
+          manifest as unknown as Record<string, unknown>,
+        );
+      } catch (error) {
+        clearTimeout(timer);
+        attempt.pendingArtifactUpload = null;
+        reject(error);
+      }
     });
   }
 
-  private downloadSnapshotFile(
+  private async downloadSnapshotFile(
     downloadUrl: string,
     dataToken: string,
     destPath: string,
     expectedSize: number,
     expectedSha256: string,
+    attemptSignal: AbortSignal,
   ): Promise<void> {
-    return new Promise<void>((resolvePromise, rejectPromise) => {
-      const req = httpsRequest(
-        downloadUrl,
-        {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${dataToken}`,
+    attemptSignal.throwIfAborted();
+    const deadline = new AbortController();
+    const signal = AbortSignal.any([attemptSignal, deadline.signal]);
+    const timer = setTimeout(
+      () => deadline.abort(new Error('Source download deadline exceeded')),
+      SOURCE_DOWNLOAD_TIMEOUT_MS,
+    );
+    timer.unref();
+
+    try {
+      const response = await new Promise<IncomingMessage>((resolve, reject) => {
+        const req = httpsRequest(
+          downloadUrl,
+          {
+            method: 'GET',
+            headers: { Authorization: `Bearer ${dataToken}` },
+            signal,
+            ...pinnedTlsRequestOptions(this.config.controllerFingerprint, signal),
           },
-          ...pinnedTlsRequestOptions(this.config.controllerFingerprint),
-        },
-        (res) => {
-          const pinError = assertPinnedPeerCert(res, this.config.controllerFingerprint);
-          if (pinError) {
-            res.resume();
-            rejectPromise(pinError);
-            return;
-          }
-          if (res.statusCode !== 200) {
-            rejectPromise(new Error(`Snapshot download failed with HTTP ${res.statusCode}`));
-            return;
-          }
-
-          void streamDownloadWithLimits(res, destPath, expectedSize, expectedSha256).then(
-            resolvePromise,
-            rejectPromise,
-          );
-        },
-      );
-
-      req.on('error', rejectPromise);
-      req.end();
-    });
+          resolve,
+        );
+        req.once('error', reject);
+        req.setTimeout(SOURCE_DOWNLOAD_IDLE_TIMEOUT_MS, () => {
+          deadline.abort(new Error('Source download stalled'));
+        });
+        req.end();
+      });
+      if (response.statusCode !== 200) {
+        response.destroy();
+        throw new Error(`Snapshot download failed with HTTP ${response.statusCode}`);
+      }
+      await streamDownloadWithLimits(response, destPath, expectedSize, expectedSha256, signal);
+    } catch (error) {
+      signal.throwIfAborted();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private uploadArtifactFile(
@@ -1968,44 +2351,41 @@ export class AgentJobExecutor {
     uploadToken: string,
     filePath: string,
     logicalName: string,
-    _sizeBytes: number,
+    sizeBytes: number,
     sha256: string,
   ): Promise<void> {
     return new Promise<void>((resolvePromise, rejectPromise) => {
-      void stat(filePath)
-        .then((info) => {
-          const req = httpsRequest(
-            uploadUrl,
-            {
-              method: 'PUT',
-              headers: {
-                Authorization: `Bearer ${uploadToken}`,
-                'Content-Length': info.size,
-                'X-RBO-SHA256': sha256,
-                'X-RBO-Artifact-Name': logicalName,
-              },
-              ...pinnedTlsRequestOptions(this.config.controllerFingerprint),
-            },
-            (res) => {
-              const pinError = assertPinnedPeerCert(res, this.config.controllerFingerprint);
-              if (pinError) {
-                res.resume();
-                rejectPromise(pinError);
-                return;
-              }
-              res.resume();
-              if (res.statusCode === 200) {
-                resolvePromise();
-              } else {
-                rejectPromise(new Error(`Artifact upload failed HTTP ${res.statusCode}`));
-              }
-            },
-          );
-
-          req.on('error', rejectPromise);
-          createReadStream(filePath).pipe(req);
-        })
-        .catch(rejectPromise);
+      const req = httpsRequest(
+        uploadUrl,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${uploadToken}`,
+            'Content-Length': sizeBytes,
+            'X-RBO-SHA256': sha256,
+            'X-RBO-Artifact-Name': logicalName,
+          },
+          signal: AbortSignal.timeout(ARTIFACT_UPLOAD_TIMEOUT_MS),
+          ...pinnedTlsRequestOptions(this.config.controllerFingerprint),
+        },
+        (res) => {
+          res.on('error', rejectPromise);
+          res.resume();
+          const status = res.statusCode ?? 0;
+          if (status === 200) {
+            resolvePromise();
+          } else {
+            const message = `Artifact upload failed HTTP ${status}`;
+            const retryable =
+              status === 0 || status >= 500 || status === 408 || status === 409 || status === 429;
+            rejectPromise(
+              retryable ? new Error(message) : new PermanentArtifactUploadError(message),
+            );
+          }
+        },
+      );
+      req.on('error', rejectPromise);
+      void pipeline(createReadStream(filePath), req).catch(rejectPromise);
     });
   }
 }

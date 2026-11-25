@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { rm } from 'node:fs/promises';
-import type { Readable } from 'node:stream';
+import { type Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 /**
  * Stream a readable body to destPath while enforcing declared size and sha256.
@@ -12,66 +13,35 @@ export async function streamDownloadWithLimits(
   destPath: string,
   expectedSize: number,
   expectedSha256: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const hasher = createHash('sha256');
-  const writeStream = createWriteStream(destPath);
   let sizeCounter = 0;
-  let limitExceeded = false;
+  const sizeError = () =>
+    new Error(`Downloaded size ${sizeCounter} mismatch with expected ${expectedSize}`);
+  const verify = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      sizeCounter += chunk.length;
+      if (sizeCounter > expectedSize) {
+        callback(sizeError());
+        return;
+      }
+      hasher.update(chunk);
+      callback(null, chunk);
+    },
+  });
 
   try {
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      let settled = false;
-      const settle = (fn: () => void) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        fn();
-      };
-
-      writeStream.on('finish', () => settle(resolvePromise));
-      writeStream.on('close', () => settle(resolvePromise));
-      writeStream.on('error', (err) => settle(() => rejectPromise(err)));
-
-      source.on('data', (chunk: Buffer) => {
-        if (limitExceeded) {
-          return;
-        }
-        sizeCounter += chunk.length;
-        if (sizeCounter > expectedSize) {
-          limitExceeded = true;
-          source.unpipe(writeStream);
-          source.destroy();
-          writeStream.destroy();
-          // destroy() may not emit finish/error; close settles the write Promise.
-          settle(resolvePromise);
-          return;
-        }
-        hasher.update(chunk);
-      });
-
-      source.on('error', (err) => settle(() => rejectPromise(err)));
-      source.pipe(writeStream);
-    });
-
-    if (limitExceeded) {
-      await rm(destPath, { force: true });
-      throw new Error(`Downloaded size ${sizeCounter} mismatch with expected ${expectedSize}`);
-    }
-
-    const sha256 = hasher.digest('hex');
+    await pipeline(source, verify, createWriteStream(destPath), { signal });
     if (sizeCounter !== expectedSize) {
-      await rm(destPath, { force: true });
-      throw new Error(`Downloaded size ${sizeCounter} mismatch with expected ${expectedSize}`);
+      throw sizeError();
     }
+    const sha256 = hasher.digest('hex');
     if (sha256 !== expectedSha256) {
-      await rm(destPath, { force: true });
       throw new Error(`Downloaded sha256 ${sha256} mismatch with expected ${expectedSha256}`);
     }
   } catch (err) {
-    if (!limitExceeded) {
-      await rm(destPath, { force: true });
-    }
+    await rm(destPath, { force: true });
     throw err;
   }
 }

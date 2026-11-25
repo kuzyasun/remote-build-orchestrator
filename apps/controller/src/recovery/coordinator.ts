@@ -2,12 +2,17 @@ import type { ReconcileDecisionPayload, RecoveryReportPayload } from '@rbo/proto
 import { createLogger, generateId, processIdentityFromPid } from '@rbo/shared';
 import type { WebSocket } from 'ws';
 import { getAgentLastBootId } from '../agents/registry.js';
+import { clearArtifactExpectations } from '../http/data-plane.js';
 import {
   ATTEMPT_OUTCOME_LOST,
   ATTEMPT_STATE_ORPHANED,
   type AttemptRow,
   getAttempt,
+  getJob,
   getJobRequest,
+  recordArtifactCollectionInterruption,
+  recordRemoteProcessExit,
+  runLifecycleTransaction,
   transitionAttemptState,
   transitionJobState,
   updateAttempt,
@@ -21,6 +26,47 @@ const logger = createLogger('controller.recovery');
 export const DEFAULT_DISCONNECT_GRACE_SECONDS = 60;
 export const DEFAULT_ORPHAN_TIMEOUT_SECONDS = 300;
 export const DEFAULT_RECONCILE_DEADLINE_SECONDS = 120;
+
+function hasExitedForArtifactCollection(attempt: Pick<AttemptRow, 'state' | 'outcome'>): boolean {
+  return (
+    attempt.outcome !== null &&
+    ['collecting_artifacts', ATTEMPT_STATE_ORPHANED].includes(attempt.state)
+  );
+}
+
+function canRecoverUnrecordedExit(attempt: AttemptRow): boolean {
+  return (
+    attempt.outcome === null &&
+    (attempt.state === 'running' || attempt.state === ATTEMPT_STATE_ORPHANED)
+  );
+}
+
+/** An interrupted transfer cannot replace the already recorded process result. */
+export function finalizeInterruptedArtifactCollection(
+  db: ControllerDatabase,
+  attempt: Pick<AttemptRow, 'id' | 'job_id' | 'state' | 'outcome'>,
+): boolean {
+  if (!attempt.outcome || !hasExitedForArtifactCollection(attempt)) {
+    return false;
+  }
+  const outcome = attempt.outcome;
+  const finished = nowIso();
+  runLifecycleTransaction(db, () => {
+    const exitCode = getJob(db, attempt.job_id)?.exit_code ?? null;
+    if (getJobRequest(db, attempt.job_id)?.artifacts?.length) {
+      recordArtifactCollectionInterruption(db, attempt.id);
+    }
+    transitionAttemptState(db, attempt.id, 'completed', { outcome, finished_at: finished });
+    transitionJobState(db, attempt.job_id, 'completed', {
+      outcome,
+      finished_at: finished,
+      result_json: JSON.stringify({ outcome, exit_code: exitCode }),
+    });
+  });
+  clearArtifactExpectations(attempt.id);
+  logger.warn('artifact collection ended before recovery completed', { attemptId: attempt.id });
+  return true;
+}
 
 export interface RecoveryCoordinatorOptions {
   db: ControllerDatabase;
@@ -48,6 +94,7 @@ export class RecoveryCoordinator {
   private readonly graceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly orphanTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly restartExitDeadlines = new Map<string, number>();
 
   constructor(options: RecoveryCoordinatorOptions) {
     this.db = options.db;
@@ -72,6 +119,7 @@ export class RecoveryCoordinator {
     this.graceTimers.clear();
     this.orphanTimers.clear();
     this.reconcileTimers.clear();
+    this.restartExitDeadlines.clear();
   }
 
   /**
@@ -86,14 +134,74 @@ export class RecoveryCoordinator {
       logger.info('reset stale agent states to offline on startup', { count: updated.changes });
     }
 
+    this.finishJobsWithCompletedAttempts();
     const rows = this.db
-      .prepare(`SELECT id FROM job_attempts WHERE state NOT IN ('completed')`)
-      .all() as Array<{ id: string }>;
+      .prepare(
+        `SELECT id, state, outcome, lease_deadline FROM job_attempts WHERE state <> 'completed'`,
+      )
+      .all() as Array<Pick<AttemptRow, 'id' | 'state' | 'outcome' | 'lease_deadline'>>;
 
+    const reconcileDeadline = new Date(Date.now() + this.reconcileSeconds * 1000).toISOString();
     for (const row of rows) {
+      // Startup reconciliation may outlast the previous Controller's lease.
+      // Extending a recorded exit can only restore artifact transfer authority.
+      if (
+        hasExitedForArtifactCollection(row) &&
+        (row.lease_deadline === null || row.lease_deadline < reconcileDeadline)
+      ) {
+        updateAttempt(this.db, row.id, { lease_deadline: reconcileDeadline });
+      }
       this.armReconcileDeadline(row.id);
     }
     logger.info('recovery coordinator armed reconcile deadlines', { count: rows.length });
+  }
+
+  private finishJobsWithCompletedAttempts(): void {
+    // Older Controllers could stop after persisting the attempt but before finalizing its job.
+    const rows = this.db
+      .prepare(
+        `SELECT jobs.id, jobs.state, jobs.exit_code, jobs.failure_category, jobs.failure_message,
+                attempts.outcome, attempts.finished_at
+         FROM jobs JOIN job_attempts AS attempts ON attempts.id = (
+           SELECT id FROM job_attempts WHERE job_id = jobs.id ORDER BY ordinal DESC LIMIT 1
+         )
+         WHERE jobs.state IN ('leasing', 'leased', 'preparing_source', 'transferring_source',
+                              'materializing', 'starting', 'running', 'orphaned',
+                              'collecting_artifacts', 'cleaning')
+           AND attempts.agent_id IS NOT NULL AND attempts.state = 'completed'
+           AND attempts.outcome IS NOT NULL`,
+      )
+      .all() as Array<{
+      id: string;
+      state: string;
+      exit_code: number | null;
+      failure_category: string | null;
+      failure_message: string | null;
+      outcome: string;
+      finished_at: string | null;
+    }>;
+    for (const {
+      id,
+      state,
+      exit_code,
+      failure_category,
+      failure_message,
+      outcome,
+      finished_at,
+    } of rows) {
+      const hadProcessResult = state === 'collecting_artifacts' || state === 'cleaning';
+      transitionJobState(this.db, id, 'completed', {
+        outcome,
+        finished_at: finished_at ?? nowIso(),
+        result_json: JSON.stringify({ outcome, exit_code }),
+        failure_category: hadProcessResult
+          ? failure_category
+          : (failure_category ?? 'agent_disconnected'),
+        failure_message: hadProcessResult
+          ? failure_message
+          : (failure_message ?? 'Remote attempt ended before the Controller finalized its job'),
+      });
+    }
   }
 
   /**
@@ -105,7 +213,7 @@ export class RecoveryCoordinator {
   onAgentDisconnect(agentId: string): void {
     const attempts = this.db
       .prepare(
-        `SELECT id, job_id, state, process_identity FROM job_attempts
+        `SELECT id, job_id, state, process_identity, lease_deadline FROM job_attempts
          WHERE agent_id = ? AND state NOT IN ('completed')`,
       )
       .all(agentId) as Array<{
@@ -113,6 +221,7 @@ export class RecoveryCoordinator {
       job_id: string;
       state: string;
       process_identity: string | null;
+      lease_deadline: string | null;
     }>;
 
     for (const att of attempts) {
@@ -122,10 +231,14 @@ export class RecoveryCoordinator {
         continue;
       }
 
-      // Extend lease so expireStaleLeases does not race grace/orphan windows.
+      // Keep a valid lease alive through grace/orphan windows. A disconnect
+      // cannot reopen an already expired lease.
       const extendMs = (this.graceSeconds + this.orphanSeconds + 30) * 1000;
-      const deadline = new Date(Date.now() + extendMs).toISOString();
-      updateAttempt(this.db, att.id, { lease_deadline: deadline });
+      const now = Date.now();
+      const leaseDeadline = Date.parse(att.lease_deadline ?? '');
+      if (leaseDeadline > now && leaseDeadline < now + extendMs) {
+        updateAttempt(this.db, att.id, { lease_deadline: new Date(now + extendMs).toISOString() });
+      }
 
       this.clearTimer(this.graceTimers, att.id);
       const timer = this.setTimeoutFn(() => {
@@ -143,14 +256,18 @@ export class RecoveryCoordinator {
 
   /**
    * Agent (re)connected and reported a `boot_id` (process marker). When it differs from the last
-   * known value the Agent process restarted, so every in-flight attempt pinned to it is leaked
-   * (the Agent no longer runs it). Fail them immediately as `lost` rather than waiting for the
-   * grace/orphan timers. A matching (or absent) boot_id means a network reconnect with a live
-   * executor or an older Agent — leave attempts untouched.
+   * known value the Agent process restarted. Attempts that were still executing are lost;
+   * completed processes can recover artifact transfers from persisted staging.
+   * A declared pending exit reserves a bounded window for its artifact-only report.
+   * A matching or absent boot_id leaves attempts untouched.
    *
    * `updateAgentCapabilities` (called by the WS layer right after this) persists the new boot_id.
    */
-  onAgentConnect(agentId: string, bootId: string | undefined): void {
+  onAgentConnect(
+    agentId: string,
+    bootId: string | undefined,
+    pendingProcessExitAttemptIds: string[] = [],
+  ): void {
     if (bootId === undefined) {
       // Older Agent without boot_id: no restart detection (grace/orphan timers remain as fallback).
       return;
@@ -168,16 +285,43 @@ export class RecoveryCoordinator {
       )
       .all(agentId) as Array<{ id: string; job_id: string; state: string }>;
 
+    const pendingExits = new Set(pendingProcessExitAttemptIds);
+    let swept = 0;
     for (const att of attempts) {
       const attempt = getAttempt(this.db, att.id);
       if (attempt && attempt.state !== 'completed') {
+        if (
+          hasExitedForArtifactCollection(attempt) &&
+          Date.parse(attempt.lease_deadline ?? '') > Date.now()
+        ) {
+          this.clearAllTimersFor(attempt.id);
+          this.armReconcileDeadline(attempt.id);
+          continue;
+        }
+        const leaseDeadline = Date.parse(attempt.lease_deadline ?? '');
+        if (
+          pendingExits.has(attempt.id) &&
+          canRecoverUnrecordedExit(attempt) &&
+          leaseDeadline > Date.now()
+        ) {
+          const deadline = Math.min(
+            leaseDeadline,
+            Date.now() + this.reconcileSeconds * 1000,
+            this.restartExitDeadlines.get(attempt.id) ?? Number.POSITIVE_INFINITY,
+          );
+          this.clearAllTimersFor(attempt.id);
+          this.restartExitDeadlines.set(attempt.id, deadline);
+          this.armReconcileDeadline(attempt.id, deadline - Date.now());
+          continue;
+        }
         this.markLost(attempt);
+        swept++;
       }
     }
 
     logger.info('agent restart detected, swept leaked attempts', {
       agentId,
-      swept: attempts.length,
+      swept,
       bootId,
       lastBootId,
     });
@@ -218,14 +362,26 @@ export class RecoveryCoordinator {
    * Authenticated Agent recovery_report. Returns the decision payload (also sent on WS).
    */
   onRecoveryReport(agentId: string, payload: RecoveryReportPayload): ReconcileDecisionPayload {
-    this.clearTimer(this.reconcileTimers, payload.attempt_id);
-    this.clearTimer(this.graceTimers, payload.attempt_id);
-    this.clearTimer(this.orphanTimers, payload.attempt_id);
-
     const attempt = getAttempt(this.db, payload.attempt_id);
+    const restartDeadline = this.restartExitDeadlines.get(payload.attempt_id);
+    const ownsLease =
+      attempt?.agent_id === agentId &&
+      attempt.lease_id === payload.lease_id &&
+      attempt.lease_epoch === payload.lease_epoch;
+    const leaseIsLive = Date.parse(attempt?.lease_deadline ?? '') > Date.now();
 
-    // Fail closed: never adopt until job_started has persisted process_identity.
-    if (attempt && attempt.state !== 'completed' && !attempt.process_identity) {
+    // Live recovery still requires job_started to have persisted a process identity.
+    if (
+      attempt &&
+      ownsLease &&
+      leaseIsLive &&
+      attempt.state !== 'completed' &&
+      !attempt.process_identity &&
+      payload.status !== 'completed_awaiting_upload' &&
+      !hasExitedForArtifactCollection(attempt) &&
+      restartDeadline === undefined
+    ) {
+      this.clearAllTimersFor(attempt.id);
       updateAttempt(this.db, attempt.id, { last_reconcile_at: nowIso() });
       this.rearmOrphanWatchdog(attempt.id);
       logger.info('recovery_report deferred pending process_identity', {
@@ -241,20 +397,20 @@ export class RecoveryCoordinator {
       };
     }
 
-    const decision = this.decide(agentId, attempt, payload);
-    if (decision.reason !== 'process_identity_pending') {
-      this.sendReconcileDecision(agentId, decision);
-    }
+    const decision = this.decide(agentId, attempt, payload, restartDeadline);
 
     if (decision.action === 'adopt' && attempt) {
-      const nextState =
-        payload.status === 'completed_awaiting_upload' ? 'collecting_artifacts' : 'running';
+      const artifactOnly = payload.status === 'completed_awaiting_upload';
+      if (artifactOnly && payload.process_exit) {
+        recordRemoteProcessExit(this.db, attempt, payload.process_exit);
+      }
       updateAttempt(this.db, attempt.id, {
-        state: nextState,
+        state: artifactOnly ? 'collecting_artifacts' : 'running',
         orphaned_at: null,
         last_reconcile_at: nowIso(),
-        process_identity: payload.process_identity,
+        ...(artifactOnly ? {} : { process_identity: payload.process_identity }),
       });
+      this.clearAllTimersFor(attempt.id);
       logger.info('attempt adopted', {
         attemptId: attempt.id,
         agentId,
@@ -266,17 +422,18 @@ export class RecoveryCoordinator {
         agentId,
         reason: decision.reason,
       });
-      if (attempt && attempt.state !== 'completed') {
-        if (decision.reason === 'agent_mismatch') {
-          // Another agent owns this attempt — do not fail it; keep orphan watchdog.
-          updateAttempt(this.db, attempt.id, { last_reconcile_at: nowIso() });
-          this.rearmOrphanWatchdog(attempt.id);
-        } else {
-          this.markTerminateStaleFailed(attempt, decision.reason);
-        }
+      if (
+        attempt &&
+        attempt.state !== 'completed' &&
+        ownsLease &&
+        leaseIsLive &&
+        decision.reason !== 'lease_expired'
+      ) {
+        this.markTerminateStaleFailed(attempt, decision.reason);
       }
     }
 
+    this.sendReconcileDecision(agentId, decision);
     return decision;
   }
 
@@ -284,6 +441,7 @@ export class RecoveryCoordinator {
     agentId: string,
     attempt: AttemptRow | null,
     payload: RecoveryReportPayload,
+    restartDeadline: number | undefined,
   ): ReconcileDecisionPayload {
     if (!attempt || attempt.state === 'completed') {
       return {
@@ -305,22 +463,57 @@ export class RecoveryCoordinator {
       };
     }
 
-    if (
-      attempt.lease_id !== payload.lease_id ||
-      attempt.lease_epoch !== payload.lease_epoch ||
-      attempt.process_identity !== payload.process_identity
-    ) {
+    if (attempt.lease_id !== payload.lease_id || attempt.lease_epoch !== payload.lease_epoch) {
       return {
         attempt_id: payload.attempt_id,
         lease_id: payload.lease_id,
         lease_epoch: payload.lease_epoch,
         action: 'terminate_stale',
-        reason:
-          attempt.lease_epoch !== payload.lease_epoch
-            ? 'newer_epoch'
-            : attempt.lease_id !== payload.lease_id
-              ? 'lease_mismatch'
-              : 'process_identity_mismatch',
+        reason: attempt.lease_epoch !== payload.lease_epoch ? 'newer_epoch' : 'lease_mismatch',
+      };
+    }
+
+    const artifactOnly = payload.status === 'completed_awaiting_upload';
+    const exited = hasExitedForArtifactCollection(attempt);
+    let reason: string | undefined;
+    if (artifactOnly) {
+      const deadline = Math.min(
+        Date.parse(attempt.lease_deadline ?? ''),
+        restartDeadline ?? Number.POSITIVE_INFINITY,
+      );
+      if (
+        !exited &&
+        (!payload.process_exit ||
+          !payload.artifact_upload_pending ||
+          !canRecoverUnrecordedExit(attempt) ||
+          getJob(this.db, attempt.job_id)?.state !== 'running')
+      ) {
+        reason = 'process_exit_not_recorded';
+      } else if (!(deadline > Date.now())) {
+        reason = 'lease_expired';
+      } else if (
+        !exited &&
+        attempt.process_identity &&
+        attempt.process_identity !== payload.process_identity
+      ) {
+        reason = 'process_identity_mismatch';
+      }
+    } else if (restartDeadline !== undefined) {
+      reason = 'agent_restarted';
+    } else if (exited) {
+      reason = 'process_already_exited';
+    } else if (!(Date.parse(attempt.lease_deadline ?? '') > Date.now())) {
+      reason = 'lease_expired';
+    } else if (attempt.process_identity !== payload.process_identity) {
+      reason = 'process_identity_mismatch';
+    }
+    if (reason) {
+      return {
+        attempt_id: attempt.id,
+        lease_id: attempt.lease_id,
+        lease_epoch: attempt.lease_epoch,
+        action: 'terminate_stale',
+        reason,
       };
     }
 
@@ -333,7 +526,7 @@ export class RecoveryCoordinator {
     };
   }
 
-  private armReconcileDeadline(attemptId: string): void {
+  private armReconcileDeadline(attemptId: string, delayMs = this.reconcileSeconds * 1000): void {
     this.clearTimer(this.reconcileTimers, attemptId);
     const timer = this.setTimeoutFn(() => {
       this.reconcileTimers.delete(attemptId);
@@ -342,53 +535,57 @@ export class RecoveryCoordinator {
         return;
       }
       this.markLost(attempt);
-    }, this.reconcileSeconds * 1000);
+    }, delayMs);
     this.reconcileTimers.set(attemptId, timer);
   }
 
   private markPreStartLost(attemptId: string, jobId: string): void {
-    this.clearAllTimersFor(attemptId);
     const finished = nowIso();
     // Phase 3 forbade auto-retry: fail without requeue / new attempt.
-    transitionAttemptState(this.db, attemptId, 'completed', {
-      outcome: 'failed',
-      finished_at: finished,
+    runLifecycleTransaction(this.db, () => {
+      transitionAttemptState(this.db, attemptId, 'completed', {
+        outcome: 'failed',
+        finished_at: finished,
+      });
+      transitionJobState(this.db, jobId, 'completed', {
+        outcome: 'failed',
+        finished_at: finished,
+        failure_category: 'agent_disconnected',
+        failure_message: 'Agent disconnected before script start',
+      });
     });
-    transitionJobState(this.db, jobId, 'completed', {
-      outcome: 'failed',
-      finished_at: finished,
-      failure_category: 'agent_disconnected',
-      failure_message: 'Agent disconnected before script start',
-    });
+    this.clearAllTimersFor(attemptId);
     logger.info('pre-start disconnect marked failed', { attemptId, jobId });
   }
 
   /**
-   * Fence mismatch / unknown claim → terminal failed so the attempt cannot sit
-   * forever in orphaned after timers were cleared by onRecoveryReport.
+   * End the current lease when its owner's recovery report cannot be accepted.
    */
   private markTerminateStaleFailed(attempt: AttemptRow, reason: string | undefined): void {
-    this.clearAllTimersFor(attempt.id);
+    if (finalizeInterruptedArtifactCollection(this.db, attempt)) {
+      this.clearAllTimersFor(attempt.id);
+      return;
+    }
     const finished = nowIso();
-    const failureCategory = reason === 'newer_epoch' ? 'lease_expired' : 'agent_lost';
-    const failureMessage =
-      reason === 'newer_epoch'
-        ? 'Stale recovery_report rejected (newer lease epoch)'
-        : `Stale recovery_report rejected (${reason ?? 'terminate_stale'})`;
-    transitionAttemptState(this.db, attempt.id, 'completed', {
-      outcome: 'failed',
-      finished_at: finished,
+    const failureCategory = 'agent_lost';
+    const failureMessage = `Stale recovery_report rejected (${reason ?? 'terminate_stale'})`;
+    runLifecycleTransaction(this.db, () => {
+      transitionAttemptState(this.db, attempt.id, 'completed', {
+        outcome: 'failed',
+        finished_at: finished,
+      });
+      updateAttempt(this.db, attempt.id, {
+        orphaned_at: null,
+        last_reconcile_at: finished,
+      });
+      transitionJobState(this.db, attempt.job_id, 'completed', {
+        outcome: 'failed',
+        finished_at: finished,
+        failure_category: failureCategory,
+        failure_message: failureMessage,
+      });
     });
-    updateAttempt(this.db, attempt.id, {
-      orphaned_at: null,
-      last_reconcile_at: finished,
-    });
-    transitionJobState(this.db, attempt.job_id, 'completed', {
-      outcome: 'failed',
-      finished_at: finished,
-      failure_category: failureCategory,
-      failure_message: failureMessage,
-    });
+    this.clearAllTimersFor(attempt.id);
     logger.info('terminate_stale marked attempt failed', {
       attemptId: attempt.id,
       reason,
@@ -421,22 +618,29 @@ export class RecoveryCoordinator {
   }
 
   private markLost(attempt: AttemptRow): void {
-    this.clearAllTimersFor(attempt.id);
+    if (finalizeInterruptedArtifactCollection(this.db, attempt)) {
+      this.clearAllTimersFor(attempt.id);
+      return;
+    }
     const finished = nowIso();
-    transitionAttemptState(this.db, attempt.id, 'completed', {
-      outcome: ATTEMPT_OUTCOME_LOST,
-      finished_at: finished,
+    runLifecycleTransaction(this.db, () => {
+      transitionAttemptState(this.db, attempt.id, 'completed', {
+        outcome: ATTEMPT_OUTCOME_LOST,
+        finished_at: finished,
+      });
+      transitionJobState(this.db, attempt.job_id, 'completed', {
+        outcome: ATTEMPT_OUTCOME_LOST,
+        finished_at: finished,
+        failure_category: 'agent_disconnected',
+        failure_message: 'Attempt lost during disconnect / restart reconciliation',
+      });
     });
-    transitionJobState(this.db, attempt.job_id, 'completed', {
-      outcome: ATTEMPT_OUTCOME_LOST,
-      finished_at: finished,
-      failure_category: 'agent_disconnected',
-      failure_message: 'Attempt lost during disconnect / restart reconciliation',
-    });
+    this.clearAllTimersFor(attempt.id);
     logger.info('attempt marked lost', { attemptId: attempt.id });
   }
 
   private clearAllTimersFor(attemptId: string): void {
+    this.restartExitDeadlines.delete(attemptId);
     this.clearTimer(this.graceTimers, attemptId);
     this.clearTimer(this.orphanTimers, attemptId);
     this.clearTimer(this.reconcileTimers, attemptId);

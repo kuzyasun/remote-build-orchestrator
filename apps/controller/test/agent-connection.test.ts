@@ -1,13 +1,26 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { once } from 'node:events';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureControllerIdentity, signNonce } from '@rbo/shared';
 import type { ControllerIdentity } from '@rbo/shared';
 import { createMockAgentCapability } from '@rbo/testing';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import { AgentConnection } from '../../agent/src/connection/client.js';
+import type { AgentJobExecutor } from '../../agent/src/executor/index.js';
+import { writeAttemptMetadata } from '../../agent/src/recovery/attempt-metadata.js';
+import { AgentRecoveryCoordinator } from '../../agent/src/recovery/coordinator.js';
+import { requestAgentProbe } from '../src/agents/probe.js';
 import { listAgents } from '../src/agents/service.js';
+import { handleAdminRequest } from '../src/http/admin.js';
+import {
+  createAttempt,
+  createJob,
+  getAttempt,
+  getJob,
+  updateAttempt,
+} from '../src/jobs/lifecycle.js';
 import { approvePairingRequest, listPairingRequests } from '../src/security/pairing.js';
 import { migrateToLatest, openDatabase } from '../src/storage/database.js';
 import type { ControllerDatabase } from '../src/storage/database.js';
@@ -46,13 +59,13 @@ function latestPendingRequest() {
   return pending[pending.length - 1];
 }
 
-function agentConnection(stateDir: string, fingerprint?: string): AgentConnection {
+function agentConnection(stateDir: string, fingerprint?: string, bootId?: string): AgentConnection {
   return new AgentConnection({
     controllerUrl: `wss://127.0.0.1:${plane.port}/agent`,
     expectedFingerprint: fingerprint ?? identity.fingerprint,
     stateDir,
     displayName: 'test-agent',
-    capabilities: createMockAgentCapability({ display_name: 'test-agent' }),
+    capabilities: createMockAgentCapability({ display_name: 'test-agent', boot_id: bootId }),
     gitAllowlist: { schemes: ['https', 'ssh'], hosts: ['github.com'] },
   });
 }
@@ -107,10 +120,17 @@ describe('Agent pairing over TLS WebSocket', () => {
     const { agentId } = approvePairingRequest(db, identity, request.id);
     const session = await conn.connectOnce();
     expect(session.status).toBe('authenticated');
-    conn.close();
 
-    const { revokeAgent } = await import('../src/agents/registry.js');
-    revokeAgent(db, agentId);
+    const disconnected = conn.waitUntilDisconnected();
+    await handleAdminRequest({ db, connectedAgents: plane.connectedAgents }, 'agents/revoke', {
+      agent_id: agentId,
+    });
+    await disconnected;
+    await vi.waitFor(() => expect(plane.connectedAgents.has(agentId)).toBe(false));
+    expect(db.prepare('SELECT state FROM agents WHERE id = ?').get(agentId)).toEqual({
+      state: 'revoked',
+    });
+    conn.close();
 
     const conn2 = agentConnection(dir);
     const denied = await conn2.connectOnce();
@@ -157,6 +177,247 @@ describe('Agent pairing over TLS WebSocket', () => {
     expect(persisted.devicePrivateKeyPem).toMatch(/BEGIN PRIVATE KEY/);
 
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('defers refresh and lease renewal while scanning for durable exits on a new session', async () => {
+    const dir = newAgentDir();
+    const original = agentConnection(dir, undefined, 'boot_old');
+    const reconnect = agentConnection(dir, undefined, 'boot_new');
+    const unblockScan = Promise.withResolvers<void>();
+    const originalReportAll = AgentRecoveryCoordinator.prototype.reportAll;
+    const scan = vi.spyOn(AgentRecoveryCoordinator.prototype, 'reportAll');
+    try {
+      await original.connectOnce();
+      const request = latestPendingRequest();
+      if (!request) throw new Error('Missing pairing fixture');
+      const { agentId } = approvePairingRequest(db, identity, request.id);
+      await original.connectOnce();
+      await vi.waitFor(() =>
+        expect(plane.connectedAgents.get(agentId)?.capabilitiesReady).toBe(true),
+      );
+      original.close();
+      await vi.waitFor(() => expect(plane.connectedAgents.has(agentId)).toBe(false));
+
+      const job = createJob(db, {
+        clientId: 'test',
+        clientRequestId: 'req_deferred_capabilities',
+        initialState: 'running',
+        request: {
+          client_request_id: 'req_deferred_capabilities',
+          source: { project_root: dir, cwd: '.' },
+          execution: { script: 'echo done' },
+        },
+      });
+      const attempt = createAttempt(db, job.id, 1);
+      const deadline = new Date(Date.now() + 45_000).toISOString();
+      updateAttempt(db, attempt.id, {
+        agent_id: agentId,
+        state: 'running',
+        lease_deadline: deadline,
+      });
+      writeAttemptMetadata(dir, {
+        attempt_id: attempt.id,
+        job_id: job.id,
+        lease_id: attempt.lease_id,
+        lease_epoch: attempt.lease_epoch,
+        process_identity: null,
+        status: 'completed_awaiting_upload',
+        workspace_path: null,
+        spool_dir: join(dir, 'logs', attempt.id),
+        risk_level: 'normal',
+        updated_at: new Date().toISOString(),
+        last_exit: { exit_code: 0, outcome: 'succeeded' },
+        artifact_staging: 'complete',
+        artifact_manifest: [],
+        cleanup_result: { exit_code: 0, timed_out: false },
+      });
+
+      scan.mockImplementationOnce(async function (this: AgentRecoveryCoordinator, beforeReports) {
+        await unblockScan.promise;
+        await originalReportAll.call(this, beforeReports);
+      });
+      const connecting = reconnect.connectOnce();
+      await vi.waitFor(() =>
+        expect(plane.connectedAgents.get(agentId)?.capabilitiesReady).toBe(false),
+      );
+      await vi.waitFor(() => expect(scan).toHaveBeenCalledTimes(2));
+      const socket = (reconnect as unknown as { socket: WebSocket }).socket;
+      const receivedProbe = once(socket, 'message');
+      expect(requestAgentProbe(plane.connectedAgents, agentId)).toEqual({ requested: true });
+      await receivedProbe;
+      socket.send(JSON.stringify({ type: 'heartbeat', payload: { state: 'busy' } }));
+      const pong = once(socket, 'pong');
+      socket.ping();
+      await pong;
+
+      expect(plane.connectedAgents.get(agentId)?.capabilitiesReady).toBe(false);
+      expect(getAttempt(db, attempt.id)).toMatchObject({
+        state: 'running',
+        outcome: null,
+        lease_deadline: deadline,
+      });
+
+      unblockScan.resolve();
+      await expect(connecting).resolves.toMatchObject({ status: 'authenticated', agentId });
+      await vi.waitFor(() =>
+        expect(getJob(db, job.id)).toMatchObject({ state: 'completed', outcome: 'succeeded' }),
+      );
+    } finally {
+      scan.mockRestore();
+      unblockScan.resolve();
+      original.close();
+      reconnect.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('confirms SQLite renewals once per heartbeat, including a delayed acknowledgement', async () => {
+    const dir = newAgentDir();
+    const conn = agentConnection(dir);
+    try {
+      await conn.connectOnce();
+      const { agentId } = approvePairingRequest(db, identity, latestPendingRequest().id);
+      await expect(conn.connectOnce()).resolves.toMatchObject({ status: 'authenticated', agentId });
+      const { socket, executor } = conn as unknown as {
+        socket: WebSocket;
+        executor: AgentJobExecutor;
+      };
+      const controllerSocket = plane.connectedAgents.get(agentId)?.socket;
+      if (!controllerSocket) throw new Error('missing connected agent');
+
+      // Drain the initial heartbeat before instrumenting subsequent exchanges.
+      const pong = once(socket, 'pong');
+      socket.ping();
+      await pong;
+
+      const requestId = 'req_heartbeat_ack';
+      const job = createJob(db, {
+        clientId: 'test',
+        clientRequestId: requestId,
+        initialState: 'running',
+        request: {
+          client_request_id: requestId,
+          source: { project_root: dir, cwd: '.' },
+          execution: { script: 'echo done' },
+        },
+      });
+      const current = createAttempt(db, job.id, 1);
+      const expired = createAttempt(db, job.id, 2);
+      const completed = createAttempt(db, job.id, 3);
+      const unassigned = createAttempt(db, job.id, 4);
+      const longer = createAttempt(db, job.id, 5);
+      const liveDeadline = new Date(Date.now() + 60_000).toISOString();
+      const expiredDeadline = new Date(Date.now() - 5_000).toISOString();
+      const longerDeadline = new Date(Date.now() + 900_000).toISOString();
+      updateAttempt(db, current.id, {
+        agent_id: agentId,
+        state: 'running',
+        lease_deadline: liveDeadline,
+      });
+      updateAttempt(db, expired.id, {
+        agent_id: agentId,
+        state: 'running',
+        lease_deadline: expiredDeadline,
+      });
+      updateAttempt(db, completed.id, {
+        agent_id: agentId,
+        state: 'completed',
+        lease_deadline: liveDeadline,
+      });
+      updateAttempt(db, unassigned.id, { state: 'running', lease_deadline: liveDeadline });
+      updateAttempt(db, longer.id, {
+        agent_id: agentId,
+        state: 'running',
+        lease_deadline: longerDeadline,
+      });
+
+      const confirm = vi.spyOn(executor, 'confirmLeaseRenewal');
+      const responses: string[] = [];
+      const transmit = controllerSocket.send.bind(controllerSocket);
+      const capture = vi.spyOn(controllerSocket, 'send').mockImplementation((frame) => {
+        responses.push(String(frame));
+      });
+      const heartbeat = conn as unknown as { sendHeartbeat(socket: WebSocket): void };
+      try {
+        heartbeat.sendHeartbeat(socket);
+        await vi.waitFor(() => expect(responses).toHaveLength(1));
+        expect(confirm).not.toHaveBeenCalled();
+        expect(Date.parse(getAttempt(db, current.id)?.lease_deadline ?? '')).toBeGreaterThan(
+          Date.parse(liveDeadline),
+        );
+        expect(getAttempt(db, expired.id)?.lease_deadline).toBe(expiredDeadline);
+        expect(getAttempt(db, completed.id)?.lease_deadline).toBe(liveDeadline);
+        expect(getAttempt(db, unassigned.id)?.lease_deadline).toBe(liveDeadline);
+        expect(getAttempt(db, longer.id)?.lease_deadline).toBe(longerDeadline);
+
+        const secondSendAt = Date.now();
+        heartbeat.sendHeartbeat(socket);
+        await vi.waitFor(() => expect(responses).toHaveLength(2));
+        const delayedReceived = once(socket, 'message');
+        transmit(responses[0]);
+        await delayedReceived;
+        expect(confirm).toHaveBeenCalledTimes(1);
+
+        transmit(responses[1]);
+        await vi.waitFor(() => expect(confirm).toHaveBeenCalledTimes(2));
+        expect(confirm).toHaveBeenNthCalledWith(
+          1,
+          expect.objectContaining({
+            lease_ttl_seconds: 300,
+            renewed_leases: expect.arrayContaining(
+              [current, longer].map((attempt) => ({
+                attempt_id: attempt.id,
+                lease_id: attempt.lease_id,
+                lease_epoch: attempt.lease_epoch,
+              })),
+            ),
+          }),
+          expect.objectContaining({ epochMs: expect.any(Number), monotonicMs: expect.any(Number) }),
+        );
+        const [[firstAck, firstClock], [secondAck, secondClock]] = confirm.mock.calls;
+        expect(firstAck.renewed_leases).toHaveLength(2);
+        expect(secondAck.renewed_leases).toEqual(firstAck.renewed_leases);
+        expect(firstAck.heartbeat_message_id).not.toBe(secondAck.heartbeat_message_id);
+        expect(firstClock.monotonicMs).toBeLessThan(secondClock.monotonicMs);
+        expect(secondClock.epochMs).toBeGreaterThanOrEqual(secondSendAt);
+
+        const replayReceived = once(socket, 'message');
+        transmit(responses[0]);
+        await replayReceived;
+        expect(confirm).toHaveBeenCalledTimes(2);
+      } finally {
+        capture.mockRestore();
+        confirm.mockRestore();
+      }
+    } finally {
+      conn.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries authentication after an unreadable recovery directory', async () => {
+    const dir = newAgentDir();
+    const conn = agentConnection(dir);
+    try {
+      await conn.connectOnce();
+      const request = latestPendingRequest();
+      if (!request) throw new Error('Missing pairing fixture');
+      const { agentId } = approvePairingRequest(db, identity, request.id);
+
+      // The attempts path being a file makes the directory scan fail on every platform.
+      const attemptsPath = join(dir, 'attempts');
+      writeFileSync(attemptsPath, '');
+      await expect(conn.connectOnce()).rejects.toThrow(
+        'Could not prepare initial Agent capabilities',
+      );
+      await vi.waitFor(() => expect(plane.connectedAgents.has(agentId)).toBe(false));
+
+      rmSync(attemptsPath);
+      await expect(conn.connectOnce()).resolves.toMatchObject({ status: 'authenticated', agentId });
+    } finally {
+      conn.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('keeps the new session when the agent reconnects and the old socket closes', async () => {

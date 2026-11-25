@@ -262,6 +262,27 @@ describe('daemon helpers', () => {
     expect(existsSync(logFile)).toBe(true);
   });
 
+  it('can start when a live PID in the marker belongs to a different program', async () => {
+    const base = await tempDir('rbo-cli-daemon-reused-pid-');
+    const pidFile = controllerPidPath(base);
+    await mkdir(join(base, 'run'), { recursive: true });
+    await writeFile(pidFile, `${process.pid}\n`, 'utf8');
+    const spawn = vi.fn(() => ({ pid: 4242, unref: vi.fn(), on: vi.fn() }));
+
+    await expect(
+      spawnDetachedDaemon({
+        command: process.execPath,
+        args: ['script.js', 'controller', 'start'],
+        role: 'controller',
+        pidFile,
+        logFile: controllerLogPath(base),
+        listProcesses: async () => [{ pid: process.pid, commandLine: 'node test-runner.js' }],
+        spawn,
+      }),
+    ).resolves.toBe(4242);
+    expect(spawn).toHaveBeenCalledOnce();
+  });
+
   it('spawnDetachedDaemon rejects when spawn emits error', async () => {
     const base = await tempDir('rbo-cli-daemon-err-');
     const pidFile = join(base, 'run', 'test.pid');

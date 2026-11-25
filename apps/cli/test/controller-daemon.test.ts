@@ -5,11 +5,12 @@ import { runController } from '@rbo/controller/run';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runControllerStart } from '../src/commands/controller.js';
 import { isDaemonChild, spawnDetachedDaemon } from '../src/commands/daemon.js';
-import { ensureNotRunningOrReplace } from '../src/commands/process-lifecycle.js';
+import { ensureNotRunningOrReplace, runRegisteredRole } from '../src/commands/process-lifecycle.js';
 
 vi.mock('@rbo/controller/run', () => ({ runController: vi.fn() }));
 vi.mock('../src/commands/process-lifecycle.js', () => ({
   ensureNotRunningOrReplace: vi.fn(async () => true),
+  runRegisteredRole: vi.fn<typeof runRegisteredRole>(async (_role, _dirs, run) => run()),
 }));
 vi.mock('../src/commands/daemon.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/commands/daemon.js')>()),
@@ -61,6 +62,7 @@ describe('Controller daemon startup', () => {
     const dataDir = await initializedDir();
     await runControllerStart({ dataDir });
     expect(ensureNotRunningOrReplace).toHaveBeenCalledOnce();
+    expect(runRegisteredRole).toHaveBeenCalledWith('controller', { dataDir }, expect.any(Function));
     expect(runController).toHaveBeenCalledWith({ dataDir });
   });
 });

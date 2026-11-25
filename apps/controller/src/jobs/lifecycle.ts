@@ -1,4 +1,4 @@
-import type { JobEvent, JobRequest } from '@rbo/protocol';
+import type { JobEvent, JobExitPayload, JobRequest } from '@rbo/protocol';
 import { JobEventSchema } from '@rbo/protocol';
 import { generateId } from '@rbo/shared';
 import type { ControllerDatabase } from '../storage/database.js';
@@ -289,6 +289,35 @@ export function transitionAttemptState(
     throw new Error(`Attempt not found after transition: ${attemptId}`);
   }
   return row;
+}
+
+export function recordArtifactCollectionInterruption(
+  db: ControllerDatabase,
+  attemptId: string,
+): void {
+  db.prepare(
+    'UPDATE job_attempts SET artifact_collection_json = ? WHERE id = ? AND artifact_collection_json IS NULL',
+  ).run(JSON.stringify({ rules: [], staging_interrupted: true }), attemptId);
+}
+
+/** Persist an authorized remote process result before artifact collection can proceed. */
+export function recordRemoteProcessExit(
+  db: ControllerDatabase,
+  attempt: Pick<AttemptRow, 'id' | 'job_id' | 'outcome'>,
+  exit: Pick<JobExitPayload, 'outcome' | 'exit_code' | 'failure_category' | 'failure_message'>,
+): void {
+  if (attempt.outcome !== null) {
+    return;
+  }
+  runLifecycleTransaction(db, () => {
+    transitionAttemptState(db, attempt.id, 'collecting_artifacts', { outcome: exit.outcome });
+    updateAttempt(db, attempt.id, { orphaned_at: null });
+    transitionJobState(db, attempt.job_id, 'collecting_artifacts', {
+      exit_code: exit.exit_code,
+      failure_category: exit.failure_category ?? null,
+      failure_message: exit.failure_message ?? null,
+    });
+  });
 }
 
 export function recordEvent(db: ControllerDatabase, event: JobEvent): JobEvent {

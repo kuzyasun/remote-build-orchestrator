@@ -11,8 +11,8 @@ are lost or compromised.
 The default Controller data directory is `~/.rbo` (or `%USERPROFILE%\.rbo` on Windows). A complete
 backup includes:
 
-- `controller.sqlite`;
-- `identity/`;
+- `controller.db`;
+- `security/`, including the Controller certificate, both key pairs, identity metadata, and bearer tokens;
 - `attempts/` when retained logs and artifacts matter;
 - the Controller configuration.
 
@@ -39,16 +39,25 @@ Do not restore state created by a newer RBO version into an older binary.
 ## Manifest-based restore
 
 `rbo controller restore` is for a staging directory produced by compatible backup tooling. The
-directory must contain `BACKUP_MANIFEST.json`, `controller.sqlite`, and `identity/`, with hashes
-and Controller ownership recorded in the manifest:
+directory must contain `BACKUP_MANIFEST.json`, the checkpointed database named `controller.sqlite`,
+and the Controller identity files under `security/`. Record each file's hash and the Controller ID
+in the manifest. The restored database is written to `controller.db` in the Controller data directory.
 
 ```bash
 rbo controller restore <staging-directory>
 ```
 
-Use `--data-dir <path>` when restoring outside the default location. RBO validates required files,
-hashes, schema compatibility, and Controller identity before copying anything. A failed validation
-leaves the target data directory unchanged.
+Use `--data-dir <path>` when restoring outside the default location. Before replacing live files,
+RBO verifies the copied files against the manifest, checks the Controller key pairs, and checks the
+copied SQLite database for corruption, broken foreign key references, and a matching schema
+version. For older backups, RBO tests the Controller's migrations on a temporary copy and checks
+its foreign key references again. The Controller applies those migrations to the restored database
+when it starts.
+
+Stop the Controller and complete one restore at a time. Keep the staging and Controller data
+directories separate. If the restore process stops before committing the replacement, the next
+Controller start or restore attempt recovers the former files before continuing. If recovery reports an error,
+keep the `.rbo-restore-state` directory and resolve the reported filesystem issue before retrying.
 
 Do not hand-write the manifest or bypass validation. Keep the original backup until the restored
 Controller has started and passed `rbo doctor`.

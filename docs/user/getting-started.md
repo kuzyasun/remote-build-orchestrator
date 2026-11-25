@@ -168,6 +168,11 @@ Start the Agent:
 rbo agent start --daemon
 ```
 
+Windows Agents require the native Windows Job Object helper to run job and cleanup scripts.
+If the helper is missing, the Agent can connect to the Controller but will not accept jobs.
+On Windows x64, run `rbo doctor` to check the installation, install the matching Windows helper
+package or set `RBO_WINDOWS_EXECUTOR` to its executable path, then restart the Agent.
+
 Back on the Controller machine, approve the pending pairing request:
 
 ```bash

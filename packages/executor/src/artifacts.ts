@@ -1,16 +1,25 @@
-import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants, type Stats } from 'node:fs';
+import { copyFile, lstat, mkdir, open, opendir, rename, rm } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import type { ArtifactCollectionSummary, ArtifactRule } from '@rbo/protocol';
 import { sha256 } from '@rbo/shared';
-import { createZstdTarArchive } from '@rbo/snapshot';
+import {
+  ArchiveBudgetExceeded,
+  type TarEntryInput,
+  writeZstdTarArchiveCandidate,
+} from '@rbo/snapshot';
 
 /** Default caps for local artifact collection (configurable per call). */
 export const DEFAULT_MAX_ARTIFACT_FILES = 100;
 export const DEFAULT_MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 export const DEFAULT_MAX_SINGLE_ARTIFACT_BYTES = DEFAULT_MAX_ARTIFACT_BYTES;
+const MAX_DIRECTORY_ARTIFACT_ENTRIES = 100_000;
 
-function globMatch(pattern: string, value: string): boolean {
-  const regex = new RegExp(
+function compileGlob(pattern: string): RegExp {
+  return new RegExp(
     `^${pattern
       .replace(/[.+^${}()|[\]\\]/g, '\\$&')
       .replace(/\*\*/g, '§§')
@@ -18,58 +27,77 @@ function globMatch(pattern: string, value: string): boolean {
       .replace(/§§/g, '.*')
       .replace(/\?/g, '[^/]')}$`,
   );
-  return regex.test(value.replace(/\\/g, '/'));
 }
 
-async function walkEntries(
+function globMatch(pattern: string, value: string): boolean {
+  return compileGlob(pattern).test(value.replace(/\\/g, '/'));
+}
+
+interface WorkspaceEntry {
+  path: string;
+  sourcePath: string;
+  isDirectory: boolean;
+}
+
+async function* walkEntries(
   root: string,
+  excludedDir: string,
   dir = '',
-): Promise<Array<{ path: string; isDirectory: boolean }>> {
-  const absolute = join(root, dir);
-  const entries = await readdir(absolute, { withFileTypes: true });
-  const result: Array<{ path: string; isDirectory: boolean }> = [];
-  for (const entry of entries) {
+): AsyncGenerator<WorkspaceEntry> {
+  for await (const entry of await opendir(join(root, dir))) {
     const rel = dir ? `${dir}/${entry.name}` : entry.name;
-    const normalized = rel.replace(/\\/g, '/');
-    if (entry.isDirectory()) {
-      result.push({ path: normalized, isDirectory: true });
-      result.push(...(await walkEntries(root, rel)));
-    } else if (entry.isFile() || entry.isSymbolicLink()) {
-      result.push({ path: normalized, isDirectory: false });
-    }
-  }
-  return result;
-}
-
-async function archiveDirectory(sourceDir: string): Promise<Buffer> {
-  const entries = await walkEntries(sourceDir);
-  const tarEntries = [];
-  for (const entry of entries) {
-    const absolute = join(sourceDir, entry.path);
-    const info = await lstat(absolute);
-    if (info.isSymbolicLink()) {
+    const sourcePath = join(root, rel);
+    // A literal backslash in a POSIX filename cannot round-trip through the
+    // slash-delimited artifact and tar paths.
+    if (sourcePath === excludedDir || entry.name.includes('\\')) {
       continue;
     }
-    if (entry.isDirectory) {
+    const isDirectory = entry.isDirectory();
+    if (isDirectory || entry.isFile() || entry.isSymbolicLink()) {
+      yield { path: rel, sourcePath, isDirectory };
+    }
+    if (isDirectory) {
+      yield* walkEntries(root, excludedDir, rel);
+    }
+  }
+}
+
+async function directoryArchiveEntries(
+  sourceDir: string,
+  excludedDir: string,
+  maxSourceBytes: number,
+): Promise<TarEntryInput[]> {
+  const tarEntries: TarEntryInput[] = [];
+  let bytes = 0;
+  let entryCount = 0;
+  for await (const entry of walkEntries(sourceDir, excludedDir)) {
+    entryCount += 1;
+    if (entryCount > MAX_DIRECTORY_ARTIFACT_ENTRIES) {
+      throw new ArchiveBudgetExceeded('entry_count', MAX_DIRECTORY_ARTIFACT_ENTRIES, entryCount);
+    }
+    const info = await lstat(entry.sourcePath);
+    if (!info.isDirectory() && !info.isFile()) {
+      continue;
+    }
+    if (Buffer.byteLength(entry.path) > 255) {
+      throw new Error(`Artifact path exceeds the tar path limit: ${entry.path}`);
+    }
+    if (info.isDirectory()) {
+      tarEntries.push({ path: entry.path, mode: 0o755, type: 'directory' });
+    } else if (info.isFile()) {
+      bytes += info.size;
+      if (bytes > maxSourceBytes) {
+        throw new ArchiveBudgetExceeded('source_bytes', maxSourceBytes, bytes);
+      }
       tarEntries.push({
         path: entry.path,
-        mode: 0o755,
-        type: 'directory' as const,
+        mode: 0o644,
+        type: 'file',
+        contentPath: entry.sourcePath,
       });
-      continue;
     }
-    if (!info.isFile()) {
-      continue;
-    }
-    const content = await readFile(absolute);
-    tarEntries.push({
-      path: entry.path,
-      mode: 0o644,
-      type: 'file' as const,
-      content,
-    });
   }
-  return createZstdTarArchive(tarEntries).data;
+  return tarEntries;
 }
 
 export interface CollectedArtifactFile {
@@ -96,8 +124,74 @@ export interface ArtifactCollectionResult {
   skipped: ArtifactSkipped[];
   limitExceeded?: ArtifactLimitExceeded;
   summary: ArtifactCollectionSummary;
-  /** Temp files created during collection (directory archives); cleaned on limit breach. */
+  /** Staged candidates created during collection, cleaned on limit breach. */
   tempPaths: string[];
+}
+
+async function stageRegularArtifact(
+  sourcePath: string,
+  listed: Stats,
+  tempDir: string,
+  maxFileBytes: number,
+  remainingBytes: number,
+): Promise<Omit<CollectedArtifactFile, 'logical_name'> | null> {
+  const checkSize = (size: number) => {
+    if (size > maxFileBytes) {
+      throw new ArchiveBudgetExceeded('output_bytes', maxFileBytes, size);
+    }
+    if (size > remainingBytes) {
+      throw new ArchiveBudgetExceeded('stored_bytes', remainingBytes, size);
+    }
+  };
+  const source = await open(
+    sourcePath,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+  );
+  try {
+    const before = await source.stat();
+    if (!before.isFile() || before.dev !== listed.dev || before.ino !== listed.ino) {
+      return null;
+    }
+    checkSize(before.size);
+    await mkdir(tempDir, { recursive: true });
+    const candidatePath = join(tempDir, `artifact-${randomUUID()}.candidate`);
+    const candidate = await open(candidatePath, 'wx', 0o600);
+    const hash = createHash('sha256');
+    let size = 0;
+    try {
+      try {
+        await pipeline(
+          source.createReadStream({
+            autoClose: false,
+            start: 0,
+            // The inclusive end gives us one extra byte to detect growth past the budget.
+            end: Math.floor(Math.min(maxFileBytes, remainingBytes)),
+          }),
+          new Transform({
+            transform(chunk: Buffer, _encoding, done) {
+              try {
+                size += chunk.length;
+                checkSize(size);
+                hash.update(chunk);
+                done(null, chunk);
+              } catch (error) {
+                done(error as Error);
+              }
+            },
+          }),
+          candidate.createWriteStream(),
+        );
+      } finally {
+        await candidate.close();
+      }
+      return { sourcePath: candidatePath, size_bytes: size, sha256: hash.digest('hex') };
+    } catch (error) {
+      await rm(candidatePath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await source.close();
+  }
 }
 
 function summarizeCollection(
@@ -137,149 +231,160 @@ export async function collectArtifactFiles(input: {
   maxFiles?: number;
   maxBytes?: number;
   maxSingleFileBytes?: number;
-  /** Directory for temporary directory-archive blobs (defaults under project). */
+  /** Directory for staged artifact candidates (defaults under project). */
   tempDir?: string;
 }): Promise<ArtifactCollectionResult> {
   const maxFiles = input.maxFiles ?? DEFAULT_MAX_ARTIFACT_FILES;
   const maxBytes = input.maxBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
   const maxSingleFileBytes = input.maxSingleFileBytes ?? DEFAULT_MAX_SINGLE_ARTIFACT_BYTES;
-  const tempDir = input.tempDir ?? join(input.projectPath, '.rbo-artifact-tmp');
-  await mkdir(tempDir, { recursive: true });
-
-  const allEntries = await walkEntries(input.projectPath);
+  const projectPath = resolve(input.projectPath);
+  const tempDir = resolve(input.tempDir ?? join(projectPath, '.rbo-artifact-tmp'));
+  // Use a raw-source budget independently of compression so small custom
+  // output caps still allow directory artifacts containing compressible files.
+  const maxSourceBytes = Math.max(DEFAULT_MAX_SINGLE_ARTIFACT_BYTES, maxSingleFileBytes);
   const matchedCounts = input.rules.map(() => 0);
-  const matchedDirs = new Set<string>();
-  const matchedFiles = new Set<string>();
-
-  for (const [index, rule] of input.rules.entries()) {
-    for (const entry of allEntries) {
-      if (!globMatch(rule.glob, entry.path)) {
-        continue;
+  if (input.rules.length === 0) {
+    return { files: [], skipped: [], tempPaths: [], summary: { rules: [] } };
+  }
+  const patterns = input.rules.map(({ glob }) => compileGlob(glob));
+  const selected: WorkspaceEntry[] = [];
+  let selectedCount = 0;
+  let matchedAncestor: string | undefined;
+  for await (const entry of walkEntries(projectPath, tempDir)) {
+    if (matchedAncestor && !entry.path.startsWith(matchedAncestor)) {
+      matchedAncestor = undefined;
+    }
+    let matched = false;
+    for (const [index, pattern] of patterns.entries()) {
+      if (pattern.test(entry.path)) {
+        matchedCounts[index] = (matchedCounts[index] ?? 0) + 1;
+        matched = true;
       }
-      matchedCounts[index] = (matchedCounts[index] ?? 0) + 1;
+    }
+    // The depth-first walk sees a matching directory before any of its files.
+    if (matched && (entry.isDirectory || !matchedAncestor)) {
       if (entry.isDirectory) {
-        matchedDirs.add(entry.path);
-      } else {
-        matchedFiles.add(entry.path);
+        matchedAncestor ??= `${entry.path}/`;
+      }
+      selectedCount += 1;
+      if (selectedCount <= maxFiles) {
+        selected.push(entry);
       }
     }
-  }
-
-  // Prefer whole-directory archives; drop file matches nested under a matched dir.
-  for (const file of [...matchedFiles]) {
-    for (const dir of matchedDirs) {
-      if (file === dir || file.startsWith(`${dir}/`)) {
-        matchedFiles.delete(file);
-        break;
-      }
-    }
-  }
-
-  const selected = [
-    ...[...matchedDirs].map((path) => ({ path, isDirectory: true })),
-    ...[...matchedFiles].map((path) => ({ path, isDirectory: false })),
-  ].sort((a, b) => a.path.localeCompare(b.path));
-
-  if (selected.length > maxFiles) {
-    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-    return {
-      files: [],
-      skipped: [],
-      limitExceeded: { reason: 'file_count', limit: maxFiles, actual: selected.length },
-      summary: summarizeCollection(input.rules, matchedCounts, [], [], {
-        reason: 'file_count',
-        limit: maxFiles,
-        actual: selected.length,
-      }),
-      tempPaths: [],
-    };
   }
 
   const files: CollectedArtifactFile[] = [];
   const skipped: ArtifactSkipped[] = [];
   const tempPaths: string[] = [];
+  const discardTempFiles = () =>
+    Promise.all(tempPaths.map((path) => rm(path, { force: true }).catch(() => undefined)));
+  const failure = async (
+    limitExceeded: ArtifactLimitExceeded,
+  ): Promise<ArtifactCollectionResult> => {
+    await discardTempFiles();
+    return {
+      files: [],
+      skipped,
+      limitExceeded,
+      summary: summarizeCollection(input.rules, matchedCounts, [], skipped, limitExceeded),
+      tempPaths: [],
+    };
+  };
+  if (selectedCount > maxFiles) {
+    return failure({ reason: 'file_count', limit: maxFiles, actual: selectedCount });
+  }
+
+  selected.sort((a, b) => a.path.localeCompare(b.path));
   let totalBytes = 0;
 
-  for (const item of selected) {
-    const sourcePath = join(input.projectPath, item.path);
-    const info = await lstat(sourcePath);
+  for (const { path, sourcePath, isDirectory } of selected) {
+    const info = await lstat(sourcePath).catch(async (error) => {
+      await discardTempFiles();
+      throw error;
+    });
     if (info.isSymbolicLink()) {
-      skipped.push({ path: item.path, reason: 'symlink artifacts are not collected' });
+      skipped.push({ path, reason: 'symlink artifacts are not collected' });
       continue;
     }
 
-    if (item.isDirectory) {
-      const archive = await archiveDirectory(sourcePath);
-      if (archive.length > maxSingleFileBytes) {
-        skipped.push({
-          path: item.path,
-          reason: `directory archive size ${archive.length} exceeds per-file limit ${maxSingleFileBytes}`,
+    if (isDirectory && info.isDirectory()) {
+      const logicalName = `${path}.tar.zst`;
+      const tempPath = join(tempDir, `${sha256(Buffer.from(logicalName)).slice(0, 16)}.tar.zst`);
+      try {
+        const entries = await directoryArchiveEntries(sourcePath, tempDir, maxSourceBytes);
+        await mkdir(tempDir, { recursive: true });
+        const archive = await writeZstdTarArchiveCandidate(tempPath, entries, {
+          maxSourceBytes,
+          maxOutputBytes: maxSingleFileBytes,
+          maxStoredBytes: maxBytes - totalBytes,
         });
-        continue;
-      }
-      const projectedTotal = totalBytes + archive.length;
-      if (projectedTotal > maxBytes) {
-        await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-        return {
-          files: [],
-          skipped,
-          limitExceeded: { reason: 'total_bytes', limit: maxBytes, actual: projectedTotal },
-          summary: summarizeCollection(input.rules, matchedCounts, [], skipped, {
+        tempPaths.push(archive.candidatePath);
+        totalBytes += archive.size;
+        files.push({
+          logical_name: logicalName,
+          size_bytes: archive.size,
+          sha256: archive.sha256,
+          sourcePath: archive.candidatePath,
+        });
+      } catch (error) {
+        if (!(error instanceof ArchiveBudgetExceeded)) {
+          await discardTempFiles();
+          throw error;
+        }
+        if (error.budget === 'stored_bytes') {
+          return failure({
             reason: 'total_bytes',
             limit: maxBytes,
-            actual: projectedTotal,
-          }),
-          tempPaths: [],
-        };
+            actual: totalBytes + error.actual,
+          });
+        }
+        const reason =
+          error.budget === 'output_bytes'
+            ? `directory archive size exceeds per-file limit ${maxSingleFileBytes}`
+            : error.budget === 'source_bytes'
+              ? `directory source bytes exceed limit ${maxSourceBytes}`
+              : `directory entry count exceeds limit ${MAX_DIRECTORY_ARTIFACT_ENTRIES}`;
+        skipped.push({ path, reason });
       }
-      const logicalName = `${item.path}.tar.zst`;
-      const tempPath = join(tempDir, `${sha256(Buffer.from(logicalName)).slice(0, 16)}.tar.zst`);
-      await writeFile(tempPath, archive);
-      tempPaths.push(tempPath);
-      totalBytes += archive.length;
-      files.push({
-        logical_name: logicalName,
-        size_bytes: archive.length,
-        sha256: sha256(archive),
-        sourcePath: tempPath,
-      });
       continue;
     }
 
     if (!info.isFile()) {
-      skipped.push({ path: item.path, reason: 'only regular files are collected' });
+      skipped.push({ path, reason: 'only regular files are collected' });
       continue;
     }
-    if (info.size > maxSingleFileBytes) {
-      skipped.push({
-        path: item.path,
-        reason: `file size ${info.size} exceeds per-file limit ${maxSingleFileBytes}`,
-      });
-      continue;
-    }
-    const projectedTotal = totalBytes + info.size;
-    if (projectedTotal > maxBytes) {
-      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-      return {
-        files: [],
-        skipped,
-        limitExceeded: { reason: 'total_bytes', limit: maxBytes, actual: projectedTotal },
-        summary: summarizeCollection(input.rules, matchedCounts, [], skipped, {
+    try {
+      const candidate = await stageRegularArtifact(
+        sourcePath,
+        info,
+        tempDir,
+        maxSingleFileBytes,
+        maxBytes - totalBytes,
+      );
+      if (!candidate) {
+        skipped.push({ path, reason: 'regular file changed before collection' });
+        continue;
+      }
+      tempPaths.push(candidate.sourcePath);
+      totalBytes += candidate.size_bytes;
+      files.push({ logical_name: path, ...candidate });
+    } catch (error) {
+      if (!(error instanceof ArchiveBudgetExceeded)) {
+        await discardTempFiles();
+        throw error;
+      }
+      if (error.budget === 'stored_bytes') {
+        return failure({
           reason: 'total_bytes',
           limit: maxBytes,
-          actual: projectedTotal,
-        }),
-        tempPaths: [],
-      };
+          actual: totalBytes + error.actual,
+        });
+      }
+      skipped.push({
+        path,
+        reason: `file size ${error.actual} exceeds per-file limit ${maxSingleFileBytes}`,
+      });
     }
-    const content = await readFile(sourcePath);
-    totalBytes += content.length;
-    files.push({
-      logical_name: item.path,
-      size_bytes: content.length,
-      sha256: sha256(content),
-      sourcePath,
-    });
   }
 
   for (const rule of input.rules) {
@@ -314,8 +419,7 @@ export async function moveArtifactToStore(sourcePath: string, destPath: string):
     await rename(sourcePath, destPath);
   } catch {
     // Cross-device fallback (should not happen under single dataDir).
-    const content = await readFile(sourcePath);
-    await writeFile(destPath, content);
+    await copyFile(sourcePath, destPath);
     await rm(sourcePath, { force: true }).catch(() => undefined);
   }
 }

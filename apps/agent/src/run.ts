@@ -1,3 +1,5 @@
+import { addAbortListener } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { RBO_AGENT_VERSION, createLogger, generateId } from '@rbo/shared';
 import { probeCapabilities } from './capabilities/probe.js';
 import {
@@ -73,9 +75,10 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
   let stopped = false;
   // Daemon safety net: a single async handler failure must not kill the Agent.
   // Call sites still catch and log; this covers any remaining fire-and-forget gaps.
-  process.on('unhandledRejection', (reason) => {
+  const onUnhandledRejection = (reason: unknown) => {
     logger.error('unhandledRejection', { error: String(reason) });
-  });
+  };
+  process.on('unhandledRejection', onUnhandledRejection);
 
   const reportStatus = (status: {
     connection: AgentRuntimeConnection;
@@ -110,14 +113,15 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
     getFreeDiskBytes: () => cachedFreeBytes,
   });
 
+  const stopAbort = new AbortController();
   const stop = () => {
     stopped = true;
+    stopAbort.abort();
     connection.close({ killProcess: true });
   };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
 
-  const refreshAbort = new AbortController();
   let refreshInFlight: Promise<void> | null = null;
   let sessionOpen = false;
 
@@ -132,7 +136,7 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
       const next = await discoverRelocatedControllerUrl({
         currentUrl: controllerUrl,
         fingerprint: config.controllerFingerprint,
-        signal: refreshAbort.signal,
+        signal: stopAbort.signal,
       });
       if (!next || stopped || next === controllerUrl) {
         return;
@@ -179,7 +183,7 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
         reportStatus({ connection: 'authenticated', agent_id: result.agentId });
         sessionOpen = true;
         // Heartbeats run inside AgentConnection; wait until disconnect or stop.
-        await Promise.race([connection.waitUntilDisconnected(), waitUntil(() => stopped)]);
+        await waitForDisconnect(connection, stopAbort.signal);
         sessionOpen = false;
         if (!stopped) {
           reportStatus({ connection: 'disconnected', agent_id: result.agentId });
@@ -187,15 +191,15 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
       } else if (result.status === 'pairing_pending') {
         logger.info('pairing request pending operator approval');
         reportStatus({ connection: 'pairing_pending' });
-        await sleep(RECONNECT_BASE_DELAY_MS);
+        await sleep(RECONNECT_BASE_DELAY_MS, stopAbort.signal);
       } else if (result.status === 'incompatible_protocol') {
         logger.warn('connection did not authenticate', { status: result.status });
         reportStatus({ connection: 'incompatible_protocol' });
-        await sleep(RECONNECT_BASE_DELAY_MS);
+        await sleep(RECONNECT_BASE_DELAY_MS, stopAbort.signal);
       } else {
         logger.warn('connection did not authenticate', { status: result.status });
         reportStatus({ connection: 'rejected', detail: result.status });
-        await sleep(RECONNECT_BASE_DELAY_MS);
+        await sleep(RECONNECT_BASE_DELAY_MS, stopAbort.signal);
       }
     } catch (error) {
       if (stopped) {
@@ -214,10 +218,10 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
         continue;
       }
       attempt += 1;
-      const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
-      logger.error('connection failed, retrying', { error: detail, retry_in_ms: delay });
+      const retryDelay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
+      logger.error('connection failed, retrying', { error: detail, retry_in_ms: retryDelay });
       reportStatus({ connection: 'error', detail });
-      await sleep(delay);
+      await sleep(retryDelay, stopAbort.signal);
     } finally {
       // Park attempt for reconnect; kill only when the agent process is stopping.
       connection.close({ killProcess: stopped });
@@ -229,24 +233,33 @@ export async function runAgent(overrides: Partial<AgentConfig> = {}): Promise<vo
   if (refreshTimer) {
     clearInterval(refreshTimer);
   }
-  refreshAbort.abort();
+  stopAbort.abort();
   clearInterval(freeDiskTimer);
+  process.off('SIGINT', stop);
+  process.off('SIGTERM', stop);
+  process.off('unhandledRejection', onUnhandledRejection);
   connection.close({ killProcess: true });
   logger.info('agent stopped');
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  try {
+    await delay(ms, undefined, { signal });
+  } catch (error) {
+    if (!signal.aborted) {
+      throw error;
+    }
+  }
 }
 
-function waitUntil(predicate: () => boolean): Promise<void> {
-  return new Promise((resolvePromise) => {
-    const interval = setInterval(() => {
-      if (predicate()) {
-        clearInterval(interval);
-        resolvePromise();
-      }
-    }, 250);
-    interval.unref?.();
+async function waitForDisconnect(connection: AgentConnection, signal: AbortSignal): Promise<void> {
+  let stopListener: ReturnType<typeof addAbortListener> | undefined;
+  const stopped = new Promise<void>((resolve) => {
+    stopListener = addAbortListener(signal, () => resolve());
   });
+  try {
+    await Promise.race([connection.waitUntilDisconnected(), stopped]);
+  } finally {
+    stopListener?.[Symbol.dispose]();
+  }
 }

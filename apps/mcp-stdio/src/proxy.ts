@@ -1,11 +1,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { MCP_TOOL_DEFS } from '@rbo/protocol';
-import { RBO_STDIO_ADAPTER_VERSION, readAdminToken } from '@rbo/shared';
+import { RBO_STDIO_ADAPTER_VERSION, readMcpToken } from '@rbo/shared';
 
 export interface StdioProxyOptions {
   controllerUrl: string;
   clientId: string;
-  adminToken?: string;
+  mcpToken?: string;
 }
 
 export const STDIO_JOB_RUN_HEARTBEAT_MS = 5_000;
@@ -105,7 +105,7 @@ export function createStdioProxyServer(options: StdioProxyOptions): McpServer {
   });
 
   const baseUrl = options.controllerUrl.replace(/\/+$/, '');
-  const resolveAdminToken = () => options.adminToken ?? readAdminToken();
+  const resolveMcpToken = () => options.mcpToken ?? readMcpToken();
 
   for (const def of MCP_TOOL_DEFS) {
     server.registerTool(
@@ -120,7 +120,7 @@ export function createStdioProxyServer(options: StdioProxyOptions): McpServer {
               })
             : { stop: () => undefined };
 
-        const currentToken = resolveAdminToken();
+        const currentToken = resolveMcpToken();
 
         try {
           let response: Response;

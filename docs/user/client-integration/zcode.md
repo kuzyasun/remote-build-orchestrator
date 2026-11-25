@@ -20,7 +20,7 @@ Stdio (preferred) — ZCode accepts `mcpServers` paste:
 }
 ```
 
-HTTP alternative (requires Bearer token from `~/.rbo/security/admin-token` or `<dataDir>/security/admin-token`):
+HTTP alternative (requires Bearer token from `~/.rbo/security/mcp-token` or `<dataDir>/security/mcp-token`):
 
 ```json
 {
@@ -29,7 +29,7 @@ HTTP alternative (requires Bearer token from `~/.rbo/security/admin-token` or `<
       "type": "http",
       "url": "http://127.0.0.1:7410/mcp",
       "headers": {
-        "Authorization": "Bearer <ADMIN_TOKEN>"
+        "Authorization": "Bearer <MCP_TOKEN>"
       }
     }
   }

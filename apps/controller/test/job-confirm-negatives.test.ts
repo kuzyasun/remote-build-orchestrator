@@ -51,6 +51,8 @@ function makeConfirmationFixture(): ConfirmationFixture {
     signingPublicKeyPem: keys.publicKeyPem,
     signingPrivateKeyPem: keys.privateKeyPem,
     fingerprint: 'sha256:test',
+    adminToken: 'test-only-admin',
+    mcpToken: 'test-only-mcp',
   };
 
   const request: JobRequest = {
@@ -256,6 +258,25 @@ describe('handleJobConfirm negative paths (§1.1)', () => {
     expect(result).toEqual({ job_id: jobId, state: 'queued' });
   });
 
+  it('keeps jobs pending when a previously issued token is presented under strict policy', async () => {
+    const { ctx, db, jobId, issueToken } = makeConfirmationFixture();
+    try {
+      const result = await handleJobConfirm(
+        { ...ctx, confirmationPolicy: 'strict' },
+        {
+          job_id: jobId,
+          confirmation_token: issueToken(),
+        },
+      );
+      expect(result.error).toMatchObject({
+        message: expect.stringContaining('Operator confirmation required'),
+      });
+      expect(getJob(db, jobId)?.state).toBe('awaiting_confirmation');
+    } finally {
+      db.close();
+    }
+  });
+
   it('expires stale awaiting_confirmation jobs when TTL passes', async () => {
     const { db, jobId } = makeConfirmationFixture();
     const past = new Date(Date.now() - 350 * 1000).toISOString();
@@ -291,10 +312,11 @@ describe('handleJobConfirm negative paths (§1.1)', () => {
     expect(job?.outcome).toBe('cancelled');
   });
 
-  it('allows administrator to confirm an awaiting_confirmation job directly', async () => {
+  it('allows the administrator to confirm a job under strict policy', async () => {
     const { db, identity, jobId, ctx } = makeConfirmationFixture();
     const result = await confirmJobByAdmin(db, identity, jobId, {
       ...ctx,
+      confirmationPolicy: 'strict',
       controllerPublicHost: 'controller.local',
       dataPlaneBaseUrl: 'http://controller.local:9999',
     });

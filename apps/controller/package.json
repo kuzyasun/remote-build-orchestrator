@@ -1,6 +1,6 @@
 {
   "name": "@rbo/controller",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "private": true,
   "type": "module",
   "main": "./dist/main.js",
@@ -13,6 +13,10 @@
     "./config": {
       "types": "./dist/config.d.ts",
       "import": "./dist/config.js"
+    },
+    "./restore": {
+      "types": "./dist/storage/restore-validation.d.ts",
+      "import": "./dist/storage/restore-validation.js"
     }
   },
   "scripts": {

@@ -10,7 +10,12 @@ import { createGitFixtureRepo } from '@rbo/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AgentConnection } from '../../../apps/agent/src/connection/client.js';
 import { resolveDataPlaneBaseUrl } from '../src/execution/remote-execution.js';
-import { handleDataPlaneRequest, registerArtifactExpectations } from '../src/http/data-plane.js';
+import {
+  clearArtifactExpectations,
+  filterMissingArtifacts,
+  handleDataPlaneRequest,
+  registerArtifactExpectations,
+} from '../src/http/data-plane.js';
 import { startControllerServer } from '../src/http/server.ts';
 import { handleToolCall } from '../src/mcp/handlers.js';
 import { issueDataToken } from '../src/security/data-tokens.js';
@@ -468,6 +473,83 @@ describe('Remote Execution End-to-End', () => {
 
     expect(status).toBe(413);
     expect(JSON.parse(responseBody).error?.category).toBe('artifact_upload');
+  });
+
+  it('stores case-distinct artifact names as separate objects and resumes both', async () => {
+    const attemptId = 'att_case_distinct';
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO agents (id, display_name, hostname, state, capabilities_json, paired_at)
+       VALUES ('ag-1', 'ag-1', 'localhost', 'idle', '{}', ?)`,
+    ).run(now);
+    db.prepare(
+      `INSERT INTO jobs (id, client_id, client_request_id, state, created_at, updated_at, request_json)
+       VALUES ('job-1', 'c', 'r', 'collecting_artifacts', ?, ?, '{}')`,
+    ).run(now, now);
+    db.prepare(
+      `INSERT INTO job_attempts (id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline, state)
+       VALUES (?, 'job-1', 1, 'ag-1', 'lease-1', 1, ?, 'collecting_artifacts')`,
+    ).run(attemptId, new Date(Date.now() + 60_000).toISOString());
+
+    const contents = new Map([
+      ['Report.bin', Buffer.from('first')],
+      ['report.bin', Buffer.from('second')],
+    ]);
+    const artifacts = Array.from(contents, ([logical_name, body]) => ({
+      logical_name,
+      size_bytes: body.length,
+      sha256: createHash('sha256').update(body).digest('hex'),
+    }));
+    registerArtifactExpectations(attemptId, artifacts);
+
+    try {
+      for (const [logicalName, body] of contents) {
+        const token = issueDataToken(identity, {
+          agent_id: 'ag-1',
+          job_id: 'job-1',
+          attempt_id: attemptId,
+          lease_id: 'lease-1',
+          lease_epoch: 1,
+          op: 'artifact_upload',
+          artifact_id: logicalName,
+        });
+        const req = Readable.from([body]) as IncomingMessage;
+        req.url = `/data/v1/attempts/${attemptId}/artifacts/${logicalName}`;
+        req.method = 'PUT';
+        req.headers = { host: 'localhost', authorization: `Bearer ${token}` };
+        let status = 0;
+        const res = {
+          headersSent: false,
+          writeHead(code: number) {
+            status = code;
+            this.headersSent = true;
+          },
+          end() {},
+        } as unknown as ServerResponse;
+        await expect(
+          handleDataPlaneRequest(req, res, { db, identity, dataDir: tempDir }),
+        ).resolves.toBe(true);
+        expect(status).toBe(200);
+      }
+
+      // The verified objects remain recoverable if publication committed before SQLite.
+      db.prepare('DELETE FROM artifacts WHERE attempt_id = ?').run(attemptId);
+      await expect(
+        filterMissingArtifacts({ db, dataDir: tempDir }, attemptId, artifacts, () => true),
+      ).resolves.toEqual([]);
+      const stored = db
+        .prepare('SELECT logical_name, path FROM artifacts WHERE attempt_id = ?')
+        .all(attemptId) as Array<{
+        logical_name: string;
+        path: string;
+      }>;
+      expect(new Set(stored.map(({ path }) => path.toLowerCase())).size).toBe(2);
+      for (const { logical_name, path } of stored) {
+        await expect(readFile(path)).resolves.toEqual(contents.get(logical_name));
+      }
+    } finally {
+      clearArtifactExpectations(attemptId);
+    }
   });
 
   describe('resolveDataPlaneBaseUrl and extractConnectionHost', () => {

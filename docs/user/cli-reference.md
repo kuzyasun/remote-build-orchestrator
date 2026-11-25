@@ -42,6 +42,7 @@ rbo run [options] -- <shell-command-string>
 | `--json` | Output one final JSON execution result object to stdout. Mutually exclusive with `--follow`. |
 | `--project <path>` | Path to project root (default: current working directory). Must be inside `allowed_project_roots`. |
 | `--cwd <relative-path>` | Working directory inside the project root (default: `.`). |
+| `--full-snapshot` | Capture the allowed source as a full snapshot when submitting this job. |
 | `--shell <shell>` | Target shell: `bash`, `zsh`, `sh`, `powershell`, `pwsh`, `cmd`, or `direct`. Default: Controller host default shell. |
 | `--target-os <os>` | Repeatable OS filter: `linux`, `macos`, or `windows`. Default: Controller host OS. |
 | `--timeout <seconds>` | Remote execution timeout in seconds (default: Controller config). |

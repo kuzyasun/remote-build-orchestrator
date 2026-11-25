@@ -45,6 +45,7 @@ export interface JobRunInput {
   command?: string;
   project_root?: string;
   job_id?: string;
+  snapshot_mode?: JobRequest['source']['snapshot_mode'];
   shell?: ShellId;
   target_os?: Array<'macos' | 'windows' | 'linux'>;
   queue_policy?: QueuePolicy;
@@ -232,6 +233,7 @@ export function buildJobRunRequest(
     source: {
       project_root: input.project_root,
       cwd: input.cwd ?? '.',
+      ...(input.snapshot_mode ? { snapshot_mode: input.snapshot_mode } : {}),
     },
     execution: wrapCommandAsExecution(
       input.command,
@@ -463,7 +465,11 @@ async function finishJobRunResponse(
           skip_reasons?: string[];
         }>
       | undefined) ?? []
-  ).filter((rule) => rule.required && rule.stored_count === 0);
+  ).filter(
+    (rule) =>
+      rule.required &&
+      (rule.stored_count === 0 || rule.status === 'not_stored' || rule.status === 'interrupted'),
+  );
   const maxBytes = rawInput.max_output_bytes ?? 16384;
   const artifactPayload = fitArtifactMetadata(
     artifactsRaw,
@@ -519,12 +525,16 @@ async function finishJobRunResponse(
   }
 
   if (terminal) {
+    const collectionStatus = artifactListing?.collection_interrupted
+      ? { collection_interrupted: true }
+      : {};
     if (job.outcome === 'succeeded') {
       const out: Record<string, unknown> = {
         job_id: jobId,
         state: job.state,
         outcome: job.outcome,
         exit_code: job.exit_code,
+        ...collectionStatus,
       };
       Object.assign(out, artifactPayload);
       if (missingRequired.length > 0) {
@@ -542,7 +552,9 @@ async function finishJobRunResponse(
         if (artifactListing?.collection_limit_exceeded) {
           out.collection_limit_exceeded = artifactListing.collection_limit_exceeded;
         }
-        if (missingRequired.some((rule) => rule.status === 'unknown')) {
+        if (missingRequired.some((rule) => rule.status === 'interrupted')) {
+          out.artifact_hint = 'Artifact collection did not finish before attempt recovery ended.';
+        } else if (missingRequired.some((rule) => rule.status === 'unknown')) {
           out.artifact_hint = 'Collection summary unavailable; update the remote Agent.';
         }
       }
@@ -556,6 +568,7 @@ async function finishJobRunResponse(
       state: job.state,
       outcome: job.outcome,
       exit_code: job.exit_code,
+      ...collectionStatus,
     };
     if (job.failure_category != null)
       out.failure_category = truncateUtf8(job.failure_category, 1024);

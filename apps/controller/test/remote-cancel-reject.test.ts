@@ -8,7 +8,13 @@ import {
   initiateRemoteAttempt,
   requestRemoteJobCancel,
 } from '../src/execution/remote-execution.js';
-import { createJob, getJob, persistSnapshot, transitionJobState } from '../src/jobs/lifecycle.js';
+import {
+  createJob,
+  getAttempt,
+  getJob,
+  persistSnapshot,
+  transitionJobState,
+} from '../src/jobs/lifecycle.js';
 import { migrateToLatest, nowIso, openDatabase } from '../src/storage/database.js';
 import type { ConnectedAgent } from '../src/websocket/server.js';
 
@@ -257,6 +263,7 @@ describe('remote cancel + lease_reject rematch', () => {
     };
 
     const firstAttemptId = await initiateRemoteAttempt(remoteOpts, job.id, 'agt_1');
+    if (!firstAttemptId) throw new Error('Expected a claimed attempt');
     handleRemoteLeaseReject(remoteOpts, 'agt_1', {
       attempt_id: firstAttemptId,
       lease_id: (
@@ -315,7 +322,7 @@ describe('remote cancel + lease_reject rematch', () => {
     db.close();
   });
 
-  it('cleanup_complete keeps cancelled exit_code null instead of adopting cleanup script exit 0', async () => {
+  it('rolls back remote cleanup finalization on a failed job write and preserves the process exit', async () => {
     const db = openDatabase(':memory:');
     migrateToLatest(db);
     insertAgent(db, 'agt_1');
@@ -357,16 +364,36 @@ describe('remote cancel + lease_reject rematch', () => {
       failure_message: 'operator cancel',
     });
 
-    await handleRemoteCleanupComplete(opts, 'agt_1', {
+    const cleanup = {
       attempt_id: attemptId,
       lease_id: leaseId,
       lease_epoch: 1,
-      exit_code: 0,
+      exit_code: 1,
       timed_out: false,
+      message: 'cleanup failed',
+    };
+    db.exec(`CREATE TRIGGER fail_job_completion BEFORE UPDATE OF state ON jobs
+      WHEN NEW.state = 'completed' BEGIN SELECT RAISE(ABORT, 'job write failed'); END`);
+    await expect(handleRemoteCleanupComplete(opts, 'agt_1', cleanup)).rejects.toThrow(
+      'job write failed',
+    );
+    expect(getAttempt(db, attemptId)?.state).toBe('collecting_artifacts');
+    expect(getJob(db, job.id)?.state).toBe('collecting_artifacts');
+    const cleanupErrors = db.prepare(
+      "SELECT COUNT(*) AS count FROM job_events WHERE event_type = 'cleanup_error'",
+    );
+    expect(cleanupErrors.get()).toEqual({ count: 0 });
+
+    db.exec('DROP TRIGGER fail_job_completion');
+    await handleRemoteCleanupComplete(opts, 'agt_1', {
+      ...cleanup,
+      exit_code: 0,
       message: 'cleanup ok',
     });
 
     const after = getJob(db, job.id);
+    expect(getAttempt(db, attemptId)?.state).toBe('completed');
+    expect(after?.state).toBe('completed');
     expect(after?.outcome).toBe('cancelled');
     // Job process never exited with 0; cleanup script success must not overwrite null exit_code.
     expect(after?.exit_code).toBeNull();

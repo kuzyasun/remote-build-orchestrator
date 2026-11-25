@@ -1,21 +1,13 @@
 import { mkdtemp, rm } from 'node:fs/promises';
-import { createServer as createHttpsServer } from 'node:https';
-import { request as httpsRequest } from 'node:https';
+import { createServer, request } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { TLSSocket } from 'node:tls';
 import { ensureControllerIdentity } from '@rbo/shared';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import {
-  assertPinnedPeerCert,
-  controllerDataPlaneAgent,
-  pinnedTlsRequestOptions,
-} from '../src/executor/tls-pin.js';
+import { pinnedTlsRequestOptions } from '../src/executor/tls-pin.js';
 
-/**
- * Regression: TLS 1.3 session resumption leaves getPeerCertificate() empty.
- * Second data-plane download must not fail pin with "did not present a TLS certificate".
- */
-describe('tls-pin session resume', () => {
+describe('Controller data-plane TLS pin', () => {
   let fingerprint: string;
   let port: number;
   let tempDir: string;
@@ -26,16 +18,13 @@ describe('tls-pin session resume', () => {
     const identity = await ensureControllerIdentity(tempDir);
     fingerprint = identity.fingerprint;
 
-    const server = createHttpsServer(
+    const server = createServer(
       { cert: identity.tlsCertPem, key: identity.tlsKeyPem },
-      (_req, res) => {
-        res.writeHead(200, { 'content-type': 'text/plain' });
-        res.end('ok');
-      },
+      (_req, res) => res.end('ok'),
     );
-
-    await new Promise<void>((resolve) => {
-      server.listen(0, '127.0.0.1', () => resolve());
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
     });
     const addr = server.address();
     if (!addr || typeof addr === 'string') {
@@ -49,92 +38,48 @@ describe('tls-pin session resume', () => {
   });
 
   afterAll(async () => {
-    controllerDataPlaneAgent.destroy();
-    await closeServer();
+    await closeServer?.();
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  function getOnce(): Promise<{
-    pinError: Error | undefined;
-    sessionReused: boolean;
-    hasRaw: boolean;
-  }> {
+  function getOnce(): Promise<{ status: number | undefined; sessionReused: boolean }> {
     return new Promise((resolve, reject) => {
-      const req = httpsRequest(
+      const req = request(
         `https://127.0.0.1:${port}/`,
-        {
-          method: 'GET',
-          ...pinnedTlsRequestOptions(fingerprint),
-        },
+        pinnedTlsRequestOptions(fingerprint),
         (res) => {
-          const socket = res.socket as {
-            isSessionReused?: () => boolean;
-            getPeerCertificate?: (d?: boolean) => { raw?: Buffer };
-          };
-          const cert = socket.getPeerCertificate?.(true);
-          const pinError = assertPinnedPeerCert(res, fingerprint);
+          const socket = res.socket as TLSSocket;
           res.resume();
-          resolve({
-            pinError,
-            sessionReused: Boolean(socket.isSessionReused?.()),
-            hasRaw: Boolean(cert?.raw),
-          });
+          res.once('end', () =>
+            resolve({ status: res.statusCode, sessionReused: socket.isSessionReused() }),
+          );
         },
       );
-      req.on('error', reject);
+      req.once('error', reject);
       req.end();
     });
   }
 
-  it('accepts TLS session resume when peer cert DER is unavailable', () => {
-    const res = {
-      socket: {
-        isSessionReused: () => true,
-        getPeerCertificate: () => ({}),
-        getX509Certificate: () => undefined,
-      },
-    } as unknown as import('node:http').IncomingMessage;
-    expect(assertPinnedPeerCert(res, fingerprint)).toBeUndefined();
+  it('checks a fresh TLS handshake on successive data-plane requests', async () => {
+    expect(await getOnce()).toEqual({ status: 200, sessionReused: false });
+    expect(await getOnce()).toEqual({ status: 200, sessionReused: false });
   });
 
-  it('pins the first full handshake and accepts a resumed TLS session', async () => {
-    const first = await getOnce();
-    expect(first.pinError).toBeUndefined();
-    expect(first.sessionReused).toBe(false);
-    expect(first.hasRaw).toBe(true);
-
-    const second = await getOnce();
-    expect(second.pinError).toBeUndefined();
-    // On TLS 1.3 resume Node often returns an empty peer cert object.
-    if (second.sessionReused) {
-      expect(second.hasRaw).toBe(false);
-    }
-  });
-
-  it('rejects a fingerprint mismatch on a full handshake', async () => {
+  it('never hands a socket with an unknown certificate to HTTP', async () => {
+    const { createConnection } = pinnedTlsRequestOptions(`sha256:${'0'.repeat(64)}`);
+    expect(createConnection).toBeTypeOf('function');
     await new Promise<void>((resolve, reject) => {
-      const req = httpsRequest(
-        `https://127.0.0.1:${port}/`,
-        {
-          method: 'GET',
-          // Force a full handshake so mismatch is observable.
-          agent: false,
-          rejectUnauthorized: false,
-          checkServerIdentity: () => undefined,
-        },
-        (res) => {
-          const pinError = assertPinnedPeerCert(res, `sha256:${'0'.repeat(64)}`);
-          res.resume();
-          try {
-            expect(pinError?.message).toMatch(/fingerprint mismatch/);
-            resolve();
-          } catch (err) {
-            reject(err);
-          }
-        },
-      );
-      req.on('error', reject);
-      req.end();
+      const returned = createConnection?.({ host: '127.0.0.1', port }, (error, socket) => {
+        try {
+          expect(error?.message).toMatch(/fingerprint mismatch/);
+          expect(socket.destroyed).toBe(true);
+          resolve();
+        } catch (assertionError) {
+          reject(assertionError);
+        }
+      });
+      // Node would attach any synchronously returned socket before TLS completes.
+      expect(returned).toBeUndefined();
     });
   });
 });

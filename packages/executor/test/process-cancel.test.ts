@@ -32,6 +32,65 @@ async function waitForPidExit(pid: number, timeoutMs: number, diagnostic: string
 }
 
 describe('process containment (§15.2)', () => {
+  it.skipIf(process.platform !== 'linux' && process.platform !== 'darwin')(
+    'can still stop an owned descendant after its wrapper closes',
+    async () => {
+      const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-closed-wrapper-'));
+      const controlDir = join(workspace, 'control');
+      const logs = await ensureAttemptLogs(join(workspace, 'logs'));
+      const execution = {
+        shell: 'bash' as const,
+        script:
+          '(exec </dev/null >/dev/null 2>&1; exec sleep 120) &\nprintf "%s\\n" "$!" > descendant.pid',
+        timeout_seconds: 120,
+        cancel_grace_seconds: 1,
+      };
+      let descendantPid: number | undefined;
+
+      try {
+        await writeJobScript(controlDir, execution);
+        const child = spawnJobScript({
+          attemptId: `att_closed_${process.pid}`,
+          controlDir,
+          workspacePath: workspace,
+          projectPath: workspace,
+          execution,
+          env: {},
+          logs,
+        });
+        expect(await child.waitForExit()).toMatchObject({ exitCode: 0 });
+        descendantPid = Number.parseInt(
+          await readFile(join(workspace, 'descendant.pid'), 'utf8'),
+          10,
+        );
+        const status = () =>
+          execFileAsync('ps', ['-p', String(descendantPid), '-o', 'stat='])
+            .then(({ stdout }) => stdout.trim())
+            .catch(() => '');
+        expect(await status()).toMatch(/^[^Z]/);
+
+        await child.kill(0);
+
+        await expect
+          .poll(async () => {
+            const state = await status();
+            return state === '' || state.startsWith('Z');
+          })
+          .toBe(true);
+        descendantPid = undefined;
+      } finally {
+        if (descendantPid) {
+          try {
+            process.kill(descendantPid, 'SIGKILL');
+          } catch {
+            // Descendant already exited.
+          }
+        }
+        await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      }
+    },
+  );
+
   // PLATFORM-GAP: Unix process-group kill requires POSIX setsid/SIGTERM semantics — verify on a Unix/macOS runner
   it.skipIf(process.platform === 'win32')(
     'cancel kills child and grandchild on Unix via process group',
@@ -436,6 +495,7 @@ Wait-Process -Id $p.Id
         await writeJobScript(controlDir, execution);
         const child = spawnJobScript({
           attemptId: 'att_win_cancel',
+          requireWindowsJobObject: true,
           controlDir,
           workspacePath: workspace,
           projectPath: workspace,
@@ -477,6 +537,56 @@ Wait-Process -Id $p.Id
     30_000,
   );
 
+  it.skipIf(process.platform !== 'win32')(
+    'passes an absolute Windows start authorization to the native helper',
+    async () => {
+      const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-lease-win-'));
+      try {
+        const controlDir = join(workspace, 'control');
+        const marker = join(workspace, 'started.txt');
+        const execution = {
+          shell: 'cmd' as const,
+          script: 'echo started>started.txt',
+          timeout_seconds: 5,
+          cancel_grace_seconds: 1,
+        };
+        await writeJobScript(controlDir, execution);
+        const input = {
+          attemptId: 'att_win_start',
+          requireWindowsJobObject: true,
+          controlDir,
+          workspacePath: workspace,
+          projectPath: workspace,
+          execution,
+          env: {},
+          logs: await ensureAttemptLogs(join(workspace, 'logs')),
+        };
+        const expired = spawnJobScript({
+          ...input,
+          getWindowsStartBudgetMs: () => {
+            // Model a stall between reading the lease budget and sending the request.
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+            return 100;
+          },
+        });
+        expect(await expired.waitForStart()).toEqual({
+          started: false,
+          errorMessage: 'Job start authorization expired',
+        });
+        expect(await expired.waitForExit()).toMatchObject({ exitCode: null });
+        await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+
+        const authorized = spawnJobScript({ ...input, getWindowsStartBudgetMs: () => 5_000 });
+        expect(await authorized.waitForStart()).toEqual({ started: true });
+        expect(await authorized.waitForExit()).toMatchObject({ exitCode: 0 });
+        expect((await readFile(marker, 'utf8')).trim()).toBe('started');
+      } finally {
+        await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      }
+    },
+    15_000,
+  );
+
   it('cleanup script runs in isolated containment identity and is not killed by late cancel scan', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-cleanup-id-'));
     const controlDir = join(workspace, 'control');
@@ -499,6 +609,7 @@ Wait-Process -Id $p.Id
 
       const child = spawnJobScript({
         attemptId: 'att_cleanup_isolation',
+        requireWindowsJobObject: true,
         controlDir,
         workspacePath: workspace,
         projectPath: workspace,
@@ -521,6 +632,7 @@ Wait-Process -Id $p.Id
       // Immediately run cleanup script with the same attemptId while killPromise is still sleeping in grace period
       const cleanupPromise = runCleanupScript({
         attemptId: 'att_cleanup_isolation',
+        requireWindowsJobObject: true,
         controlDir,
         workspacePath: workspace,
         projectPath: workspace,

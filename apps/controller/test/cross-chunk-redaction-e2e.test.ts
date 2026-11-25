@@ -30,6 +30,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
         stdout: PassThrough;
         stderr: PassThrough;
         pid: number;
+        waitForStart: () => Promise<{ started: true }>;
         waitForExit: () => Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
         kill: (grace?: number) => Promise<void>;
         ignoredRboEnvKeys: string[];
@@ -38,6 +39,7 @@ vi.mock('@rbo/executor', async (importOriginal) => {
       child.stderr = new PassThrough();
       child.pid = 4242;
       child.ignoredRboEnvKeys = [];
+      child.waitForStart = async () => ({ started: true });
       child.waitForExit = () =>
         new Promise((resolve) => {
           waitResolve = resolve;

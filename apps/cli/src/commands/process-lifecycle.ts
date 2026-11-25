@@ -1,6 +1,10 @@
 import { stdin as defaultStdin, stdout as defaultStdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
-import { findLiveRolePids, stopRoleProcesses } from '../../scripts/stop-running-rbo.mjs';
+import {
+  findLiveRolePids,
+  registerRoleInstance,
+  stopRoleProcesses,
+} from '../../scripts/stop-running-rbo.mjs';
 
 export type RboDaemonRole = 'controller' | 'agent';
 
@@ -62,6 +66,19 @@ export async function confirmReplaceOrThrow(options: {
 export interface RoleDirs {
   dataDir?: string;
   stateDir?: string;
+}
+
+export async function runRegisteredRole(
+  role: RboDaemonRole,
+  dirs: RoleDirs,
+  run: () => Promise<void>,
+): Promise<void> {
+  const unregister = await registerRoleInstance(role, dirs);
+  try {
+    await run();
+  } finally {
+    unregister();
+  }
 }
 
 export interface ProcessLifecycleDeps {

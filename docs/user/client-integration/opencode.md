@@ -21,7 +21,7 @@ Stdio (preferred):
 }
 ```
 
-Remote HTTP alternative (requires Bearer token from `~/.rbo/security/admin-token` or `<dataDir>/security/admin-token`):
+Remote HTTP alternative (requires Bearer token from `~/.rbo/security/mcp-token` or `<dataDir>/security/mcp-token`):
 
 ```json
 {
@@ -31,7 +31,7 @@ Remote HTTP alternative (requires Bearer token from `~/.rbo/security/admin-token
       "type": "remote",
       "url": "http://127.0.0.1:7410/mcp",
       "headers": {
-        "Authorization": "Bearer <ADMIN_TOKEN>"
+        "Authorization": "Bearer <MCP_TOKEN>"
       },
       "enabled": true
     }

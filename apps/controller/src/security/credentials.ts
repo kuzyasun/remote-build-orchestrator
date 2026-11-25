@@ -89,9 +89,7 @@ export function verifyAgentCredential(
 }
 
 export function markAgentSeen(db: ControllerDatabase, agentId: string, state: string): void {
-  db.prepare('UPDATE agents SET state = ?, last_seen_at = ? WHERE id = ?').run(
-    state,
-    nowIso(),
-    agentId,
-  );
+  db.prepare(
+    'UPDATE agents SET state = ?, last_seen_at = ? WHERE id = ? AND revoked_at IS NULL',
+  ).run(state, nowIso(), agentId);
 }

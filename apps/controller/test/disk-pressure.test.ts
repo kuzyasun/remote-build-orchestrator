@@ -4,10 +4,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  readAttemptMetadata,
+  writeAttemptMetadata,
+} from '../../agent/src/recovery/attempt-metadata.js';
+import {
   applyDiskPressureCleanup,
   isAcceptingJobsUnderDiskPressure,
 } from '../../agent/src/recovery/disk-pressure.js';
-import { filterMissingArtifacts } from '../src/http/data-plane.js';
+import {
+  clearArtifactExpectations,
+  filterMissingArtifacts,
+  registerArtifactExpectations,
+} from '../src/http/data-plane.js';
+import { migrateToLatest, nowIso, openDatabase } from '../src/storage/database.js';
 
 describe('Disk-pressure admission + cleanup order (§31.4)', () => {
   let stateDir: string;
@@ -212,11 +221,76 @@ describe('Disk-pressure admission + cleanup order (§31.4)', () => {
     await mkdir(artDir, { recursive: true });
     await writeFile(join(artDir, 'present.bin'), present);
 
-    const filtered = await filterMissingArtifacts(stateDir, attemptId, [
+    const manifest = [
       { logical_name: 'present.bin', size_bytes: present.length, sha256: presentHash },
       { logical_name: 'missing.bin', size_bytes: missing.length, sha256: missingHash },
-    ]);
+    ];
+    const db = openDatabase(':memory:');
+    try {
+      migrateToLatest(db);
+      db.prepare(
+        "INSERT INTO jobs (id, client_id, client_request_id, state, created_at, updated_at, request_json) VALUES ('job_resume', 'client', 'request', 'collecting_artifacts', ?, ?, '{}')",
+      ).run(nowIso(), nowIso());
+      db.prepare(
+        "INSERT INTO job_attempts (id, job_id, ordinal, lease_id, lease_epoch, state) VALUES (?, 'job_resume', 1, 'lease', 1, 'collecting_artifacts')",
+      ).run(attemptId);
+      db.prepare(
+        `INSERT INTO artifacts (id, job_id, attempt_id, logical_name, path, size_bytes, sha256, created_at)
+         VALUES ('art_legacy', 'job_resume', ?, 'present.bin', ?, ?, ?, ?)`,
+      ).run(attemptId, join(artDir, 'present.bin'), present.length, presentHash, nowIso());
+      registerArtifactExpectations(attemptId, manifest);
+      const filtered = await filterMissingArtifacts(
+        { db, dataDir: stateDir },
+        attemptId,
+        manifest,
+        () => true,
+      );
 
-    expect(filtered.map((a) => a.logical_name)).toEqual(['missing.bin']);
+      expect(filtered.map((a) => a.logical_name)).toEqual(['missing.bin']);
+      expect(
+        db
+          .prepare('SELECT path, size_bytes, sha256 FROM artifacts WHERE attempt_id = ?')
+          .all(attemptId),
+      ).toEqual([
+        { path: join(artDir, 'present.bin'), size_bytes: present.length, sha256: presentHash },
+      ]);
+    } finally {
+      clearArtifactExpectations(attemptId);
+      db.close();
+    }
+  });
+
+  it('retires leftover artifact staging while keeping metadata for a pending cleanup replay', async () => {
+    const { activeId } = await seedTree();
+    const meta = readAttemptMetadata(stateDir, activeId);
+    if (!meta) throw new Error('Missing fixture attempt metadata');
+    writeAttemptMetadata(stateDir, {
+      ...meta,
+      status: 'completed_awaiting_upload',
+      artifact_transfer: 'failed',
+    });
+    const cleaned: string[] = [];
+    await applyDiskPressureCleanup({
+      stateDir,
+      freeBytes: 0,
+      minFreeBytes: 1,
+      retentionMs: 7 * 24 * 60 * 60 * 1000,
+      cleanupAttemptResources: async (attemptId) => {
+        cleaned.push(attemptId);
+      },
+      evictInactiveRepos: async () => [],
+    });
+    const { readFile } = await import('node:fs/promises');
+    await expect(readFile(join(stateDir, 'artifacts', activeId, 'live.bin'))).rejects.toMatchObject(
+      { code: 'ENOENT' },
+    );
+    await expect(
+      readFile(join(stateDir, 'workspaces', activeId, 'marker.txt'), 'utf8'),
+    ).resolves.toBe('keep-or-delete');
+    expect(readAttemptMetadata(stateDir, activeId)).toMatchObject({
+      status: 'completed_awaiting_upload',
+      artifact_transfer: 'failed',
+    });
+    expect(cleaned).not.toContain(activeId);
   });
 });

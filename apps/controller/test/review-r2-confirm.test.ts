@@ -2,8 +2,6 @@
  * Round-2 fixes — assert corrected Controller/shared behaviour.
  */
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { isAllowedRepositoryUrl } from '@rbo/shared';
 import { describe, expect, it } from 'vitest';
 
@@ -42,14 +40,5 @@ describe('REVIEW R2 controller/shared fixes', () => {
         hosts: ['github.com'],
       }),
     ).toBe(true);
-  });
-
-  it('[P2] bundle data-plane includes x-rbo-sha256 (contract)', async () => {
-    const dataPlanePath = join(process.cwd(), 'apps/controller/src/http/data-plane.ts');
-    const src = await readFile(dataPlanePath, 'utf8');
-    const bundlePathIdx = src.indexOf('bundle.gitbundle');
-    expect(bundlePathIdx).toBeGreaterThan(-1);
-    const slice = src.slice(bundlePathIdx, bundlePathIdx + 500);
-    expect(slice).toContain("'x-rbo-sha256'");
   });
 });

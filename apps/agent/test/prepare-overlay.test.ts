@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { addAbortListener } from 'node:events';
 import {
+  access,
   copyFile,
   lstat,
   mkdir,
@@ -14,11 +16,14 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import type { PrepareSourceGitOverlayPayload } from '@rbo/protocol';
 import { type GitUrlAllowlist, computeRepoKey, normalizeRepositoryUrl } from '@rbo/shared';
 import { applyGitOverlay, captureGitOverlaySnapshot } from '@rbo/snapshot';
 import { createGitFixtureRepo } from '@rbo/testing';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentJobExecutor } from '../src/executor/index.js';
+import { hasPendingWorktreeCleanup } from '../src/recovery/worktree-cleanup.js';
+import * as mirrorGit from '../src/repos/mirror-git.js';
 import { DEFAULT_REPO_CACHE_CONFIG, RepoMirrorManager } from '../src/repos/mirror.js';
 
 const execFileAsync = promisify(execFile);
@@ -120,6 +125,57 @@ function baseLeaseOffer(attemptId: string, leaseId: string) {
       sha256: 'ab',
     },
     lease_ttl_seconds: 300,
+  };
+}
+
+async function prepareLocalOverlay(stateDir: string) {
+  const reposDir = join(stateDir, 'repos');
+  const repoPath = join(reposDir, computeRepoKey(canonicalUrl));
+  const fixture = await createGitFixtureRepo({
+    committed: [{ path: 'base.txt', content: 'base' }],
+  });
+  try {
+    await runGit(fixture.root, ['remote', 'add', 'origin', canonicalUrl]);
+    const captured = await captureGitOverlaySnapshot({
+      projectRoot: fixture.root,
+      allowedProjectRoots: [fixture.root],
+      sourcePolicy: { include_untracked: true, include_ignored: [], secret_policy: 'allow' },
+      contentStorageDir: join(stateDir, 'capture'),
+      repoUrl: canonicalUrl,
+    });
+    await mkdir(repoPath, { recursive: true });
+    await runGit(repoPath, ['clone', '--mirror', fixture.root, 'mirror.git']);
+    return { fixture, reposDir, manifest: captured.manifest };
+  } catch (error) {
+    await fixture.cleanup();
+    throw error;
+  }
+}
+
+function localOverlayPrepare(
+  offer: ReturnType<typeof baseLeaseOffer>,
+  manifest: PrepareSourceGitOverlayPayload['manifest'],
+  fetchRefs: string[],
+): PrepareSourceGitOverlayPayload {
+  return {
+    source_mode: 'git_overlay',
+    attempt_id: offer.attempt_id,
+    lease_id: offer.lease_id,
+    lease_epoch: offer.lease_epoch,
+    repo: {
+      url: canonicalUrl,
+      canonical_id: normalizeRepositoryUrl(canonicalUrl),
+      branch: 'main',
+      base_commit: manifest.repo.base_commit,
+      fetch_refs: fetchRefs,
+    },
+    overlay: {
+      download_url: 'https://controller.test/overlay',
+      data_token: 'overlay-token',
+      expected_size_bytes: 1,
+      expected_sha256: '0'.repeat(64),
+    },
+    manifest,
   };
 }
 
@@ -306,101 +362,366 @@ describe('git_overlay prepare path (mirror + worktree + overlay)', () => {
     expect(await readFile(join(projectPath, 'src/b.txt'), 'utf8')).toBe('B');
   });
 
-  it('AgentJobExecutor imports bundle then applies overlay when base commit is missing', async () => {
-    stateDir = await mkdtemp(join(tmpdir(), 'rbo-agent-exec-bundle-'));
-    const repoCacheRoot = join(stateDir, 'repo-cache');
-    const reposDir = join(repoCacheRoot, 'repos');
-    const attemptId = 'att_exec_bundle';
-    const leaseId = 'lease_exec_bundle';
+  it.each([true, false])(
+    'handles overlay preparation when bundle contains the base: %s',
+    async (baseInBundle) => {
+      stateDir = await mkdtemp(join(tmpdir(), 'rbo-agent-exec-bundle-'));
+      const repoCacheRoot = join(stateDir, 'repo-cache');
+      const reposDir = join(repoCacheRoot, 'repos');
+      const attemptId = 'att_exec_bundle';
+      const leaseId = 'lease_exec_bundle';
 
-    fixture = await createGitFixtureRepo({
-      committed: [{ path: 'bundle.txt', content: 'from-bundle' }],
-      unstaged: [{ path: 'bundle.txt', content: 'from-overlay' }],
-    });
-    await runGit(fixture.root, ['remote', 'add', 'origin', canonicalUrl]);
-    const head = await runGit(fixture.root, ['rev-parse', 'HEAD']);
+      fixture = await createGitFixtureRepo({
+        committed: [{ path: 'bundle.txt', content: 'from-bundle' }],
+        unstaged: [{ path: 'bundle.txt', content: 'from-overlay' }],
+      });
+      await runGit(fixture.root, ['remote', 'add', 'origin', canonicalUrl]);
+      const head = await runGit(fixture.root, ['rev-parse', 'HEAD']);
 
-    const bundlePath = join(stateDir, 'bundle.gitbundle');
-    await runGit(fixture.root, ['bundle', 'create', bundlePath, 'HEAD']);
-    const bundleBytes = await readFile(bundlePath);
+      const bundlePath = join(stateDir, 'bundle.gitbundle');
+      await runGit(fixture.root, ['bundle', 'create', bundlePath, 'HEAD']);
+      const bundleBytes = await readFile(bundlePath);
 
-    const storage = join(stateDir, 'capture');
-    const captured = await captureGitOverlaySnapshot({
-      projectRoot: fixture.root,
-      allowedProjectRoots: [fixture.root],
-      sourcePolicy: {
-        include_untracked: true,
-        include_ignored: [],
-        secret_policy: 'allow',
-      },
-      contentStorageDir: storage,
-      repoUrl: canonicalUrl,
-    });
-    const overlayBytes = await readFile(captured.archivePath);
+      const storage = join(stateDir, 'capture');
+      const captured = await captureGitOverlaySnapshot({
+        projectRoot: fixture.root,
+        allowedProjectRoots: [fixture.root],
+        sourcePolicy: {
+          include_untracked: true,
+          include_ignored: [],
+          secret_policy: 'allow',
+        },
+        contentStorageDir: storage,
+        repoUrl: canonicalUrl,
+      });
+      const overlayBytes = await readFile(captured.archivePath);
 
-    const repoKey = computeRepoKey(canonicalUrl);
-    const repoDir = join(reposDir, repoKey);
-    await mkdir(repoDir, { recursive: true });
-    await runGit(repoDir, ['init', '--bare', 'mirror.git']);
+      const repoKey = computeRepoKey(canonicalUrl);
+      const repoDir = join(reposDir, repoKey);
+      await mkdir(repoDir, { recursive: true });
+      await runGit(repoDir, ['init', '--bare', 'mirror.git']);
 
-    const socket = mockSocket();
-    const executor = new AgentJobExecutor(socket, {
-      stateDir,
-      repoCacheDir: repoCacheRoot,
-      controllerFingerprint: 'sha256:deadbeef',
-      gitAllowlist: allowlist,
-      repoCache: DEFAULT_REPO_CACHE_CONFIG,
-    });
-    patchLocalDownloads(executor, {
-      overlay: captured.archivePath,
-      bundle: bundlePath,
-    });
+      const socket = mockSocket();
+      const executor = new AgentJobExecutor(socket, {
+        stateDir,
+        repoCacheDir: repoCacheRoot,
+        controllerFingerprint: 'sha256:deadbeef',
+        gitAllowlist: allowlist,
+        repoCache: DEFAULT_REPO_CACHE_CONFIG,
+      });
+      patchLocalDownloads(executor, {
+        overlay: captured.archivePath,
+        bundle: bundlePath,
+      });
 
-    executor.handleLeaseOffer(baseLeaseOffer(attemptId, leaseId));
+      executor.handleLeaseOffer(baseLeaseOffer(attemptId, leaseId));
 
-    const preparePromise = executor.handlePrepareSource({
-      source_mode: 'git_overlay',
-      attempt_id: attemptId,
-      lease_id: leaseId,
-      lease_epoch: 1,
-      repo: {
-        url: canonicalUrl,
-        canonical_id: normalizeRepositoryUrl(canonicalUrl),
-        branch: 'main',
-        base_commit: head,
-        fetch_refs: [],
-      },
-      overlay: {
-        download_url: 'https://controller.test/data/v1/attempts/att/overlay',
-        data_token: 'overlay-token',
-        expected_size_bytes: overlayBytes.length,
-        expected_sha256: sha256File(overlayBytes),
-      },
-      manifest: captured.manifest,
-    });
+      const preparePromise = executor.handlePrepareSource({
+        source_mode: 'git_overlay',
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        repo: {
+          url: canonicalUrl,
+          canonical_id: normalizeRepositoryUrl(canonicalUrl),
+          branch: 'main',
+          base_commit: baseInBundle ? head : '0'.repeat(40),
+          fetch_refs: [],
+        },
+        overlay: {
+          download_url: 'https://controller.test/data/v1/attempts/att/overlay',
+          data_token: 'overlay-token',
+          expected_size_bytes: overlayBytes.length,
+          expected_sha256: sha256File(overlayBytes),
+        },
+        manifest: captured.manifest,
+      });
 
-    await viWaitFor(() =>
-      socket.sent.some(
-        (frame) => frame.type === 'source_need' && frame.payload?.reason === 'base_commit_missing',
-      ),
-    );
+      await viWaitFor(() =>
+        socket.sent.some(
+          (frame) =>
+            frame.type === 'source_need' && frame.payload?.reason === 'base_commit_missing',
+        ),
+      );
 
-    executor.handleBundleDownload({
-      attempt_id: attemptId,
-      lease_id: leaseId,
-      lease_epoch: 1,
-      download_url: 'https://controller.test/data/v1/attempts/att/bundle',
-      data_token: 'bundle-token',
-      expected_size_bytes: bundleBytes.length,
-      expected_sha256: sha256File(bundleBytes),
-    });
+      executor.handleBundleDownload({
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        download_url: 'https://controller.test/data/v1/attempts/att/bundle',
+        data_token: 'bundle-token',
+        expected_size_bytes: bundleBytes.length,
+        expected_sha256: sha256File(bundleBytes),
+      });
 
-    await preparePromise;
+      await preparePromise;
 
-    expect(socket.sent.some((frame) => frame.type === 'source_ready')).toBe(true);
-    const projectPath = join(stateDir, 'workspaces', attemptId, 'project');
-    expect(await readFile(join(projectPath, 'bundle.txt'), 'utf8')).toBe('from-overlay');
+      if (!baseInBundle) {
+        expect(socket.sent).toContainEqual(
+          expect.objectContaining({
+            type: 'job_exit',
+            payload: expect.objectContaining({
+              outcome: 'failed',
+              failure_category: 'repo_fetch',
+              failure_message: expect.stringContaining('snapshot_mode=full'),
+            }),
+          }),
+        );
+        expect(socket.sent.some((frame) => frame.type === 'source_ready')).toBe(false);
+        expect(executor.getActiveJobs()).toEqual([]);
+        return;
+      }
+
+      expect(socket.sent.some((frame) => frame.type === 'source_ready')).toBe(true);
+      const projectPath = join(stateDir, 'workspaces', attemptId, 'project');
+      expect(await readFile(join(projectPath, 'bundle.txt'), 'utf8')).toBe('from-overlay');
+    },
+  );
+});
+
+describe('git_overlay cancel while the mirror is busy', () => {
+  let stateDir: string;
+  let fixture: Awaited<ReturnType<typeof createGitFixtureRepo>> | undefined;
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    await fixture?.cleanup();
+    if (stateDir) {
+      await rm(stateDir, { recursive: true, force: true });
+    }
   });
+
+  function stallMirrorFetch() {
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const run = mirrorGit.runGitMutation;
+    const git = vi
+      .spyOn(mirrorGit, 'runGitMutation')
+      .mockImplementation(async (owner, cwd, args) => {
+        if (args[0] === 'clone') {
+          throw new Error('expected a seeded local mirror');
+        }
+        if (args[0] === 'fetch') {
+          entered.resolve();
+          await finish.promise;
+          return;
+        }
+        await run(owner, cwd, args);
+      });
+    return { entered, finish, git };
+  }
+
+  it.each(['cancel', 'disconnect', 'lease expiry'] as const)(
+    'releases the source slot on %s before the mirror fetch settles',
+    async (action) => {
+      stateDir = await mkdtemp(join(tmpdir(), 'rbo-overlay-stalled-fetch-'));
+      const local = await prepareLocalOverlay(stateDir);
+      fixture = local.fixture;
+      const socket = mockSocket();
+      const executor = new AgentJobExecutor(socket, {
+        stateDir,
+        repoCacheDir: stateDir,
+        controllerFingerprint: 'sha256:deadbeef',
+        gitAllowlist: allowlist,
+        repoCache: DEFAULT_REPO_CACHE_CONFIG,
+      });
+      const contender = new RepoMirrorManager({
+        reposDir: local.reposDir,
+        allowlist,
+        repoCache: DEFAULT_REPO_CACHE_CONFIG,
+      });
+      const baseOffer = baseLeaseOffer('att_fetch', 'lease_fetch');
+      const offer = {
+        ...baseOffer,
+        job_request: { ...baseOffer.job_request, risk_level: 'hardware' as const },
+        lease_ttl_seconds: 5,
+      };
+      const prepare = localOverlayPrepare(offer, local.manifest, [
+        'refs/heads/main',
+        'refs/heads/next',
+      ]);
+      const { entered, finish, git } = stallMirrorFetch();
+
+      if (action === 'lease expiry') {
+        vi.useFakeTimers({ toFake: ['Date', 'performance', 'setTimeout', 'clearTimeout'] });
+      }
+      executor.handleLeaseOffer(offer);
+      const preparing = executor.handlePrepareSource(prepare);
+      let stopped: Promise<void> | undefined;
+      try {
+        await Promise.race([
+          entered.promise,
+          preparing.then(() => {
+            throw new Error('expected a mirror fetch');
+          }),
+        ]);
+        if (action === 'cancel') {
+          stopped = executor.handleCancelJob({ ...prepare, grace_seconds: 1 });
+        } else if (action === 'disconnect') {
+          stopped = executor.abandonOnDisconnect();
+        } else {
+          await vi.advanceTimersByTimeAsync(5_000);
+          vi.useRealTimers();
+        }
+
+        await vi.waitFor(() => expect(executor.isBusy()).toBe(false));
+        await stopped;
+        await preparing;
+        await expect(access(join(stateDir, 'workspaces', offer.attempt_id))).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+        expect(socket.sent.some((frame) => frame.type === 'source_ready')).toBe(false);
+        expect(socket.sent.some((frame) => frame.type === 'source_need')).toBe(false);
+        const exit = socket.sent.find((frame) => frame.type === 'job_exit');
+        if (action === 'disconnect') {
+          expect(exit).toBeUndefined();
+        } else {
+          expect(exit?.payload).toMatchObject({
+            failure_category: action === 'cancel' ? 'cancelled' : 'lease_expired',
+          });
+        }
+
+        executor.handleLeaseOffer(baseLeaseOffer('att_next', 'lease_next'));
+        expect(executor.getActiveAttemptId()).toBe('att_next');
+        await expect(contender.ensureMirror(canonicalUrl)).rejects.toThrow(/Fetch lock held/);
+      } finally {
+        vi.useRealTimers();
+        finish.resolve();
+        await preparing;
+        await stopped;
+        await executor.forceAbandon();
+        await vi.waitFor(() => contender.ensureMirror(canonicalUrl));
+      }
+      expect(git).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(['same manager', 'another manager'] as const)(
+    'waits for a mirror owner in %s before removing a cancelled attempt worktree',
+    async (owner) => {
+      stateDir = await mkdtemp(join(tmpdir(), 'rbo-overlay-deferred-cleanup-'));
+      const local = await prepareLocalOverlay(stateDir);
+      fixture = local.fixture;
+      const socket = mockSocket();
+      const config = {
+        stateDir,
+        repoCacheDir: stateDir,
+        controllerFingerprint: 'sha256:deadbeef',
+        gitAllowlist: allowlist,
+        repoCache: DEFAULT_REPO_CACHE_CONFIG,
+        maxJobs: 2,
+      };
+      const executor = new AgentJobExecutor(socket, config);
+      let cleanupExecutor = executor;
+      const offer = baseLeaseOffer('att_checkout', 'lease_checkout');
+      const checkout = localOverlayPrepare(offer, local.manifest, []);
+      const fetchOffer = baseLeaseOffer('att_fetch', 'lease_fetch');
+      const fetch = localOverlayPrepare(fetchOffer, local.manifest, ['refs/heads/main']);
+      const otherManager = new RepoMirrorManager({
+        reposDir: local.reposDir,
+        allowlist,
+        repoCache: DEFAULT_REPO_CACHE_CONFIG,
+      });
+      const repoKey = computeRepoKey(canonicalUrl);
+      const workspace = join(stateDir, 'workspaces', checkout.attempt_id);
+      const downloading = Promise.withResolvers<void>();
+      const downloads = executor as unknown as {
+        downloadSnapshotFile: (
+          ...args: [string, string, string, number, string, AbortSignal]
+        ) => Promise<void>;
+      };
+      vi.spyOn(downloads, 'downloadSnapshotFile').mockImplementationOnce(
+        async (_url, _token, _path, _size, _sha, signal) => {
+          const cancelled = Promise.withResolvers<never>();
+          const listener = addAbortListener(signal, () => cancelled.reject(signal.reason));
+          downloading.resolve();
+          try {
+            return await cancelled.promise;
+          } finally {
+            listener[Symbol.dispose]();
+          }
+        },
+      );
+      const { entered, finish, git } = stallMirrorFetch();
+
+      executor.handleLeaseOffer(offer);
+      const checkingOut = executor.handlePrepareSource(checkout);
+      let fetching: Promise<void> | undefined;
+      let cancelling: Promise<void> | undefined;
+      try {
+        await Promise.race([
+          downloading.promise,
+          checkingOut.then(() => {
+            throw new Error('expected an overlay download');
+          }),
+        ]);
+        if (owner === 'same manager') {
+          executor.handleLeaseOffer(fetchOffer);
+          fetching = executor.handlePrepareSource(fetch);
+        } else {
+          fetching = otherManager.fetchRefs(canonicalUrl, fetch.repo.fetch_refs);
+        }
+        await Promise.race([
+          entered.promise,
+          fetching.then(() => {
+            throw new Error('expected a mirror fetch');
+          }),
+        ]);
+
+        cancelling = executor.handleCancelJob({ ...checkout, grace_seconds: 1 });
+        const remaining = owner === 'same manager' ? fetch.attempt_id : null;
+        await vi.waitFor(() => expect(executor.getActiveAttemptId()).toBe(remaining));
+        await cancelling;
+        await checkingOut;
+        await expect(access(join(workspace, 'project'))).resolves.toBeUndefined();
+        expect(hasPendingWorktreeCleanup(stateDir, checkout.attempt_id)).toBe(true);
+        const heldMetadata = await otherManager.readMetadata(repoKey);
+        expect(heldMetadata?.active_worktree_count).toBe(1);
+        expect(git.mock.calls.map(([, , args]) => args.slice(0, 2))).toEqual([
+          ['worktree', 'add'],
+          ['fetch', '--no-tags'],
+        ]);
+
+        executor.handleLeaseOffer(offer);
+        expect(socket.sent.at(-1)).toMatchObject({ type: 'lease_reject' });
+        if (owner === 'another manager') {
+          // A restarted Executor must fence the workspace before its first scan.
+          const restartedSocket = mockSocket();
+          cleanupExecutor = new AgentJobExecutor(restartedSocket, config);
+          cleanupExecutor.handleLeaseOffer(offer);
+          expect(restartedSocket.sent.at(-1)).toMatchObject({ type: 'lease_reject' });
+        }
+        await cleanupExecutor.retryPendingWorktreeCleanup();
+        await expect(access(join(workspace, 'project'))).resolves.toBeUndefined();
+        if (owner === 'same manager') {
+          await executor.handleCancelJob({ ...fetch, grace_seconds: 1 });
+          await fetching;
+        }
+        expect(executor.isBusy()).toBe(false);
+      } finally {
+        finish.resolve();
+        await executor.forceAbandon();
+        await Promise.all([checkingOut, fetching, cancelling]);
+        await vi.waitFor(
+          async () => {
+            await cleanupExecutor.retryPendingWorktreeCleanup();
+            await expect(access(workspace)).rejects.toMatchObject({ code: 'ENOENT' });
+          },
+          { timeout: 10_000 },
+        );
+      }
+      const cleanedMetadata = await otherManager.readMetadata(repoKey);
+      expect(cleanedMetadata?.active_worktree_count).toBe(0);
+      expect(hasPendingWorktreeCleanup(stateDir, checkout.attempt_id)).toBe(false);
+      expect(git.mock.calls.map(([, , args]) => args.slice(0, 2))).toEqual([
+        ['worktree', 'add'],
+        ['fetch', '--no-tags'],
+        ['worktree', 'remove'],
+        ['worktree', 'prune'],
+      ]);
+    },
+  );
 });
 
 describe('git_overlay overlay fixtures (executable / symlink / empty-dir)', () => {

@@ -1,9 +1,9 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGitFixtureRepo } from '@rbo/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { captureGitOverlaySnapshot } from '../src/capture.js';
+import { captureFullSnapshot, captureGitOverlaySnapshot } from '../src/capture.js';
 import { gitStatusPorcelainV2 } from '../src/git-status.js';
 import { applyGitOverlay } from '../src/materialize.js';
 import { computeOverlayPlan } from '../src/overlay.js';
@@ -20,6 +20,44 @@ afterEach(async () => {
 });
 
 describe('Overlay plan + apply', () => {
+  it.each([
+    ['full', captureFullSnapshot],
+    ['git_overlay', captureGitOverlaySnapshot],
+  ] as const)(
+    'checks additional root authorization before %s storage setup',
+    async (_, capture) => {
+      const repo = await createGitFixtureRepo({
+        committed: [{ path: 'main.txt', content: 'main' }],
+      });
+      cleanups.push(repo.cleanup);
+      const temp = await mkdtemp(join(tmpdir(), 'rbo-capture-root-'));
+      cleanups.push(async () => rm(temp, { recursive: true, force: true }));
+      const extra = join(temp, 'extra');
+      const storage = join(temp, 'captures');
+      await mkdir(extra);
+      await mkdir(storage);
+      const input = {
+        projectRoot: repo.root,
+        allowedProjectRoots: [repo.root],
+        sourcePolicy: {
+          include_untracked: true,
+          include_ignored: [],
+          secret_policy: 'allow' as const,
+        },
+        additionalRoots: [
+          { source_path: extra, mount_path: 'shared', include: ['**'], exclude: [] },
+        ],
+        contentStorageDir: storage,
+        repoUrl: 'https://example.invalid/example.git',
+      };
+      await expect(capture(input)).rejects.toMatchObject({
+        category: 'materialization',
+        message: expect.stringContaining('Additional root is not under allowed project roots'),
+      });
+      expect(await readdir(storage)).toEqual([]);
+    },
+  );
+
   it('plans staged, unstaged, deletion, untracked, and rename overlay entries', async () => {
     const repo = await createGitFixtureRepo({
       committed: [
@@ -144,6 +182,55 @@ describe('Overlay plan + apply', () => {
     expect(paths).toContain('юнікод/файл.txt');
     expect(captured.overlayBytes).toBeLessThan(64 * 1024);
   });
+
+  it.for(['directory', 'directory link'])(
+    'replaces an existing %s with a regular file',
+    async (type, { skip }) => {
+      const repo = await createGitFixtureRepo({
+        committed: [{ path: 'base.txt', content: 'base' }],
+        untracked: [{ path: 'entry', content: 'replacement' }],
+      });
+      cleanups.push(repo.cleanup);
+      const workspace = await mkdtemp(join(tmpdir(), 'rbo-overlay-type-'));
+      cleanups.push(async () => rm(workspace, { recursive: true, force: true }));
+      const projectPath = join(workspace, 'project');
+      const target = join(projectPath, 'other');
+      await mkdir(target, { recursive: true });
+      await writeFile(join(target, 'keep.txt'), 'keep');
+      const entry = join(projectPath, 'entry');
+      if (type === 'directory') {
+        await mkdir(entry);
+      } else {
+        try {
+          await symlink(target, entry, 'junction');
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === 'EPERM' || code === 'EACCES') {
+            skip();
+            return;
+          }
+          throw error;
+        }
+      }
+
+      const captured = await captureGitOverlaySnapshot({
+        projectRoot: repo.root,
+        allowedProjectRoots: [repo.root],
+        sourcePolicy: { include_untracked: true, include_ignored: [], secret_policy: 'allow' },
+        contentStorageDir: join(workspace, 'capture'),
+        repoUrl: 'https://example.invalid/example.git',
+      });
+      await applyGitOverlay({
+        manifest: captured.manifest,
+        archivePath: captured.archivePath,
+        workspaceRoot: workspace,
+        projectPath,
+      });
+      expect((await lstat(entry)).isFile()).toBe(true);
+      expect(await readFile(entry, 'utf8')).toBe('replacement');
+      expect(await readFile(join(target, 'keep.txt'), 'utf8')).toBe('keep');
+    },
+  );
 
   it('rejects an overlay mutation after archive completion and cleans private storage', async () => {
     const repo = await createGitFixtureRepo({

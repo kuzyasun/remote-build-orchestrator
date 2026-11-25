@@ -6,6 +6,7 @@ import {
   ArtifactUploadGrantPayloadSchema,
   BundleDownloadPayloadSchema,
   CancelJobPayloadSchema,
+  HeartbeatAckPayloadSchema,
   LeaseOfferPayloadSchema,
   LogAckPayloadSchema,
   PrepareSourcePayloadSchema,
@@ -34,7 +35,7 @@ import {
 } from '../capabilities/probe.js';
 import { resolveReposDir } from '../config.js';
 import { cleanupDockerResourcesForAttempt } from '../docker/cleanup.js';
-import { AgentJobExecutor } from '../executor/index.js';
+import { AgentJobExecutor, type LeaseClock, readLeaseClock } from '../executor/index.js';
 import { AgentRecoveryCoordinator } from '../recovery/coordinator.js';
 import { applyDiskPressureCleanup } from '../recovery/disk-pressure.js';
 import { DEFAULT_REPO_CACHE_CONFIG, type RepoCacheConfig } from '../repos/mirror.js';
@@ -42,6 +43,8 @@ import { DEFAULT_REPO_CACHE_CONFIG, type RepoCacheConfig } from '../repos/mirror
 const logger = createLogger('agent.connection');
 
 const HEARTBEAT_INTERVAL_MS = 20_000;
+// Keep more than a full 300-second Controller lease of sent heartbeats.
+const MAX_PENDING_HEARTBEATS = 32;
 
 export interface AgentConnectionOptions {
   controllerUrl: string;
@@ -91,6 +94,7 @@ export class AgentConnection {
   private executor: AgentJobExecutor | null = null;
   private recovery: AgentRecoveryCoordinator;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly pendingHeartbeats = new Map<string, { socket: WebSocket; sentAt: LeaseClock }>();
 
   constructor(options: AgentConnectionOptions) {
     this.options = options;
@@ -102,6 +106,9 @@ export class AgentConnection {
         },
         resendJobExit: (meta) => {
           this.executor?.resendJobExitIfCompleted(meta);
+        },
+        authorizeArtifactUpload: (attemptId, socket) => {
+          this.executor?.authorizeArtifactUpload(attemptId, socket);
         },
         resumeArtifactUpload: async (meta) => {
           await this.executor?.resumeArtifactUpload(meta);
@@ -179,6 +186,13 @@ export class AgentConnection {
       this.socket = socket;
 
       let settled = false;
+      let sentInitialCapabilities = false;
+      let pendingCapabilityRefresh = false;
+      const refreshBuildCache = () => {
+        void this.refreshBuildCacheCapabilities(socket).catch((error) => {
+          logger.warn('build-cache capability refresh failed', { error: String(error) });
+        });
+      };
       const finish = (result: ConnectResult) => {
         if (settled) return;
         settled = true;
@@ -187,7 +201,7 @@ export class AgentConnection {
       const fail = (error: Error) => {
         if (settled) return;
         settled = true;
-        this.stopHeartbeats();
+        if (this.socket === socket) this.stopHeartbeats();
         socket.terminate();
         rejectPromise(error);
       };
@@ -220,6 +234,7 @@ export class AgentConnection {
       });
 
       socket.on('message', (raw) => {
+        if (this.socket !== socket) return;
         let message: { type: string; payload?: Record<string, unknown> };
         try {
           message = JSON.parse(String(raw)) as typeof message;
@@ -271,11 +286,6 @@ export class AgentConnection {
             const agentId = String(message.payload?.agent_id ?? state.agentId ?? '');
             this.saveState({ ...state, agentId });
             this.options.capabilities.agent_id = agentId;
-            this.send(socket, 'capabilities', {
-              ...this.options.capabilities,
-              agent_id: agentId,
-            });
-
             this.recovery.attachSocket(socket);
             if (this.executor) {
               // Reconnect with live attempt: re-bind socket and reconcile.
@@ -299,11 +309,34 @@ export class AgentConnection {
                 getSpoolPressure: () => this.executor?.isUnderSpoolPressure() ?? false,
               });
             }
-            void this.recovery.reportAll().catch((error) => {
-              logger.warn('recovery_report scan failed', { error: String(error) });
-            });
-            this.startHeartbeats(socket);
-            finish({ status: 'authenticated', agentId });
+            void this.recovery
+              .reportAll((pendingProcessExitAttemptIds) => {
+                this.send(socket, 'capabilities', {
+                  ...this.options.capabilities,
+                  agent_id: agentId,
+                  ...(pendingProcessExitAttemptIds.length > 0
+                    ? { pending_process_exit_attempt_ids: pendingProcessExitAttemptIds }
+                    : {}),
+                });
+                sentInitialCapabilities = true;
+                if (pendingCapabilityRefresh) refreshBuildCache();
+              })
+              .catch((error) => {
+                if (!sentInitialCapabilities) {
+                  fail(new Error('Could not prepare initial Agent capabilities', { cause: error }));
+                  return;
+                }
+                logger.warn('recovery_report scan failed', { error: String(error) });
+              })
+              .finally(() => {
+                if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
+                if (sentInitialCapabilities) {
+                  this.startHeartbeats(socket);
+                  finish({ status: 'authenticated', agentId });
+                } else {
+                  fail(new Error('Initial Agent capabilities were not sent'));
+                }
+              });
             return;
           }
 
@@ -334,6 +367,17 @@ export class AgentConnection {
 
         if (this.executor) {
           switch (message.type) {
+            case 'heartbeat_ack': {
+              const parsed = HeartbeatAckPayloadSchema.safeParse(message.payload);
+              if (!parsed.success) break;
+              const messageId = parsed.data.heartbeat_message_id;
+              const pending = this.pendingHeartbeats.get(messageId);
+              if (pending?.socket === socket) {
+                this.pendingHeartbeats.delete(messageId);
+                this.executor.confirmLeaseRenewal(parsed.data, pending.sentAt);
+              }
+              break;
+            }
             case 'lease_offer': {
               const parsed = LeaseOfferPayloadSchema.safeParse(message.payload);
               if (parsed.success) {
@@ -413,13 +457,15 @@ export class AgentConnection {
               // heartbeat tick — previously nothing handled this case, so the request went nowhere.
               const agentId = this.options.capabilities.agent_id;
               if (agentId && socket.readyState === WebSocket.OPEN) {
+                if (!sentInitialCapabilities) {
+                  pendingCapabilityRefresh = true;
+                  break;
+                }
                 this.send(socket, 'capabilities', {
                   ...this.options.capabilities,
                   agent_id: agentId,
                 });
-                void this.refreshBuildCacheCapabilities(socket).catch((error) => {
-                  logger.warn('build-cache capability refresh failed', { error: String(error) });
-                });
+                refreshBuildCache();
               }
               break;
             }
@@ -439,9 +485,11 @@ export class AgentConnection {
       });
 
       socket.on('close', () => {
-        this.stopHeartbeats();
-        // Park attempt through grace — do not kill safe/normal jobs.
-        void this.executor?.abandonOnDisconnect();
+        if (this.socket === socket) {
+          this.stopHeartbeats();
+          // Park attempt through grace — do not kill safe/normal jobs.
+          void this.executor?.abandonOnDisconnect();
+        }
         // Keep executor alive across reconnect so the process and spool sender remain.
         if (!settled) {
           settled = true;
@@ -480,8 +528,8 @@ export class AgentConnection {
   }
 
   private sendHeartbeat(socket: WebSocket): void {
+    void this.executor?.retryPendingWorktreeCleanup();
     const busy = this.executor?.isBusy() ?? false;
-    this.executor?.renewLeaseDeadline();
     const freeBytes = this.options.getFreeDiskBytes?.() ?? 0;
     const minFree = this.options.diskMinFreeBytes ?? 0;
     const spoolPressure = this.executor?.isUnderSpoolPressure() ?? false;
@@ -491,6 +539,9 @@ export class AgentConnection {
 
     if (underPressure) {
       const retentionDays = this.options.repoCache?.retention_days ?? 14;
+      const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
+      const nowMs = Date.now();
+      const executor = this.executor;
       const buildCache = this.options.buildCache ?? DEFAULT_BUILD_CACHE_CONFIG;
       // Wire heartbeat free-disk measurement so min-free eviction can trigger.
       const buildCacheStore = new BuildCacheStore(
@@ -506,10 +557,15 @@ export class AgentConnection {
         minFreeBytes: minFree > 0 ? minFree : 1,
         freeBytes,
         spoolPressure,
-        retentionMs: retentionDays * 24 * 60 * 60 * 1000,
+        retentionMs,
+        nowMs,
+        evictInactiveRepos: executor
+          ? () => executor.evictInactiveRepos(nowMs - retentionMs)
+          : undefined,
         cleanupAttemptResources: async (attemptId) => {
           await this.recovery.cleanupVerifiedOrphan(attemptId);
         },
+        shouldRetainWorkspace: (attemptId) => executor?.shouldRetainWorkspace(attemptId) ?? false,
         // After inactive repo caches: evict LRU inactive build-cache keys (never locked/in-use).
         evictInactiveBuildCaches: async () => {
           const result = await buildCacheStore.evictInactive({
@@ -523,16 +579,24 @@ export class AgentConnection {
       });
     }
 
-    this.send(socket, 'heartbeat', {
+    const payload = {
       state: busy ? 'busy' : 'idle',
       active_jobs: this.executor?.getActiveJobs() ?? [],
       cpu_load: probeCpuLoad(),
       accepting_jobs: accepting,
+      request_lease_ack: true,
       disk_free_bytes: freeBytes,
       disk_min_free_bytes: minFree,
       disk_pressure: diskPressure,
       spool_pressure: spoolPressure,
-    });
+    };
+    const messageId = generateId('msg');
+    this.pendingHeartbeats.set(messageId, { socket, sentAt: readLeaseClock() });
+    if (this.pendingHeartbeats.size > MAX_PENDING_HEARTBEATS) {
+      const oldest = this.pendingHeartbeats.keys().next();
+      if (!oldest.done) this.pendingHeartbeats.delete(oldest.value);
+    }
+    this.send(socket, 'heartbeat', payload, messageId);
 
     void this.refreshBuildCacheCapabilities(socket).catch((error) => {
       logger.warn('build-cache capability refresh failed', { error: String(error) });
@@ -571,18 +635,24 @@ export class AgentConnection {
   }
 
   private stopHeartbeats(): void {
+    this.pendingHeartbeats.clear();
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
   }
 
-  private send(socket: WebSocket, type: string, payload: Record<string, unknown>): void {
+  private send(
+    socket: WebSocket,
+    type: string,
+    payload: Record<string, unknown>,
+    messageId = generateId('msg'),
+  ): void {
     socket.send(
       JSON.stringify({
         protocol: 1,
         type,
-        message_id: generateId('msg'),
+        message_id: messageId,
         sent_at: new Date().toISOString(),
         attempt_id: null,
         lease_id: null,

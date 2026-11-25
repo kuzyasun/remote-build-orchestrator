@@ -1,11 +1,15 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WebSocket } from 'ws';
 import { AgentJobExecutor } from '../src/executor/index.js';
-import { type AttemptMetadata, writeAttemptMetadata } from '../src/recovery/attempt-metadata.js';
+import {
+  type AttemptMetadata,
+  readAttemptMetadata,
+  writeAttemptMetadata,
+} from '../src/recovery/attempt-metadata.js';
 import { AgentRecoveryCoordinator } from '../src/recovery/coordinator.js';
 
 const collectSpy = vi.fn(async () => ({ files: [] }));
@@ -59,163 +63,381 @@ describe('Artifact upload resume (completed_awaiting_upload)', () => {
     await rm(stateDir, { recursive: true, force: true });
   });
 
-  it('on adopt re-sends artifact_manifest from persisted staging; never re-collects workspace', async () => {
-    const content = Buffer.from('artifact-bytes');
-    const sha256 = createHash('sha256').update(content).digest('hex');
-    const stagingPath = join(stateDir, 'artifacts', 'att_1', 'out.txt');
-    await mkdir(join(stagingPath, '..'), { recursive: true });
-    await writeFile(stagingPath, content);
+  it.each([
+    { expectedTransfer: 'stored', attempts: 2, reconnect: true },
+    { expectedTransfer: 'failed', attempts: 3, reconnect: false },
+  ])(
+    'on adopt retires staged files after a $expectedTransfer transfer',
+    async ({ expectedTransfer, attempts, reconnect }) => {
+      const content = Buffer.from('artifact-bytes');
+      const sha256 = createHash('sha256').update(content).digest('hex');
+      const stagingPath = join(stateDir, 'artifacts', 'att_1', 'out.txt');
+      await mkdir(join(stagingPath, '..'), { recursive: true });
+      await writeFile(stagingPath, content);
 
-    const meta: AttemptMetadata = {
-      attempt_id: 'att_1',
-      job_id: 'job_1',
-      lease_id: 'lease_1',
-      lease_epoch: 1,
-      process_identity: 'pid:42',
-      status: 'completed_awaiting_upload',
-      workspace_path: join(stateDir, 'workspaces', 'att_1'),
-      spool_dir: join(stateDir, 'logs', 'att_1'),
-      risk_level: 'normal',
-      updated_at: new Date().toISOString(),
-      last_exit: { exit_code: 0, outcome: 'succeeded' },
-      artifact_manifest: [
-        {
-          logical_name: 'out.txt',
-          path: stagingPath,
-          size_bytes: content.length,
-          sha256,
+      const meta: AttemptMetadata = {
+        attempt_id: 'att_1',
+        job_id: 'job_1',
+        lease_id: 'lease_1',
+        lease_epoch: 1,
+        process_identity: 'pid:42',
+        status: 'completed_awaiting_upload',
+        workspace_path: join(stateDir, 'workspaces', 'att_1'),
+        spool_dir: join(stateDir, 'logs', 'att_1'),
+        risk_level: 'normal',
+        updated_at: new Date().toISOString(),
+        last_exit: { exit_code: 0, outcome: 'succeeded' },
+        cleanup_result: { exit_code: 0, timed_out: false },
+        artifact_manifest: [
+          {
+            logical_name: 'out.txt',
+            path: stagingPath,
+            size_bytes: content.length,
+            sha256,
+          },
+        ],
+        artifact_collection: {
+          rules: [{ matched_count: 1, collected_count: 1, skipped_count: 0, skip_reasons: [] }],
         },
-      ],
-      artifact_collection: {
-        rules: [{ matched_count: 1, collected_count: 1, skipped_count: 0, skip_reasons: [] }],
-      },
-    };
-    writeAttemptMetadata(stateDir, meta);
+      };
+      const socket = mockSocket();
+      const executor = new AgentJobExecutor(reconnect ? mockSocket() : socket, {
+        stateDir,
+        controllerFingerprint: 'sha256:test',
+        gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+        repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
+      });
+      if (reconnect) {
+        executor.handleLeaseOffer({
+          attempt_id: meta.attempt_id,
+          lease_id: meta.lease_id,
+          lease_epoch: meta.lease_epoch,
+          job_id: meta.job_id,
+          job_request: {
+            client_request_id: 'req_1',
+            source: { project_root: stateDir, cwd: '.' },
+            execution: { script: 'echo artifact' },
+          },
+          snapshot_metadata: {
+            snapshot_id: 'snp_1',
+            content_id: 'cid',
+            size_bytes: 1,
+            sha256: 'unused',
+          },
+          lease_ttl_seconds: 300,
+        });
+        executor.attachSocket(socket);
+      }
+      writeAttemptMetadata(stateDir, meta);
 
-    const socket = mockSocket();
-    const executor = new AgentJobExecutor(socket, {
-      stateDir,
-      controllerFingerprint: 'sha256:test',
-      gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
-      repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
-    });
+      // Grant arrives after manifest — resolve upload without network
+      const uploadSpy = vi
+        .spyOn(
+          executor as unknown as {
+            uploadArtifactFile: (...a: unknown[]) => Promise<void>;
+          },
+          'uploadArtifactFile',
+        )
+        .mockImplementationOnce(async () => {
+          await expect(access(stagingPath)).resolves.toBeUndefined();
+          expect(socket.sent.some((f) => f.type === 'cleanup_complete')).toBe(false);
+          throw new Error('Temporary upload failure');
+        })
+        .mockImplementation(async () => {
+          await expect(access(stagingPath)).resolves.toBeUndefined();
+          expect(socket.sent.some((f) => f.type === 'cleanup_complete')).toBe(false);
+          if (expectedTransfer === 'failed') throw new Error('Repeated upload failure');
+        });
 
-    // Grant arrives after manifest — resolve upload without network
-    const uploadSpy = vi
-      .spyOn(
-        executor as unknown as {
-          uploadArtifactFile: (...a: unknown[]) => Promise<void>;
+      const recovery = new AgentRecoveryCoordinator({
+        stateDir,
+        hooks: {
+          terminateAttempt: async () => undefined,
+          resendJobExit: (m) => executor.resendJobExitIfCompleted(m),
+          authorizeArtifactUpload: (id, session) => executor.authorizeArtifactUpload(id, session),
+          resumeArtifactUpload: (m) => executor.resumeArtifactUpload(m),
         },
-        'uploadArtifactFile',
-      )
-      .mockResolvedValue(undefined);
+      });
+      recovery.attachSocket(socket);
+      (executor as unknown as { config: { recovery: AgentRecoveryCoordinator } }).config.recovery =
+        recovery;
 
-    const recovery = new AgentRecoveryCoordinator({
-      stateDir,
-      hooks: {
-        terminateAttempt: async () => undefined,
-        resendJobExit: (m) => executor.resendJobExitIfCompleted(m),
-        resumeArtifactUpload: (m) => executor.resumeArtifactUpload(m),
-      },
-    });
-    recovery.attachSocket(socket);
-    (executor as unknown as { config: { recovery: AgentRecoveryCoordinator } }).config.recovery =
-      recovery;
+      // Simulate grant handler wired like connection client
+      const origSend = socket.send.bind(socket);
+      socket.send = (raw: string) => {
+        origSend(raw);
+        const frame = JSON.parse(raw) as { type: string; payload: Record<string, unknown> };
+        if (frame.type === 'artifact_manifest') {
+          queueMicrotask(() => {
+            executor.handleArtifactUploadGrant({
+              attempt_id: 'att_1',
+              lease_id: 'lease_1',
+              lease_epoch: 1,
+              artifacts: [
+                {
+                  logical_name: 'out.txt',
+                  path: stagingPath,
+                  size_bytes: content.length,
+                  sha256,
+                  upload_url: 'https://example.invalid/upload',
+                  upload_token: 'tok',
+                },
+              ],
+            });
+          });
+        }
+      };
 
-    // Simulate grant handler wired like connection client
-    const origSend = socket.send.bind(socket);
-    socket.send = (raw: string) => {
-      origSend(raw);
-      const frame = JSON.parse(raw) as { type: string; payload: Record<string, unknown> };
-      if (frame.type === 'artifact_manifest') {
-        queueMicrotask(() => {
-          executor.handleArtifactUploadGrant({
-            attempt_id: 'att_1',
-            lease_id: 'lease_1',
-            lease_epoch: 1,
-            artifacts: [
+      const decision = {
+        attempt_id: 'att_1',
+        lease_id: 'lease_1',
+        lease_epoch: 1,
+        action: 'adopt' as const,
+        resume_from_sequence: 0,
+      };
+      const pendingProcessExits = vi.fn();
+      await recovery.reportAll(pendingProcessExits);
+      expect(pendingProcessExits).toHaveBeenCalledWith([meta.attempt_id]);
+      expect(socket.sent[0]).toMatchObject({
+        type: 'recovery_report',
+        payload: {
+          status: 'completed_awaiting_upload',
+          artifact_upload_pending: true,
+          process_exit: meta.last_exit,
+        },
+      });
+      if (reconnect) {
+        await executor.resumeArtifactUpload(meta);
+        expect(socket.sent.map((frame) => frame.type)).toEqual(['recovery_report']);
+        const live = (
+          executor as unknown as {
+            attempts: Map<string, { runInProgress: boolean }>;
+          }
+        ).attempts.get(meta.attempt_id);
+        if (!live) throw new Error('Missing live attempt fixture');
+        live.runInProgress = true;
+        writeAttemptMetadata(stateDir, {
+          ...meta,
+          artifact_manifest: undefined,
+          artifact_collection: undefined,
+          cleanup_result: undefined,
+        });
+        await recovery.handleReconcileDecision(decision);
+        expect(socket.sent.map((frame) => frame.type)).toEqual(['recovery_report', 'job_exit']);
+        writeAttemptMetadata(stateDir, meta);
+        live.runInProgress = false;
+        await executor.resumeArtifactUpload(meta);
+      } else {
+        await recovery.handleReconcileDecision(decision);
+      }
+      expect(socket.sent.map((frame) => frame.type).slice(0, 3)).toEqual([
+        'recovery_report',
+        'job_exit',
+        'artifact_manifest',
+      ]);
+
+      expect(collectSpy).not.toHaveBeenCalled();
+      const manifestFrame = socket.sent.find((f) => f.type === 'artifact_manifest');
+      expect(manifestFrame?.payload).toMatchObject({
+        attempt_id: 'att_1',
+        artifacts: [{ logical_name: 'out.txt', sha256, size_bytes: content.length }],
+        collection: { rules: [{ matched_count: 1, collected_count: 1 }] },
+      });
+      expect(uploadSpy).toHaveBeenCalledTimes(attempts);
+      expect(socket.sent.find((f) => f.type === 'cleanup_complete')?.payload).toMatchObject({
+        exit_code: 0,
+        timed_out: false,
+      });
+      expect(readAttemptMetadata(stateDir, 'att_1')).toMatchObject({
+        artifact_transfer: expectedTransfer,
+        last_exit: { exit_code: 0, outcome: 'succeeded' },
+      });
+      expect(readAttemptMetadata(stateDir, 'att_1')?.artifact_manifest).toBeUndefined();
+      await expect(access(stagingPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      await recovery.handleReconcileDecision(decision);
+      expect(uploadSpy).toHaveBeenCalledTimes(attempts);
+      expect(socket.sent.filter((f) => f.type === 'cleanup_complete')).toHaveLength(2);
+    },
+  );
+
+  it.each([
+    { staging: 'pending', hasEntries: false },
+    { staging: undefined, hasEntries: false },
+    { staging: 'pending', hasEntries: true },
+  ] as const)(
+    'reports interrupted disk-only staging (marker=$staging, entries=$hasEntries)',
+    async ({ staging, hasEntries }) => {
+      const socket = mockSocket();
+      const executor = new AgentJobExecutor(socket, {
+        stateDir,
+        controllerFingerprint: 'sha256:test',
+        gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+        repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
+      });
+      const exit = {
+        exit_code: 7,
+        outcome: 'failed' as const,
+        failure_category: 'process_exit' as const,
+      };
+      const entry = {
+        logical_name: 'already-staged.txt',
+        path: join(stateDir, 'artifacts', 'att_interrupted', 'already-staged.txt'),
+        size_bytes: 3,
+        sha256: createHash('sha256').update('abc').digest('hex'),
+      };
+      if (hasEntries) {
+        await mkdir(join(entry.path, '..'), { recursive: true });
+        await writeFile(entry.path, 'abc');
+      }
+      writeAttemptMetadata(stateDir, {
+        attempt_id: 'att_interrupted',
+        job_id: 'job_interrupted',
+        lease_id: 'lease_interrupted',
+        lease_epoch: 1,
+        process_identity: 'pid:42',
+        status: 'completed_awaiting_upload',
+        workspace_path: join(stateDir, 'workspaces', 'att_interrupted'),
+        spool_dir: join(stateDir, 'logs', 'att_interrupted'),
+        risk_level: 'normal',
+        updated_at: new Date().toISOString(),
+        artifact_staging: staging,
+        ...(hasEntries ? { artifact_manifest: [entry] } : {}),
+        last_exit: exit,
+      });
+      const recovery = new AgentRecoveryCoordinator({
+        stateDir,
+        hooks: {
+          terminateAttempt: async () => undefined,
+          resumeArtifactUpload: (meta) => executor.resumeArtifactUpload(meta),
+        },
+      });
+      recovery.attachSocket(socket);
+      const send = socket.send.bind(socket);
+      socket.send = (raw: string) => {
+        send(raw);
+        if (JSON.parse(raw).type === 'artifact_manifest') {
+          queueMicrotask(() =>
+            executor.handleArtifactUploadGrant({
+              attempt_id: 'att_interrupted',
+              lease_id: 'lease_interrupted',
+              lease_epoch: 1,
+              artifacts: [], // Controller already has the artifact.
+            }),
+          );
+        }
+      };
+      await recovery.reportAll();
+      const decision = {
+        action: 'adopt' as const,
+        attempt_id: 'att_interrupted',
+        lease_id: 'lease_interrupted',
+        lease_epoch: 1,
+      };
+      await recovery.handleReconcileDecision(decision);
+      await recovery.handleReconcileDecision(decision);
+
+      expect(socket.sent.find((frame) => frame.type === 'recovery_report')?.payload).toMatchObject({
+        process_exit: exit,
+      });
+      const manifests = socket.sent.filter((frame) => frame.type === 'artifact_manifest');
+      expect(manifests.map((manifest) => manifest.payload)).toEqual(
+        hasEntries
+          ? [
               {
-                logical_name: 'out.txt',
-                path: stagingPath,
-                size_bytes: content.length,
-                sha256,
-                upload_url: 'https://example.invalid/upload',
-                upload_token: 'tok',
+                artifacts: [entry],
+                attempt_id: 'att_interrupted',
+                lease_id: 'lease_interrupted',
+                lease_epoch: 1,
               },
-            ],
-          });
+            ]
+          : [],
+      );
+      const cleanup = socket.sent.filter((frame) => frame.type === 'cleanup_complete');
+      expect(cleanup).toHaveLength(2);
+      for (const frame of cleanup) {
+        expect(frame.payload).toMatchObject({
+          exit_code: null,
+          timed_out: false,
+          artifact_staging_interrupted: true,
+          cleanup_interrupted: true,
         });
       }
-    };
+      expect(readAttemptMetadata(stateDir, 'att_interrupted')).toMatchObject({
+        last_exit: exit,
+        artifact_staging: 'interrupted',
+        artifact_transfer: hasEntries ? 'stored' : 'failed',
+      });
+      expect(collectSpy).not.toHaveBeenCalled();
+    },
+  );
 
-    await recovery.handleReconcileDecision({
-      attempt_id: 'att_1',
-      lease_id: 'lease_1',
-      lease_epoch: 1,
-      action: 'adopt',
-      resume_from_sequence: 0,
-    });
-
-    // Allow microtasks for grant + upload
-    await new Promise((r) => setTimeout(r, 20));
-
-    expect(collectSpy).not.toHaveBeenCalled();
-    const manifestFrame = socket.sent.find((f) => f.type === 'artifact_manifest');
-    expect(manifestFrame?.payload).toMatchObject({
-      attempt_id: 'att_1',
-      artifacts: [{ logical_name: 'out.txt', sha256, size_bytes: content.length }],
-      collection: { rules: [{ matched_count: 1, collected_count: 1 }] },
-    });
-    expect(uploadSpy).toHaveBeenCalled();
-  });
-
-  it('re-sends a no-match collection summary even when no artifact was staged', async () => {
-    const socket = mockSocket();
-    const executor = new AgentJobExecutor(socket, {
-      stateDir,
-      controllerFingerprint: 'sha256:test',
-      gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
-      repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
-    });
-    const originalSend = socket.send.bind(socket);
-    socket.send = (raw: string) => {
-      originalSend(raw);
-      const frame = JSON.parse(raw) as { type: string };
-      if (frame.type === 'artifact_manifest') {
-        queueMicrotask(() => {
-          executor.handleArtifactUploadGrant({
-            attempt_id: 'att_empty',
-            lease_id: 'lease_empty',
-            lease_epoch: 1,
-            artifacts: [],
+  it.each([
+    { staging: undefined, cleanupCompleted: true },
+    { staging: 'complete', cleanupCompleted: true },
+    { staging: 'complete', cleanupCompleted: false },
+  ] as const)(
+    'recognizes completed empty staging (marker=$staging, cleanup=$cleanupCompleted)',
+    async ({ staging, cleanupCompleted }) => {
+      const socket = mockSocket();
+      const executor = new AgentJobExecutor(socket, {
+        stateDir,
+        controllerFingerprint: 'sha256:test',
+        gitAllowlist: { schemes: ['https'], hosts: ['github.com'] },
+        repoCache: { max_size_gb: 1, min_free_disk_gb: 1, retention_days: 1 },
+      });
+      const originalSend = socket.send.bind(socket);
+      socket.send = (raw: string) => {
+        originalSend(raw);
+        const frame = JSON.parse(raw) as { type: string };
+        if (frame.type === 'artifact_manifest') {
+          queueMicrotask(() => {
+            executor.handleArtifactUploadGrant({
+              attempt_id: 'att_empty',
+              lease_id: 'lease_empty',
+              lease_epoch: 1,
+              artifacts: [],
+            });
           });
-        });
+        }
+      };
+      const meta: AttemptMetadata = {
+        attempt_id: 'att_empty',
+        job_id: 'job_empty',
+        lease_id: 'lease_empty',
+        lease_epoch: 1,
+        process_identity: 'pid:42',
+        status: 'completed_awaiting_upload',
+        workspace_path: null,
+        spool_dir: join(stateDir, 'logs', 'att_empty'),
+        risk_level: 'normal',
+        updated_at: new Date().toISOString(),
+        artifact_staging: staging,
+        artifact_manifest: [],
+        ...(cleanupCompleted ? { cleanup_result: { exit_code: 0, timed_out: false } } : {}),
+        artifact_collection: {
+          rules: [{ matched_count: 0, collected_count: 0, skipped_count: 0, skip_reasons: [] }],
+        },
+      };
+      await executor.resumeArtifactUpload(meta);
+      const frame = socket.sent.find((entry) => entry.type === 'artifact_manifest');
+      expect(frame?.payload).toMatchObject({
+        artifacts: [],
+        collection: { rules: [{ matched_count: 0, collected_count: 0 }] },
+      });
+      const cleanup = socket.sent.find((entry) => entry.type === 'cleanup_complete');
+      expect(cleanup?.payload).not.toHaveProperty('artifact_staging_interrupted');
+      if (cleanupCompleted) {
+        expect(cleanup?.payload).not.toHaveProperty('cleanup_interrupted');
+      } else {
+        expect(cleanup?.payload).toHaveProperty('cleanup_interrupted', true);
       }
-    };
-    const meta: AttemptMetadata = {
-      attempt_id: 'att_empty',
-      job_id: 'job_empty',
-      lease_id: 'lease_empty',
-      lease_epoch: 1,
-      process_identity: 'pid:42',
-      status: 'completed_awaiting_upload',
-      workspace_path: null,
-      spool_dir: join(stateDir, 'logs', 'att_empty'),
-      risk_level: 'normal',
-      updated_at: new Date().toISOString(),
-      artifact_manifest: [],
-      artifact_collection: {
-        rules: [{ matched_count: 0, collected_count: 0, skipped_count: 0, skip_reasons: [] }],
-      },
-    };
-    await executor.resumeArtifactUpload(meta);
-    const frame = socket.sent.find((entry) => entry.type === 'artifact_manifest');
-    expect(frame?.payload).toMatchObject({
-      artifacts: [],
-      collection: { rules: [{ matched_count: 0, collected_count: 0 }] },
-    });
-    expect(collectSpy).not.toHaveBeenCalled();
-  });
+      expect(readAttemptMetadata(stateDir, meta.attempt_id)).toMatchObject({
+        artifact_staging: 'complete',
+        artifact_transfer: 'stored',
+      });
+      expect(collectSpy).not.toHaveBeenCalled();
+    },
+  );
 
   it('ignores an artifact_upload_grant with a stale/mismatched lease_epoch, then accepts the correct one', async () => {
     const content = Buffer.from('artifact-bytes-2');

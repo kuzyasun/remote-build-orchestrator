@@ -1,10 +1,16 @@
 import { z } from 'zod';
 import {
+  AgentCapabilityReportSchema,
   ErrorCategorySchema,
   JobOutcomeSchema,
   JobRequestSchema,
   ToolchainProfileSchema,
 } from './schemas.js';
+
+export const AgentCapabilitiesPayloadSchema = AgentCapabilityReportSchema.extend({
+  /** Attempts with a durable result the Agent will report during this reconnect. */
+  pending_process_exit_attempt_ids: z.array(z.string().min(1)).optional(),
+});
 
 // --- Agent → Controller (§20.3) ---
 
@@ -30,6 +36,7 @@ export const AgentMessageTypeSchema = z.enum([
 
 export const ControllerMessageTypeSchema = z.enum([
   'hello_ack',
+  'heartbeat_ack',
   'pairing_challenge',
   'lease_offer',
   'prepare_source',
@@ -74,6 +81,19 @@ export const JOB_SCOPED_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'recovery_report',
   'reconcile_decision',
 ]);
+
+const RenewedLeaseSchema = z.object({
+  attempt_id: z.string().min(1),
+  lease_id: z.string().min(1),
+  lease_epoch: z.number().int().positive(),
+});
+
+/** Confirms the exact Controller leases renewed for a sent heartbeat. */
+export const HeartbeatAckPayloadSchema = z.object({
+  heartbeat_message_id: z.string().min(1).max(128),
+  lease_ttl_seconds: z.number().positive().max(2_147_483.647),
+  renewed_leases: z.array(RenewedLeaseSchema),
+});
 
 // --- Typed Job-Scoped Message Payloads (§20.2 - §20.4, §35 Phase 4) ---
 
@@ -204,6 +224,7 @@ export const JobStartedPayloadSchema = z.object({
   lease_id: z.string().min(1),
   lease_epoch: z.number().int().positive(),
   pid: z.number().int().positive().optional(),
+  process_identity: z.string().min(1).nullable().optional(),
 });
 
 export const LogChunkPayloadSchema = z.object({
@@ -227,6 +248,7 @@ export const JobExitPayloadSchema = z.object({
 
 /** Agent → Controller: declared artifacts before upload (§20.3). */
 export const ArtifactCollectionSummarySchema = z.object({
+  staging_interrupted: z.literal(true).optional(),
   rules: z.array(
     z.object({
       matched_count: z.number().int().nonnegative(),
@@ -283,6 +305,8 @@ export const CleanupCompletePayloadSchema = z.object({
   exit_code: z.number().int().nullable(),
   timed_out: z.boolean(),
   message: z.string().optional(),
+  artifact_staging_interrupted: z.literal(true).optional(),
+  cleanup_interrupted: z.literal(true).optional(),
 });
 
 export const LogAckPayloadSchema = z.object({
@@ -307,6 +331,13 @@ export const RecoveryReportPayloadSchema = z.object({
   last_sent_sequence: z.number().int().nonnegative(),
   last_acked_sequence: z.number().int().nonnegative(),
   artifact_upload_pending: z.boolean(),
+  /** Durable result when the original job_exit may not have reached the Controller. */
+  process_exit: JobExitPayloadSchema.pick({
+    exit_code: true,
+    outcome: true,
+    failure_category: true,
+    failure_message: true,
+  }).optional(),
 });
 
 export const ReconcileDecisionPayloadSchema = z.object({
@@ -318,6 +349,7 @@ export const ReconcileDecisionPayloadSchema = z.object({
   reason: z.string().optional(),
 });
 
+export type HeartbeatAckPayload = z.infer<typeof HeartbeatAckPayloadSchema>;
 export type LeaseOfferPayload = z.infer<typeof LeaseOfferPayloadSchema>;
 export type LeaseAcceptPayload = z.infer<typeof LeaseAcceptPayloadSchema>;
 export type LeaseRejectPayload = z.infer<typeof LeaseRejectPayloadSchema>;

@@ -322,6 +322,7 @@ describe('Wire Protocol (Section 20)', () => {
   it('should validate Controller→Agent message types (§20.4)', () => {
     const controllerTypes = [
       'hello_ack',
+      'heartbeat_ack',
       'pairing_challenge',
       'lease_offer',
       'prepare_source',
@@ -340,7 +341,7 @@ describe('Wire Protocol (Section 20)', () => {
     for (const t of controllerTypes) {
       expect(() => ControllerMessageTypeSchema.parse(t)).not.toThrow();
     }
-    expect(ControllerMessageTypeSchema.options).toHaveLength(15);
+    expect(ControllerMessageTypeSchema.options).toHaveLength(16);
   });
 
   it('should validate Section 20.2 WireMessageEnvelope', () => {

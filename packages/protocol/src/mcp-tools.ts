@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { JobRequestSchema, ShellIdSchema } from './schemas.js';
+import { JobRequestSchema, ShellIdSchema, SourceConfigSchema } from './schemas.js';
 
 // Shared MCP tool registry (§4.3, §23). Both transport adapters (Streamable
 // HTTP inside the Controller and the rbo mcp-stdio proxy) register exactly
@@ -71,6 +71,9 @@ export const JOB_RUN_INPUT = {
     .optional()
     .describe('Absolute path to the project on the Controller machine.'),
   job_id: z.string().min(1).optional(),
+  snapshot_mode: SourceConfigSchema.shape.snapshot_mode.describe(
+    'Use full to capture the entire allowed source at submission time.',
+  ),
   shell: ShellIdSchema.optional(),
   target_os: z
     .array(z.enum(['macos', 'windows', 'linux']))

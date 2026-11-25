@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import {
   AGENT_CONFIG_FILENAME,
@@ -17,7 +17,11 @@ import {
 } from '@rbo/discovery';
 import { resolveAgentStateDir } from '@rbo/shared';
 import { agentLogPath, agentPidPath, spawnDetachedDaemon } from './daemon.js';
-import { ensureNotRunningOrReplace, stopRoleForCli } from './process-lifecycle.js';
+import {
+  ensureNotRunningOrReplace,
+  runRegisteredRole,
+  stopRoleForCli,
+} from './process-lifecycle.js';
 
 export interface AgentInitOptions {
   stateDir?: string;
@@ -362,15 +366,16 @@ export async function runAgentStart(
     }
     const pid = await spawnDetachedDaemon({
       command: process.execPath,
-      args: [cliScript, 'agent', 'start', '--state-dir', stateDir],
+      args: [cliScript, 'agent', 'start', '--state-dir', resolve(stateDir)],
       pidFile: agentPidPath(stateDir),
       logFile: agentLogPath(stateDir),
       label: 'Agent',
+      role: 'agent',
     });
     return pid;
   }
 
-  await runAgent({ stateDir });
+  await runRegisteredRole('agent', { stateDir }, () => runAgent({ stateDir }));
 }
 
 export async function runAgentStopProcess(options: AgentInitOptions = {}): Promise<{

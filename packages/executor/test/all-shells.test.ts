@@ -3,9 +3,15 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ensureAttemptLogs } from '../src/logs.js';
-import { POSIX_JOB_CONTROL_PRELUDE, spawnJobScript, writeJobScript } from '../src/script.js';
+import {
+  POSIX_JOB_CONTROL_PRELUDE,
+  runCleanupScript,
+  spawnJobScript,
+  writeJobScript,
+} from '../src/script.js';
+import { resolveWindowsExecutorPath } from '../src/windows-executor-path.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -78,6 +84,53 @@ describe('All shells script writing', () => {
     expect(cmdPath.endsWith('job.cmd')).toBe(true);
     expect(await readFile(cmdPath, 'utf8')).toBe('echo cmd');
   });
+
+  it.each([
+    ['pwsh', 'cleanup.ps1'],
+    ['cmd', 'cleanup.cmd'],
+  ] as const)(
+    'writes the %s cleanup script and handles a missing working directory',
+    async (shell, name) => {
+      const workspace = await mkdtemp(join(tmpdir(), 'rbo-exec-cleanup-'));
+      dirs.push(workspace);
+      const controlDir = join(workspace, 'control');
+      const logs = await ensureAttemptLogs(join(workspace, 'logs'));
+      const createTimer = vi.spyOn(globalThis, 'setTimeout');
+      const clearTimer = vi.spyOn(globalThis, 'clearTimeout');
+      try {
+        const result = await runCleanupScript({
+          attemptId: 'att_missing_cwd',
+          controlDir,
+          workspacePath: workspace,
+          projectPath: join(workspace, 'removed-project'),
+          execution: {
+            shell,
+            script: 'echo main',
+            cleanup_script: 'echo cleaning',
+            timeout_seconds: 30,
+            cancel_grace_seconds: 0.25,
+            cleanup_timeout_seconds: 123,
+          },
+          env: {},
+          logs,
+        });
+        expect(await readFile(join(controlDir, name), 'utf8')).toContain('echo cleaning');
+        expect(await readFile(logs.stderrPath, 'utf8')).toContain('Process error:');
+        expect(result.exitCode).not.toBe(0);
+        expect(result.timedOut).toBe(false);
+        // The native helper has its own cleanup deadline. Node's watchdog also
+        // allows two 250 ms drain windows and one second for reporting the result.
+        const watchdogMs =
+          process.platform === 'win32' && resolveWindowsExecutorPath() ? 124_500 : 123_000;
+        const timerIndex = createTimer.mock.calls.findIndex(([, ms]) => ms === watchdogMs);
+        expect(timerIndex).toBeGreaterThanOrEqual(0);
+        expect(clearTimer).toHaveBeenCalledWith(createTimer.mock.results[timerIndex]?.value);
+      } finally {
+        createTimer.mockRestore();
+        clearTimer.mockRestore();
+      }
+    },
+  );
 });
 
 // Asserting only on written script *content* is what let a fatal `set -m`

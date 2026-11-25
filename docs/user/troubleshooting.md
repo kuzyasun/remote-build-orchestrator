@@ -54,18 +54,32 @@ reports that the path is outside allowed destinations, compare the returned
 root to Controller configuration if needed, then restart the Controller.
 Junctions and symlinks are checked by their resolved paths.
 
+On Windows, the Controller needs a compatible RBO Windows helper to publish files into the
+verified directory. Check `windows_executor` with `rbo doctor` and install or update the helper
+from the matching RBO release if it is missing or out of date.
+
+## A Windows job fails with an unsupported helper protocol
+
+Windows job execution requires Windows 10 or Windows Server 2016 or later and helper protocol v3.
+Install the Windows helper from the same RBO
+release as the Agent or Controller. If `RBO_WINDOWS_EXECUTOR` points to a custom helper, update
+that executable and restart the Agent or Controller before retrying the job.
+
 ## A build succeeds but required artifacts are missing
 
 Read `missing_required_artifacts` in the final `job_run` response. It includes
 the glob, status, counts, and `artifact_search_base` for the terminal attempt.
 The base is the submitted `source.project_root`, not `source.cwd`.
 
-`no_match` means the Agent found no path; `skipped` includes a collection
-reason; `limit_exceeded` reports a file-count or byte limit; `not_stored`
-means a matching path was collected but no artifact was stored by the
-Controller. `job_artifacts` provides complete per-rule counts and skip reasons.
-If `collection_reported` is false, update the remote Agent to receive exact
-match counts; the Controller can only report stored artifacts. A successful
+`no_match` means the Agent found no path. `skipped` includes a collection
+reason. `limit_exceeded` reports a file-count or byte limit. `not_stored`
+means the Controller is missing one or more collected artifacts for the rule.
+`interrupted` means the Controller reached the end of attempt recovery without a complete artifact summary.
+In that case, `collection_interrupted: true` identifies the interruption and the process outcome
+is preserved.
+`job_artifacts` provides complete per-rule counts and skip reasons.
+When `collection_reported` is false and there is no `collection_interrupted` flag, update the
+remote Agent to receive exact match counts. A successful
 command still has outcome `succeeded` when a required artifact is missing.
 
 ## The Agent stays in `pairing_pending`
@@ -171,14 +185,31 @@ causes are:
 
 Fix the reason shown in the error. Keep Controller and Agent Git allowlists aligned.
 
+If an Agent cannot restore a submitted Git overlay, RBO fails that job with a diagnostic. For a new
+job, select a full snapshot at submission with `rbo run --full-snapshot`, `snapshot_mode: "full"`
+in `job_run`, or `source.snapshot_mode: "full"` in `job_submit`.
+
 `allow_full_snapshot_fallback` is off by default because a full upload can be slow and large.
-Enable it only for repositories that genuinely cannot use an overlay:
+It applies when overlay capture is unavailable at submission time. Enable it only for repositories
+that genuinely cannot use an overlay:
 
 ```json
 {
   "allow_full_snapshot_fallback": true
 }
 ```
+
+## The Agent reports a Git mirror lock
+
+Cancelling a preparation that is waiting for a mirror clone or fetch frees its Agent slot. Git
+keeps the mirror locked until it finishes, so other jobs for the same repository may still wait.
+If a mirror lock blocks worktree cleanup, the Agent records it and retries during heartbeats,
+including after reconnect or restart. The workspace stays in place until Git cleanup succeeds.
+
+Once Git finishes, the lock can be reclaimed even if the Agent process exited first. A legacy lock
+or a marker left after the Git launcher itself stops can require manual recovery. Stop the Agent
+and confirm that the previous Git operation has ended before removing the lock identified in the
+Agent log.
 
 ## Submission is slow and uses a full CPU core
 

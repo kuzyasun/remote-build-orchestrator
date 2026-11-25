@@ -275,9 +275,14 @@ export async function assertLfsContentMaterialized(
   }
 }
 
-async function repoDeclaresLfs(repoRoot: string): Promise<boolean> {
-  const tracked = await gitLfsTrackedPaths(repoRoot);
-  if (tracked.length > 0) {
+async function repoDeclaresLfs(
+  repoRoot: string,
+  hasTrackedLfsFiles?: (repoRoot: string) => Promise<boolean>,
+): Promise<boolean> {
+  const tracked = hasTrackedLfsFiles
+    ? await hasTrackedLfsFiles(repoRoot)
+    : (await gitLfsTrackedPaths(repoRoot)).length > 0;
+  if (tracked) {
     return true;
   }
   try {
@@ -288,12 +293,14 @@ async function repoDeclaresLfs(repoRoot: string): Promise<boolean> {
   }
 }
 
+/** A caller that owns subprocess lifetime can supply its own LFS lookup. */
 export async function detectGitSourceRequirements(
   repoRoot: string,
+  hasTrackedLfsFiles?: (repoRoot: string) => Promise<boolean>,
 ): Promise<GitSourceRequirements> {
   const [hasModules, lfs] = await Promise.all([
     hasGitModulesFile(repoRoot),
-    repoDeclaresLfs(repoRoot),
+    repoDeclaresLfs(repoRoot, hasTrackedLfsFiles),
   ]);
   return {
     submodules: hasModules,

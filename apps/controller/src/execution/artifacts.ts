@@ -1,16 +1,19 @@
-import { appendFile, mkdir, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { appendFile, mkdir, stat } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { CollectedArtifactFile } from '@rbo/executor';
 import { moveArtifactToStore } from '@rbo/executor';
-import {
-  RboError,
-  assertRealPathContained,
-  generateId,
-  resolveRealPath,
-  sha256,
-} from '@rbo/shared';
+import { RboError, generateId, isPathContained, resolveRealPath } from '@rbo/shared';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
+import { publishPosixArtifact, publishWindowsArtifact } from './artifact-publication.js';
+
+function containsCanonicalDestination(root: string, destination: string): boolean {
+  if (process.platform !== 'win32') return isPathContained(root, destination);
+  // Windows supports case-sensitive directories. The canonical paths from realpath
+  // already contain the on-disk spelling, so compare whole path components as-is.
+  const prefix = root.endsWith('\\') ? root : `${root}\\`;
+  return destination === root || destination.startsWith(prefix);
+}
 
 export async function persistCollectedArtifacts(input: {
   db: ControllerDatabase;
@@ -96,8 +99,17 @@ export async function materializeArtifactToDestination(input: {
   const destinationPath = resolve(input.destinationPath);
   const destinationParent = dirname(destinationPath);
   let realDestParent: string;
+  let destinationParentIdentity: { dev: bigint; ino: bigint };
   try {
     realDestParent = await resolveRealPath(destinationParent);
+    const parent = await stat(realDestParent, { bigint: true });
+    if (!parent.isDirectory()) {
+      throw new RboError(
+        'materialization',
+        `Destination parent is not a directory: ${destinationParent}`,
+      );
+    }
+    destinationParentIdentity = parent;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       throw new RboError(
@@ -121,12 +133,10 @@ export async function materializeArtifactToDestination(input: {
       continue;
     }
     resolvedAllowedRoots.push(realRoot);
-    try {
-      await assertRealPathContained(realRoot, realDestParent);
+    // Authorize the exact canonical pathname that the publisher will verify.
+    if (containsCanonicalDestination(realRoot, realDestParent)) {
       allowed = true;
       break;
-    } catch {
-      // Try the next configured root.
     }
   }
   if (!allowed) {
@@ -144,30 +154,15 @@ export async function materializeArtifactToDestination(input: {
     );
   }
 
-  const { access, readFile, rename } = await import('node:fs/promises');
-  try {
-    await access(input.destinationPath);
-    if (!input.overwrite) {
-      throw new Error('Destination exists and overwrite=false');
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('overwrite')) {
-      throw error;
-    }
-  }
-
-  const content = await readFile(row.path);
-  if (sha256(content) !== row.sha256) {
-    throw new Error('Stored artifact hash mismatch');
-  }
-
-  const tempPath = `${input.destinationPath}.rbo.tmp`;
-  await writeFile(tempPath, content);
-  const writtenHash = sha256(await readFile(tempPath));
-  if (writtenHash !== row.sha256) {
-    throw new Error('Temporary artifact hash mismatch');
-  }
-  await rename(tempPath, input.destinationPath);
+  const publish = process.platform === 'win32' ? publishWindowsArtifact : publishPosixArtifact;
+  await publish({
+    parentPath: realDestParent,
+    parentIdentity: destinationParentIdentity,
+    sourcePath: row.path,
+    destinationName: basename(destinationPath),
+    sha256: row.sha256,
+    overwrite: input.overwrite,
+  });
 
   if (input.dataDir) {
     const auditDir = join(input.dataDir, 'audit');

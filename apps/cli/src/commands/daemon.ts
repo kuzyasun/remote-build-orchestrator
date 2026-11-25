@@ -2,6 +2,12 @@ import { type SpawnOptions, spawn as nodeSpawn } from 'node:child_process';
 import { existsSync, openSync, readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import {
+  findLiveRolePids,
+  listNodeProcesses,
+  readLivePidFromFile,
+} from '../../scripts/stop-running-rbo.mjs';
+import type { RboDaemonRole } from './process-lifecycle.js';
 
 export function stripDaemonFlag(args: string[]): { daemon: boolean; args: string[] } {
   const daemon = args.includes('--daemon');
@@ -41,13 +47,17 @@ export function isProcessAlive(pid: number): boolean {
  * If `pidFile` exists and names a live process, throw so `--daemon` cannot
  * stack a second instance on a stale-looking but still-running PID.
  */
-export function assertNoLivePid(pidFile: string, label: string): void {
+export function assertNoLivePid(
+  pidFile: string,
+  label: string,
+  isLive: (pid: number) => boolean = isProcessAlive,
+): void {
   if (!existsSync(pidFile)) {
     return;
   }
   const raw = readFileSync(pidFile, 'utf8').trim();
   const pid = Number.parseInt(raw, 10);
-  if (isProcessAlive(pid)) {
+  if (isLive(pid)) {
     throw new Error(
       `${label} appears to already be running (pid ${pid} from ${pidFile}). Stop it first.`,
     );
@@ -74,6 +84,8 @@ export interface SpawnDetachedDaemonOptions {
   logFile: string;
   /** Human label for live-PID conflict errors (e.g. "Controller"). */
   label?: string;
+  role?: RboDaemonRole;
+  listProcesses?: typeof listNodeProcesses;
   spawn?: DetachedSpawn;
   /** Wait for this private IPC message from the newly spawned process. */
   readyMessage?: string;
@@ -135,7 +147,25 @@ function waitForReady(
 export async function spawnDetachedDaemon(options: SpawnDetachedDaemonOptions): Promise<number> {
   const spawn = options.spawn ?? nodeSpawn;
   const label = options.label ?? 'Daemon';
-  assertNoLivePid(options.pidFile, label);
+  const recordedPid = readLivePidFromFile(options.pidFile, isProcessAlive);
+  if (options.role && recordedPid !== null) {
+    const processes = await (options.listProcesses ?? listNodeProcesses)();
+    if (processes.some((entry) => entry.pid === process.pid)) {
+      const dir = dirname(dirname(options.pidFile));
+      const matching = await findLiveRolePids(options.role, {
+        ...(options.role === 'controller' ? { dataDir: dir } : { stateDir: dir }),
+        listProcesses: async () => processes,
+      });
+      assertNoLivePid(options.pidFile, label, (pid) =>
+        pid === recordedPid ? matching.includes(pid) : isProcessAlive(pid),
+      );
+    } else {
+      // An unavailable process inventory cannot disprove the existing PID.
+      assertNoLivePid(options.pidFile, label);
+    }
+  } else {
+    assertNoLivePid(options.pidFile, label);
+  }
 
   await mkdir(dirname(options.pidFile), { recursive: true });
   await mkdir(dirname(options.logFile), { recursive: true });

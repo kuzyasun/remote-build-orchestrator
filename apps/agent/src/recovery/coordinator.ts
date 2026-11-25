@@ -1,3 +1,5 @@
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import { openAttemptSpool, readAck } from '@rbo/executor';
 import type { ReconcileDecisionPayload, RecoveryReportPayload } from '@rbo/protocol';
 import { createLogger, generateId } from '@rbo/shared';
@@ -24,6 +26,8 @@ export interface AgentRecoveryHooks {
   onAdopted?: (decision: ReconcileDecisionPayload, meta: AttemptMetadata) => Promise<void>;
   /** Re-send job_exit when local process already completed before reconnect. */
   resendJobExit?: (meta: AttemptMetadata) => void;
+  /** Authorize a live attempt to transfer artifacts on the adopted connection. */
+  authorizeArtifactUpload?: (attemptId: string, socket: WebSocket) => void;
   /** Resume artifact_manifest + PUT from persisted staging (never re-collect). */
   resumeArtifactUpload?: (meta: AttemptMetadata) => Promise<void>;
   /**
@@ -46,6 +50,7 @@ export class AgentRecoveryCoordinator {
   private readonly stateDir: string;
   private readonly hooks: AgentRecoveryHooks;
   private socket: WebSocket | null = null;
+  private reportingSocket: WebSocket | null = null;
   /** Attempts told to terminate_stale — reject further frames. */
   private readonly rejectedAttempts = new Set<string>();
   private readonly liveSenders = new Map<string, SpoolSender>();
@@ -61,6 +66,7 @@ export class AgentRecoveryCoordinator {
 
   detachSocket(): void {
     this.socket = null;
+    this.reportingSocket = null;
   }
 
   isRejected(attemptId: string): boolean {
@@ -87,41 +93,83 @@ export class AgentRecoveryCoordinator {
    * After authenticated session: scan disk metadata and emit recovery_report for
    * each non-terminal attempt. Replay happens only after adopt.
    */
-  async reportAll(): Promise<void> {
-    const all = await listAttemptMetadata(this.stateDir);
+  async reportAll(beforeReports?: (pendingProcessExitAttemptIds: string[]) => void): Promise<void> {
+    const socket = this.socket;
+    const all = await listAttemptMetadata(this.stateDir, { requireReadable: true });
+    if (this.socket !== socket || !socket || socket.readyState !== socket.OPEN) {
+      return;
+    }
+    beforeReports?.(
+      all
+        .filter((meta) => meta.status === 'completed_awaiting_upload' && meta.last_exit)
+        .map((meta) => meta.attempt_id),
+    );
+    this.reportingSocket = socket;
     for (const meta of all) {
-      if (meta.status === 'terminal') {
-        continue;
+      if (this.socket !== socket || socket.readyState !== socket.OPEN) {
+        return;
       }
-      await this.emitRecoveryReport(meta);
+      await this.emitRecoveryReport(meta, socket);
     }
   }
 
-  async emitRecoveryReport(meta: AttemptMetadata): Promise<void> {
-    if (!hasProcessIdentity(meta.process_identity)) {
-      // recovery_report.process_identity is required (min 1). Pre-spawn leftovers
-      // (prepare_source failed, cancelled, or disconnect before job_started) cannot
-      // be fenced — drop them once so reconnect does not warn forever.
-      await this.discardUnfencedLeftover(meta);
-      return;
+  async reportCompletedAttempt(attemptId: string): Promise<void> {
+    const socket = this.reportingSocket;
+    const meta = readAttemptMetadata(this.stateDir, attemptId);
+    if (
+      socket &&
+      socket === this.socket &&
+      socket.readyState === socket.OPEN &&
+      meta?.status === 'completed_awaiting_upload'
+    ) {
+      await this.emitRecoveryReport(meta, socket);
     }
-    if (!this.socket || this.socket.readyState !== this.socket.OPEN) {
-      return;
-    }
+  }
 
+  private async emitRecoveryReport(saved: AttemptMetadata, socket: WebSocket): Promise<void> {
+    if (saved.status === 'terminal') {
+      return;
+    }
     let lastAcked = 0;
     let lastSent = 0;
     try {
-      const spool = await openAttemptSpool(meta.spool_dir);
+      const spool = await openAttemptSpool(saved.spool_dir);
       lastAcked = await readAck(spool);
       lastSent = lastAcked;
       // Approximate last_sent from ack; live sender may know more.
-      const live = this.liveSenders.get(meta.attempt_id);
+      const live = this.liveSenders.get(saved.attempt_id);
       if (live) {
         lastAcked = Math.max(lastAcked, live.lastAckedSequence);
       }
     } catch {
       // Spool may not exist yet
+    }
+
+    // The job may have completed while the spool was being read.
+    const meta = readAttemptMetadata(this.stateDir, saved.attempt_id);
+    if (
+      !meta ||
+      meta.status === 'terminal' ||
+      this.isRejected(saved.attempt_id) ||
+      this.socket !== socket ||
+      socket.readyState !== socket.OPEN
+    ) {
+      return;
+    }
+    const exit = meta.status === 'completed_awaiting_upload' ? meta.last_exit : undefined;
+    const processIdentity = hasProcessIdentity(meta.process_identity)
+      ? meta.process_identity
+      : exit
+        ? 'unavailable'
+        : null;
+    if (!processIdentity) {
+      if (this.liveSenders.has(meta.attempt_id)) {
+        // A live run without a process identity can still report its durable exit.
+        return;
+      }
+      // Pre-spawn leftovers cannot be fenced for live recovery.
+      await this.discardUnfencedLeftover(meta);
+      return;
     }
 
     const status: RecoveryReportPayload['status'] =
@@ -136,10 +184,11 @@ export class AgentRecoveryCoordinator {
       lease_id: meta.lease_id,
       lease_epoch: meta.lease_epoch,
       status,
-      process_identity: meta.process_identity,
+      process_identity: processIdentity,
       last_sent_sequence: lastSent,
       last_acked_sequence: lastAcked,
       artifact_upload_pending: meta.status === 'completed_awaiting_upload',
+      ...(exit ? { process_exit: exit } : {}),
     };
 
     this.sendJobScoped('recovery_report', meta, payload as unknown as Record<string, unknown>);
@@ -151,6 +200,13 @@ export class AgentRecoveryCoordinator {
 
   async handleReconcileDecision(decision: ReconcileDecisionPayload): Promise<void> {
     const meta = readAttemptMetadata(this.stateDir, decision.attempt_id);
+    const socket = this.socket;
+    if (
+      meta &&
+      (meta.lease_id !== decision.lease_id || meta.lease_epoch !== decision.lease_epoch)
+    ) {
+      return;
+    }
     if (decision.action === 'terminate_stale') {
       this.rejectedAttempts.add(decision.attempt_id);
       await this.hooks.terminateAttempt(decision.attempt_id);
@@ -158,6 +214,15 @@ export class AgentRecoveryCoordinator {
       await this.invokeCleanupAttemptResources(decision.attempt_id);
       if (meta) {
         writeAttemptMetadata(this.stateDir, { ...meta, status: 'terminal' });
+        await rm(join(this.stateDir, 'artifacts', meta.attempt_id), {
+          recursive: true,
+          force: true,
+        }).catch((error) => {
+          logger.warn('failed to remove terminal artifact staging', {
+            attemptId: meta.attempt_id,
+            error: String(error),
+          });
+        });
       }
       await removeAttemptMetadata(this.stateDir, decision.attempt_id).catch(() => undefined);
       logger.info('terminate_stale applied', {
@@ -168,7 +233,7 @@ export class AgentRecoveryCoordinator {
     }
 
     // adopt
-    if (!meta) {
+    if (!meta || !socket || socket.readyState !== socket.OPEN) {
       logger.warn('adopt for unknown metadata', { attemptId: decision.attempt_id });
       return;
     }
@@ -196,33 +261,42 @@ export class AgentRecoveryCoordinator {
       await this.replayFromDisk(meta, decision.resume_from_sequence ?? 0);
     }
 
-    if (wasCompletedAwaitingUpload) {
-      this.hooks.resendJobExit?.(meta);
+    // A live process can finish during spool replay. Replay its exit before
+    // authorizing artifact traffic on this connection.
+    const current = readAttemptMetadata(this.stateDir, decision.attempt_id);
+    if (
+      this.socket !== socket ||
+      socket.readyState !== socket.OPEN ||
+      !current ||
+      current.status === 'terminal' ||
+      current.lease_id !== decision.lease_id ||
+      current.lease_epoch !== decision.lease_epoch ||
+      this.isRejected(decision.attempt_id)
+    ) {
+      return;
+    }
+    const completed = current.status === 'completed_awaiting_upload';
+    if (completed) {
+      this.hooks.resendJobExit?.(current);
       // Fallback: emit job_exit from coordinator when no executor hook is wired.
-      if (!this.hooks.resendJobExit && meta.last_exit) {
-        this.sendJobScoped('job_exit', meta, {
-          attempt_id: meta.attempt_id,
-          lease_id: meta.lease_id,
-          lease_epoch: meta.lease_epoch,
-          exit_code: meta.last_exit.exit_code,
-          outcome: meta.last_exit.outcome,
-          ...(meta.last_exit.failure_category
-            ? { failure_category: meta.last_exit.failure_category }
-            : {}),
-          ...(meta.last_exit.failure_message
-            ? { failure_message: meta.last_exit.failure_message }
-            : {}),
+      if (!this.hooks.resendJobExit && current.last_exit) {
+        this.sendJobScoped('job_exit', current, {
+          attempt_id: current.attempt_id,
+          lease_id: current.lease_id,
+          lease_epoch: current.lease_epoch,
+          ...current.last_exit,
         });
       }
-      if (this.hooks.resumeArtifactUpload) {
-        await this.hooks.resumeArtifactUpload(meta);
-      }
+    }
+    this.hooks.authorizeArtifactUpload?.(current.attempt_id, socket);
+    if (completed && this.hooks.resumeArtifactUpload) {
+      await this.hooks.resumeArtifactUpload(current);
     }
 
     logger.info('attempt adopted; spool replay started', {
       attemptId: decision.attempt_id,
       resume_from_sequence: decision.resume_from_sequence,
-      completed_awaiting_upload: wasCompletedAwaitingUpload,
+      completed_awaiting_upload: completed,
     });
   }
 

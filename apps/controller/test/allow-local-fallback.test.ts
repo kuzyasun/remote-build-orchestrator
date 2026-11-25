@@ -90,6 +90,8 @@ describe('allowLocalFallback config (§2.3)', () => {
       signingPublicKeyPem: keys.publicKeyPem,
       signingPrivateKeyPem: keys.privateKeyPem,
       fingerprint: 'sha256:test',
+      adminToken: 'test-only-admin',
+      mcpToken: 'test-only-mcp',
     };
 
     await dispatchJobExecution(
@@ -153,6 +155,8 @@ describe('allowLocalFallback config (§2.3)', () => {
       signingPublicKeyPem: keys.publicKeyPem,
       signingPrivateKeyPem: keys.privateKeyPem,
       fingerprint: 'sha256:test',
+      adminToken: 'test-only-admin',
+      mcpToken: 'test-only-mcp',
     };
 
     await dispatchJobExecution(

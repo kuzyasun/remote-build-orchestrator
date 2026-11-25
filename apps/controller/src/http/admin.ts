@@ -14,6 +14,7 @@ import {
 } from '../security/pairing.js';
 import type { ControllerDatabase } from '../storage/database.js';
 import type { ConnectedAgent } from '../websocket/server.js';
+import { abortAgentTransfers } from './data-plane.js';
 
 // Local-only admin operations behind the CLI (§33): pairing approve/reject,
 // agent revoke/probe, job confirm. Never exposed as MCP tools — these are operator actions,
@@ -77,6 +78,8 @@ export async function handleAdminRequest(
     case 'agents/revoke': {
       const agentId = String(args.agent_id ?? '');
       revokeAgent(ctx.db, agentId);
+      abortAgentTransfers(ctx.db, agentId);
+      ctx.connectedAgents?.get(agentId)?.socket.terminate();
       return { status: 200, body: {} };
     }
 

@@ -25,8 +25,8 @@ describe('spawnJobScript onLogChunk', () => {
     const execution = {
       script: 'echo HELLO_CHUNK',
       shell: isWin ? ('direct' as const) : ('bash' as const),
-      timeout_seconds: 30,
-      cancel_grace_seconds: 1,
+      timeout_seconds: 30.25,
+      cancel_grace_seconds: 0.25,
     };
 
     await writeJobScript(controlDir, execution);

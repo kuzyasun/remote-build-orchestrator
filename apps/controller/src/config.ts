@@ -2,7 +2,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { RBO_MDNS_DEFAULT_DISPLAY_NAME, validateMdnsDisplayName } from '@rbo/discovery';
 import { type QueuePolicy, QueuePolicySchema } from '@rbo/protocol';
-import { type GitUrlAllowlist, resolveControllerDataDir } from '@rbo/shared';
+import {
+  CONTROLLER_DATABASE_FILENAME,
+  type GitUrlAllowlist,
+  resolveControllerDataDir,
+} from '@rbo/shared';
 import type { SnapshotCaptureLimits } from '@rbo/snapshot';
 import { z } from 'zod';
 
@@ -516,7 +520,7 @@ export function loadControllerConfig(
     controllerPublicHost,
     dataPlaneBaseUrl,
     dataDir,
-    databasePath: fieldOverrides.databasePath ?? join(dataDir, 'controller.db'),
+    databasePath: fieldOverrides.databasePath ?? join(dataDir, CONTROLLER_DATABASE_FILENAME),
     allowedProjectRoots,
     allowedArtifactDestinations,
     gitAllowlist: mergeGitAllowlist(

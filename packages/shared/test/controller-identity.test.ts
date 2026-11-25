@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -43,6 +43,28 @@ describe('Controller identity and admin token handling', () => {
     const identity = await ensureControllerIdentity(tempDir);
     const token = readAdminToken({ env: { RBO_DATA_DIR: tempDir } });
     expect(token).toBe(identity.adminToken);
+  });
+
+  it('rotates a legacy file bearer on Controller startup without changing identity', async () => {
+    const original = await ensureControllerIdentity(tempDir);
+    const metaPath = join(tempDir, 'security', 'controller.json');
+    const legacy = JSON.stringify({ controller_id: original.controllerId });
+    writeFileSync(metaPath, legacy);
+
+    const inspected = await ensureControllerIdentity(tempDir);
+    expect(inspected.adminToken).toBe(original.adminToken);
+
+    const migrated = await ensureControllerIdentity(tempDir, { rotateLegacyAdminBearer: true });
+    expect(migrated.adminToken).not.toBe(original.adminToken);
+    expect(migrated.adminToken).not.toBe(migrated.mcpToken);
+    expect(migrated.fingerprint).toBe(original.fingerprint);
+    expect(readAdminToken({ env: { RBO_DATA_DIR: tempDir } })).toBe(migrated.adminToken);
+
+    // A restart after replacing the bearer but before recording its scope version
+    // must retain the new bearer.
+    writeFileSync(metaPath, legacy);
+    const retried = await ensureControllerIdentity(tempDir, { rotateLegacyAdminBearer: true });
+    expect(retried.adminToken).toBe(migrated.adminToken);
   });
 
   it('prefers options.env.RBO_ADMIN_TOKEN over disk token in readAdminToken', async () => {

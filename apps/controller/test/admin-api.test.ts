@@ -83,6 +83,13 @@ describe('Admin API for CLI (§33)', () => {
     expect(res.body.requests).toBeDefined();
   });
 
+  it('keeps MCP and administrator bearer scopes separate', async () => {
+    const admin = await post('/internal/v1/admin/pairing/list', {}, `Bearer ${identity.mcpToken}`);
+    expect(admin.status).toBe(401);
+    const mcp = await post('/mcp', {}, `Bearer ${identity.adminToken}`);
+    expect(mcp.status).toBe(401);
+  });
+
   it('supports RBO_ADMIN_TOKEN environment override for server auth', async () => {
     const customDb = openDatabase(':memory:');
     migrateToLatest(customDb);
@@ -331,7 +338,7 @@ describe('Admin API for CLI (§33)', () => {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
-            authorization: `Bearer ${identity.adminToken}`,
+            authorization: `Bearer ${identity.mcpToken}`,
           },
           body: JSON.stringify({
             client_request_id: 'req_strict_test',
@@ -347,6 +354,18 @@ describe('Admin API for CLI (§33)', () => {
       expect(submitBody.confirmation_token).toBeNull();
       expect(submitBody.requires_operator_confirmation).toBe(true);
       expect(submitBody.message).toContain('Operator confirmation required');
+      const confirmation = await fetch(
+        `http://127.0.0.1:${strictRunning.port}/internal/v1/admin/jobs/confirm`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${identity.mcpToken}`,
+          },
+          body: JSON.stringify({ job_id: submitBody.job_id }),
+        },
+      );
+      expect(confirmation.status).toBe(401);
     } finally {
       await strictRunning.close();
       await fixture.cleanup();

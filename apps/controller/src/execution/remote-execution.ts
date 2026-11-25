@@ -1,7 +1,6 @@
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -11,6 +10,7 @@ import type {
   ArtifactUploadGrantPayload,
   BundleDownloadPayload,
   CleanupCompletePayload,
+  HeartbeatAckPayload,
   JobExitPayload,
   JobStartedPayload,
   LeaseAcceptPayload,
@@ -24,14 +24,22 @@ import type {
   ToolchainProfileSchema,
 } from '@rbo/protocol';
 import type { ControllerIdentity } from '@rbo/shared';
-import { RboError, createLogger, generateId, sha256File } from '@rbo/shared';
-import { captureFullSnapshot, discardCapturedContent } from '@rbo/snapshot';
+import {
+  RboError,
+  createLogger,
+  generateId,
+  isSafeRelativePath,
+  parseProcessIdentity,
+  sha256File,
+} from '@rbo/shared';
+import { FullSnapshotManifestSchema } from '@rbo/snapshot';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
 import { DEFAULT_MAX_GIT_BUNDLE_BYTES } from '../config.js';
 import {
   clearArtifactExpectations,
   filterMissingArtifacts,
+  readBundleMetadata,
   registerArtifactExpectations,
 } from '../http/data-plane.js';
 import {
@@ -45,13 +53,20 @@ import {
   getJobRequest,
   getLatestAttempt,
   nextLeaseEpochForJob,
+  recordArtifactCollectionInterruption,
   recordEvent,
+  recordRemoteProcessExit,
+  runLifecycleTransaction,
   transitionAttemptState,
   transitionJobState,
   updateAttempt,
 } from '../jobs/lifecycle.js';
 import { persistAndPublishLogChunk } from '../logs/stream.js';
-import { processIdentityFromPid } from '../recovery/coordinator.js';
+import {
+  finalizeInterruptedArtifactCollection,
+  processIdentityFromPid,
+} from '../recovery/coordinator.js';
+import { getActiveJobsForAgents } from '../scheduler/index.js';
 import { issueDataToken } from '../security/data-tokens.js';
 import type { ControllerDatabase } from '../storage/database.js';
 import { nowIso } from '../storage/database.js';
@@ -80,9 +95,6 @@ export interface RemoteExecutionOptions {
   controllerPublicHost?: string;
   /** Full base URL override (e.g. https://192.168.1.10:7411). Wins over host+port. */
   dataPlaneBaseUrl?: string;
-  allowedProjectRoots?: string[];
-  /** Metadata-admission limits for on-demand full snapshot transfer fallback (§4.3). */
-  snapshotCaptureLimits?: import('@rbo/snapshot').SnapshotCaptureLimits;
   /** Max git bundle bytes; defaults to DEFAULT_MAX_GIT_BUNDLE_BYTES. */
   maxGitBundleBytes?: number;
   /**
@@ -91,6 +103,8 @@ export interface RemoteExecutionOptions {
    * normalization.
    */
   defaultQueuePolicy?: import('@rbo/protocol').QueuePolicy;
+  /** A live dispatcher can evaluate the remaining candidates after a rejected offer. */
+  canRescheduleLeaseReject?: boolean;
 }
 
 function snapshotManifestMode(manifest: unknown): 'full' | 'git_overlay' {
@@ -242,15 +256,18 @@ function failAttemptPrepare(
   category: NonNullable<JobExitPayload['failure_category']>,
   message: string,
 ): void {
-  transitionAttemptState(opts.db, attemptId, 'completed', {
-    outcome: 'failed',
-    finished_at: nowIso(),
-  });
-  transitionJobState(opts.db, jobId, 'completed', {
-    outcome: 'failed',
-    finished_at: nowIso(),
-    failure_category: category,
-    failure_message: message,
+  const finishedAt = nowIso();
+  runLifecycleTransaction(opts.db, () => {
+    transitionAttemptState(opts.db, attemptId, 'completed', {
+      outcome: 'failed',
+      finished_at: finishedAt,
+    });
+    transitionJobState(opts.db, jobId, 'completed', {
+      outcome: 'failed',
+      finished_at: finishedAt,
+      failure_category: category,
+      failure_message: message,
+    });
   });
 }
 
@@ -270,114 +287,112 @@ export async function createGitBundle(
   bundlePath: string,
   maxBytes: number = DEFAULT_MAX_GIT_BUNDLE_BYTES,
 ): Promise<{ sizeBytes: number; sha256: string }> {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(baseCommit)) {
+    throw new Error('Captured base commit is not a Git object ID');
+  }
   await mkdir(dirname(bundlePath), { recursive: true });
-  const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
-    cwd: projectRoot,
-    windowsHide: true,
-  });
-  const headCommit = head.trim();
-  await execFileAsync('git', ['cat-file', '-e', `${baseCommit}^{commit}`], {
-    cwd: projectRoot,
-    windowsHide: true,
-  });
-  const bundleRef = headCommit === baseCommit ? 'HEAD' : baseCommit;
+  const workDir = await mkdtemp(join(dirname(bundlePath), '.git-bundle-'));
   try {
-    await execFileAsync('git', ['bundle', 'create', bundlePath, bundleRef], {
-      cwd: projectRoot,
-      maxBuffer: 64 * 1024 * 1024,
-      windowsHide: true,
+    const { stdout } = await execFileAsync(
+      'git',
+      ['rev-parse', '--path-format=absolute', '--git-path', 'objects'],
+      {
+        cwd: projectRoot,
+        windowsHide: true,
+      },
+    );
+    const objectsPath = stdout.replace(/\r?\n$/, '');
+    if (!objectsPath || /[\r\n]/.test(objectsPath)) {
+      throw new Error('Git object database path cannot be recorded as an alternate');
+    }
+
+    // Git bundles require a named ref. Use a private ref and read-only access to the source objects.
+    const gitDir = join(workDir, 'repo.git');
+    const stagedBundle = join(workDir, 'bundle.gitbundle');
+    const objectFormat = baseCommit.length === 64 ? 'sha256' : 'sha1';
+    const gitOpts = { cwd: workDir, windowsHide: true, maxBuffer: 1024 * 1024 };
+    await execFileAsync(
+      'git',
+      ['init', '--bare', '--template=', `--object-format=${objectFormat}`, gitDir],
+      gitOpts,
+    );
+    await writeFile(join(gitDir, 'objects', 'info', 'alternates'), `${objectsPath}\n`, {
+      flag: 'wx',
     });
-  } catch {
-    await execFileAsync('git', ['bundle', 'create', bundlePath, '--all'], {
-      cwd: projectRoot,
-      maxBuffer: 64 * 1024 * 1024,
-      windowsHide: true,
-    });
+    const bundleRef = 'refs/heads/rbo-captured-base';
+    await execFileAsync(
+      'git',
+      [`--git-dir=${gitDir}`, 'update-ref', bundleRef, baseCommit],
+      gitOpts,
+    );
+    await execFileAsync(
+      'git',
+      [`--git-dir=${gitDir}`, 'bundle', 'create', stagedBundle, bundleRef],
+      gitOpts,
+    );
+
+    const { size: sizeBytes } = await stat(stagedBundle);
+    if (sizeBytes > maxBytes) {
+      throw new GitBundleSizeExceededError(sizeBytes, maxBytes);
+    }
+    const sha256 = await sha256File(stagedBundle);
+    await rename(stagedBundle, bundlePath);
+    return { sizeBytes, sha256 };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
   }
-  // Check the on-disk size first — `git bundle create` already wrote the whole bundle
-  // unconditionally, but a stat is cheap; it lets an oversized bundle be rejected and deleted
-  // without also loading the entire (potentially multi-GB) file into a Buffer just to throw it
-  // away. This bounds Controller memory even though disk usage during the git subprocess's own
-  // write is not itself streamed/aborted early — that would need piping `git bundle create -`
-  // through a size-limiting transform, a larger change than this fix covers.
-  const { size: sizeBytes } = await stat(bundlePath);
-  if (sizeBytes > maxBytes) {
-    await rm(bundlePath, { force: true });
-    throw new GitBundleSizeExceededError(sizeBytes, maxBytes);
-  }
-  const data = await readFile(bundlePath);
-  return {
-    sizeBytes: data.length,
-    sha256: createHash('sha256').update(data).digest('hex'),
-  };
 }
 
-async function ensureFullFallbackArchive(
-  opts: RemoteExecutionOptions,
-  attemptId: string,
-  jobId: string,
-): Promise<{
-  archivePath: string;
-  sizeBytes: number;
-  sha256: string;
-  manifest: unknown;
-} | null> {
-  const request = getJobRequest(opts.db, jobId);
-  if (!request) {
-    return null;
-  }
-
-  const transferDir = attemptTransferDir(opts.dataDir, attemptId);
-  const archivePath = join(transferDir, 'snapshot.tar.zst');
-  const manifestPath = join(transferDir, 'snapshot.manifest.json');
-  try {
-    const existing = await stat(archivePath);
-    const sha256 = await sha256File(archivePath);
-    const manifestRaw = await readFile(manifestPath, 'utf8');
-    const manifest = JSON.parse(manifestRaw) as {
-      payload?: { sha256?: string; size?: number };
-    };
-    if (manifest.payload?.sha256 === sha256 && manifest.payload?.size === existing.size) {
-      return {
-        archivePath,
-        sizeBytes: existing.size,
-        sha256,
-        manifest,
-      };
+async function prepareBundleTransfer(
+  transferDir: string,
+  projectRoot: string,
+  baseCommit: string,
+  maxBytes: number,
+): Promise<{ sizeBytes: number; sha256: string }> {
+  const publishedDir = join(transferDir, 'bundle');
+  const readPublished = async () => {
+    const metadata = await readBundleMetadata(publishedDir);
+    if (metadata.baseCommit !== baseCommit) {
+      throw new Error('Published bundle does not match the captured commit');
     }
-    // Stale cache: recreate below.
-  } catch {
-    // create on demand
+    if (metadata.sizeBytes > maxBytes) {
+      throw new GitBundleSizeExceededError(metadata.sizeBytes, maxBytes);
+    }
+    return metadata;
+  };
+  try {
+    return await readPublished();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
   }
 
   await mkdir(transferDir, { recursive: true });
-  const captured = await captureFullSnapshot({
-    projectRoot: request.source.project_root,
-    allowedProjectRoots: opts.allowedProjectRoots ?? [request.source.project_root],
-    cwd: request.source.cwd,
-    sourcePolicy: {
-      include_untracked: request.source_policy?.include_untracked ?? true,
-      include_ignored: request.source_policy?.include_ignored ?? [],
-      secret_policy: request.source_policy?.secret_policy ?? 'block',
-    },
-    additionalRoots: request.source.additional_roots,
-    contentStorageDir: transferDir,
-    limits: opts.snapshotCaptureLimits,
-  });
+  const stagingDir = await mkdtemp(join(transferDir, '.bundle-transfer-'));
   try {
-    await copyFile(captured.archivePath, archivePath);
-    await writeFile(manifestPath, JSON.stringify(captured.manifest, null, 2));
-    return {
-      archivePath,
-      sizeBytes: captured.manifest.payload.size,
-      sha256: captured.manifest.payload.sha256,
-      manifest: captured.manifest,
-    };
+    const metadata = await createGitBundle(
+      projectRoot,
+      baseCommit,
+      join(stagingDir, 'bundle.gitbundle'),
+      maxBytes,
+    );
+    await writeFile(
+      join(stagingDir, 'metadata.json'),
+      JSON.stringify({ ...metadata, baseCommit }),
+      { flag: 'wx' },
+    );
+    try {
+      await rename(stagingDir, publishedDir);
+      return metadata;
+    } catch (error) {
+      // Another request may have published this same captured commit while Git was running.
+      return await readPublished().catch(() => {
+        throw error;
+      });
+    }
   } finally {
-    // `captureFullSnapshot` always writes into a private child of transferDir.
-    // The stable transfer artifacts above are the only files this fallback owns
-    // after the copy attempt, so discard the candidate on both success and error.
-    await discardCapturedContent(captured.contentStorageDir);
+    await rm(stagingDir, { recursive: true, force: true });
   }
 }
 
@@ -477,7 +492,11 @@ function loadAttemptByLease(
     .prepare(
       `SELECT id, job_id, agent_id, state, lease_id, lease_epoch, lease_deadline, outcome,
               log_acked_sequence
-       FROM job_attempts WHERE id = ? AND lease_id = ? AND lease_epoch = ?`,
+       FROM job_attempts WHERE id = ? AND lease_id = ? AND lease_epoch = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM agents WHERE agents.id = job_attempts.agent_id
+           AND (revoked_at IS NOT NULL OR disabled_at IS NOT NULL)
+         )`,
     )
     .get(attemptId, leaseId, leaseEpoch) as AttemptLeaseRow | undefined;
 }
@@ -518,38 +537,47 @@ export function renewActiveLease(
   db: ControllerDatabase,
   agentId: string,
   ttlSeconds = DEFAULT_LEASE_TTL_SECONDS,
-): void {
-  const deadline = new Date(Date.now() + ttlSeconds * 1000).toISOString();
-  db.prepare(
-    `UPDATE job_attempts
-     SET lease_deadline = ?
-     WHERE agent_id = ?
-       AND state NOT IN ('completed')
-       AND lease_deadline IS NOT NULL`,
-  ).run(deadline, agentId);
+): Omit<HeartbeatAckPayload, 'heartbeat_message_id'> {
+  const renewedLeases = db
+    .prepare(
+      `UPDATE job_attempts
+       SET lease_deadline = max(lease_deadline, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?))
+       WHERE agent_id = ?
+         AND state <> 'completed'
+         AND lease_deadline > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND revoked_at IS NULL)
+       RETURNING id AS attempt_id, lease_id, lease_epoch`,
+    )
+    .all(`+${ttlSeconds} seconds`, agentId, agentId) as HeartbeatAckPayload['renewed_leases'];
+  return { lease_ttl_seconds: ttlSeconds, renewed_leases: renewedLeases };
 }
 
 export function expireStaleLeases(db: ControllerDatabase): void {
   const now = nowIso();
   const rows = db
     .prepare(
-      `SELECT id, job_id FROM job_attempts
+      `SELECT id, job_id, state, outcome FROM job_attempts
        WHERE state NOT IN ('completed', 'orphaned')
          AND lease_deadline IS NOT NULL
          AND lease_deadline <= ?`,
     )
-    .all(now) as Array<{ id: string; job_id: string }>;
+    .all(now) as Array<{ id: string; job_id: string; state: string; outcome: string | null }>;
 
   for (const row of rows) {
-    transitionAttemptState(db, row.id, 'completed', {
-      outcome: 'failed',
-      finished_at: now,
-    });
-    transitionJobState(db, row.job_id, 'completed', {
-      outcome: 'failed',
-      finished_at: now,
-      failure_category: 'agent_disconnected',
-      failure_message: 'Lease expired during remote execution',
+    if (finalizeInterruptedArtifactCollection(db, row)) {
+      continue;
+    }
+    runLifecycleTransaction(db, () => {
+      transitionAttemptState(db, row.id, 'completed', {
+        outcome: 'failed',
+        finished_at: now,
+      });
+      transitionJobState(db, row.job_id, 'completed', {
+        outcome: 'failed',
+        finished_at: now,
+        failure_category: 'agent_disconnected',
+        failure_message: 'Lease expired during remote execution',
+      });
     });
   }
 }
@@ -559,93 +587,106 @@ export async function initiateRemoteAttempt(
   jobId: string,
   agentId: string,
   selectedToolchains?: ToolchainProfile[],
-): Promise<string> {
-  const job = getJob(opts.db, jobId);
-  if (!job) {
-    throw RboError.validation(`Unknown job ${jobId}`);
-  }
-
+): Promise<string | null> {
   const agentConn = opts.connectedAgents.get(agentId);
-  if (!agentConn || agentConn.socket.readyState !== agentConn.socket.OPEN) {
-    throw RboError.internal(`Agent ${agentId} is not connected`);
+  if (
+    !agentConn ||
+    agentConn.capabilitiesReady === false ||
+    agentConn.socket.readyState !== agentConn.socket.OPEN ||
+    agentConn.acceptingJobs === false ||
+    (agentConn.leaseRetryAfter ?? 0) > Date.now()
+  ) {
+    return null;
   }
 
-  const snapshotRow = opts.db
-    .prepare('SELECT id, content_id, size_bytes, sha256 FROM snapshots WHERE id = ?')
-    .get(job.snapshot_id) as
-    | { id: string; content_id: string; size_bytes: number; sha256: string }
-    | undefined;
+  const offerPayload = runLifecycleTransaction(opts.db, (): LeaseOfferPayload | null => {
+    const agent = opts.db
+      .prepare(
+        'SELECT max_jobs FROM agents WHERE id = ? AND revoked_at IS NULL AND disabled_at IS NULL',
+      )
+      .get(agentId) as { max_jobs: number } | undefined;
+    if (!agent || (getActiveJobsForAgents(opts.db).get(agentId) ?? 0) >= agent.max_jobs) {
+      return null;
+    }
+    const claim = opts.db
+      .prepare(
+        "UPDATE jobs SET state = 'leasing', updated_at = ? WHERE id = ? AND state = 'queued'",
+      )
+      .run(nowIso(), jobId);
+    if (claim.changes !== 1) {
+      return null;
+    }
+    const snapshotRow = opts.db
+      .prepare(
+        `SELECT s.id, s.content_id, s.size_bytes, s.sha256 FROM snapshots s
+         JOIN jobs j ON j.snapshot_id = s.id WHERE j.id = ?`,
+      )
+      .get(jobId) as
+      | { id: string; content_id: string; size_bytes: number | null; sha256: string | null }
+      | undefined;
+    if (!snapshotRow?.sha256 || snapshotRow.size_bytes == null) {
+      throw RboError.internal(`Missing snapshot size/sha256 metadata for job ${jobId}`);
+    }
+    const request = getJobRequest(opts.db, jobId);
+    if (!request) {
+      throw RboError.internal(`Missing job request for ${jobId}`);
+    }
 
-  if (!snapshotRow) {
-    throw RboError.internal(`Missing snapshot metadata for job ${jobId}`);
+    const leaseId = generateId('lease');
+    const leaseEpoch = nextLeaseEpochForJob(opts.db, jobId);
+    const leaseDeadline = new Date(Date.now() + DEFAULT_LEASE_TTL_SECONDS * 1000).toISOString();
+    const attemptId = generateId('att');
+    const maxOrdinal = opts.db
+      .prepare('SELECT COALESCE(MAX(ordinal), 0) AS max_ordinal FROM job_attempts WHERE job_id = ?')
+      .get(jobId) as { max_ordinal: number };
+    const toolchains = selectedToolchains?.length ? selectedToolchains : undefined;
+
+    opts.db
+      .prepare(
+        `INSERT INTO job_attempts (id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline, state, toolchain_profiles_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'leasing', ?)`,
+      )
+      .run(
+        attemptId,
+        jobId,
+        maxOrdinal.max_ordinal + 1,
+        agentId,
+        leaseId,
+        leaseEpoch,
+        leaseDeadline,
+        toolchains ? JSON.stringify(toolchains) : null,
+      );
+    notifyJobLifecycleChanged(opts.db, jobId);
+
+    return {
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      lease_epoch: leaseEpoch,
+      job_id: jobId,
+      job_request: request,
+      snapshot_metadata: {
+        snapshot_id: snapshotRow.id,
+        content_id: snapshotRow.content_id,
+        size_bytes: snapshotRow.size_bytes,
+        sha256: snapshotRow.sha256,
+      },
+      selected_toolchain_profiles: toolchains,
+      lease_ttl_seconds: DEFAULT_LEASE_TTL_SECONDS,
+    };
+  });
+  if (!offerPayload) {
+    return null;
   }
-  if (!snapshotRow.sha256 || snapshotRow.size_bytes == null) {
-    throw RboError.internal(`Snapshot ${snapshotRow.id} is missing size/sha256 metadata`);
-  }
-
-  const leaseId = generateId('lease');
-  const leaseEpoch = nextLeaseEpochForJob(opts.db, jobId);
-  const leaseDeadline = new Date(Date.now() + DEFAULT_LEASE_TTL_SECONDS * 1000).toISOString();
-  const attemptId = generateId('att');
-  const maxOrdinal = opts.db
-    .prepare('SELECT MAX(ordinal) AS max_ordinal FROM job_attempts WHERE job_id = ?')
-    .get(jobId) as { max_ordinal: number | null } | undefined;
-  const ordinal = (maxOrdinal?.max_ordinal ?? 0) + 1;
-
-  opts.db
-    .prepare(
-      `INSERT INTO job_attempts (id, job_id, ordinal, agent_id, lease_id, lease_epoch, lease_deadline, state, toolchain_profiles_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'leasing', ?)`,
-    )
-    .run(
-      attemptId,
-      jobId,
-      ordinal,
-      agentId,
-      leaseId,
-      leaseEpoch,
-      leaseDeadline,
-      selectedToolchains && selectedToolchains.length > 0
-        ? JSON.stringify(selectedToolchains)
-        : null,
-    );
-
-  transitionJobState(opts.db, jobId, 'leasing');
-
-  const request = JSON.parse(
-    (
-      opts.db.prepare('SELECT request_json FROM jobs WHERE id = ?').get(jobId) as {
-        request_json: string;
-      }
-    ).request_json,
-  );
-
-  const offerPayload: LeaseOfferPayload = {
-    attempt_id: attemptId,
-    lease_id: leaseId,
-    lease_epoch: leaseEpoch,
-    job_id: jobId,
-    job_request: request,
-    snapshot_metadata: {
-      snapshot_id: snapshotRow.id,
-      content_id: snapshotRow.content_id,
-      size_bytes: snapshotRow.size_bytes,
-      sha256: snapshotRow.sha256,
-    },
-    selected_toolchain_profiles:
-      selectedToolchains && selectedToolchains.length > 0 ? selectedToolchains : undefined,
-    lease_ttl_seconds: DEFAULT_LEASE_TTL_SECONDS,
-  };
 
   sendWsFrame(
     agentConn.socket,
     'lease_offer',
-    attemptId,
-    leaseId,
-    leaseEpoch,
+    offerPayload.attempt_id,
+    offerPayload.lease_id,
+    offerPayload.lease_epoch,
     offerPayload as unknown as Record<string, unknown>,
   );
-  return attemptId;
+  return offerPayload.attempt_id;
 }
 
 export function handleRemoteLeaseAccept(
@@ -724,17 +765,41 @@ export async function handleRemoteSourceNeed(
     return;
   }
 
+  const stillPreparing = () =>
+    opts.connectedAgents.get(agentId) === conn &&
+    rejectStale(
+      'source_need',
+      loadAttemptByLease(opts.db, attempt.id, payload.lease_id, payload.lease_epoch),
+      agentId,
+      ['preparing_source'],
+    );
+
+  const failSourceNeed = (
+    category: NonNullable<JobExitPayload['failure_category']>,
+    message: string,
+  ) => {
+    failAttemptPrepare(opts, attempt.id, attempt.job_id, category, message);
+    sendWsFrame(
+      conn.socket,
+      'reconcile_decision',
+      attempt.id,
+      payload.lease_id,
+      payload.lease_epoch,
+      {
+        attempt_id: attempt.id,
+        lease_id: payload.lease_id,
+        lease_epoch: payload.lease_epoch,
+        action: 'terminate_stale',
+        reason: message,
+      },
+    );
+  };
+
   if (payload.reason === 'base_commit_missing' || payload.reason === 'bundle_required') {
     const request = getJobRequest(opts.db, attempt.job_id);
     const snapshotRow = loadSnapshotForJob(opts.db, attempt.job_id);
     if (!request || !snapshotRow?.manifest_path) {
-      failAttemptPrepare(
-        opts,
-        attempt.id,
-        attempt.job_id,
-        'materialization',
-        'Cannot create bundle: missing job request or manifest',
-      );
+      failSourceNeed('materialization', 'Cannot create bundle: missing job request or manifest');
       return;
     }
 
@@ -744,38 +809,28 @@ export async function handleRemoteSourceNeed(
         repo?: { base_commit?: string };
       };
     } catch {
-      failAttemptPrepare(
-        opts,
-        attempt.id,
-        attempt.job_id,
-        'materialization',
-        'Cannot create bundle: manifest unreadable',
-      );
+      failSourceNeed('materialization', 'Cannot create bundle: manifest unreadable');
       return;
     }
 
     const baseCommit = manifest.repo?.base_commit;
     if (!baseCommit) {
-      failAttemptPrepare(
-        opts,
-        attempt.id,
-        attempt.job_id,
-        'materialization',
-        'Cannot create bundle: manifest missing base_commit',
-      );
+      failSourceNeed('materialization', 'Cannot create bundle: manifest missing base_commit');
       return;
     }
 
     const transferDir = attemptTransferDir(opts.dataDir, attempt.id);
-    const bundlePath = join(transferDir, 'bundle.gitbundle');
     try {
       const maxBundleBytes = opts.maxGitBundleBytes ?? DEFAULT_MAX_GIT_BUNDLE_BYTES;
-      const { sizeBytes, sha256 } = await createGitBundle(
+      const { sizeBytes, sha256 } = await prepareBundleTransfer(
+        transferDir,
         request.source.project_root,
         baseCommit,
-        bundlePath,
         maxBundleBytes,
       );
+      if (!stillPreparing()) {
+        return;
+      }
       const bundleToken = issueDataToken(opts.identity, {
         agent_id: agentId,
         job_id: attempt.job_id,
@@ -803,38 +858,26 @@ export async function handleRemoteSourceNeed(
         bundlePayload as unknown as Record<string, unknown>,
       );
     } catch (error) {
-      failAttemptPrepare(
-        opts,
-        attempt.id,
-        attempt.job_id,
-        'materialization',
-        `Failed to create git bundle: ${String(error)}`,
-      );
+      if (!stillPreparing()) {
+        return;
+      }
+      failSourceNeed('materialization', `Failed to create git bundle: ${String(error)}`);
     }
     return;
   }
 
   if (payload.reason === 'full_snapshot_required' || payload.reason === 'repo_fetch_failed') {
     const snapshotRow = loadSnapshotForJob(opts.db, attempt.job_id);
-    if (!snapshotRow) {
-      failAttemptPrepare(
-        opts,
-        attempt.id,
-        attempt.job_id,
-        'repo_fetch',
-        'No snapshot available for full-mode fallback',
-      );
-      return;
-    }
-
     let manifest: unknown;
     try {
-      manifest = JSON.parse(readFileSync(snapshotRow.manifest_path, 'utf8'));
+      if (snapshotRow) {
+        manifest = JSON.parse(readFileSync(snapshotRow.manifest_path, 'utf8'));
+      }
     } catch {
-      manifest = undefined;
+      // Handle the unavailable snapshot below.
     }
 
-    if (snapshotManifestMode(manifest) === 'full') {
+    if (snapshotRow && FullSnapshotManifestSchema.safeParse(manifest).success) {
       sendPrepareSource(
         opts,
         agentId,
@@ -848,46 +891,11 @@ export async function handleRemoteSourceNeed(
       return;
     }
 
-    const fallback = await ensureFullFallbackArchive(opts, attempt.id, attempt.job_id);
-    if (!fallback) {
-      failAttemptPrepare(
-        opts,
-        attempt.id,
-        attempt.job_id,
-        'repo_fetch',
-        'Full snapshot fallback unavailable',
-      );
-      return;
-    }
-
-    const dataToken = issueDataToken(opts.identity, {
-      agent_id: agentId,
-      job_id: attempt.job_id,
-      attempt_id: attempt.id,
-      lease_id: payload.lease_id,
-      lease_epoch: payload.lease_epoch,
-      op: 'snapshot_download',
-    });
-    const downloadUrl = `${resolveDataPlaneBaseUrl(opts, conn)}/data/v1/attempts/${attempt.id}/snapshot`;
-    const preparePayload: PrepareSourcePayload = {
-      source_mode: 'full',
-      attempt_id: attempt.id,
-      lease_id: payload.lease_id,
-      lease_epoch: payload.lease_epoch,
-      download_url: downloadUrl,
-      data_token: dataToken,
-      expected_size_bytes: fallback.sizeBytes,
-      expected_sha256: fallback.sha256,
-      manifest: fallback.manifest,
-    };
-    sendWsFrame(
-      conn.socket,
-      'prepare_source',
-      attempt.id,
-      payload.lease_id,
-      payload.lease_epoch,
-      preparePayload as unknown as Record<string, unknown>,
-    );
+    const message =
+      snapshotManifestMode(manifest) === 'git_overlay'
+        ? `Agent could not restore the submitted Git overlay (${payload.reason}). Resolve Git access or submit a new job with snapshot_mode=full.`
+        : 'The submitted snapshot is unavailable or invalid';
+    failSourceNeed('repo_fetch', message);
   }
 }
 
@@ -895,7 +903,7 @@ export function handleRemoteLeaseReject(
   opts: RemoteExecutionOptions,
   agentId: string,
   payload: LeaseRejectPayload,
-): void {
+): boolean {
   const attempt = loadAttemptByLease(
     opts.db,
     payload.attempt_id,
@@ -903,44 +911,48 @@ export function handleRemoteLeaseReject(
     payload.lease_epoch,
   );
   if (!rejectStale('lease_reject', attempt, agentId, ['leasing'])) {
-    return;
+    return false;
   }
 
   // Abandon only this offer/attempt. Capacity-race rejects must not hard-fail
   // wait (or other rematch-eligible) jobs — re-queue for later dispatch.
-  bumpLeaseEpoch(opts.db, attempt.id);
-  transitionAttemptState(opts.db, attempt.id, 'completed', {
-    outcome: 'failed',
-    finished_at: nowIso(),
-  });
-
-  const request = getJobRequest(opts.db, attempt.job_id);
-  const queuePolicy = request?.queue_policy ?? opts.defaultQueuePolicy ?? 'local_fallback';
-  if (queuePolicy === 'fail_fast') {
-    transitionJobState(opts.db, attempt.job_id, 'completed', {
+  runLifecycleTransaction(opts.db, () => {
+    const finished = nowIso();
+    bumpLeaseEpoch(opts.db, attempt.id);
+    transitionAttemptState(opts.db, attempt.id, 'completed', {
       outcome: 'failed',
-      finished_at: nowIso(),
-      failure_category: 'no_capacity',
-      failure_message: `Agent rejected lease offer: ${payload.reason}`,
+      finished_at: finished,
     });
-    return;
-  }
 
-  assertJobLifecycleWriteAllowed(opts.db);
-  opts.db
-    .prepare(
-      `UPDATE jobs
-       SET state = 'queued',
-           outcome = NULL,
-           finished_at = NULL,
-           failure_category = NULL,
-           failure_message = NULL,
-           queued_at = COALESCE(queued_at, ?),
-           updated_at = ?
-       WHERE id = ?`,
-    )
-    .run(nowIso(), nowIso(), attempt.job_id);
-  notifyJobLifecycleChanged(opts.db, attempt.job_id);
+    const request = getJobRequest(opts.db, attempt.job_id);
+    const queuePolicy = request?.queue_policy ?? opts.defaultQueuePolicy ?? 'local_fallback';
+    if (queuePolicy === 'fail_fast' && !opts.canRescheduleLeaseReject) {
+      transitionJobState(opts.db, attempt.job_id, 'completed', {
+        outcome: 'failed',
+        finished_at: finished,
+        failure_category: 'no_capacity',
+        failure_message: `Agent rejected lease offer: ${payload.reason}`,
+      });
+      return;
+    }
+
+    assertJobLifecycleWriteAllowed(opts.db);
+    opts.db
+      .prepare(
+        `UPDATE jobs
+         SET state = 'queued',
+             outcome = NULL,
+             finished_at = NULL,
+             failure_category = NULL,
+             failure_message = NULL,
+             queued_at = COALESCE(queued_at, ?),
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(finished, finished, attempt.job_id);
+    notifyJobLifecycleChanged(opts.db, attempt.job_id);
+  });
+  return true;
 }
 
 /**
@@ -1074,6 +1086,10 @@ export async function handleRemoteLogChunk(
     chunk: payload.bytes,
     sequence: payload.sequence,
   });
+  const current = loadAttemptByLease(opts.db, attempt.id, payload.lease_id, payload.lease_epoch);
+  if (!rejectStale('log_chunk', current, agentId)) {
+    return;
+  }
   updateAttempt(opts.db, attempt.id, { log_acked_sequence: payload.sequence });
   sendAck();
 }
@@ -1143,11 +1159,12 @@ export function handleRemoteJobStarted(
     return;
   }
 
-  if (payload.pid && payload.pid > 0) {
-    const process_identity = processIdentityFromPid(payload.pid);
-    if (process_identity) {
-      updateAttempt(opts.db, attempt.id, { process_identity });
-    }
+  const identity = payload.process_identity;
+  if (identity && payload.pid && parseProcessIdentity(identity)?.pid === payload.pid) {
+    updateAttempt(opts.db, attempt.id, { process_identity: identity });
+  } else if (identity === undefined && payload.pid) {
+    const legacyIdentity = processIdentityFromPid(payload.pid);
+    if (legacyIdentity) updateAttempt(opts.db, attempt.id, { process_identity: legacyIdentity });
   }
 
   const event = createJobEvent(opts.db, {
@@ -1183,26 +1200,7 @@ export function handleRemoteJobExit(
     return;
   }
 
-  // Persist process outcome here; cleanup_complete only finalizes the attempt.
-  transitionAttemptState(opts.db, attempt.id, 'collecting_artifacts', {
-    outcome: payload.outcome,
-  });
-  updateAttempt(opts.db, attempt.id, { orphaned_at: null });
-  assertJobLifecycleWriteAllowed(opts.db);
-  opts.db
-    .prepare(
-      `UPDATE jobs SET exit_code = ?, failure_category = ?, failure_message = ?, updated_at = ?
-       WHERE id = ?`,
-    )
-    .run(
-      payload.exit_code,
-      payload.failure_category ?? null,
-      payload.failure_message ?? null,
-      nowIso(),
-      attempt.job_id,
-    );
-  notifyJobLifecycleChanged(opts.db, attempt.job_id);
-  transitionJobState(opts.db, attempt.job_id, 'collecting_artifacts');
+  recordRemoteProcessExit(opts.db, attempt, payload);
 }
 
 export function handleRemoteArtifactManifest(
@@ -1217,6 +1215,22 @@ export function handleRemoteArtifactManifest(
     payload.lease_epoch,
   );
   if (!rejectStale('artifact_manifest', attempt, agentId, ['collecting_artifacts'])) {
+    return;
+  }
+  const conn = opts.connectedAgents.get(agentId);
+  if (!conn) {
+    return;
+  }
+  const canReconcile = () =>
+    opts.connectedAgents.get(agentId) === conn &&
+    rejectStale(
+      'artifact_manifest',
+      loadAttemptByLease(opts.db, attempt.id, payload.lease_id, payload.lease_epoch),
+      agentId,
+      ['collecting_artifacts'],
+    );
+  if (payload.artifacts.some((art) => !isSafeRelativePath(art.logical_name))) {
+    logger.warn('invalid artifact logical name ignored', { attemptId: attempt.id, agentId });
     return;
   }
 
@@ -1238,39 +1252,41 @@ export function handleRemoteArtifactManifest(
   // Register full manifest expectations, then grant tokens only for missing objects.
   registerArtifactExpectations(attempt.id, payload.artifacts);
 
-  void filterMissingArtifacts(opts.dataDir, attempt.id, payload.artifacts).then((missing) => {
-    const pathByName = new Map(payload.artifacts.map((a) => [a.logical_name, a.path]));
-    const conn = opts.connectedAgents.get(agentId);
-    const uploadBaseUrl = resolveDataPlaneBaseUrl(opts, conn);
-    const artifactsWithTokens = missing.map((art) => {
-      const uploadToken = issueDataToken(opts.identity, {
-        agent_id: agentId,
-        job_id: attempt.job_id,
+  void filterMissingArtifacts(opts, attempt.id, payload.artifacts, canReconcile)
+    .then((missing) => {
+      if (!canReconcile()) {
+        return;
+      }
+      const pathByName = new Map(payload.artifacts.map((a) => [a.logical_name, a.path]));
+      const uploadBaseUrl = resolveDataPlaneBaseUrl(opts, conn);
+      const artifactsWithTokens = missing.map((art) => {
+        const uploadToken = issueDataToken(opts.identity, {
+          agent_id: agentId,
+          job_id: attempt.job_id,
+          attempt_id: attempt.id,
+          lease_id: payload.lease_id,
+          lease_epoch: payload.lease_epoch,
+          op: 'artifact_upload',
+          artifact_id: art.logical_name,
+        });
+        const uploadUrl = `${uploadBaseUrl}/data/v1/attempts/${attempt.id}/artifacts/${encodeURIComponent(art.logical_name)}`;
+        return {
+          logical_name: art.logical_name,
+          path: pathByName.get(art.logical_name) ?? art.logical_name,
+          size_bytes: art.size_bytes,
+          sha256: art.sha256,
+          upload_token: uploadToken,
+          upload_url: uploadUrl,
+        };
+      });
+
+      const responsePayload: ArtifactUploadGrantPayload = {
         attempt_id: attempt.id,
         lease_id: payload.lease_id,
         lease_epoch: payload.lease_epoch,
-        op: 'artifact_upload',
-        artifact_id: art.logical_name,
-      });
-      const uploadUrl = `${uploadBaseUrl}/data/v1/attempts/${attempt.id}/artifacts/${encodeURIComponent(art.logical_name)}`;
-      return {
-        logical_name: art.logical_name,
-        path: pathByName.get(art.logical_name) ?? art.logical_name,
-        size_bytes: art.size_bytes,
-        sha256: art.sha256,
-        upload_token: uploadToken,
-        upload_url: uploadUrl,
+        artifacts: artifactsWithTokens,
       };
-    });
 
-    const responsePayload: ArtifactUploadGrantPayload = {
-      attempt_id: attempt.id,
-      lease_id: payload.lease_id,
-      lease_epoch: payload.lease_epoch,
-      artifacts: artifactsWithTokens,
-    };
-
-    if (conn) {
       sendWsFrame(
         conn.socket,
         'artifact_upload_grant',
@@ -1279,8 +1295,13 @@ export function handleRemoteArtifactManifest(
         payload.lease_epoch,
         responsePayload as unknown as Record<string, unknown>,
       );
-    }
-  });
+    })
+    .catch((error) => {
+      logger.warn('failed to reconcile artifact manifest', {
+        attemptId: attempt.id,
+        error: String(error),
+      });
+    });
 }
 
 export async function handleRemoteCleanupComplete(
@@ -1313,8 +1334,6 @@ export async function handleRemoteCleanupComplete(
     return;
   }
 
-  clearArtifactExpectations(attempt.id);
-
   const job = getJob(opts.db, attempt.job_id);
   const outcome =
     attempt.outcome ??
@@ -1324,36 +1343,49 @@ export async function handleRemoteCleanupComplete(
   const exitCode =
     attempt.outcome != null ? (job?.exit_code ?? null) : (job?.exit_code ?? payload.exit_code);
 
-  if (payload.timed_out || (payload.exit_code !== null && payload.exit_code !== 0)) {
-    const event = createJobEvent(opts.db, {
-      type: 'cleanup_error',
-      job_id: attempt.job_id,
-      attempt_id: attempt.id,
-      exit_code: payload.exit_code,
-      timed_out: payload.timed_out,
-      message: payload.message ?? 'Cleanup script failed or timed out',
-    });
-    recordEvent(opts.db, event);
-  }
+  const finishedAt = nowIso();
+  runLifecycleTransaction(opts.db, () => {
+    if (payload.artifact_staging_interrupted) {
+      recordArtifactCollectionInterruption(opts.db, attempt.id);
+    }
+    if (
+      payload.cleanup_interrupted ||
+      payload.timed_out ||
+      (payload.exit_code !== null && payload.exit_code !== 0)
+    ) {
+      const event = createJobEvent(opts.db, {
+        type: 'cleanup_error',
+        job_id: attempt.job_id,
+        attempt_id: attempt.id,
+        exit_code: payload.exit_code,
+        timed_out: payload.timed_out,
+        message: payload.cleanup_interrupted
+          ? 'Cleanup result was unavailable when the Agent recovered the attempt'
+          : (payload.message ?? 'Cleanup script failed or timed out'),
+      });
+      recordEvent(opts.db, event);
+    }
 
-  transitionAttemptState(opts.db, attempt.id, 'completed', {
-    outcome,
-    finished_at: nowIso(),
+    transitionAttemptState(opts.db, attempt.id, 'completed', {
+      outcome,
+      finished_at: finishedAt,
+    });
+    transitionJobState(opts.db, attempt.job_id, 'cleaning');
+    transitionJobState(opts.db, attempt.job_id, 'completed', {
+      outcome,
+      finished_at: finishedAt,
+      exit_code: exitCode,
+      failure_category:
+        job?.failure_category ??
+        (outcome === 'failed' ? 'process_exit' : outcome === 'timed_out' ? 'timeout' : null),
+      failure_message:
+        job?.failure_message ??
+        payload.message ??
+        (outcome === 'failed' ? `Process exited with code ${exitCode}` : null),
+      result_json: JSON.stringify({ outcome, exit_code: exitCode }),
+    });
   });
-  transitionJobState(opts.db, attempt.job_id, 'cleaning');
-  transitionJobState(opts.db, attempt.job_id, 'completed', {
-    outcome,
-    finished_at: nowIso(),
-    exit_code: exitCode,
-    failure_category:
-      job?.failure_category ??
-      (outcome === 'failed' ? 'process_exit' : outcome === 'timed_out' ? 'timeout' : null),
-    failure_message:
-      job?.failure_message ??
-      payload.message ??
-      (outcome === 'failed' ? `Process exited with code ${exitCode}` : null),
-    result_json: JSON.stringify({ outcome, exit_code: exitCode }),
-  });
+  clearArtifactExpectations(attempt.id);
 }
 
 export function handleAgentDisconnect(db: ControllerDatabase, agentId: string): void {

@@ -1,11 +1,13 @@
 import { readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createLogger } from '@rbo/shared';
+import { DEFAULT_REPO_CACHE_CONFIG, RepoMirrorManager } from '../repos/mirror.js';
 import {
   type AttemptMetadata,
   type AttemptMetadataStatus,
   listAttemptMetadata,
 } from './attempt-metadata.js';
+import { hasPendingWorktreeCleanup } from './worktree-cleanup.js';
 
 const logger = createLogger('agent.disk-pressure');
 
@@ -51,7 +53,9 @@ export interface DiskPressureCleanupOptions {
    * removing attempt workspaces or sweeping orphan attempt artifact dirs.
    */
   cleanupAttemptResources?: (attemptId: string) => Promise<void>;
-  /** Optional repo eviction hook; default scans inactive mirrors. */
+  /** Retain workspaces still protected by live Agent ownership. */
+  shouldRetainWorkspace?: (attemptId: string) => boolean;
+  /** Optional repo eviction hook; defaults to lock-aware mirror eviction. */
   evictInactiveRepos?: () => Promise<string[]>;
   /**
    * Optional build-cache eviction hook.
@@ -142,6 +146,9 @@ export async function applyDiskPressureCleanup(
 
   const allMeta = await listAttemptMetadata(options.stateDir);
   const activeIds = new Set(allMeta.filter(isActiveMeta).map((m) => m.attempt_id));
+  const finishedTransferIds = new Set(
+    allMeta.filter((m) => m.artifact_transfer).map((m) => m.attempt_id),
+  );
   const terminalOld = allMeta.filter(
     (m) =>
       m.status === 'terminal' &&
@@ -161,16 +168,19 @@ export async function applyDiskPressureCleanup(
   try {
     const entries = await readdir(artifactsRoot);
     for (const name of entries) {
-      if (activeIds.has(name)) {
+      const active = activeIds.has(name);
+      if (active && !finishedTransferIds.has(name)) {
         continue;
       }
       const already = terminalOld.some((m) => m.attempt_id === name);
       if (already) {
         continue;
       }
-      // Orphan artifact staging without active attempt — treat as expired
+      // Finished transfer staging and unowned artifact directories can be retired.
       const artDir = join(artifactsRoot, name);
-      await invokeAttemptResourceCleanup(name, options.cleanupAttemptResources);
+      if (!active) {
+        await invokeAttemptResourceCleanup(name, options.cleanupAttemptResources);
+      }
       if (await removePath('artifacts', artDir, record)) {
         logger.info('disk-pressure removed orphan artifacts', { attemptId: name });
       }
@@ -183,7 +193,13 @@ export async function applyDiskPressureCleanup(
   for (const meta of terminalOld) {
     await invokeAttemptResourceCleanup(meta.attempt_id, options.cleanupAttemptResources);
     const ws = meta.workspace_path ?? join(options.stateDir, 'workspaces', meta.attempt_id);
-    if (await removePath('workspaces', ws, record)) {
+    if (
+      (await pathExists(ws)) &&
+      !options.shouldRetainWorkspace?.(meta.attempt_id) &&
+      !hasPendingWorktreeCleanup(options.stateDir, meta.attempt_id)
+    ) {
+      await rm(ws, { recursive: true, force: true });
+      record('workspaces', ws);
       logger.info('disk-pressure removed old workspace', { attemptId: meta.attempt_id });
     }
   }
@@ -197,42 +213,17 @@ export async function applyDiskPressureCleanup(
   }
 
   // 4. Inactive repo caches
-  if (options.evictInactiveRepos) {
-    const evicted = await options.evictInactiveRepos();
-    for (const key of evicted) {
-      record('repos', join(options.reposDir ?? join(options.stateDir, 'repos'), key));
-    }
-  } else {
-    const reposDir = options.reposDir ?? join(options.stateDir, 'repos');
-    try {
-      const entries = await readdir(reposDir);
-      for (const name of entries) {
-        const metaPath = join(reposDir, name, 'metadata.json');
-        try {
-          const { readFile } = await import('node:fs/promises');
-          const raw = await readFile(metaPath, 'utf8');
-          const meta = JSON.parse(raw) as {
-            active_worktree_count?: number;
-            last_used_at?: string;
-          };
-          if ((meta.active_worktree_count ?? 0) > 0) {
-            continue;
-          }
-          const lastUsed = meta.last_used_at ? Date.parse(meta.last_used_at) : 0;
-          if (nowMs - lastUsed < options.retentionMs) {
-            continue;
-          }
-          const repoPath = join(reposDir, name);
-          if (await removePath('repos', repoPath, record)) {
-            logger.info('disk-pressure evicted inactive repo', { repoKey: name });
-          }
-        } catch {
-          // skip broken
-        }
-      }
-    } catch {
-      // no repos dir
-    }
+  const reposDir = options.reposDir ?? join(options.stateDir, 'repos');
+  const evictedRepos = options.evictInactiveRepos
+    ? await options.evictInactiveRepos()
+    : await new RepoMirrorManager({
+        reposDir,
+        allowlist: { schemes: [], hosts: [] },
+        repoCache: DEFAULT_REPO_CACHE_CONFIG,
+      }).evictMirrors({ inactiveThroughMs: nowMs - options.retentionMs });
+  for (const key of evictedRepos) {
+    record('repos', join(reposDir, key));
+    logger.info('disk-pressure evicted inactive repo', { repoKey: key });
   }
 
   // 5. Inactive build caches (AFTER repo caches). Never evict locked / active_users > 0.

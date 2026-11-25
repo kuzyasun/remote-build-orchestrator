@@ -1,13 +1,15 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { writeDefaultControllerConfigFile } from '@rbo/controller/config';
+import { validateRestoredControllerDatabase } from '@rbo/controller/restore';
 import { runController } from '@rbo/controller/run';
 import {
   type BackupManifest,
   RBO_CONTROLLER_SCHEMA_VERSION,
   applyRestoredFiles,
   ensureControllerIdentity,
+  recoverPendingControllerRestore,
   validateRestore,
 } from '@rbo/shared';
 import {
@@ -16,7 +18,11 @@ import {
   isDaemonChild,
   spawnDetachedDaemon,
 } from './daemon.js';
-import { ensureNotRunningOrReplace, stopRoleForCli } from './process-lifecycle.js';
+import {
+  ensureNotRunningOrReplace,
+  runRegisteredRole,
+  stopRoleForCli,
+} from './process-lifecycle.js';
 
 export interface ControllerInitOptions {
   dataDir: string;
@@ -39,6 +45,7 @@ export interface ControllerIdentitySummary {
 export async function runControllerInit(
   options: ControllerInitOptions,
 ): Promise<ControllerIdentitySummary> {
+  await recoverPendingControllerRestore(options.dataDir);
   const identity = await ensureControllerIdentity(options.dataDir);
   const config = writeDefaultControllerConfigFile(options.dataDir, { force: options.force });
   return {
@@ -54,6 +61,7 @@ export async function runControllerInit(
 export async function runControllerFingerprint(
   options: ControllerInitOptions,
 ): Promise<Pick<ControllerIdentitySummary, 'controllerId' | 'fingerprint'>> {
+  await recoverPendingControllerRestore(options.dataDir);
   const identity = await ensureControllerIdentity(options.dataDir);
   return { controllerId: identity.controllerId, fingerprint: identity.fingerprint };
 }
@@ -102,14 +110,16 @@ export interface ControllerStartOptions {
 export async function runControllerStart(
   options: ControllerStartOptions,
 ): Promise<number | undefined | null> {
+  await recoverPendingControllerRestore(options.dataDir);
   if (!(await isControllerInitialized(options.dataDir))) {
     throw new Error('Controller is not initialized. Run `rbo controller init` first.');
   }
 
   // The daemon launcher already checked/replaced the running role. Scanning again
   // would mistake the launcher (which now waits for readiness) for another Controller.
+  const daemonChild = !options.daemon && isDaemonChild();
   const shouldStart =
-    (!options.daemon && isDaemonChild()) ||
+    daemonChild ||
     (await ensureNotRunningOrReplace('controller', {
       dataDir: options.dataDir,
       replace: options.replace,
@@ -125,16 +135,23 @@ export async function runControllerStart(
     }
     const pid = await spawnDetachedDaemon({
       command: process.execPath,
-      args: [cliScript, 'controller', 'start', '--data-dir', options.dataDir],
+      args: [cliScript, 'controller', 'start', '--data-dir', resolve(options.dataDir)],
       pidFile: controllerPidPath(options.dataDir),
       logFile: controllerLogPath(options.dataDir),
       label: 'Controller',
+      role: 'controller',
       readyMessage: 'rbo:controller-ready',
     });
     return pid;
   }
 
-  await runController({ dataDir: options.dataDir });
+  const run = () => runController({ dataDir: options.dataDir });
+  if (daemonChild) {
+    // The parent uses an absolute path in the child command line.
+    await run();
+  } else {
+    await runRegisteredRole('controller', { dataDir: options.dataDir }, run);
+  }
 }
 
 export async function runControllerStop(options: ControllerInitOptions): Promise<{
@@ -150,12 +167,18 @@ export async function runControllerStop(options: ControllerInitOptions): Promise
 export async function runControllerRestore(
   options: ControllerRestoreOptions,
 ): Promise<ControllerRestoreResult> {
+  await recoverPendingControllerRestore(options.dataDir, options.stagingDir);
   const expectedControllerId = await readExistingControllerId(options.dataDir);
   const manifest: BackupManifest = await validateRestore(options.stagingDir, {
     latestSchemaVersion: RBO_CONTROLLER_SCHEMA_VERSION,
     expectedControllerId,
   });
-  await applyRestoredFiles(options.stagingDir, options.dataDir, manifest);
+  await applyRestoredFiles(
+    options.stagingDir,
+    options.dataDir,
+    manifest,
+    validateRestoredControllerDatabase,
+  );
   return {
     ok: true,
     controller_id: manifest.controller_id,

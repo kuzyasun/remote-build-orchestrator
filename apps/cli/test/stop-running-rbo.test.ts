@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -7,6 +15,7 @@ import {
   findLiveRolePids,
   matchRboDaemonRole,
   readLivePidFromFile,
+  registerRoleInstance,
   resolveDaemonPidFiles,
   shouldSkipInstallStop,
   stopRoleProcesses,
@@ -101,7 +110,7 @@ describe('stop-running-rbo (install auto-stop)', () => {
     expect(existsSync(pidPath)).toBe(false);
   });
 
-  it('findLiveRolePids returns only the requested role and skips self', async () => {
+  it('finds the requested instance and ignores unrelated processes named in stale PID files', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'rbo-find-'));
     temps.push(dir);
     mkdirSync(join(dir, 'run'), { recursive: true });
@@ -112,13 +121,14 @@ describe('stop-running-rbo (install auto-stop)', () => {
       selfPid: 999,
       isAlive: (pid) => pid === 111 || pid === 222 || pid === 333,
       listProcesses: async () => [
+        { pid: 111, commandLine: '/usr/bin/node /x/unrelated.js' },
         {
           pid: 222,
-          commandLine: '/usr/bin/node /x/rbo.js controller start',
+          commandLine: `/usr/bin/node /x/rbo.js controller start --data-dir "${dir}"`,
         },
         {
           pid: 333,
-          commandLine: '/usr/bin/node /x/rbo.js agent start',
+          commandLine: '/usr/bin/node /x/rbo.js controller start --data-dir a-different-instance',
         },
         {
           pid: 999,
@@ -126,8 +136,81 @@ describe('stop-running-rbo (install auto-stop)', () => {
         },
       ],
     });
-    expect(pids).toEqual([111, 222]);
+    expect(pids).toEqual([222]);
   });
+
+  it.each(['controller', 'agent'] as const)(
+    'matches unflagged %s starts only in their registered scope',
+    async (role) => {
+      const base = mkdtempSync(join(tmpdir(), 'rbo-foreground-scope-'));
+      temps.push(base);
+      const selected = join(base, 'registered');
+      const alias = join(base, 'registered-alias');
+      const callerScope = join(base, 'caller');
+      const directoryKey = role === 'controller' ? 'dataDir' : 'stateDir';
+      const ownProcess = {
+        pid: process.pid,
+        commandLine: `/usr/bin/node /usr/local/bin/rbo ${role} start`,
+        startedAt: 'current-start',
+      };
+      const another = { ...ownProcess, pid: process.pid + 1, startedAt: 'another-start' };
+      const nativeMarker = join(selected, 'run', `${role}.pid`);
+      mkdirSync(join(selected, 'run'), { recursive: true });
+      mkdirSync(join(callerScope, 'run'), { recursive: true });
+      let aliasAvailable = false;
+      try {
+        symlinkSync(selected, alias, process.platform === 'win32' ? 'junction' : 'dir');
+        aliasAvailable = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+      }
+      writeFileSync(nativeMarker, `${ownProcess.pid}\n`);
+      writeFileSync(join(callerScope, 'run', `${role}.pid`), `${ownProcess.pid}\n`);
+      const unregister = await registerRoleInstance(role, {
+        [directoryKey]: selected,
+        listProcesses: async () => [ownProcess],
+      });
+      try {
+        const common = {
+          isAlive: () => true,
+          selfPid: -1,
+          listProcesses: async () => [ownProcess, another],
+        };
+        const callerOptions = {
+          ...common,
+          env: { RBO_DATA_DIR: callerScope, RBO_AGENT_STATE_DIR: callerScope },
+        };
+        const stopped: number[] = [];
+        const stop = await stopRoleProcesses(role, {
+          ...callerOptions,
+          stopPid: async (pid) => {
+            stopped.push(pid);
+          },
+        });
+        expect(stop).toEqual({ stopped: [], alreadyStopped: true });
+        expect(stopped).toEqual([]);
+        expect(await findLiveRolePids(role, { ...common, [directoryKey]: selected })).toEqual([
+          ownProcess.pid,
+        ]);
+        if (aliasAvailable) {
+          expect(await findLiveRolePids(role, { ...common, [directoryKey]: alias })).toEqual([
+            ownProcess.pid,
+          ]);
+        }
+        expect(
+          await findLiveRolePids(role, {
+            ...common,
+            [directoryKey]: selected,
+            listProcesses: async () => [{ ...ownProcess, startedAt: 'reused-start' }],
+          }),
+        ).toEqual([]);
+      } finally {
+        unregister();
+      }
+      expect(existsSync(`${nativeMarker}.${ownProcess.pid}.instance`)).toBe(false);
+      expect(readFileSync(nativeMarker, 'utf8')).toBe(`${ownProcess.pid}\n`);
+    },
+  );
 
   it('stopRoleProcesses stops matched role strictly and clears pid file', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'rbo-stop-role-'));
@@ -140,7 +223,9 @@ describe('stop-running-rbo (install auto-stop)', () => {
     const result = await stopRoleProcesses('controller', {
       dataDir: dir,
       isAlive: (pid) => live.has(pid),
-      listProcesses: async () => [],
+      listProcesses: async () => [
+        { pid: 111, commandLine: `/usr/bin/node /x/rbo.js controller start --data-dir "${dir}"` },
+      ],
       stopPid: async (pid) => {
         killed.push(pid);
         live.delete(pid);
@@ -163,7 +248,7 @@ describe('stop-running-rbo (install auto-stop)', () => {
         stateDir: dir,
         isAlive: () => true,
         listProcesses: async () => [
-          { pid: 55, commandLine: '/usr/bin/node /x/rbo.js agent start' },
+          { pid: 55, commandLine: `/usr/bin/node /x/rbo.js agent start --state-dir "${dir}"` },
         ],
         stopPid: async () => {},
         log: () => {},
@@ -173,7 +258,7 @@ describe('stop-running-rbo (install auto-stop)', () => {
     ).rejects.toThrow(/still alive/);
   });
 
-  it('stopRunningRbo stops matched processes and pid-file daemons, then continues on kill failure', async () => {
+  it('stopRunningRbo stops verified processes and continues on a stop failure', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'rbo-stop-'));
     temps.push(dir);
     mkdirSync(join(dir, '.rbo', 'run'), { recursive: true });
@@ -187,12 +272,14 @@ describe('stop-running-rbo (install auto-stop)', () => {
       env: { npm_config_global: 'true' },
       home: dir,
       listProcesses: async () => [
+        { pid: 111, commandLine: '/usr/bin/node /x/rbo.js controller start' },
         {
           pid: 222,
           commandLine:
             '/usr/bin/node /x/node_modules/@gemslibe/rbo/dist/rbo.js agent start --daemon',
         },
         { pid: 333, commandLine: '/usr/bin/node /x/rbo-mcp-stdio.js' },
+        { pid: 999, commandLine: '/usr/bin/node /x/rbo.js agent start' },
       ],
       isAlive: (pid) => pid === 111 || pid === 222 || pid === 999,
       stopPid: async (pid) => {
@@ -203,13 +290,35 @@ describe('stop-running-rbo (install auto-stop)', () => {
       },
       log: (msg) => logs.push(msg),
       warn: (msg) => warnings.push(msg),
-      extraPids: [999],
     });
 
     expect(killed.sort()).toEqual([111, 222]);
     expect(logs.some((line) => line.includes('controller') && line.includes('111'))).toBe(true);
     expect(logs.some((line) => line.includes('agent') && line.includes('222'))).toBe(true);
     expect(warnings.some((line) => line.includes('999'))).toBe(true);
+  });
+
+  it('skips a process whose start time changed before it can be stopped', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rbo-replaced-'));
+    temps.push(dir);
+    let scan = 0;
+    const stopped: number[] = [];
+    await stopRoleProcesses('controller', {
+      dataDir: dir,
+      listProcesses: async () => [
+        {
+          pid: 55,
+          commandLine: `/usr/bin/node /x/rbo.js controller start --data-dir "${dir}"`,
+          startedAt: String(scan++),
+        },
+      ],
+      isAlive: () => true,
+      stopPid: async (pid) => {
+        stopped.push(pid);
+      },
+    });
+    expect(stopped).toEqual([]);
+    expect(scan).toBe(2);
   });
 
   it('stopRunningRbo is a no-op when skip env is set', async () => {

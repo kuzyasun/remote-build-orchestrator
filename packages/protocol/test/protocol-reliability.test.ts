@@ -88,6 +88,32 @@ describe('Protocol schemas — reliability (log ack, recovery report, reconcile 
     ).toBe(false);
   });
 
+  it('validates a durable process result in a recovery_report', () => {
+    const report = {
+      attempt_id: 'att_1',
+      lease_id: 'lease_1',
+      lease_epoch: 1,
+      status: 'completed_awaiting_upload',
+      process_identity: 'unavailable',
+      last_sent_sequence: 0,
+      last_acked_sequence: 0,
+      artifact_upload_pending: true,
+      process_exit: {
+        exit_code: 7,
+        outcome: 'failed',
+        failure_category: 'process_exit',
+        failure_message: 'Script exited with code 7',
+      },
+    };
+    expect(RecoveryReportPayloadSchema.parse(report)).toEqual(report);
+    expect(
+      RecoveryReportPayloadSchema.safeParse({
+        ...report,
+        process_exit: { ...report.process_exit, exit_code: '7' },
+      }).success,
+    ).toBe(false);
+  });
+
   it('validates reconcile_decision actions', () => {
     expect(
       ReconcileDecisionPayloadSchema.safeParse({

@@ -35,6 +35,10 @@ credential is stored, and whether the process is connected. Omit `--daemon` to r
 the current terminal. `rbo agent stop` belongs to the optional OS-service workflow; use
 `stop-process` for a foreground or daemon process.
 
+Run the stop command with the same data or state directory as the instance you intend to stop.
+For an older foreground process launched without an explicit directory flag, stop it from its
+original terminal before upgrading.
+
 ## Pair
 
 On the new worker (auto-discovery path):
@@ -117,6 +121,10 @@ See [Troubleshooting](troubleshooting.md) for common symptoms.
 
 If npm lifecycle scripts are disabled, the automatic stop hook may not run. Restart every process
 explicitly so it uses the new bundle.
+
+Update both the Controller and Agents before submitting `destructive` or `hardware` jobs. These jobs
+stop at their local lease deadline if the Agent receives no lease renewal confirmation from the
+Controller.
 
 ## Backup
 

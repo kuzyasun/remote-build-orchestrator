@@ -3,7 +3,7 @@ import type { IncomingMessage } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import type { Server as HttpsServer } from 'node:https';
 import {
-  AgentCapabilityReportSchema,
+  AgentCapabilitiesPayloadSchema,
   ArtifactManifestPayloadSchema,
   CleanupCompletePayloadSchema,
   JobExitPayloadSchema,
@@ -21,7 +21,7 @@ import type { ControllerIdentity } from '@rbo/shared';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type { z } from 'zod';
-import { patchAgentCpuLoad, updateAgentCapabilities } from '../agents/registry.js';
+import { isAgentRevoked, patchAgentCpuLoad, updateAgentCapabilities } from '../agents/registry.js';
 import {
   enqueueRemoteLogChunk,
   expireStaleLeases,
@@ -84,12 +84,17 @@ export interface AgentPlaneOptions {
 }
 
 export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 60_000;
+const LEASE_REJECT_COOLDOWN_MS = 1_000;
 
 export interface ConnectedAgent {
   agentId: string;
   socket: WebSocket;
   protocolVersion: number;
   lastHeartbeatAt: number;
+  /** Real sessions wait for their initial capability report and boot reconciliation. */
+  capabilitiesReady?: boolean;
+  acceptingJobs?: boolean;
+  leaseRetryAfter?: number;
   /** Host/IP through which the agent connected to the Controller (for reachable data plane URLs). */
   connectionHost?: string;
 }
@@ -223,10 +228,9 @@ export async function startAgentPlaneServer(
     serverPort: boundPort,
     controllerPublicHost: options.controllerPublicHost,
     dataPlaneBaseUrl: options.dataPlaneBaseUrl,
-    allowedProjectRoots: options.dispatchContext?.allowedProjectRoots,
-    snapshotCaptureLimits: options.dispatchContext?.snapshotCaptureLimits,
     maxGitBundleBytes: options.maxGitBundleBytes,
     defaultQueuePolicy: options.dispatchContext?.defaultQueuePolicy,
+    canRescheduleLeaseReject: options.dispatchContext !== undefined,
   });
 
   const buildSubmitContext = () => {
@@ -276,16 +280,31 @@ export async function startAgentPlaneServer(
   };
 
   httpsServer.on('request', (req, res) => {
-    void handleDataPlaneRequest(req, res, { db, identity, dataDir }).then((handled) => {
-      if (!handled && !res.headersSent) {
-        res.writeHead(404, { 'content-type': 'application/json' });
+    void handleDataPlaneRequest(req, res, { db, identity, dataDir })
+      .then((handled) => {
+        if (!handled && !res.headersSent && !res.destroyed) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: { category: 'validation', message: 'Not found', retryable: false },
+            }),
+          );
+        }
+      })
+      .catch((error) => {
+        logger.error('data-plane request failed', { error: String(error) });
+        if (res.destroyed) return;
+        if (res.headersSent) {
+          res.destroy();
+          return;
+        }
+        res.writeHead(500, { 'content-type': 'application/json' });
         res.end(
           JSON.stringify({
-            error: { category: 'validation', message: 'Not found', retryable: false },
+            error: { category: 'internal', message: 'Internal error', retryable: false },
           }),
         );
-      }
-    });
+      });
   });
 
   let boundPort = options.port;
@@ -328,19 +347,45 @@ export async function startAgentPlaneServer(
     let pendingCredential: string | null = null;
     const connectionHost = req ? extractConnectionHost(req) : undefined;
 
+    socket.on('error', (error) => {
+      logger.warn('agent socket failed', { error: String(error) });
+    });
+
     socket.on('message', (raw) => {
       if (shuttingDown) {
         return;
       }
-      let message: WireMessage;
+      let decoded: unknown;
       try {
-        message = JSON.parse(String(raw)) as WireMessage;
+        decoded = JSON.parse(String(raw));
       } catch {
         socket.close(1002, 'invalid JSON');
         return;
       }
+      if (
+        !decoded ||
+        typeof decoded !== 'object' ||
+        !('type' in decoded) ||
+        typeof decoded.type !== 'string' ||
+        ('payload' in decoded &&
+          (!decoded.payload ||
+            typeof decoded.payload !== 'object' ||
+            Array.isArray(decoded.payload)))
+      ) {
+        socket.close(1002, 'invalid message envelope');
+        return;
+      }
+      const message = decoded as WireMessage;
 
       try {
+        if (
+          authenticated &&
+          (connectedAgents.get(authenticated.agentId) !== authenticated ||
+            isAgentRevoked(db, authenticated.agentId))
+        ) {
+          socket.terminate();
+          return;
+        }
         switch (message.type) {
           case 'hello': {
             const negotiated = negotiateProtocolVersion({
@@ -426,6 +471,7 @@ export async function startAgentPlaneServer(
               socket,
               protocolVersion: 1,
               lastHeartbeatAt: Date.now(),
+              capabilitiesReady: false,
               connectionHost,
             };
             // Identity is the credential, not the source address. A reconnect from a
@@ -441,7 +487,6 @@ export async function startAgentPlaneServer(
             }
             markAgentSeen(db, verified.agentId, 'idle');
             send(socket, 'hello_ack', { status: 'authenticated', agent_id: verified.agentId });
-            maybeDispatchQueued();
             return;
           }
 
@@ -449,19 +494,29 @@ export async function startAgentPlaneServer(
             if (!authenticated) {
               return;
             }
-            const parsed = AgentCapabilityReportSchema.safeParse(message.payload);
+            const parsed = AgentCapabilitiesPayloadSchema.safeParse(message.payload);
             if (parsed.success) {
+              const { pending_process_exit_attempt_ids, ...capabilities } = parsed.data;
               // Detect an Agent process restart via boot_id (before updateAgentCapabilities
               // persists the new one) and sweep leaked in-flight attempts pinned to it.
-              recovery.onAgentConnect(authenticated.agentId, parsed.data.boot_id);
-              updateAgentCapabilities(db, authenticated.agentId, parsed.data);
+              recovery.onAgentConnect(
+                authenticated.agentId,
+                capabilities.boot_id,
+                pending_process_exit_attempt_ids,
+              );
+              updateAgentCapabilities(db, authenticated.agentId, capabilities);
+              authenticated.acceptingJobs ??= capabilities.accepting_jobs;
+              if (authenticated.capabilitiesReady === false) {
+                authenticated.capabilitiesReady = true;
+                authenticated.lastHeartbeatAt = Date.now();
+              }
               maybeDispatchQueued();
             }
             return;
           }
 
           case 'heartbeat': {
-            if (!authenticated) {
+            if (!authenticated?.capabilitiesReady) {
               return;
             }
             authenticated.lastHeartbeatAt = Date.now();
@@ -471,7 +526,26 @@ export async function startAgentPlaneServer(
             if (typeof cpuLoad === 'number' && Number.isFinite(cpuLoad)) {
               patchAgentCpuLoad(db, authenticated.agentId, cpuLoad);
             }
-            renewActiveLease(db, authenticated.agentId);
+            const accepting = message.payload?.accepting_jobs;
+            const becameReady = accepting === true && authenticated.acceptingJobs === false;
+            if (typeof accepting === 'boolean') {
+              authenticated.acceptingJobs = accepting;
+            }
+            const renewal = renewActiveLease(db, authenticated.agentId);
+            if (
+              message.payload?.request_lease_ack === true &&
+              typeof message.message_id === 'string' &&
+              message.message_id.length > 0 &&
+              message.message_id.length <= 128
+            ) {
+              send(socket, 'heartbeat_ack', {
+                heartbeat_message_id: message.message_id,
+                ...renewal,
+              });
+            }
+            if (becameReady) {
+              maybeDispatchQueued();
+            }
             return;
           }
 
@@ -487,8 +561,10 @@ export async function startAgentPlaneServer(
             if (!authenticated) return;
             const payload = parsePayload(LeaseRejectPayloadSchema, message.payload, message.type);
             if (!payload) return;
-            handleRemoteLeaseReject(remoteOpts(), authenticated.agentId, payload);
-            maybeDispatchQueued();
+            if (handleRemoteLeaseReject(remoteOpts(), authenticated.agentId, payload)) {
+              authenticated.leaseRetryAfter = Date.now() + LEASE_REJECT_COOLDOWN_MS;
+              maybeDispatchQueued();
+            }
             return;
           }
 
@@ -569,7 +645,7 @@ export async function startAgentPlaneServer(
           }
 
           case 'recovery_report': {
-            if (!authenticated) return;
+            if (!authenticated?.capabilitiesReady) return;
             const payload = parsePayload(
               RecoveryReportPayloadSchema,
               message.payload,

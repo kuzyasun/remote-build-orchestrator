@@ -184,6 +184,7 @@ export async function handleToolCall(
           command: args.command as string | undefined,
           project_root: args.project_root as string | undefined,
           job_id: args.job_id as string | undefined,
+          snapshot_mode: args.snapshot_mode as JobRunInput['snapshot_mode'],
           shell: args.shell as JobRunInput['shell'],
           target_os: args.target_os as JobRunInput['target_os'],
           queue_policy: args.queue_policy as QueuePolicy | undefined,

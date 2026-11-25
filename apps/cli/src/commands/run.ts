@@ -51,6 +51,7 @@ export function parseRunCommandArgs(
 
   let projectOption: string | undefined;
   let cwdOption: string | undefined;
+  let fullSnapshot = false;
   let shell: JobRunInput['shell'];
   let timeoutSeconds: number | undefined;
   let riskLevel: JobRunInput['risk_level'];
@@ -69,6 +70,9 @@ export function parseRunCommandArgs(
       case '--cwd':
         cwdOption = takeOptionValue(optionArgs, index, option);
         index += 1;
+        break;
+      case '--full-snapshot':
+        fullSnapshot = true;
         break;
       case '--shell':
         shell = takeOptionValue(optionArgs, index, option) as JobRunInput['shell'];
@@ -119,6 +123,7 @@ export function parseRunCommandArgs(
       command: commandArgs[0],
       project_root: projectRoot,
       cwd,
+      ...(fullSnapshot ? { snapshot_mode: 'full' } : {}),
       ...(shell !== undefined ? { shell } : {}),
       ...(targetOs.length > 0 ? { target_os: targetOs } : {}),
       ...(timeoutSeconds !== undefined ? { timeout_seconds: timeoutSeconds } : {}),

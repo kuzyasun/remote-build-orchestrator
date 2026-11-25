@@ -1,19 +1,33 @@
-import { execFile, spawn } from 'node:child_process';
+import { type ChildProcess, execFile, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { chmod, mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { promisify } from 'node:util';
 import type { ExecutionConfig } from '@rbo/protocol';
 import { RboError } from '@rbo/shared';
+import { waitForCompletion } from './completion.js';
 import { type LinuxCgroupScope, createLinuxCgroupScope, findAttemptPids } from './containment.js';
 import type { AttemptLogPaths } from './logs.js';
 import { appendStderr, appendStdout } from './logs.js';
 import { buildReservedRboEnv } from './runtime-env.js';
-import { resolveWindowsExecutorPath } from './windows-executor-path.js';
+import { describeWindowsExecutorResolution } from './windows-executor-path.js';
 import { WindowsHelperFrameReader } from './windows-frames.js';
 
 const execFileAsync = promisify(execFile);
+
+type ProcessExit = {
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  timedOut?: boolean;
+};
+
+type ProcessStart = { started: true } | { started: false; errorMessage?: string };
+
+interface NativeResultDelivery {
+  graceMs: number;
+  abort: () => void;
+}
 
 /**
  * ChildProcess-like EventEmitter façade shared by Unix spawn and Windows
@@ -22,11 +36,10 @@ const execFileAsync = promisify(execFile);
 export class ManagedChildProcess extends EventEmitter {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
+  readonly nativeResultDelivery?: NativeResultDelivery;
   pid: number;
-  private readonly waitForExitImpl: () => Promise<{
-    exitCode: number | null;
-    signal: NodeJS.Signals | null;
-  }>;
+  private readonly waitForExitImpl: () => Promise<ProcessExit>;
+  private readonly waitForStartImpl: () => Promise<ProcessStart>;
   private readonly killImpl: (graceSeconds: number) => Promise<void>;
   /**
    * Chain of every fire-and-forget durable log append started by attachLogPipes
@@ -44,17 +57,25 @@ export class ManagedChildProcess extends EventEmitter {
 
   constructor(input: {
     pid: number;
-    waitForExit: () => Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
+    waitForExit: () => Promise<ProcessExit>;
+    waitForStart?: () => Promise<ProcessStart>;
     kill: (graceSeconds: number) => Promise<void>;
+    nativeResultDelivery?: NativeResultDelivery;
   }) {
     super();
     this.pid = input.pid;
     this.waitForExitImpl = input.waitForExit;
+    this.waitForStartImpl = input.waitForStart ?? (async () => ({ started: input.pid > 0 }));
     this.killImpl = input.kill;
+    this.nativeResultDelivery = input.nativeResultDelivery;
   }
 
-  waitForExit(): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }> {
+  waitForExit(): Promise<ProcessExit> {
     return this.waitForExitImpl();
+  }
+
+  waitForStart(): Promise<ProcessStart> {
+    return this.waitForStartImpl();
   }
 
   kill(graceSeconds = 10): Promise<void> {
@@ -93,6 +114,56 @@ export class ManagedChildProcess extends EventEmitter {
 
 export type RunningProcess = ManagedChildProcess;
 
+function manageChild(
+  child: ChildProcess,
+  kill: (graceSeconds: number) => Promise<void>,
+  onClose: (exitCode: number | null, signal: NodeJS.Signals | null) => ProcessExit,
+  nativeResultDelivery?: NativeResultDelivery,
+  nativeStart?: Promise<ProcessStart>,
+): ManagedChildProcess {
+  let resolveExit: (result: ProcessExit) => void;
+  const exit = new Promise<ProcessExit>((resolvePromise) => {
+    resolveExit = resolvePromise;
+  });
+  const start =
+    nativeStart ??
+    new Promise<ProcessStart>((resolvePromise) => {
+      child.once('spawn', () => resolvePromise({ started: true }));
+      child.once('error', (error) =>
+        resolvePromise({ started: false, errorMessage: error.message }),
+      );
+      child.once('close', () => resolvePromise({ started: false }));
+    });
+  const managed = new ManagedChildProcess({
+    pid: child.pid ?? -1,
+    waitForExit: () => exit,
+    waitForStart: () => start,
+    kill,
+    nativeResultDelivery,
+  });
+  child.on('error', (error) => {
+    managed.stderr.write(`Process error: ${error.message}\n`);
+  });
+  child.once('close', (code, signal) => {
+    const result = onClose(code, signal);
+    void managed.endStreamsAfterDrain().then(() => {
+      resolveExit(result);
+      managed.emit('exit', result.exitCode, result.signal);
+    });
+  });
+  return managed;
+}
+
+function scriptFileName(shell: ExecutionConfig['shell'], name: 'job' | 'cleanup'): string {
+  if (shell === 'powershell' || shell === 'pwsh') {
+    return `${name}.ps1`;
+  }
+  if (shell === 'cmd' || (shell === 'direct' && process.platform === 'win32')) {
+    return `${name}.cmd`;
+  }
+  return `${name}.sh`;
+}
+
 function resolveShellCommand(shell: ExecutionConfig['shell']): { command: string; args: string[] } {
   switch (shell) {
     case 'bash':
@@ -127,15 +198,8 @@ export async function writeJobScript(
 ): Promise<string> {
   await mkdir(controlDir, { recursive: true });
   const isPowerShell = execution.shell === 'powershell' || execution.shell === 'pwsh';
-  const isCmd = execution.shell === 'cmd';
   const isDirect = execution.shell === 'direct';
-  const fileName =
-    scriptName ??
-    (isPowerShell
-      ? 'job.ps1'
-      : isCmd || (isDirect && process.platform === 'win32')
-        ? 'job.cmd'
-        : 'job.sh');
+  const fileName = scriptName ?? scriptFileName(execution.shell, 'job');
   const scriptPath = join(controlDir, fileName);
   const isCleanup =
     scriptName === 'cleanup.ps1' || scriptName === 'cleanup.sh' || scriptName === 'cleanup.cmd';
@@ -384,7 +448,12 @@ function spawnNodeProcess(input: {
     if (!pid) {
       return;
     }
+    const wrapperRunning = () =>
+      !processExited && child.exitCode === null && child.signalCode === null;
     if (isWindows) {
+      if (!wrapperRunning()) {
+        return;
+      }
       try {
         // Keep the wrapper alive until taskkill captures its process tree.
         // Terminating it first can reparent a still-running descendant, making
@@ -409,18 +478,23 @@ function spawnNodeProcess(input: {
     // and the moment its real parent exits, a still-running descendant is
     // reparented to init, no longer showing the wrapper as its ppid. Looking it
     // up *after* signaling would silently miss it.
-    const preSignalDescendants = await listDescendantPids([pid]);
+    const initialDescendants = wrapperRunning() ? await listDescendantPids([pid]) : [];
+    const preSignalDescendants = wrapperRunning() ? initialDescendants : [];
     const envDescendants = containmentId ? await findAttemptPids(containmentId) : [];
     const cgroupDescendants = cgroupScope ? await cgroupScope.listPids() : [];
 
     const signalAll = async (signal: NodeJS.Signals, extraDescendants: number[] = []) => {
-      try {
-        process.kill(-pid, signal);
-      } catch {
+      // The wrapper may have exited while collecting containment evidence.
+      // Its numeric PID/PGID can no longer identify a live process we own.
+      if (wrapperRunning()) {
         try {
-          child.kill(signal);
+          process.kill(-pid, signal);
         } catch {
-          // already gone
+          try {
+            child.kill(signal);
+          } catch {
+            // already gone
+          }
         }
       }
       // Catch anything that fell outside the wrapper's process group (see
@@ -458,9 +532,14 @@ function spawnNodeProcess(input: {
     // from the known descendants as well as the wrapper: by now the wrapper is
     // usually dead, so walking from it alone finds nothing (survivors have been
     // reparented to init) and newly-spawned grandchildren would leak.
-    const lateDescendants = await listDescendantPids([pid, ...preSignalDescendants]).catch(
-      () => [],
-    );
+    let lateDescendants = wrapperRunning()
+      ? await listDescendantPids([pid, ...preSignalDescendants]).catch(() => [])
+      : [];
+    if (!wrapperRunning()) {
+      lateDescendants = preSignalDescendants.length
+        ? await listDescendantPids(preSignalDescendants).catch(() => [])
+        : [];
+    }
     const lateEnvDescendants = containmentId ? await findAttemptPids(containmentId) : [];
     const lateCgroupDescendants = cgroupScope ? await cgroupScope.listPids() : [];
     await signalAll('SIGKILL', [
@@ -488,23 +567,14 @@ function spawnNodeProcess(input: {
     return killInFlight;
   };
 
-  const managed = new ManagedChildProcess({
-    pid: child.pid ?? -1,
-    waitForExit: () =>
-      new Promise((resolvePromise) => {
-        if (child.exitCode !== null || child.signalCode !== null) {
-          clearTimers();
-          resolvePromise({ exitCode: child.exitCode, signal: child.signalCode });
-          return;
-        }
-        child.once('close', (code, signal) => {
-          clearTimers();
-          managed.emit('exit', code, signal);
-          resolvePromise({ exitCode: code, signal });
-        });
-      }),
-    kill: (graceSeconds: number) => killTree(child.pid, graceSeconds),
-  });
+  const managed = manageChild(
+    child,
+    (graceSeconds) => killTree(child.pid, graceSeconds),
+    (exitCode, signal) => {
+      clearTimers();
+      return { exitCode, signal };
+    },
+  );
 
   const idleTimeoutSeconds = input.idleTimeoutSeconds;
   const resetIdle = () => {
@@ -536,13 +606,6 @@ function spawnNodeProcess(input: {
     resetIdle();
     managed.stderr.write(chunk);
   });
-  child.on('close', () => {
-    // Drain durable appends before ending the streams: a late stdout/stderr
-    // chunk arriving just before close would otherwise be appended to a file
-    // the caller may have already torn down, racing teardown.
-    void managed.endStreamsAfterDrain();
-  });
-
   if (input.onLogChunk || input.attachLogs !== false) {
     attachLogPipes(managed, input.logs, input.onLogChunk);
   }
@@ -550,6 +613,7 @@ function spawnNodeProcess(input: {
 }
 
 function spawnWindowsHelperProcess(input: {
+  helperPath: string;
   attemptId: string;
   command: string;
   args: string[];
@@ -561,14 +625,33 @@ function spawnWindowsHelperProcess(input: {
   timeoutSeconds: number;
   cancelGraceSeconds: number;
   idleTimeoutSeconds?: number;
-}): ManagedChildProcess | null {
-  const helperPath = resolveWindowsExecutorPath();
-  if (!helperPath) {
-    return null;
+  getStartBudgetMs?: () => number;
+}): ManagedChildProcess {
+  let startAuthorization:
+    | { kind: 'unleased' }
+    | { kind: 'lease'; qpc_issued_ms: number; qpc_deadline_ms: number; epoch_deadline_ms: number } =
+    { kind: 'unleased' };
+  if (input.getStartBudgetMs) {
+    // On Windows Node's hrtime is libuv's QPC timestamp in nanoseconds. Sample
+    // both clocks before measuring the lease budget so marshalling cannot extend it.
+    const qpcIssuedMs = Number(process.hrtime.bigint() / 1_000_000n);
+    const epochIssuedMs = Date.now();
+    // Keep one millisecond for clock conversion and inter-thread tick ambiguity.
+    const remainingMs = Math.max(0, Math.floor(input.getStartBudgetMs()) - 1);
+    const qpcDeadlineMs = qpcIssuedMs + remainingMs;
+    const epochDeadlineMs = epochIssuedMs + remainingMs;
+    if (!Number.isSafeInteger(qpcDeadlineMs) || !Number.isSafeInteger(epochDeadlineMs)) {
+      throw new RboError('process_spawn', 'Invalid Windows executor start authorization deadline');
+    }
+    startAuthorization = {
+      kind: 'lease',
+      qpc_issued_ms: qpcIssuedMs,
+      qpc_deadline_ms: qpcDeadlineMs,
+      epoch_deadline_ms: epochDeadlineMs,
+    };
   }
-
   const request = JSON.stringify({
-    protocol: 2,
+    protocol: 3,
     attempt_id: input.attemptId,
     command: input.command,
     args: input.args,
@@ -580,21 +663,31 @@ function spawnWindowsHelperProcess(input: {
     ),
     timeout_seconds: input.timeoutSeconds,
     cancel_grace_seconds: input.cancelGraceSeconds,
+    start_authorization: startAuthorization,
   });
 
-  const child = spawn(helperPath, [], {
+  const child = spawn(resolve(input.helperPath), [], {
     cwd: input.cwd,
     env: input.env,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
 
-  child.stdin?.write(`${request}\n`);
-
   let cancelSent = false;
+  let helperClosed = false;
+  let killInFlight: Promise<void> | undefined;
   let lastOutputAt = Date.now();
   let idleTimer: NodeJS.Timeout | undefined;
   let controlPayload: Buffer | undefined;
+  let started = false;
+  let resolveStart: (result: ProcessStart) => void;
+  const start = new Promise<ProcessStart>((resolvePromise) => {
+    resolveStart = resolvePromise;
+  });
+  let spawnError: string | undefined;
+  child.once('error', (error) => {
+    spawnError = error.message;
+  });
   const frameReader = new WindowsHelperFrameReader();
 
   const clearIdle = () => {
@@ -607,48 +700,99 @@ function spawnWindowsHelperProcess(input: {
   const resetIdle = () => {
     lastOutputAt = Date.now();
     const idleTimeoutSeconds = input.idleTimeoutSeconds;
-    if (!idleTimeoutSeconds || idleTimeoutSeconds <= 0) {
+    if (cancelSent || !idleTimeoutSeconds || idleTimeoutSeconds <= 0) {
       return;
     }
     clearIdle();
     idleTimer = setInterval(() => {
       if (Date.now() - lastOutputAt >= idleTimeoutSeconds * 1000) {
-        if (!cancelSent) {
-          cancelSent = true;
-          child.stdin?.write('CANCEL\n');
-        }
-        child.kill();
+        clearIdle();
+        void managed.kill(0);
       }
     }, 500);
   };
-  resetIdle();
-
-  let exitCode: number | null = null;
-  let resolved = false;
-  const waiters: Array<(value: { exitCode: number | null; signal: null }) => void> = [];
-
-  const managed = new ManagedChildProcess({
-    pid: child.pid ?? -1,
-    waitForExit: () =>
-      new Promise((resolvePromise) => {
-        if (resolved) {
-          resolvePromise({ exitCode, signal: null });
-          return;
-        }
-        waiters.push(resolvePromise);
-      }),
-    kill: async (graceSeconds: number) => {
-      if (!cancelSent) {
-        cancelSent = true;
-        child.stdin?.write('CANCEL\n');
+  const cancelHelper = async (graceSeconds: number) => {
+    if (!child.pid || helperClosed) {
+      return;
+    }
+    cancelSent = true;
+    child.stdin?.write('CANCEL\n');
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      // Allow the helper time to publish its final frame after its own drain window.
+      const finished = await Promise.race([
+        managed.waitForExit().then(() => true),
+        new Promise<boolean>((resolvePromise) => {
+          timer = setTimeout(() => resolvePromise(false), graceSeconds * 1000 + 1000);
+        }),
+      ]);
+      if (!finished && !helperClosed) {
+        child.kill();
       }
-      await new Promise((r) => setTimeout(r, graceSeconds * 1000));
-      child.kill();
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const managed = manageChild(
+    child,
+    (graceSeconds) => {
+      killInFlight ??= cancelHelper(graceSeconds);
+      return killInFlight;
     },
-  });
+    (code, signal) => {
+      helperClosed = true;
+      clearIdle();
+      let startError = spawnError ?? 'Windows executor exited before confirming job start';
+      if (controlPayload) {
+        try {
+          const parsed = JSON.parse(controlPayload.toString('utf8')) as {
+            exit_code?: number | null;
+            success?: boolean;
+            timed_out?: boolean;
+            error_message?: string | null;
+          };
+          if (parsed.error_message) {
+            managed.stderr.write(`Windows executor: ${parsed.error_message}\n`);
+            startError = parsed.error_message;
+          }
+          if (parsed.exit_code === null || typeof parsed.exit_code === 'number') {
+            resolveStart({ started: false, errorMessage: startError });
+            return {
+              exitCode:
+                (!started || parsed.success === false) && parsed.exit_code === 0
+                  ? null
+                  : parsed.exit_code,
+              signal,
+              ...(parsed.timed_out ? { timedOut: true } : {}),
+            };
+          }
+        } catch {
+          // Fall back to the helper's exit status if the control frame is malformed.
+        }
+      }
+      resolveStart({ started: false, errorMessage: startError });
+      if (code === 0) {
+        managed.stderr.write('Windows executor did not return a valid result\n');
+        return { exitCode: null, signal };
+      }
+      return { exitCode: code, signal };
+    },
+    {
+      // The helper owns the root deadline and can drain both before and after closing the Job Object.
+      graceMs: input.cancelGraceSeconds * 2000 + 1000,
+      abort: () => {
+        child.kill();
+      },
+    },
+    start,
+  );
 
   child.stdout?.on('data', (chunk: Buffer) => {
     const frames = frameReader.append(chunk);
+    if (frames.started) {
+      started = true;
+      resolveStart({ started: true });
+    }
     for (const data of frames.stdout) {
       resetIdle();
       managed.stdout.write(data);
@@ -666,37 +810,18 @@ function spawnWindowsHelperProcess(input: {
     managed.stderr.write(chunk);
   });
 
-  child.on('close', (code) => {
-    clearIdle();
-    let resolvedExit: number | null = code;
-    if (controlPayload) {
-      try {
-        const parsed = JSON.parse(controlPayload.toString('utf8')) as {
-          exit_code?: number | null;
-        };
-        if (parsed.exit_code === null || typeof parsed.exit_code === 'number') {
-          resolvedExit = parsed.exit_code ?? null;
-        }
-      } catch {
-        // fall back to helper process exit code
-      }
+  child.stdin?.on('error', (error) => {
+    if (!cancelSent && !helperClosed) {
+      managed.stderr.write(`Windows executor stdin error: ${error.message}\n`);
     }
-    exitCode = resolvedExit;
-    resolved = true;
-    // Drain durable appends (see attachLogPipes) before ending the streams and
-    // unblocking waitForExit waiters — callers wait on exit, then tear down, so
-    // a late append must be flushed first.
-    void managed.endStreamsAfterDrain().then(() => {
-      managed.emit('exit', exitCode, null);
-      for (const waiter of waiters) {
-        waiter({ exitCode, signal: null });
-      }
-    });
+    child.stdin?.destroy();
   });
 
   if (input.onLogChunk || input.attachLogs !== false) {
     attachLogPipes(managed, input.logs, input.onLogChunk);
   }
+  child.stdin?.write(`${request}\n`);
+  resetIdle();
   return managed;
 }
 
@@ -708,6 +833,13 @@ function buildChildEnv(input: {
   execution: ExecutionConfig;
   injected: Record<string, string>;
 }): { env: NodeJS.ProcessEnv; ignoredRboEnvKeys: string[] } {
+  const inheritedEnv = { ...process.env };
+  for (const key of Object.keys(inheritedEnv)) {
+    const name = key.toUpperCase();
+    if (name === 'RBO_ADMIN_TOKEN' || name === 'RBO_MCP_TOKEN') {
+      delete inheritedEnv[key];
+    }
+  }
   const userEnv = { ...(input.execution.env ?? {}) };
   const ignoredRboEnvKeys: string[] = [];
   for (const key of Object.keys(userEnv)) {
@@ -717,7 +849,7 @@ function buildChildEnv(input: {
     }
   }
   return {
-    env: { ...process.env, ...userEnv, ...input.injected },
+    env: { ...inheritedEnv, ...userEnv, ...input.injected },
     ignoredRboEnvKeys,
   };
 }
@@ -732,6 +864,10 @@ export function spawnJobScript(input: {
   env: Record<string, string>;
   logs: AttemptLogPaths;
   scriptFileName?: string;
+  /** Require Windows Job Object containment for Agent scripts. */
+  requireWindowsJobObject?: boolean;
+  /** Remaining lease time for a Windows launch that requires active authorization. */
+  getWindowsStartBudgetMs?: () => number;
   /** When false, caller owns redaction/persistence of stdout/stderr. Default true. */
   attachLogs?: boolean;
   /** Optional chunk callback (used with attachLogs: false for Controller live logs). */
@@ -792,22 +928,31 @@ export function spawnJobScript(input: {
   }
 
   if (process.platform === 'win32') {
-    const helper = spawnWindowsHelperProcess({
-      attemptId: input.attemptId,
-      command,
-      args,
-      cwd: input.projectPath,
-      env: childEnv,
-      logs: input.logs,
-      attachLogs: input.attachLogs,
-      onLogChunk: input.onLogChunk,
-      timeoutSeconds: input.execution.timeout_seconds,
-      cancelGraceSeconds: input.execution.cancel_grace_seconds,
-      idleTimeoutSeconds: input.execution.idle_timeout_seconds,
-    });
-    if (helper) {
+    const resolution = describeWindowsExecutorResolution();
+    if (resolution.path) {
+      const helper = spawnWindowsHelperProcess({
+        helperPath: resolution.path,
+        attemptId: input.attemptId,
+        command,
+        args,
+        cwd: input.projectPath,
+        env: childEnv,
+        logs: input.logs,
+        attachLogs: input.attachLogs,
+        onLogChunk: input.onLogChunk,
+        timeoutSeconds: input.execution.timeout_seconds,
+        cancelGraceSeconds: input.execution.cancel_grace_seconds,
+        idleTimeoutSeconds: input.execution.idle_timeout_seconds,
+        getStartBudgetMs: input.getWindowsStartBudgetMs,
+      });
       Object.assign(helper, { ignoredRboEnvKeys });
       return helper as SpawnJobScriptResult;
+    }
+    if (input.requireWindowsJobObject || input.getWindowsStartBudgetMs) {
+      throw new RboError(
+        'process_spawn',
+        `Windows Job Object helper required. ${resolution.detail}`,
+      );
     }
   }
 
@@ -837,31 +982,88 @@ export async function runCleanupScript(input: {
   execution: ExecutionConfig;
   env: Record<string, string>;
   logs: AttemptLogPaths;
-}): Promise<{ exitCode: number | null; timedOut: boolean }> {
+  requireWindowsJobObject?: boolean;
+  getWindowsStartBudgetMs?: () => number;
+  cancelSignal?: AbortSignal;
+}): Promise<{ exitCode: number | null; timedOut: boolean; message?: string }> {
   if (!input.execution.cleanup_script) {
     return { exitCode: 0, timedOut: false };
   }
-  const isPowerShell = input.execution.shell === 'powershell';
-  const isDirectWin = input.execution.shell === 'direct' && process.platform === 'win32';
-  const cleanupName = isPowerShell ? 'cleanup.ps1' : isDirectWin ? 'cleanup.cmd' : 'cleanup.sh';
+  const interruptionReason = () => {
+    const reason: unknown = input.cancelSignal?.reason;
+    return reason instanceof Error ? reason.message : 'lease expired';
+  };
+  const skipped = () => ({
+    exitCode: null,
+    timedOut: false,
+    message: `Cleanup script skipped: ${interruptionReason()}`,
+  });
+  if (input.cancelSignal?.aborted) return skipped();
+
+  const cleanupName = scriptFileName(input.execution.shell, 'cleanup');
   await writeJobScript(input.controlDir, input.execution, cleanupName);
   const cleanupContainmentId = `${input.attemptId}_cleanup`;
+  const execution: ExecutionConfig = {
+    ...input.execution,
+    timeout_seconds: input.execution.cleanup_timeout_seconds ?? 60,
+    // On POSIX the adapter coalesces kills. An earlier timeout must not leave
+    // a grace period in progress when the active lease expires.
+    ...(process.platform !== 'win32' && input.getWindowsStartBudgetMs
+      ? { cancel_grace_seconds: 0 }
+      : {}),
+    completion: { type: 'run_to_exit' },
+  };
+  const budget = input.getWindowsStartBudgetMs?.();
+  if (input.cancelSignal?.aborted || (budget !== undefined && budget <= 0)) {
+    return skipped();
+  }
   const child = spawnJobScript({
     ...input,
+    execution,
     attemptId: input.attemptId,
     containmentId: cleanupContainmentId,
     scriptFileName: cleanupName,
   });
-  const timeoutMs = (input.execution.cleanup_timeout_seconds ?? 60) * 1000;
-  const result = await Promise.race([
-    child.waitForExit().then((r) => ({ type: 'exit' as const, ...r })),
-    new Promise<'timeout'>((resolvePromise) =>
-      setTimeout(() => resolvePromise('timeout'), timeoutMs),
-    ),
-  ]);
-  if (result === 'timeout') {
-    await child.kill(input.execution.cancel_grace_seconds);
-    return { exitCode: null, timedOut: true };
+  let stopping: Promise<void> | undefined;
+  const stop = (grace: number) => {
+    stopping ??= child.kill(grace);
+    return stopping;
+  };
+  const onCancel = () => {
+    void stop(0).catch(() => undefined);
+  };
+  input.cancelSignal?.addEventListener('abort', onCancel, { once: true });
+  if (input.cancelSignal?.aborted) onCancel();
+  try {
+    const result = await waitForCompletion({
+      child,
+      execution,
+      logs: input.logs,
+      signal: { cancelled: false },
+    });
+    if (input.cancelSignal?.aborted) {
+      return {
+        exitCode: null,
+        timedOut: false,
+        message: `Cleanup script interrupted: ${interruptionReason()}`,
+      };
+    }
+    if (result.type === 'timeout') {
+      await stop(execution.cancel_grace_seconds);
+      return { exitCode: null, timedOut: true };
+    }
+    return { exitCode: result.type === 'exit' ? result.exitCode : null, timedOut: false };
+  } finally {
+    input.cancelSignal?.removeEventListener('abort', onCancel);
+    try {
+      if (input.getWindowsStartBudgetMs && process.platform !== 'win32') {
+        // Sweep descendants still tagged for cleanup after the wrapper exits.
+        await stop(0);
+      } else {
+        await stopping;
+      }
+    } finally {
+      await child.waitForExit();
+    }
   }
-  return { exitCode: result.exitCode, timedOut: false };
 }

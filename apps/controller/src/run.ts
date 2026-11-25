@@ -10,6 +10,8 @@ import {
   RBO_CONTROLLER_VERSION,
   createLogger,
   ensureControllerIdentity,
+  recoverPendingControllerRestore,
+  resolveControllerDataDir,
 } from '@rbo/shared';
 import { type ControllerConfig, ensureDataDir, loadControllerConfig } from './config.js';
 import { startControllerServer } from './http/server.js';
@@ -43,7 +45,9 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
     startupTimingsMs[phase] = Math.round(now - phaseStartedAt);
     phaseStartedAt = now;
   };
-  const config = loadControllerConfig(overrides);
+  const dataDir = overrides.dataDir ?? resolveControllerDataDir();
+  await recoverPendingControllerRestore(dataDir);
+  const config = loadControllerConfig({ ...overrides, dataDir });
   ensureDataDir(config);
   recordStartupPhase('config');
 
@@ -67,7 +71,9 @@ export async function runController(overrides: Partial<ControllerConfig> = {}): 
   const lifecycleNotifier = new JobLifecycleNotifier();
   bindJobLifecycleNotifier(db, lifecycleNotifier);
 
-  const identity = await ensureControllerIdentity(config.dataDir);
+  const identity = await ensureControllerIdentity(config.dataDir, {
+    rotateLegacyAdminBearer: true,
+  });
   recordStartupPhase('identity');
 
   const hostCpuMonitor = new HostCpuMonitor();

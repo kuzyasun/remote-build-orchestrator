@@ -70,7 +70,7 @@ async function connectStdioStyleClient(server = running, token?: string): Promis
   const proxy = createStdioProxyServer({
     controllerUrl: `http://127.0.0.1:${server.port}`,
     clientId: 'test-stdio-client',
-    adminToken: token,
+    mcpToken: token,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await proxy.connect(serverTransport);
@@ -337,8 +337,8 @@ describe('job_logs transport parity with persistent cursor identity', () => {
     let httpClient: Client | undefined;
     let stdioClient: Client | undefined;
     try {
-      httpClient = await connectHttpClient(fixtureServer, fixtureIdentity.adminToken);
-      stdioClient = await connectStdioStyleClient(fixtureServer, fixtureIdentity.adminToken);
+      httpClient = await connectHttpClient(fixtureServer, fixtureIdentity.mcpToken);
+      stdioClient = await connectStdioStyleClient(fixtureServer, fixtureIdentity.mcpToken);
       const arguments_ = {
         job_id: 'job_transport_logs',
         attempt_id: 'att_transport_logs',

@@ -507,7 +507,11 @@ export async function dispatchJobExecution(
   jobId: string,
   request: JobRequest,
 ): Promise<void> {
-  if (ctx.shouldContinueDispatch && !ctx.shouldContinueDispatch()) {
+  if (ctx.shouldContinueDispatch?.() === false || getJob(ctx.db, jobId)?.state !== 'queued') {
+    return;
+  }
+  const gitSourceRequirements = await readGitSourceRequirements(ctx.dataDir, jobId);
+  if (ctx.shouldContinueDispatch?.() === false || getJob(ctx.db, jobId)?.state !== 'queued') {
     return;
   }
   const connectedMap = ctx.connectedAgents ?? new Map();
@@ -520,11 +524,17 @@ export async function dispatchJobExecution(
   const candidates: SchedulerAgent[] = [];
 
   for (const agentRow of dbAgents) {
-    if (!connectedMap.has(agentRow.id)) {
+    const connection = connectedMap.get(agentRow.id);
+    if (
+      !connection ||
+      connection.capabilitiesReady === false ||
+      (connection.leaseRetryAfter ?? 0) > Date.now()
+    ) {
       continue;
     }
     try {
       const caps = JSON.parse(agentRow.capabilities_json) as AgentCapabilityReport;
+      caps.accepting_jobs = connection.acceptingJobs ?? caps.accepting_jobs;
       candidates.push({
         agentId: agentRow.id,
         capabilities: caps,
@@ -555,11 +565,14 @@ export async function dispatchJobExecution(
         ? `local:${snapshotMeta.content_id}`
         : null;
 
-  const gitSourceRequirements = await readGitSourceRequirements(ctx.dataDir, jobId);
-  if (ctx.shouldContinueDispatch && !ctx.shouldContinueDispatch()) {
-    return;
-  }
-  const schedulingRequest = mergeGitSourceToolRequirements(request, gitSourceRequirements);
+  const sourceRequest = mergeGitSourceToolRequirements(request, gitSourceRequirements);
+  // A captured overlay has a Git base commit and requires remote materialization.
+  // Wait for another Agent rather than claiming an unusable local attempt.
+  const schedulingRequest =
+    snapshotMeta?.base_commit &&
+    (sourceRequest.queue_policy ?? 'local_fallback') === 'local_fallback'
+      ? { ...sourceRequest, queue_policy: 'wait' as const }
+      : sourceRequest;
 
   const hostLoad: HostLoadSnapshot | undefined = ctx.getHostCpuBusyFraction
     ? {
@@ -600,7 +613,6 @@ export async function dispatchJobExecution(
         serverPort: ctx.agentPlanePort,
         controllerPublicHost: ctx.controllerPublicHost,
         dataPlaneBaseUrl: ctx.dataPlaneBaseUrl,
-        snapshotCaptureLimits: ctx.snapshotCaptureLimits,
       },
       jobId,
       decision.selectedAgent.agentId,
@@ -677,6 +689,22 @@ export async function tryDispatchQueuedJobs(ctx: SubmitJobContext): Promise<void
 }
 
 export async function handleJobConfirm(
+  ctx: SubmitJobContext,
+  args: { job_id: string; confirmation_token: string },
+): Promise<Record<string, unknown>> {
+  if (ctx.confirmationPolicy === 'strict') {
+    return {
+      error: {
+        category: 'validation',
+        message: 'Operator confirmation required. Use rbo jobs confirm <job-id>.',
+        retryable: false,
+      },
+    };
+  }
+  return confirmJobWithToken(ctx, args);
+}
+
+async function confirmJobWithToken(
   ctx: SubmitJobContext,
   args: { job_id: string; confirmation_token: string },
 ): Promise<Record<string, unknown>> {
@@ -841,7 +869,7 @@ export async function confirmJobByAdmin(
     ...options,
   };
 
-  const result = await handleJobConfirm(ctx, {
+  const result = await confirmJobWithToken(ctx, {
     job_id: job.id,
     confirmation_token,
   });
@@ -1049,7 +1077,7 @@ export async function handleJobCancel(
   // Remote attempt: send cancel_job over Agent WS. Do not free Controller
   // capacity / mark cancelled until Agent reports cancelled exit/cleanup
   // (or disconnect). If the Agent is already gone, finalize here.
-  if (attempt?.agent_id) {
+  if (attempt?.agent_id && attempt.state !== 'completed') {
     if (ctx.connectedAgents) {
       signalled = requestRemoteJobCancel(
         { db: ctx.db, connectedAgents: ctx.connectedAgents },
@@ -1141,20 +1169,21 @@ export function handleJobArtifacts(db: ControllerDatabase, jobId: string): Recor
           const name = artifact.logical_name.replace(/\.tar\.zst$/, '');
           return globMatch(rule.glob, artifact.logical_name) || globMatch(rule.glob, name);
         }).length;
-        const status =
-          storedCount > 0
-            ? 'stored'
-            : !collected
-              ? 'unknown'
-              : collected.matched_count === 0
-                ? 'no_match'
-                : summary.limit_exceeded
-                  ? 'limit_exceeded'
-                  : collected.collected_count > 0
-                    ? 'not_stored'
-                    : collected.skipped_count > 0
-                      ? 'skipped'
-                      : 'not_stored';
+        let status = storedCount > 0 ? 'stored' : 'unknown';
+        if (summary?.staging_interrupted) {
+          status = 'interrupted';
+        } else if (collected && collected.collected_count > storedCount) {
+          status = 'not_stored';
+        } else if (collected && storedCount === 0) {
+          status =
+            collected.matched_count === 0
+              ? 'no_match'
+              : summary.limit_exceeded
+                ? 'limit_exceeded'
+                : collected.skipped_count > 0
+                  ? 'skipped'
+                  : 'not_stored';
+        }
         return {
           glob: rule.glob,
           required: rule.required,
@@ -1183,7 +1212,8 @@ export function handleJobArtifacts(db: ControllerDatabase, jobId: string): Recor
           ...(request?.source?.project_root
             ? { artifact_search_base: request.source.project_root }
             : {}),
-          collection_reported: Boolean(summary),
+          collection_reported: Boolean(summary && !summary.staging_interrupted),
+          ...(summary?.staging_interrupted ? { collection_interrupted: true } : {}),
           artifact_rule_results: artifactRuleResults,
           ...(summary?.limit_exceeded ? { collection_limit_exceeded: summary.limit_exceeded } : {}),
         }

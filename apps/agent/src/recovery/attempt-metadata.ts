@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { readdir, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import type { ArtifactCollectionSummary } from '@rbo/protocol';
+import type { ArtifactCollectionSummary, CleanupCompletePayload } from '@rbo/protocol';
 import type { ErrorCategory } from '@rbo/shared';
 
 export type AttemptMetadataStatus =
@@ -43,9 +43,15 @@ export interface AttemptMetadata {
   last_exit?: AttemptExitRecord;
   /** Absolute ISO lease deadline tracked locally for destructive/hardware self-term. */
   lease_deadline?: string;
-  /** Persisted after collect; resume re-sends this manifest without re-collection. */
+  /** An explicitly empty manifest still represents completed staging. */
+  artifact_staging?: 'pending' | 'complete' | 'interrupted';
+  /** Resume re-sends only the durably staged entries. */
   artifact_manifest?: AttemptArtifactManifestItem[];
   artifact_collection?: ArtifactCollectionSummary;
+  /** Cleanup and transfer have independent results from the already-exited job process. */
+  cleanup_result?: Pick<CleanupCompletePayload, 'exit_code' | 'timed_out' | 'message'>;
+  /** Terminal transfer decision. Only the cleanup notification can still need replay. */
+  artifact_transfer?: 'stored' | 'failed';
 }
 
 export function attemptMetadataDir(stateDir: string, attemptId: string): string {
@@ -70,28 +76,40 @@ export function writeAttemptMetadata(stateDir: string, meta: AttemptMetadata): v
   renameSync(tmp, target);
 }
 
-export function readAttemptMetadata(stateDir: string, attemptId: string): AttemptMetadata | null {
+export function readAttemptMetadata(
+  stateDir: string,
+  attemptId: string,
+  options?: { requireReadable?: boolean },
+): AttemptMetadata | null {
   const path = attemptMetadataPath(stateDir, attemptId);
   try {
     const raw = readFileSync(path, 'utf8');
     return JSON.parse(raw) as AttemptMetadata;
-  } catch {
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (options?.requireReadable && code && code !== 'ENOENT') throw error;
     return null;
   }
 }
 
 /** Scan attempt metadata.json under stateDir/attempts. */
-export async function listAttemptMetadata(stateDir: string): Promise<AttemptMetadata[]> {
+export async function listAttemptMetadata(
+  stateDir: string,
+  options?: { requireReadable?: boolean },
+): Promise<AttemptMetadata[]> {
   const root = join(stateDir, 'attempts');
   let entries: string[];
   try {
     entries = await readdir(root);
-  } catch {
+  } catch (error) {
+    if (options?.requireReadable && (error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
     return [];
   }
   const out: AttemptMetadata[] = [];
   for (const name of entries) {
-    const meta = readAttemptMetadata(stateDir, name);
+    const meta = readAttemptMetadata(stateDir, name, options);
     if (meta) {
       out.push(meta);
     }
