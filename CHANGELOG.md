@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-26
+
+### Fixed
+
+- The Controller refuses duplicate connections for an Agent ID while its existing session has a current heartbeat. The original session keeps its jobs. A refused Agent retries with its existing pairing credential.
+- `rbo doctor` reports recent duplicate Agent sessions. The Controller log records the affected Agent ID so operators can identify the worker with competing instances.
+
 ## [0.11.0] - 2026-11-25
 
 ### Changed
@@ -192,7 +199,8 @@ helper.
 
 Earlier pre-1.0 npm releases were not documented in this file.
 
-[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/kuzyasun/remote-build-orchestrator/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.11.1
 [0.11.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.11.0
 [0.10.1]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.10.1
 [0.10.0]: https://github.com/kuzyasun/remote-build-orchestrator/releases/tag/v0.10.0

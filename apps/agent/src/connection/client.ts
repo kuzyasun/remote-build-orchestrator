@@ -484,7 +484,7 @@ export class AgentConnection {
         }
       });
 
-      socket.on('close', () => {
+      socket.on('close', (code, reason) => {
         if (this.socket === socket) {
           this.stopHeartbeats();
           // Park attempt through grace — do not kill safe/normal jobs.
@@ -493,7 +493,15 @@ export class AgentConnection {
         // Keep executor alive across reconnect so the process and spool sender remain.
         if (!settled) {
           settled = true;
-          rejectPromise(new Error('connection closed before authentication'));
+          const conflict =
+            code === 1013 && reason.toString() === 'Agent ID already has an active session';
+          rejectPromise(
+            new Error(
+              conflict
+                ? 'Agent ID already has an active session'
+                : 'connection closed before authentication',
+            ),
+          );
         }
       });
 

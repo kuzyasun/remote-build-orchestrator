@@ -16,7 +16,9 @@ rbo agents
 ```
 
 `rbo doctor` checks the local installation, Controller reachability, data directory, Git, shells,
-and the Windows executor when applicable. `rbo agents` shows registered workers, pending pairing
+and the Windows executor when applicable. It also reports recent duplicate Agent sessions.
+See [Doctor reports duplicate Agent sessions](troubleshooting.md#doctor-reports-duplicate-agent-sessions)
+to identify the affected worker. `rbo agents` shows registered workers, pending pairing
 requests, OS, and current capacity. It does not list compilers or SDKs.
 
 ## Start and stop processes

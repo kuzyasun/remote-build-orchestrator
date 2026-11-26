@@ -189,7 +189,7 @@ describe('Admin API for CLI (§33)', () => {
     const res = await fetch(`http://127.0.0.1:${running.port}/internal/v1/health`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { ok: boolean };
-    expect(body).toEqual({ ok: true });
+    expect(body).toEqual({ ok: true, agent_session_conflicts: 0 });
   });
 
   it('lists pending pairing requests', async () => {

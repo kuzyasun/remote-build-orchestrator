@@ -420,7 +420,7 @@ describe('Agent pairing over TLS WebSocket', () => {
     }
   });
 
-  it('keeps the new session when the agent reconnects and the old socket closes', async () => {
+  it('accepts a reconnect after heartbeat expiry even while the stale socket is still open', async () => {
     const dir = newAgentDir();
     const first = agentConnection(dir);
     await first.connectOnce();
@@ -430,8 +430,14 @@ describe('Agent pairing over TLS WebSocket', () => {
     const session = await first.connectOnce();
     expect(session.status).toBe('authenticated');
 
-    const previousSocket = plane.connectedAgents.get(agentId)?.socket;
+    await vi.waitFor(() =>
+      expect(plane.connectedAgents.get(agentId)?.capabilitiesReady).toBe(true),
+    );
+    const previous = plane.connectedAgents.get(agentId);
+    if (!previous) throw new Error('missing connected agent');
+    const previousSocket = previous.socket;
     expect(previousSocket?.readyState).toBe(WebSocket.OPEN);
+    previous.lastHeartbeatAt = 0;
 
     const second = agentConnection(dir);
     const again = await second.connectOnce();

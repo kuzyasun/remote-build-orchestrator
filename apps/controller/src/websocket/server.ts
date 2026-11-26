@@ -85,12 +85,15 @@ export interface AgentPlaneOptions {
 
 export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 60_000;
 const LEASE_REJECT_COOLDOWN_MS = 1_000;
+// Longer than the Agent's maximum reconnect backoff (60 seconds).
+const SESSION_CONFLICT_WINDOW_MS = 120_000;
 
 export interface ConnectedAgent {
   agentId: string;
   socket: WebSocket;
   protocolVersion: number;
   lastHeartbeatAt: number;
+  sessionConflictUntil?: number;
   /** Real sessions wait for their initial capability report and boot reconciliation. */
   capabilitiesReady?: boolean;
   acceptingJobs?: boolean;
@@ -352,7 +355,7 @@ export async function startAgentPlaneServer(
     });
 
     socket.on('message', (raw) => {
-      if (shuttingDown) {
+      if (shuttingDown || socket.readyState !== socket.OPEN) {
         return;
       }
       let decoded: unknown;
@@ -466,17 +469,32 @@ export async function startAgentPlaneServer(
             pendingNonce = null;
             pendingCredential = null;
             const previous = connectedAgents.get(verified.agentId);
+            const now = Date.now();
+            if (
+              previous &&
+              previous.socket !== socket &&
+              previous.socket.readyState === socket.OPEN &&
+              now - previous.lastHeartbeatAt <= heartbeatTimeoutMs
+            ) {
+              if ((previous.sessionConflictUntil ?? 0) <= now) {
+                logger.warn('duplicate agent session refused', { agentId: verified.agentId });
+              }
+              previous.sessionConflictUntil = now + SESSION_CONFLICT_WINDOW_MS;
+              // A rejected hello_ack makes existing Agents discard their pairing credential.
+              // A retryable transport close preserves it and uses normal reconnect backoff.
+              socket.close(1013, 'Agent ID already has an active session');
+              return;
+            }
             authenticated = {
               agentId: verified.agentId,
               socket,
               protocolVersion: 1,
-              lastHeartbeatAt: Date.now(),
+              lastHeartbeatAt: now,
               capabilitiesReady: false,
               connectionHost,
             };
-            // Identity is the credential, not the source address. A reconnect from a
-            // new agent IP replaces the previous session; install it before closing
-            // the old socket so that socket's close handler cannot drop this one.
+            // Install the successor before closing a stale socket so its close handler
+            // cannot take the new session offline.
             connectedAgents.set(verified.agentId, authenticated);
             if (previous && previous.socket !== socket) {
               logger.info('agent reconnected from a new session', {

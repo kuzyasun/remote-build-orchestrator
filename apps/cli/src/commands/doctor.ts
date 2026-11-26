@@ -304,23 +304,50 @@ export function describeControllerReachabilityFailure(
   return hint ? `${controllerUrl}: ${cause}. ${hint}` : `${controllerUrl}: ${cause}`;
 }
 
-async function checkControllerReachable(controllerUrl: string): Promise<DoctorCheck> {
+async function checkControllerHealth(controllerUrl: string): Promise<DoctorCheck[]> {
   const base = controllerUrl.replace(/\/+$/, '');
   try {
     const res = await fetch(`${base}/internal/v1/health`, {
       signal: AbortSignal.timeout(CONTROLLER_HEALTH_TIMEOUT_MS),
     });
-    return {
+    const reachable = {
       name: 'controller_reachable',
       ok: res.ok,
       detail: res.ok ? controllerUrl : `${controllerUrl} returned HTTP ${res.status}`,
     };
+    if (!res.ok) return [reachable];
+
+    const health = await res.json().catch(() => null);
+    const count =
+      health && typeof health === 'object' && 'agent_session_conflicts' in health
+        ? health.agent_session_conflicts
+        : undefined;
+    const name = 'agent_session_conflicts';
+    if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) {
+      return [
+        reachable,
+        { name, ok: true, warn: true, detail: 'Controller did not report Agent session conflicts' },
+      ];
+    }
+    return [
+      reachable,
+      {
+        name,
+        ok: count === 0,
+        detail:
+          count === 0
+            ? 'No recent duplicate Agent sessions'
+            : `Duplicate connections refused for ${count} Agent ID(s) in the last two minutes. Look for "duplicate agent session refused" in the Controller log and stop the extra Agent instance.`,
+      },
+    ];
   } catch (error) {
-    return {
-      name: 'controller_reachable',
-      ok: false,
-      detail: describeControllerReachabilityFailure(error, controllerUrl),
-    };
+    return [
+      {
+        name: 'controller_reachable',
+        ok: false,
+        detail: describeControllerReachabilityFailure(error, controllerUrl),
+      },
+    ];
   }
 }
 
@@ -1371,7 +1398,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
   ];
 
   if (options.controllerUrl) {
-    checks.push(await checkControllerReachable(options.controllerUrl));
+    checks.push(...(await checkControllerHealth(options.controllerUrl)));
   }
 
   return {

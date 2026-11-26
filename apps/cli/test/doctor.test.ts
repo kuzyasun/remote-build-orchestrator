@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   checkControllerPorts,
   checkControllerPublicHost,
@@ -109,6 +109,33 @@ describe('rbo doctor (§33)', () => {
     // Node/undici may reject port 1 as `bad port` instead of connecting.
     expect(reachable?.detail).toMatch(/bad port|ECONNREFUSED|ECONNRESET|timed out/i);
   }, 15_000);
+
+  it.each([
+    [{ ok: true, agent_session_conflicts: 1 }, 'FAIL'],
+    [{ ok: true, agent_session_conflicts: 0 }, 'OK  '],
+    [{ ok: true }, 'WARN'],
+  ] as const)(
+    'reports Agent session conflicts from a reachable Controller (%j)',
+    async (body, tag) => {
+      const probe = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json(body));
+      try {
+        const report = await runDoctor({
+          dataDir: tempDir(),
+          controllerUrl: 'http://127.0.0.1:7410',
+        });
+        expect(report.checks.find((check) => check.name === 'controller_reachable')?.ok).toBe(true);
+        const conflicts = report.checks.find((check) => check.name === 'agent_session_conflicts');
+        if (!conflicts) throw new Error('missing session conflict check');
+        expect(doctorStatusTag(conflicts)).toBe(tag);
+        if (tag === 'FAIL') {
+          expect(conflicts.detail).toContain('stop the extra Agent instance');
+          expect(report.ok).toBe(false);
+        }
+      } finally {
+        probe.mockRestore();
+      }
+    },
+  );
 
   it('warns for windows_executor when helper is missing (non-Windows)', async () => {
     const report = await runDoctor({

@@ -1,13 +1,13 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import { computeRepoKey, ensureControllerIdentity } from '@rbo/shared';
 import { createGitFixtureRepo } from '@rbo/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AgentConnection } from '../../../apps/agent/src/connection/client.js';
 import { resolveDataPlaneBaseUrl } from '../src/execution/remote-execution.js';
 import {
@@ -135,9 +135,20 @@ describe('Remote Execution End-to-End', () => {
     await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
   });
 
-  it('executes a full snapshot job remotely on an authenticated agent', async () => {
+  it('finishes a full snapshot job on its original Agent despite a duplicate connection', async () => {
+    const releasePath = join(tempDir, 'release-job');
     const fixture = await createGitFixtureRepo({
-      committed: [{ path: 'src/index.js', content: 'console.log("hello remote agent");' }],
+      committed: [
+        {
+          path: 'src/index.js',
+          content: `
+        const { existsSync } = require('node:fs');
+        const timer = setInterval(() => {
+          if (existsSync(${JSON.stringify(releasePath)})) clearInterval(timer);
+        }, 25);
+      `,
+        },
+      ],
     });
 
     const agentStateDir = join(tempDir, 'agent-state');
@@ -149,7 +160,7 @@ describe('Remote Execution End-to-End', () => {
       stateDir: agentStateDir,
       displayName: 'test-remote-agent',
       gitAllowlist: overlayGitAllowlist,
-      capabilities: agentCapabilities('test-remote-agent'),
+      capabilities: { ...agentCapabilities('test-remote-agent'), boot_id: 'boot_contender' },
     });
 
     const p1 = await conn1.connectOnce();
@@ -160,7 +171,7 @@ describe('Remote Execution End-to-End', () => {
     const pendingReq = db
       .prepare("SELECT id FROM pairing_requests WHERE state = 'pending'")
       .get() as { id: string };
-    approvePairingRequest(db, identity, pendingReq.id);
+    const { agentId } = approvePairingRequest(db, identity, pendingReq.id);
 
     // 3. Connect agent with credentials
     const conn2 = new AgentConnection({
@@ -169,7 +180,7 @@ describe('Remote Execution End-to-End', () => {
       stateDir: agentStateDir,
       displayName: 'test-remote-agent',
       gitAllowlist: overlayGitAllowlist,
-      capabilities: agentCapabilities('test-remote-agent'),
+      capabilities: { ...agentCapabilities('test-remote-agent'), boot_id: 'boot_owner' },
     });
 
     const p2 = await conn2.connectOnce();
@@ -195,6 +206,7 @@ describe('Remote Execution End-to-End', () => {
       execution: {
         shell: process.platform === 'win32' ? 'powershell' : 'bash',
         script: 'node src/index.js',
+        timeout_seconds: 30,
       },
       artifacts: [
         { glob: 'src/index.js', required: true },
@@ -205,6 +217,28 @@ describe('Remote Execution End-to-End', () => {
 
     expect(submitRes.job_id).toBeDefined();
     const jobId = String(submitRes.job_id);
+
+    try {
+      await vi.waitFor(
+        () =>
+          expect(
+            db
+              .prepare(
+                "SELECT 1 FROM job_events WHERE job_id = ? AND event_type = 'process_started'",
+              )
+              .get(jobId),
+          ).toBeDefined(),
+        { timeout: 30_000 },
+      );
+      const session = agentPlane.connectedAgents.get(agentId);
+      await expect(conn1.connectOnce()).rejects.toThrow('Agent ID already has an active session');
+      expect(conn1.hasStoredCredential()).toBe(true);
+      expect(agentPlane.connectedAgents.get(agentId)).toBe(session);
+      const health = await fetch(`http://127.0.0.1:${controllerServer.port}/internal/v1/health`);
+      expect(await health.json()).toEqual({ ok: true, agent_session_conflicts: 1 });
+    } finally {
+      await writeFile(releasePath, '');
+    }
 
     // 5. Wait for remote job completion
     const waitRes = await handleToolCall(ctx, 'job_wait', {
@@ -241,7 +275,11 @@ describe('Remote Execution End-to-End', () => {
     ]);
 
     conn2.close();
-  });
+    await vi.waitFor(() => expect(agentPlane.connectedAgents.has(agentId)).toBe(false));
+    await expect(conn1.connectOnce()).resolves.toMatchObject({ status: 'authenticated', agentId });
+    conn1.close();
+    await fixture.cleanup();
+  }, 120_000);
 
   it('executes a git_overlay remote prepare path on an authenticated agent', async () => {
     const fixture = await createGitFixtureRepo({

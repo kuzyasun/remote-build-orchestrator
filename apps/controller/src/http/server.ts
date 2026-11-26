@@ -339,7 +339,12 @@ export async function startControllerServer(
 
     const run = async () => {
       if (url.pathname === '/internal/v1/health') {
-        sendJson(res, 200, { ok: true });
+        const now = Date.now();
+        let agentSessionConflicts = 0;
+        for (const agent of options.connectedAgents?.values() ?? []) {
+          if ((agent.sessionConflictUntil ?? 0) > now) agentSessionConflicts++;
+        }
+        sendJson(res, 200, { ok: true, agent_session_conflicts: agentSessionConflicts });
         return;
       }
 
