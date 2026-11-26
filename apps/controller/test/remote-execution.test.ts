@@ -140,7 +140,7 @@ describe('Remote Execution End-to-End', () => {
     const fixture = await createGitFixtureRepo({
       committed: [
         {
-          path: 'src/index.js',
+          path: 'src/index.cjs',
           content: `
         const { existsSync } = require('node:fs');
         const timer = setInterval(() => {
@@ -205,11 +205,11 @@ describe('Remote Execution End-to-End', () => {
       source: { project_root: fixture.root, cwd: '.' },
       execution: {
         shell: process.platform === 'win32' ? 'powershell' : 'bash',
-        script: 'node src/index.js',
+        script: 'node src/index.cjs',
         timeout_seconds: 30,
       },
       artifacts: [
-        { glob: 'src/index.js', required: true },
+        { glob: 'src/index.cjs', required: true },
         { glob: 'build/missing.bin', required: true },
       ],
       queue_policy: 'wait',
@@ -244,18 +244,19 @@ describe('Remote Execution End-to-End', () => {
     const waitRes = await handleToolCall(ctx, 'job_wait', {
       job_id: jobId,
       timeout_ms: 10000,
+      include_log_tail_lines: 20,
     });
 
     const jobData = waitRes.job as Record<string, unknown>;
     expect(jobData.state).toBe('completed');
-    expect(jobData.outcome).toBe('succeeded');
+    expect(jobData.outcome, JSON.stringify(waitRes)).toBe('succeeded');
 
     const artifactResult = await handleToolCall(ctx, 'job_artifacts', { job_id: jobId });
     expect(artifactResult.collection_reported).toBe(true);
     expect(artifactResult.artifact_search_base).toBe(fixture.root);
     expect(artifactResult.artifact_rule_results).toMatchObject([
       {
-        glob: 'src/index.js',
+        glob: 'src/index.cjs',
         status: 'stored',
         matched_count: 1,
         collected_count: 1,

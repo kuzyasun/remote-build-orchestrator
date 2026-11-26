@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -59,7 +60,7 @@ describe('stop-running-rbo (install auto-stop)', () => {
   });
 
   it('resolves default and env-overridden pid file paths', () => {
-    const home = join(tmpdir(), 'rbo-home-fake');
+    const home = join(realpathSync(tmpdir()), 'rbo-home-fake');
     const files = resolveDaemonPidFiles({
       env: {},
       home,
@@ -69,24 +70,26 @@ describe('stop-running-rbo (install auto-stop)', () => {
       { role: 'agent', path: join(home, '.rbo', 'agent', 'run', 'agent.pid') },
     ]);
 
+    const dataDir = join(home, 'rbo-data');
+    const stateDir = join(home, 'agent-state');
     const overridden = resolveDaemonPidFiles({
-      env: { RBO_DATA_DIR: 'D:\\rbo-data', RBO_AGENT_STATE_DIR: 'E:\\agent-state' },
+      env: { RBO_DATA_DIR: dataDir, RBO_AGENT_STATE_DIR: stateDir },
       home,
     });
     expect(overridden).toEqual([
-      { role: 'controller', path: join('D:\\rbo-data', 'run', 'controller.pid') },
-      { role: 'agent', path: join('E:\\agent-state', 'run', 'agent.pid') },
+      { role: 'controller', path: join(dataDir, 'run', 'controller.pid') },
+      { role: 'agent', path: join(stateDir, 'run', 'agent.pid') },
     ]);
 
     const explicit = resolveDaemonPidFiles({
-      env: {},
+      env: { RBO_DATA_DIR: dataDir, RBO_AGENT_STATE_DIR: stateDir },
       home,
-      dataDir: 'F:\\ctrl',
-      stateDir: 'G:\\agent',
+      dataDir: join(home, 'explicit-controller'),
+      stateDir: join(home, 'explicit-agent'),
     });
     expect(explicit).toEqual([
-      { role: 'controller', path: join('F:\\ctrl', 'run', 'controller.pid') },
-      { role: 'agent', path: join('G:\\agent', 'run', 'agent.pid') },
+      { role: 'controller', path: join(home, 'explicit-controller', 'run', 'controller.pid') },
+      { role: 'agent', path: join(home, 'explicit-agent', 'run', 'agent.pid') },
     ]);
   });
 
