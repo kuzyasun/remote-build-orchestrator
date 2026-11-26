@@ -111,26 +111,50 @@ describe('rbo doctor (§33)', () => {
   }, 15_000);
 
   it.each([
-    [{ ok: true, agent_session_conflicts: 1 }, 'FAIL'],
-    [{ ok: true, agent_session_conflicts: 0 }, 'OK  '],
-    [{ ok: true }, 'WARN'],
+    [
+      'http://127.0.0.1:7410',
+      {
+        ok: true,
+        agent_session_conflicts: 1,
+        agent_session_conflict_ids: ['agt_01M66JFP3BKFDQW61BYF5KDJV0'],
+      },
+      'WARN',
+      'agt_01M66JFP3BKFDQW61BYF5KDJV0',
+    ],
+    [
+      'http://controller.example',
+      { ok: true, agent_session_conflicts: 1 },
+      'WARN',
+      'find the Agent ID',
+    ],
+    [
+      'http://127.0.0.1:7410',
+      { ok: true, agent_session_conflicts: 0 },
+      'OK  ',
+      'No recent duplicate',
+    ],
+    ['http://127.0.0.1:7410', { ok: true }, 'WARN', 'did not report'],
   ] as const)(
-    'reports Agent session conflicts from a reachable Controller (%j)',
-    async (body, tag) => {
+    'reports Agent session conflicts from %s (%j)',
+    async (controllerUrl, body, tag, detail) => {
       const probe = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json(body));
       try {
         const report = await runDoctor({
           dataDir: tempDir(),
-          controllerUrl: 'http://127.0.0.1:7410',
+          controllerUrl,
+          env: { RBO_ADMIN_TOKEN: 'test-admin-token' },
         });
+        expect(probe.mock.calls[0]?.[1]?.headers).toEqual(
+          controllerUrl === 'http://controller.example'
+            ? undefined
+            : { authorization: 'Bearer test-admin-token' },
+        );
         expect(report.checks.find((check) => check.name === 'controller_reachable')?.ok).toBe(true);
         const conflicts = report.checks.find((check) => check.name === 'agent_session_conflicts');
         if (!conflicts) throw new Error('missing session conflict check');
         expect(doctorStatusTag(conflicts)).toBe(tag);
-        if (tag === 'FAIL') {
-          expect(conflicts.detail).toContain('stop the extra Agent instance');
-          expect(report.ok).toBe(false);
-        }
+        expect(conflicts.detail).toContain(detail);
+        expect(conflicts.ok).toBe(true);
       } finally {
         probe.mockRestore();
       }

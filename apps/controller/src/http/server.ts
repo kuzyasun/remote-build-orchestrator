@@ -340,11 +340,17 @@ export async function startControllerServer(
     const run = async () => {
       if (url.pathname === '/internal/v1/health') {
         const now = Date.now();
-        let agentSessionConflicts = 0;
+        const conflictAgentIds = [];
         for (const agent of options.connectedAgents?.values() ?? []) {
-          if ((agent.sessionConflictUntil ?? 0) > now) agentSessionConflicts++;
+          if ((agent.sessionConflictUntil ?? 0) > now) conflictAgentIds.push(agent.agentId);
         }
-        sendJson(res, 200, { ok: true, agent_session_conflicts: agentSessionConflicts });
+        sendJson(res, 200, {
+          ok: true,
+          agent_session_conflicts: conflictAgentIds.length,
+          ...(isAuthorized(req, expectedAdminToken)
+            ? { agent_session_conflict_ids: conflictAgentIds }
+            : {}),
+        });
         return;
       }
 

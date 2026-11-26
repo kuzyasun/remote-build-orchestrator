@@ -9,7 +9,7 @@ import {
   type WindowsExecutorResolveResult,
   describeWindowsExecutorResolution,
 } from '@rbo/executor';
-import { resolveControllerDataDir } from '@rbo/shared';
+import { readAdminToken, resolveControllerDataDir } from '@rbo/shared';
 import { controllerPidPath, isProcessAlive } from './daemon.js';
 
 const execFileAsync = promisify(execFile);
@@ -304,11 +304,20 @@ export function describeControllerReachabilityFailure(
   return hint ? `${controllerUrl}: ${cause}. ${hint}` : `${controllerUrl}: ${cause}`;
 }
 
-async function checkControllerHealth(controllerUrl: string): Promise<DoctorCheck[]> {
+async function checkControllerHealth(
+  controllerUrl: string,
+  dataDir: string,
+  env: NodeJS.ProcessEnv,
+): Promise<DoctorCheck[]> {
   const base = controllerUrl.replace(/\/+$/, '');
   try {
+    const { hostname } = new URL(base);
+    const token = ['127.0.0.1', 'localhost', '[::1]'].includes(hostname)
+      ? readAdminToken({ env: { ...env, RBO_DATA_DIR: dataDir } })
+      : undefined;
     const res = await fetch(`${base}/internal/v1/health`, {
       signal: AbortSignal.timeout(CONTROLLER_HEALTH_TIMEOUT_MS),
+      ...(token ? { headers: { authorization: `Bearer ${token}` }, redirect: 'error' } : {}),
     });
     const reachable = {
       name: 'controller_reachable',
@@ -317,11 +326,9 @@ async function checkControllerHealth(controllerUrl: string): Promise<DoctorCheck
     };
     if (!res.ok) return [reachable];
 
-    const health = await res.json().catch(() => null);
-    const count =
-      health && typeof health === 'object' && 'agent_session_conflicts' in health
-        ? health.agent_session_conflicts
-        : undefined;
+    const data = await res.json().catch(() => null);
+    const health = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
+    const count = health.agent_session_conflicts;
     const name = 'agent_session_conflicts';
     if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) {
       return [
@@ -329,15 +336,26 @@ async function checkControllerHealth(controllerUrl: string): Promise<DoctorCheck
         { name, ok: true, warn: true, detail: 'Controller did not report Agent session conflicts' },
       ];
     }
+    const rawIds = health.agent_session_conflict_ids;
+    const ids = Array.isArray(rawIds)
+      ? rawIds.filter((id) => typeof id === 'string' && /^agt_[A-Z0-9]{26}$/.test(id))
+      : [];
+    const agents =
+      ids.length === count ? ids.join(', ') : `${count} ${count === 1 ? 'Agent' : 'Agents'}`;
+    const identify =
+      ids.length === count
+        ? ''
+        : ' Look for "duplicate agent session refused" in the Controller log to find the Agent ID.';
     return [
       reachable,
       {
         name,
-        ok: count === 0,
+        ok: true,
+        warn: count > 0,
         detail:
           count === 0
             ? 'No recent duplicate Agent sessions'
-            : `Duplicate connections refused for ${count} Agent ID(s) in the last two minutes. Look for "duplicate agent session refused" in the Controller log and stop the extra Agent instance.`,
+            : `The Controller refused duplicate connections for ${agents} in the last two minutes. The existing session kept its jobs.${identify} Stop the extra Agent instance on the worker.`,
       },
     ];
   } catch (error) {
@@ -1398,7 +1416,13 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
   ];
 
   if (options.controllerUrl) {
-    checks.push(...(await checkControllerHealth(options.controllerUrl)));
+    checks.push(
+      ...(await checkControllerHealth(
+        options.controllerUrl,
+        options.dataDir,
+        options.env ?? process.env,
+      )),
+    );
   }
 
   return {

@@ -234,8 +234,17 @@ describe('Remote Execution End-to-End', () => {
       await expect(conn1.connectOnce()).rejects.toThrow('Agent ID already has an active session');
       expect(conn1.hasStoredCredential()).toBe(true);
       expect(agentPlane.connectedAgents.get(agentId)).toBe(session);
-      const health = await fetch(`http://127.0.0.1:${controllerServer.port}/internal/v1/health`);
+      const healthUrl = `http://127.0.0.1:${controllerServer.port}/internal/v1/health`;
+      const health = await fetch(healthUrl);
       expect(await health.json()).toEqual({ ok: true, agent_session_conflicts: 1 });
+      const adminHealth = await fetch(healthUrl, {
+        headers: { authorization: `Bearer ${identity.adminToken}` },
+      });
+      expect(await adminHealth.json()).toEqual({
+        ok: true,
+        agent_session_conflicts: 1,
+        agent_session_conflict_ids: [agentId],
+      });
     } finally {
       await writeFile(releasePath, '');
     }

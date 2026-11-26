@@ -109,12 +109,13 @@ once the old connection closes or its heartbeat expires.
 
 ## Doctor reports duplicate Agent sessions
 
-`FAIL agent_session_conflicts` means a paired Agent tried to connect while the
+`WARN agent_session_conflicts` means a paired Agent tried to connect while the
 Controller still had a live session for the same Agent ID. The first session keeps
 its jobs. The other connection retries automatically.
 
-Find `duplicate agent session refused` in the Controller log for the affected
-`agentId`. On that worker, check `rbo agent status` and whether a service and a
+`rbo doctor` lists affected Agent IDs when it has the local admin token. You can
+also find the ID in the `duplicate agent session refused` Controller log entry.
+On that worker, check `rbo agent status` and whether a service and a
 manually started Agent are both running. Stop the extra instance. With the working
 session still connected, the finding clears two minutes after the last refusal.
 

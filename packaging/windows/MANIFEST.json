@@ -1,35 +1,35 @@
 {
   "schema_version": 1,
   "os": "windows",
-  "package_version": "0.11.1",
+  "package_version": "0.11.2",
   "wire_protocol": {
     "min": 1,
     "max": 1
   },
   "components": {
-    "controller": "0.11.1",
-    "agent": "0.11.1",
-    "cli": "0.11.1",
-    "mcp_stdio": "0.11.1",
-    "windows_executor": "0.11.1"
+    "controller": "0.11.2",
+    "agent": "0.11.2",
+    "cli": "0.11.2",
+    "mcp_stdio": "0.11.2",
+    "windows_executor": "0.11.2"
   },
   "files": [
     {
       "path": "bin/rbo.js",
-      "sha256": "2de4e63b7c58088496aef518905e0ef9adab839f904417ef0f671c8f7f321f7a",
-      "size_bytes": 1057739,
+      "sha256": "deb8044dd8b4da920059ff2442dddd3aa379509f5788fdfe7381a74b3f4cb6d5",
+      "size_bytes": 1058695,
       "source": "apps/cli/dist/rbo.js"
     },
     {
       "path": "bin/rbo-mcp-stdio.js",
-      "sha256": "cc1d9e4b557b5bf7f5c9079abd1ab8856947309be4aeb4e3d6adfaedc8500110",
+      "sha256": "ab96dffb0c69a42203f6a2eff893c9ddea6dd01a63ada7f8bae585baabf82254",
       "size_bytes": 36268,
       "source": "apps/cli/dist/rbo-mcp-stdio.js"
     },
     {
       "path": "bin/rbo-windows-executor.exe",
-      "sha256": "a9662458bff2e042a920692a1d7b725588fe7db2a5e5d1cb062519c734ec05bc",
-      "size_bytes": 487936,
+      "sha256": "6ac4fe83266d48976d42fb143e1c84460e8dd3eb6aeacbd38323c9fbeea0b62f",
+      "size_bytes": 489472,
       "source": "native/windows-executor/target/release/rbo-windows-executor.exe"
     },
     {
